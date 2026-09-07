@@ -1,0 +1,189 @@
+"""Absolute log-likelihood parity against celerite2 and a dense fp64 oracle.
+
+Absolute, not differential: a wrong additive constant is invisible to MCMC
+and to every delta-based check, and would only show up as a wrong Bayesian
+evidence years later.
+
+Where the two oracles disagree, the dense Cholesky wins -- celerite2's
+SHOTerm carries an ``eps`` to dodge the ``1/sqrt(4Q^2-1)`` singularity at
+Q = 1/2, and its Matern32Term is an explicit *approximation* (Matern-3/2 is
+not celerite-representable at all).  Those are exactly the corners the
+state-space route was chosen to handle, so the test asserts against the
+dense oracle there and records celerite2's deficit rather than chasing it.
+"""
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+import anvilgp as ag
+from anvilgp.kalman import sequential_loglike
+from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam, ParamMap,
+                                a64)
+from anvilgp.oracle import celerite2_loglike, dense_loglike
+
+mx.set_default_device(mx.cpu)
+c2t = pytest.importorskip("celerite2.terms")
+
+N = 512
+_rng = np.random.default_rng(7)
+T = np.sort(_rng.uniform(0.0, 20.0, N))
+YERR = np.full(N, 0.3)
+Y = _rng.standard_normal(N) * 0.9
+
+SIG, RHO = 1.3, 4.0
+
+
+def make(term, kp, t=T, y=Y, yerr=YERR, jitter=None, block=64):
+    kernel = [KernelParam(link="const", value=float(x)) for x in kp]
+    jit = [KernelParam(link="const", value=float(jitter))] if jitter else []
+    pm = ParamMap(kernel=kernel, n_dim=1, jitter=jit)
+    return GPLogLike(None, t, None, y, yerr, term, pm,
+                     GPPolicy(block=block, hi_block=block))
+
+
+def ours(term, kp, **kw):
+    gp = make(term, kp, **kw)
+    return float(np.array(gp.hi_absolute(mx.zeros((1, 1), dtype=mx.float64)))[0])
+
+
+C2_CASES = [
+    ("sho_Q0.1", ag.SHOTerm(), [SIG, RHO, 0.1],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=0.1)),
+    ("sho_Q0.4", ag.SHOTerm(), [SIG, RHO, 0.4],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=0.4)),
+    ("sho_granulation", ag.SHOTerm(), [SIG, RHO, 2 ** -0.5],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=2 ** -0.5)),
+    ("sho_Q3", ag.SHOTerm(), [SIG, RHO, 3.0],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=3.0)),
+    ("sho_Q30", ag.SHOTerm(), [SIG, RHO, 30.0],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=30.0)),
+    ("sho_Q300", ag.SHOTerm(), [SIG, RHO, 300.0],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=300.0)),
+    ("real", ag.RealTerm(), [0.8, 0.5], c2t.RealTerm(a=0.64, c=0.5)),
+    ("sum", ag.SHOTerm() + ag.RealTerm(), [SIG, RHO, 3.0, 0.8, 0.5],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=3.0) + c2t.RealTerm(a=0.64, c=0.5)),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4],
+     c2t.RotationTerm(sigma=1.5, period=7.0, Q0=3.0, dQ=1.0, f=0.4)),
+    ("rotation_lowQ", ag.RotationTerm(), [0.8, 3.1, 0.2, 0.05, 0.9],
+     c2t.RotationTerm(sigma=0.8, period=3.1, Q0=0.2, dQ=0.05, f=0.9)),
+    ("rotation_highQ", ag.RotationTerm(), [2.2, 12.5, 40.0, 20.0, 0.05],
+     c2t.RotationTerm(sigma=2.2, period=12.5, Q0=40.0, dQ=20.0, f=0.05)),
+    ("sum3", ag.SHOTerm() + ag.SHOTerm() + ag.RealTerm(),
+     [SIG, RHO, 3.0, 0.6, 1.1, 0.9, 0.8, 0.5],
+     c2t.SHOTerm(sigma=SIG, rho=RHO, Q=3.0)
+     + c2t.SHOTerm(sigma=0.6, rho=1.1, Q=0.9) + c2t.RealTerm(a=0.64, c=0.5)),
+]
+
+
+@pytest.mark.parametrize("name,term,kp,c2", C2_CASES,
+                         ids=[c[0] for c in C2_CASES])
+def test_absolute_loglike_matches_celerite2(name, term, kp, c2):
+    got = ours(term, kp)
+    ref = celerite2_loglike(c2, T, Y, YERR)
+    assert abs(got - ref) < 1e-9 * max(1.0, abs(ref))
+
+
+@pytest.mark.parametrize("name,term,kp,c2", C2_CASES,
+                         ids=[c[0] for c in C2_CASES])
+def test_absolute_loglike_matches_dense_cholesky(name, term, kp, c2):
+    got = ours(term, kp)
+    ref = dense_loglike(term, np.array(kp), T, Y, YERR)
+    assert abs(got - ref) < 1e-9 * max(1.0, abs(ref))
+
+
+@pytest.mark.parametrize("kp,term", [
+    ([SIG, RHO, 0.5], ag.SHOTerm()),
+    ([SIG, RHO, 0.5 + 1e-6], ag.SHOTerm()),
+    ([1.1, 2.5], ag.Matern32Term()),
+    ([1.1, 2.5], ag.Matern52Term()),
+])
+def test_corners_where_celerite2_itself_degrades(kp, term):
+    """We match the dense oracle where celerite2 cannot."""
+    got = ours(term, kp)
+    ref = dense_loglike(term, np.array(kp), T, Y, YERR)
+    assert abs(got - ref) < 1e-9 * max(1.0, abs(ref))
+
+
+def test_celerite2_matern32_converges_to_ours_as_its_eps_shrinks():
+    """Pins the interpretation of the 6e-3 discrepancy at celerite2's default
+    eps: it is celerite2's approximation error, not ours."""
+    got = ours(ag.Matern32Term(), [1.1, 2.5])
+    errs = [abs(got - celerite2_loglike(
+        c2t.Matern32Term(sigma=1.1, rho=2.5, eps=e), T, Y, YERR))
+        for e in (1e-2, 1e-4, 1e-6)]
+    assert errs[0] > errs[1] > errs[2]
+    assert errs[2] < 1e-8
+
+
+def test_jitter_enters_the_observation_variance():
+    got = ours(ag.SHOTerm(), [SIG, RHO, 3.0], jitter=0.45)
+    ref = celerite2_loglike(c2t.SHOTerm(sigma=SIG, rho=RHO, Q=3.0),
+                            T, Y, YERR, jitter=0.45)
+    assert abs(got - ref) < 1e-9 * abs(ref)
+
+
+def test_duplicate_timestamps_are_legal():
+    t = T.copy()
+    t[10] = t[9]
+    t[300] = t[299]
+    t = np.sort(t)
+    got = ours(ag.SHOTerm(), [SIG, RHO, 3.0], t=t)
+    ref = celerite2_loglike(c2t.SHOTerm(sigma=SIG, rho=RHO, Q=3.0), t, Y, YERR)
+    assert abs(got - ref) < 1e-9 * abs(ref)
+
+
+def test_unsorted_input_raises():
+    t = T.copy()
+    t[5], t[6] = t[6], t[5]
+    with pytest.raises(ValueError, match="sorted"):
+        make(ag.SHOTerm(), [SIG, RHO, 3.0], t=t)
+
+
+@pytest.mark.parametrize("block", [16, 64, 256, 512, 1024])
+def test_answer_is_independent_of_the_block_size(block):
+    """The block loop is a memory/graph-size knob, never a numerical one."""
+    ref = ours(ag.SHOTerm(), [SIG, RHO, 3.0], block=512)
+    got = ours(ag.SHOTerm(), [SIG, RHO, 3.0], block=block)
+    assert abs(got - ref) < 1e-9 * abs(ref)
+
+
+def test_tree_reduction_matches_the_sequential_filter():
+    """Two independent recursions over identical leaf inputs."""
+    gp = make(ag.SHOTerm(), [SIG, RHO, 3.0], block=512)
+    v = mx.zeros((1, 1), dtype=mx.float64)
+    args = gp.leaf_inputs(v, a64(gp._dt64), a64(gp._y64),
+                          a64(gp._yerr64 ** 2), None, None, 0, N)
+    seq = float(np.array(sequential_loglike(*args))[0]) + gp.log_norm_const
+    assert abs(seq - ours(ag.SHOTerm(), [SIG, RHO, 3.0])) < 1e-9 * abs(seq)
+
+
+def test_float32_gpu_path_agrees_with_float64():
+    """The production path, measured against its own verification path on the
+    scale that matters -- the ~1-unit Metropolis accept decision."""
+    gp = make(ag.SHOTerm(), [SIG, RHO, 3.0], block=256)
+    with mx.stream(mx.gpu):
+        v32 = mx.zeros((4, 1), dtype=mx.float32)
+        got = np.array(gp(v32), dtype=np.float64)
+    ref = float(np.array(gp.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
+    assert np.max(np.abs(got - ref)) < 0.05
+    assert np.ptp(got) == 0.0, "identical chains must give identical answers"
+
+
+def test_positive_definiteness_failure_is_finite_not_nan():
+    """An infeasible corner must reject the chain, not poison the ensemble.
+
+    sigma_GP/yerr ~ 1e4 with a timescale far above the cadence is the
+    documented float32-infeasible region.
+    """
+    pm = ParamMap(kernel=[KernelParam(link="log", index=0, ref=1e4),
+                          KernelParam(link="log", index=1, ref=1e6),
+                          KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
+                   GPPolicy(block=64))
+    with mx.stream(mx.gpu):
+        u = mx.zeros((4, 3), dtype=mx.float32)
+        out = gp(u)
+        val, grad = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
+        mx.eval(out, val, grad)
+    assert bool(mx.all(mx.isfinite(out))), "log-likelihood must stay finite"

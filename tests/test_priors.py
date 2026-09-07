@@ -1,0 +1,144 @@
+"""Defaults, the ordering reparametrisation, and the periodogram initialiser."""
+
+import math
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+import anvilgp as ag
+from anvilgp import priors
+from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+
+mx.set_default_device(mx.cpu)
+
+rng = np.random.default_rng(3)
+N = 400
+T = np.sort(rng.uniform(0.0, 40.0, N))
+YERR = np.full(N, 0.2)
+Y = 1.5 * np.sin(2 * np.pi * T / 7.3) + rng.standard_normal(N) * 0.2
+
+
+def test_default_hypers_cover_every_term_parameter():
+    for term in (ag.SHOTerm(), ag.RealTerm(), ag.Matern32Term(),
+                 ag.Matern52Term(), ag.RotationTerm(),
+                 ag.SHOTerm() + ag.RealTerm()):
+        hs = priors.default_hypers(term, T, Y, YERR)
+        assert len(hs) == term.n_params, type(term).__name__
+
+
+def test_log_rho_bounds_span_resolvable_timescales_only():
+    """Below 2 dt_med the kernel is unresolved and degenerate with the
+    jitter; above T/2 it is a baseline offset."""
+    hs = priors.default_hypers(ag.SHOTerm(), T, Y, YERR)
+    rho = hs[1]
+    ref = priors.data_references(T, Y, YERR)
+    assert math.isclose(rho.ref * math.exp(rho.lo), 2.0 * ref["cadence"],
+                        rel_tol=1e-9)
+    assert math.isclose(rho.ref * math.exp(rho.hi), 0.5 * ref["baseline"],
+                        rel_tol=1e-9)
+
+
+def test_amplitude_reference_is_the_data_rms():
+    hs = priors.default_hypers(ag.SHOTerm(), T, Y, YERR)
+    assert math.isclose(hs[0].ref, float(np.std(Y)), rel_tol=1e-12)
+    assert hs[0].prior == ("normal", 0.0, 1.5)
+
+
+def test_build_param_map_lays_out_v_in_the_documented_order():
+    hs = priors.default_hypers(ag.SHOTerm(), T, Y, YERR)
+    jit = [priors.jitter_hyper(YERR)]
+    off = [priors.offset_hyper(Y)]
+    pm, specs, names = priors.build_param_map(hs, n_mean=2, jitters=jit,
+                                              offsets=off)
+    assert pm.n_dim == 2 + 3 + 1 + 1
+    assert [k.index for k in pm.kernel] == [2, 3, 4]
+    assert [k.index for k in pm.jitter] == [5]
+    assert [k.index for k in pm.offset] == [6]
+    assert names[0].endswith("sigma") and names[-1] == "offset"
+    assert len(specs) == 5
+
+
+def test_order_groups_make_timescales_strictly_increasing():
+    """Permutation multimodality is killed by construction, not by rejection.
+
+    A two-SHO sum has 2! identical modes; the reparametrisation makes the
+    second period a ratio > 1 of the first, so the map is smooth and no
+    proposal is ever rejected for being out of order.
+    """
+    kernel = [KernelParam(link="log", index=i, ref=r) for i, r in
+              enumerate([1.0, 2.0, 3.0, 1.0, 1.0, 3.0])]
+    pm = ParamMap(kernel=kernel, n_dim=6, order_groups=[[1, 4]])
+    v = mx.array(rng.standard_normal((64, 6)).astype(np.float32) * 2.0)
+    kp = np.array(pm.kernel_params(v))
+    assert np.all(kp[:, 4] > kp[:, 1]), "rho_1 must exceed rho_0 always"
+    # and the unconstrained columns are untouched
+    plain = ParamMap(kernel=kernel, n_dim=6)
+    assert np.allclose(np.array(plain.kernel_params(v))[:, [0, 2, 3, 5]],
+                       kp[:, [0, 2, 3, 5]])
+
+
+def test_ordering_is_differentiable_and_finite():
+    kernel = [KernelParam(link="log", index=i, ref=1.0) for i in range(6)]
+    pm = ParamMap(kernel=kernel, n_dim=6, order_groups=[[1, 4]])
+    v = mx.zeros((4, 6), dtype=mx.float32)
+    _, g = mx.vjp(lambda z: mx.sum(pm.kernel_params(z), axis=-1), [v],
+                  [mx.ones((4,), dtype=mx.float32)])
+    assert bool(mx.all(mx.isfinite(g[0])))
+
+
+def test_log_prior_is_a_proper_normalised_density():
+    hs = priors.default_hypers(ag.SHOTerm(), T, Y, YERR)
+    lp = priors.make_log_prior(hs, jitters=[priors.jitter_hyper(YERR)])
+    v = mx.zeros((5, 4), dtype=mx.float32)
+    val = np.array(lp(v))
+    # at v = 0 every Gaussian sits at its mean: sum of -log(sd sqrt(2 pi))
+    expect = -(math.log(1.5) + math.log(1.0) + math.log(1.0)
+               + 1.5 * math.log(2 * math.pi))
+    assert np.allclose(val, expect, atol=1e-5)
+    assert np.ptp(val) == 0.0
+
+
+def test_periodogram_finds_the_injected_period():
+    p = priors.periodogram_period(T, Y)
+    assert abs(p - 7.3) / 7.3 < 0.02
+
+
+def test_defaults_drive_an_end_to_end_likelihood():
+    """The whole point: defaults that produce a working target with no
+    hand-tuning."""
+    hs = priors.default_hypers(ag.SHOTerm(), T, Y, YERR)
+    jit = [priors.jitter_hyper(YERR)]
+    pm, specs, names = priors.build_param_map(hs, jitters=jit)
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(block=128))
+    with mx.stream(mx.gpu):
+        u = mx.zeros((16, pm.n_dim), dtype=mx.float32)
+        out = gp(u)
+        val, grad = mx.vjp(gp, [u], [mx.ones((16,), dtype=mx.float32)])
+        mx.eval(out, val, grad)
+    assert bool(mx.all(mx.isfinite(out)))
+    assert bool(mx.all(mx.isfinite(grad[0])))
+    hi = np.array(gp.hi(mx.zeros((2, pm.n_dim), dtype=mx.float64)))
+    assert abs(hi[0] - float(np.array(out)[0])) < 0.05
+
+
+def test_auto_order_groups_finds_same_type_families():
+    assert priors.auto_order_groups(ag.SHOTerm()) == []
+    assert priors.auto_order_groups(ag.SHOTerm() + ag.RealTerm()) == []
+    # two SHOs (3 params each): their rho columns are positions 1 and 4
+    assert priors.auto_order_groups(ag.SHOTerm() + ag.SHOTerm()) == [[1, 4]]
+    # three SHOs plus a Real: the Real is alone, so only the SHO family
+    term = ag.SHOTerm() + ag.RealTerm() + ag.SHOTerm() + ag.SHOTerm()
+    assert priors.auto_order_groups(term) == [[1, 6, 9]]
+
+
+def test_make_target_orders_a_two_sho_sum_by_default():
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    gt = make_target(ag.SHOTerm() + ag.SHOTerm(), T, Y, YERR)
+    assert gt.param_map.order_groups == [[1, 4]]
+    v = mx.array(np.random.default_rng(0).standard_normal(
+        (128, gt.param_map.n_dim)).astype(np.float32) * 1.5)
+    kp = np.array(gt.param_map.kernel_params(v))
+    assert np.all(kp[:, 4] > kp[:, 1])
