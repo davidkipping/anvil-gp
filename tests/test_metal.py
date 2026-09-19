@@ -145,10 +145,16 @@ def test_chains_stay_independent_under_the_kernel():
 
 def test_eligibility_is_reported_not_silently_ignored():
     """A configuration the kernel cannot serve must say so, so nobody
-    concludes it is on when it is not."""
+    concludes it is on when it is not.
+
+    Asking for the kernel and quietly getting the MLX path is a ~40x
+    performance surprise with no signal at all, so it warns at construction
+    as well as answering `metal_eligible()`.
+    """
     four = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()
     pm = ParamMap(kernel=[KernelParam(link="const", value=1.0)] * 12, n_dim=1)
-    gp = GPLogLike(None, T, None, Y, YERR, four, pm, GPPolicy(metal=True))
+    with pytest.warns(RuntimeWarning, match="cannot be honoured"):
+        gp = GPLogLike(None, T, None, Y, YERR, four, pm, GPPolicy(metal=True))
     ok, why = gp.metal_eligible()
     assert not ok and "register budget" in why
 

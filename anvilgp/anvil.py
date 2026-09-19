@@ -141,11 +141,22 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
 
     def model_log_prob_hi(v):
         # The prior is cheap and dtype-polymorphic; the expensive part is the
-        # likelihood's chain-tiled float64 pass.
-        return loglike.hi(v) + log_prior(v).astype(mx.float64, stream=mx.cpu)
+        # likelihood's chain-tiled float64 pass.  Evaluate it AT float64:
+        # `log_prior(v).astype(float64)` would compute in the caller's
+        # float32 and then widen the rounding error, putting a float32 floor
+        # under the reference that `validate_precision` measures against.
+        # make_log_prior caches per dtype for exactly this.
+        with mx.stream(mx.cpu):
+            return loglike.hi(v) + log_prior(v.astype(mx.float64))
 
+    # The fused Metal kernel is forward-only until M4, so a target running
+    # on it cannot be handed to a gradient sampler.  Declare that up front:
+    # anvil's ChEES kernel checks `supports_grad` in its constructor and
+    # refuses with its own message, instead of the NotImplementedError
+    # surfacing from inside mx.vjp several minutes into a run.
     target = engine.TransformedLogDensity(
-        model_log_prob, transform, model_log_prob_hi=model_log_prob_hi)
+        model_log_prob, transform, model_log_prob_hi=model_log_prob_hi,
+        supports_grad=not loglike._metal_ok)
     return GPTarget(target=target, transform=transform, loglike=loglike,
                     names=[s.name for s in mean_specs] + names,
                     hypers=hypers + jitters + offsets, param_map=pm)

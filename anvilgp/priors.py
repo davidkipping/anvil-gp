@@ -145,7 +145,12 @@ def default_hypers(term: Term, t, y, yerr, prefix: str = "gp",
         return out
 
     rho_ref, rho_lo, rho_hi = _log_rho_bounds(ref)
-    sigma = Hyper(f"log_{prefix}_sigma", ref=ref["rms"], scale=1.5,
+    # Floor the amplitude reference at the median error bar.  `rms` is 0 for
+    # constant y (a flat-lined detector, a fully-detrended column), and a
+    # zero reference pins sigma at exactly 0 for the whole run through the
+    # log link -- a GP that is white noise, silently, from the first step.
+    sigma_ref = max(float(ref["rms"]), float(ref["median_yerr"]))
+    sigma = Hyper(f"log_{prefix}_sigma", ref=sigma_ref, scale=1.5,
                   prior=("normal", 0.0, 1.5))
 
     if isinstance(term, SHOTerm):

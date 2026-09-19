@@ -38,6 +38,7 @@ Known v1 limitations, stated rather than discovered
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -45,7 +46,7 @@ import numpy as np
 
 from .special import exp_acc
 from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
-                       combine, leaf_elements, leaf_parts, tree_reduce,
+                       leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from .terms import Term
 
@@ -138,6 +139,14 @@ class KernelParam:
     ref: float = 1.0
     scale: float = 1.0
     value: float = 0.0
+
+    def __post_init__(self):
+        # Plain Python floats, always.  A np.float64 here propagates into
+        # mx.full/mx.concatenate and fails with an unreadable pybind
+        # signature error far from the line that caused it.
+        self.ref = float(self.ref)
+        self.scale = float(self.scale)
+        self.value = float(self.value)
 
     def apply(self, v: mx.array) -> mx.array:
         # exp_acc, not mx.exp: MLX's float64 exp is only float32-accurate
@@ -271,6 +280,21 @@ class GPLogLike:
         self.n_data = self._t64.size
         if self._y64.size != self.n_data or self._yerr64.size != self.n_data:
             raise ValueError("t, y and yerr must have the same length")
+        if self.n_data == 0:
+            raise ValueError("t, y and yerr must be non-empty")
+        # Non-finite inputs pass every comparison below (NaN < 0 is False,
+        # NaN <= 0 is False), reach the graph, and come back as a sanitised
+        # -1e30 for EVERY chain -- a likelihood that is flat in every
+        # direction, which a sampler happily explores forever.  Name the
+        # array and the count so the fix is obvious.
+        for name, arr in (("t", self._t64), ("y", self._y64),
+                          ("yerr", self._yerr64)):
+            bad = ~np.isfinite(arr)
+            if bad.any():
+                raise ValueError(
+                    f"{name} contains {int(bad.sum())} non-finite "
+                    f"value(s) (first at index {int(np.argmax(bad))}). "
+                    "Mask them out before building the likelihood.")
         d = np.diff(self._t64)
         if np.any(d < 0.0):
             raise ValueError(
@@ -278,6 +302,23 @@ class GPLogLike:
                 "Sort your data and reorder y/yerr to match.")
         if np.any(self._yerr64 <= 0.0):
             raise ValueError("yerr must be strictly positive")
+
+        # A mean model needs all three of mean_fn, param_map.mean and
+        # x_mean.  With any one missing the GP silently fits y itself: the
+        # transit is never subtracted, the parameters that should describe
+        # it are sampled but inert, and the result looks like a converged
+        # GP-only fit rather than an error.
+        has_fn, has_slice = mean_fn is not None, param_map.mean is not None
+        if has_fn != has_slice:
+            raise ValueError(
+                "a mean model needs both `mean_fn` and `param_map.mean`; "
+                f"got mean_fn={'set' if has_fn else 'None'} and "
+                f"param_map.mean={'set' if has_slice else 'None'}. "
+                "Without both, the mean model is silently ignored.")
+        if has_fn and x_mean is None:
+            raise ValueError(
+                "a mean model needs `x_mean` (the covariates it is "
+                "evaluated on); got None.")
 
         # dt is precomputed in float64 on the host and enters the graph as a
         # well-conditioned O(cadence) quantity; the absolute epoch never does.
@@ -331,6 +372,15 @@ class GPLogLike:
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
         self._metal_ok, self._metal_why = self.metal_eligible()
+        if self.policy.metal and not self._metal_ok:
+            # Asking for the kernel and silently getting the MLX path is a
+            # 40x performance surprise with no signal.  Say so once, here,
+            # rather than leaving the user to infer it from the wall clock.
+            warnings.warn(
+                f"GPPolicy(metal=True) cannot be honoured: {self._metal_why}. "
+                "Falling back to the MLX path, which is correct but ~40x "
+                "slower. Call metal_eligible() to check in advance.",
+                RuntimeWarning, stacklevel=2)
         self._guard = self._build_guard()
 
     def _distinct_lags(self, dtype):
@@ -526,6 +576,22 @@ class GPLogLike:
 
         return guard
 
+    def _check_v(self, v: mx.array) -> None:
+        """``v`` is the whole model vector; a wrong width is silent otherwise.
+
+        Too wide and the extra columns are ignored, so a mis-built parameter
+        map fits the wrong thing; too narrow and MLX raises somewhere deep in
+        a broadcast with no mention of the parameter map.
+        """
+        if v.ndim != 2:
+            raise ValueError(
+                f"v must be (n_chains, n_dim); got shape {tuple(v.shape)}")
+        want = self.param_map.n_dim
+        if v.shape[1] != want:
+            raise ValueError(
+                f"v has {v.shape[1]} columns but the parameter map declares "
+                f"n_dim = {want}")
+
     def _raw_call(self, v: mx.array) -> mx.array:
         """The float32 likelihood itself, sanitised but not gradient-guarded."""
         if self._metal_ok:
@@ -555,6 +621,7 @@ class GPLogLike:
         value-and-gradient call.  The forward-only path -- the stretch move,
         and anything on the Metal kernel -- pays nothing.
         """
+        self._check_v(v)
         return self._guard(v)
 
     def log_prob_absolute(self, v: mx.array) -> mx.array:
@@ -575,6 +642,7 @@ class GPLogLike:
         ``ChunkedGaussianLogLike.hi`` this cannot tile the data axis -- it
         streams it in recursion order and tiles chains instead.
         """
+        self._check_v(v)
         pol = self.policy
         n_chains = v.shape[0]
         blk = _pow2(pol.hi_block)

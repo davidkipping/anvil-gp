@@ -179,3 +179,38 @@ def test_ordering_ratio_does_not_depend_on_the_time_unit(v_hi):
     for a, b in zip(scaled[1:], scaled[:-1]):
         assert abs(a[0] - b[0]) < 1e-9 * b[0]
         assert abs(a[1] - b[1]) < 1e-9 * b[1]
+
+
+def test_constant_data_does_not_pin_the_amplitude_at_zero():
+    """A flat-lined column must not silently give a white-noise GP.
+
+    `rms` is 0 for constant y, and a zero reference through the log link
+    makes sigma exactly 0 for every chain and every step -- the GP is gone,
+    with nothing in the output to say so.
+    """
+    t = np.linspace(0.0, 10.0, 200)
+    y = np.full(200, 3.0)
+    yerr = np.full(200, 0.05)
+    hyp = priors.default_hypers(ag.SHOTerm(), t, y, yerr)
+    sigma = hyp[0]
+    assert sigma.ref > 0.0
+    assert sigma.ref == pytest.approx(0.05)
+
+
+def test_hi_prior_is_evaluated_at_float64():
+    """The .hi path is the reference; it must not inherit float32 rounding."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+
+    rng = np.random.default_rng(1)
+    t = np.sort(rng.uniform(0.0, 20.0, 256))
+    y = rng.standard_normal(256)
+    yerr = np.full(256, 0.3)
+    tgt = make_target(ag.SHOTerm(), t, y, yerr)
+
+    dim = tgt.transform.dim
+    u = mx.array(rng.standard_normal((2, dim)) * 0.3, dtype=mx.float64)
+    with mx.stream(mx.cpu):
+        hi = tgt.target.log_prob_hi(u)
+        assert hi.dtype == mx.float64
+        assert bool(mx.all(mx.isfinite(hi)))

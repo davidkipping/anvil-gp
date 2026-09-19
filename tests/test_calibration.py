@@ -101,3 +101,59 @@ def test_a_single_realisation_is_not_evidence():
     expected = math.sqrt(SIGMA ** 2 + JIT ** 2 + YERR ** 2)
     assert 0.15 < rms.std() / expected < 0.8, rms.std() / expected
     assert abs(rms.mean() / expected - 1.0) < 0.25
+
+
+@pytest.mark.slow
+def test_chains_started_in_the_infeasible_region_recover():
+    """The brief's requirement: warmup WILL visit float32-infeasible corners.
+
+    Landing there must be survivable, not terminal.  Two things have to
+    hold.  The GP log-likelihood itself must come back large-negative and
+    **finite** -- that is anvil-gp's contract, and a NaN there would poison
+    the whole ensemble's adaptation.  And a sampler started there must walk
+    back out.
+
+    (The *target's* log-probability may still be -inf at such a point,
+    because anvil's Transform contributes a -inf Jacobian at the edge of a
+    bounded prior.  That is a correct statement about the prior, not a
+    failure of the likelihood, and a sampler rejects it cleanly.)
+
+    Uses the stretch move, which is what works on a GP target today: the
+    Metal path has no VJP until M4, and the MLX gradient path cannot be
+    compiled.  Half the ensemble starts in the failure region so the rest
+    has somewhere to pull it back from.
+    """
+    anvil = pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+
+    rng = np.random.default_rng(5)
+    n = 600
+    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    yerr = np.full(n, YERR)
+    cov = dense_covariance(ag.SHOTerm(), np.array([SIGMA, RHO, QUAL]), t,
+                           yerr, jitter=JIT)
+    y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
+
+    tgt = make_target(ag.SHOTerm(), t, y, yerr)
+    dim = tgt.transform.dim
+
+    n_chains, half = 64, 32
+    u0 = rng.standard_normal((n_chains, dim)).astype(np.float32) * 0.3
+    u0[:half] = 30.0                     # deep in the infeasible corner
+    u = mx.array(u0)
+
+    with mx.stream(mx.gpu):
+        ll = np.array(tgt.loglike(tgt.transform.to_model(u)))
+        assert np.all(np.isfinite(ll)), "the likelihood must never be NaN"
+        assert np.all(ll[:half] <= -1e29), "the dead half should be rejected"
+        assert np.all(ll[half:] > -1e29), "the live half should not be"
+
+        from anvil.kernels.ensemble import EnsembleKernel
+        res = anvil.run(EnsembleKernel(tgt.target, seed=2), tgt.target, u,
+                        n_warmup=400, n_samples=100, seed=3)
+        last = res.final_state["u"]
+        final = np.array(tgt.loglike(tgt.transform.to_model(last)))
+
+    assert np.all(np.isfinite(final))
+    assert np.all(final > -1e29), (
+        f"{int((final <= -1e29).sum())} chains never left the dead region")

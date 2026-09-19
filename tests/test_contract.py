@@ -289,3 +289,81 @@ def test_blocked_gradients_are_finite_and_match_the_dense_path():
         assert np.all(np.isfinite(grads[-1]))
     scale = max(1.0, np.abs(grads[0]).max())
     assert np.max(np.abs(grads[0] - grads[1])) < 2e-3 * scale
+
+
+# -- input validation ------------------------------------------------------
+#
+# Every one of these used to be accepted and produce a wrong answer quietly:
+# a NaN in the data made every chain -1e30 (a likelihood flat in every
+# direction, which a sampler explores forever), and a half-specified mean
+# model fitted the GP to y itself, which looks exactly like a converged
+# GP-only fit rather than an error.
+
+
+def _gp(**kw):
+    pm = kw.pop("pm", ParamMap(kernel=_const(KP), n_dim=1))
+    args = dict(mean_fn=None, t=T, x_mean=None, y=Y, yerr=YERR,
+                kernel_spec=ag.SHOTerm(), param_map=pm)
+    args.update(kw)
+    return GPLogLike(args["mean_fn"], args["t"], args["x_mean"], args["y"],
+                     args["yerr"], args["kernel_spec"], args["param_map"],
+                     GPPolicy(block=64))
+
+
+@pytest.mark.parametrize("field", ["t", "y", "yerr"])
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_non_finite_data_is_refused(field, bad):
+    arr = {"t": T.copy(), "y": Y.copy(), "yerr": YERR.copy()}
+    arr[field][7] = bad
+    with pytest.raises(ValueError, match="non-finite"):
+        _gp(**arr)
+
+
+def test_empty_data_is_refused():
+    with pytest.raises(ValueError, match="non-empty"):
+        _gp(t=np.array([]), y=np.array([]), yerr=np.array([]))
+
+
+def test_half_specified_mean_model_is_refused():
+    """The failure this prevents is a transit fit that silently has no
+    transit in it."""
+    lin = ParamMap(kernel=_const(KP), n_dim=2, mean=slice(0, 1))
+    plain = ParamMap(kernel=_const(KP), n_dim=1)
+
+    def mean_fn(p, x):
+        return p[:, 0:1] * x
+
+    # mean_fn but no slice
+    with pytest.raises(ValueError, match="silently ignored"):
+        _gp(mean_fn=mean_fn, x_mean=T, pm=plain)
+    # slice but no mean_fn
+    with pytest.raises(ValueError, match="silently ignored"):
+        _gp(pm=lin)
+    # both, but nothing to evaluate them on
+    with pytest.raises(ValueError, match="x_mean"):
+        _gp(mean_fn=mean_fn, pm=lin)
+    # all three: fine
+    _gp(mean_fn=mean_fn, x_mean=T, pm=lin)
+
+
+def test_wrong_parameter_width_is_refused():
+    gp = _gp(pm=ParamMap(kernel=[KernelParam(link="log", index=i, ref=1.0)
+                                 for i in range(3)], n_dim=3))
+    with mx.stream(mx.gpu):
+        gp(mx.zeros((4, 3), dtype=mx.float32))           # right
+        with pytest.raises(ValueError, match="n_dim"):
+            gp(mx.zeros((4, 5), dtype=mx.float32))       # too wide
+        with pytest.raises(ValueError, match="n_dim"):
+            gp(mx.zeros((4, 2), dtype=mx.float32))       # too narrow
+        with pytest.raises(ValueError, match="n_chains"):
+            gp(mx.zeros((3,), dtype=mx.float32))         # not 2-D
+
+
+def test_numpy_scalars_in_kernel_params_do_not_poison_the_graph():
+    """np.float64 refs used to fail deep inside mx.concatenate."""
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=np.float64(r))
+                          for i, r in enumerate([1.0, 3.0, 4.0])], n_dim=3)
+    gp = _gp(pm=pm)
+    with mx.stream(mx.gpu):
+        out = np.array(gp(mx.zeros((2, 3), dtype=mx.float32)))
+    assert np.all(np.isfinite(out))
