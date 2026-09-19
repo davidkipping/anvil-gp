@@ -224,9 +224,14 @@ kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
 The brief predicted "~10-50 ms forward at 1024 x 1e5"; the measurement is
 16.4 ms, at the fast end of its own range.
 
-End to end, the same injection-recovery problem (1000 points, 1024 chains,
-2100 stretch steps) goes from **39.2 s to 4.6 s**, 180 -> **1,786 ESS/s**,
-with the posteriors agreeing (rho 6.956 vs 6.948).
+End to end, `examples/gp_injection_recovery.py` (1000 points, 1024 chains,
+5800 stretch steps) goes from **85.5 s to 15.2 s**, 200 -> **1,346 ESS/s**,
+with the posteriors agreeing (rho 6.950 vs 6.955). Run it either way:
+
+```bash
+.venv/bin/python examples/gp_injection_recovery.py           # MLX graph
+METAL=1 .venv/bin/python examples/gp_injection_recovery.py   # fused kernel
+```
 
 ### What the kernel does and does not do
 
@@ -479,18 +484,19 @@ marked as an estimate.
 ### End to end
 
 `examples/gp_injection_recovery.py` fits an SHO kernel plus a jitter to 1000
-points with **1024 chains**, 5800 stretch steps in **102 s** — 196 ESS/s,
-against 12 ESS/s for the same example before the work above (256 chains,
-684 s). It recovers all four parameters:
+points with **1024 chains**, 5800 stretch steps in **15.2 s on the fused
+kernel** (1,346 ESS/s) or **85.5 s on the MLX graph** (200 ESS/s), against
+12 ESS/s for the same example before any of this work (256 chains, 684 s).
+Both paths recover all four parameters, and agree:
 
-| parameter | posterior | truth | z |
+| parameter | posterior (Metal) | truth | z |
 |---|---:|---:|---:|
-| σ_GP | 1.140 ± 0.287 | 1.5 | −1.26 |
-| ρ | 6.952 ± 0.482 | 7.3 | −0.72 |
-| Q | 6.15 ± 5.83 | 8.0 | −0.32 |
-| jitter | 0.1134 ± 0.0458 | 0.12 | −0.14 |
+| σ_GP | 1.139 ± 0.285 | 1.5 | −1.26 |
+| ρ | 6.950 ± 0.480 | 7.3 | −0.73 |
+| Q | 6.14 ± 5.49 | 8.0 | −0.34 |
+| jitter | 0.1133 ± 0.0457 | 0.12 | −0.15 |
 
-min ESS 19,879, max R-hat 1.037. σ_GP sits low because *this draw's* realised
+min ESS 20,422, max R-hat 1.037. σ_GP sits low because *this draw's* realised
 RMS is 1.118 against a process value of 1.518 — with ~5.5 correlation times in
 the baseline a single realisation scatters that much, and the posterior is
 correctly tracking the data. `tests/test_calibration.py` is what establishes

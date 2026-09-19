@@ -20,6 +20,7 @@ algebra exceeds Metal's argument-buffer limit -- see docs/float32.md.
 Run:  .venv/bin/python examples/gp_injection_recovery.py
 """
 
+import os
 import time
 
 import numpy as np
@@ -62,7 +63,14 @@ print(f"injected SHO: sigma={SIGMA_TRUE}, rho={RHO_TRUE} d, Q={Q_TRUE}, "
       f"jitter={JITTER_TRUE} on {N_DATA} points with {YERR} errors\n")
 
 # --------------------------------------------------------- target assembly
-gt = make_target(term, t, y, yerr, policy=GPPolicy(block=1024, sub_block=16))
+# METAL=1 in the environment runs the fused kernel instead of the MLX graph.
+# It is forward-only until M4, which is fine here: the stretch move needs no
+# gradient.  Same answers either way -- that is what the parity tests pin --
+# so this is purely a wall-clock switch.
+USE_METAL = os.environ.get("METAL", "0") not in ("", "0", "false", "no")
+gt = make_target(term, t, y, yerr,
+                 policy=GPPolicy(block=1024, sub_block=16, metal=USE_METAL))
+print("likelihood path   :", "fused Metal kernel" if USE_METAL else "MLX graph")
 print("sampled parameters:", ", ".join(gt.names))
 refs = [h.ref for h in gt.hypers]
 print("host references   :", ", ".join(f"{r:.4g}" for r in refs))
