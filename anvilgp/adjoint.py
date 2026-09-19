@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .linalg import matmul, matvec, outer
+from .linalg import matmul, matvec, outer, sym
 
 __all__ = ["filter_forward", "filter_backward", "blocked_backward"]
 
@@ -73,7 +73,7 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
         p_i = phi[:, i]
         mp = matvec(p_i, mean)
         cp = matmul(p_i, matmul(cov, mx.swapaxes(p_i, -1, -2))) + q[:, i]
-        cp = 0.5 * (cp + mx.swapaxes(cp, -1, -2))
+        cp = sym(cp)
         ch = matvec(cp, h)
         s = mx.sum(h * ch, axis=-1) + r_var[:, i]
         if s_floor is not None:
@@ -82,7 +82,7 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
         kg = ch / s[:, None]
         mean = mp + kg * v[:, None]
         cov = cp - outer(kg, ch)
-        cov = 0.5 * (cov + mx.swapaxes(cov, -1, -2))
+        cov = sym(cov)
         ell = ell - 0.5 * (mx.log(s / r_ref[i]) + v * v / s)
         states.append((mean, cov))
     return states, ell
@@ -123,7 +123,7 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
         # -- replay the forward quantities this step needs --
         mp = matvec(p_i, mean_prev)
         cp = matmul(p_i, matmul(cov_prev, mx.swapaxes(p_i, -1, -2))) + q[:, i]
-        cp = 0.5 * (cp + mx.swapaxes(cp, -1, -2))
+        cp = sym(cp)
         ch = matvec(cp, h)
         s = mx.sum(h * ch, axis=-1) + r_var[:, i]
         floored = None
@@ -173,11 +173,11 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
         # Cp's raw one.  Phi's happens to be right either way because its
         # own formula already sums a term and its transpose, which is why
         # only dQ came out wrong when this was missed.
-        cp_sym = 0.5 * (cp_bar + mx.swapaxes(cp_bar, -1, -2))
+        cp_sym = sym(cp_bar)
         q_rows.append(cp_sym)
         pb = matmul(2.0 * cp_sym, matmul(p_i, cov_prev))
         p_bar = matmul(mx.swapaxes(p_i, -1, -2), matmul(cp_sym, p_i))
-        p_bar = 0.5 * (p_bar + mx.swapaxes(p_bar, -1, -2))
+        p_bar = sym(p_bar)
         # mp = Phi mean
         phi_rows.append(pb + outer(mp_bar, mean_prev))
         m_bar = matvec(mx.swapaxes(p_i, -1, -2), mp_bar)

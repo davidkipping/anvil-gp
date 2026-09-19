@@ -48,6 +48,7 @@ import numpy as np
 
 from .special import exp_acc
 from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
+                       first_point,
                        leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from .terms import Term
@@ -474,20 +475,7 @@ class GPLogLike:
             get_mat = self._matrices_fn(pm.kernel_params(v), dt, None)
         phi, q, h = get_mat(s, e)
         if s == 0:
-            # First point: no predecessor.  Phi = 0 with Q = P_inf = I makes
-            # the generic leaf produce A = 0, J = 0, eta = 0 -- exactly the
-            # "no incoming state" element, with no special-cased code path.
-            keep = mx.concatenate([
-                mx.zeros((1, 1, 1, 1), dtype=dtype),
-                mx.ones((1, e - s - 1, 1, 1), dtype=dtype)], axis=1)
-            if self.blocked:
-                phi = [b * keep for b in phi]
-                q = [b * keep + (1.0 - keep) * mx.eye(b.shape[-1], dtype=dtype)
-                     for b in q]
-            else:
-                phi = phi * keep
-                q = (q * keep
-                     + (1.0 - keep) * mx.eye(self.term.n_state, dtype=dtype))
+            phi, q = first_point(phi, q, dtype)
 
         r = mx.broadcast_to(y[s:e], (n, e - s))
         if self.mean_fn is not None and pm.mean is not None:

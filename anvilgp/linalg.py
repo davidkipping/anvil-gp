@@ -35,7 +35,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 __all__ = ["chol", "tri_solve_right", "sym_from_factor", "quad_form",
-           "matvec", "matmul", "outer", "prefer_builtin", "diag_floor",
+           "matvec", "matmul", "outer", "sym", "prefer_builtin", "diag_floor",
            "FORCE_UNROLLED"]
 
 
@@ -212,3 +212,16 @@ def matvec(a: mx.array, v: mx.array) -> mx.array:
 def quad_form(v: mx.array, a: mx.array) -> mx.array:
     """``v^T a v`` for batched vectors (..., m) and matrices (..., m, m)."""
     return mx.sum(v * matvec(a, v), axis=-1)
+
+
+def sym(x: mx.array) -> mx.array:
+    """Symmetrise the trailing two axes.
+
+    Covariances and information matrices are symmetric in exact arithmetic;
+    letting rounding break that lets a drift into indefiniteness accumulate
+    over log2(N) composition levels.  It also matters in reverse: because
+    the forward symmetrises, the adjoint of a symmetrised quantity is the
+    *symmetrised* adjoint, which is the one thing that made dQ wrong when it
+    was missed.
+    """
+    return 0.5 * (x + mx.swapaxes(x, -1, -2))

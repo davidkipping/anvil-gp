@@ -5,7 +5,14 @@ MLX graph ops, with a Cholesky per composition.  Its numbers exist to (a)
 size the float64 verification path, (b) give the fused Metal kernel of M3 a
 denominator, and (c) show where the graph-op route runs out of road.
 
-Run rested; the M2 Max swings ~2x with thermal state.  Medians of 5.
+Defaults are the TARGET workload -- 1024 chains, N = 1e4, block 4096, a
+gapped cadence -- not a small smoke test.  That matters: the old block=256
+default made the value+gradient look like 2.7 s when the recommended
+setting gives 0.85 s, and that wrong number reached the README.
+
+Report the MINIMUM, not just the median: this machine's wall times swing
+~2x with background process load (not thermal state), so a median can sit
+entirely inside a slow window.  A/B old against new in the same window.
 """
 import argparse, statistics, time
 import mlx.core as mx
@@ -16,14 +23,14 @@ from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
 
 p = argparse.ArgumentParser()
 p.add_argument("--n-data", type=int, default=10_000)
-p.add_argument("--n-chains", type=int, default=256)
-p.add_argument("--block", type=int, default=256)
+p.add_argument("--n-chains", type=int, default=1024)
+p.add_argument("--block", type=int, default=4096)
 p.add_argument("--term", default="sho")
 p.add_argument("--grad", action="store_true")
 p.add_argument("--repeat", type=int, default=5)
 p.add_argument("--no-compile", action="store_true")
 p.add_argument("--sub-block", type=int, default=None)
-p.add_argument("--cadence", choices=("regular","gapped","random"), default="random")
+p.add_argument("--cadence", choices=("regular","gapped","random"), default="gapped")
 a = p.parse_args()
 
 TERMS = {"sho": (ag.SHOTerm(), [1.0, 4.0, 3.0]),

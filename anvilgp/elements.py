@@ -43,10 +43,11 @@ from typing import NamedTuple
 
 import mlx.core as mx
 
-from .linalg import (chol, matmul, matvec, outer, quad_form,
+from .linalg import (chol, matmul, matvec, outer, quad_form, sym,
                      sym_from_factor, tri_solve_right)
 
-__all__ = ["Element", "LeafRank1", "LeafParts", "leaf_elements", "leaf_parts",
+__all__ = ["Element", "LeafRank1", "LeafParts", "first_point",
+           "leaf_elements", "leaf_parts",
            "expand_leaf", "combine", "combine_leaf", "combine_leaf_blocked",
            "tree_reduce", "chunked_reduce", "chunked_reduce_blocked",
            "prefix_scan",
@@ -143,13 +144,6 @@ def use_blocked_leaves(block_sizes) -> bool:
     return len(block_sizes) >= 2 and sum(block_sizes) >= 6
 
 
-def _sym(x: mx.array) -> mx.array:
-    """Symmetrise.  Covariances and information matrices are symmetric in
-    exact arithmetic; letting rounding break that lets a drift into
-    indefiniteness accumulate over log2(N) composition levels."""
-    return 0.5 * (x + mx.swapaxes(x, -1, -2))
-
-
 def identity_element(batch: tuple[int, ...], m: int, dtype) -> Element:
     """The composition identity: pass the state through, observe nothing.
 
@@ -164,6 +158,37 @@ def identity_element(batch: tuple[int, ...], m: int, dtype) -> Element:
         b=z1, C=z2, eta=z1, J=z2,
         ell=mx.zeros(batch, dtype=dtype),
     )
+
+
+def first_point(phi, q, dtype=None):
+    """Impose "the first observation has no predecessor" on a block.
+
+    Sets ``Phi = 0`` and ``Q = P_inf = I`` at index 0 along the time axis.
+    The generic leaf then produces ``A = 0``, ``J = 0``, ``eta = 0`` -- the
+    "no incoming state" element -- so nothing downstream needs a special
+    case for the start of the series.  Accepts either a dense ``(n, K, m,
+    m)`` pair or the per-block lists of the compact representation.
+
+    The Metal kernel expresses the same fact differently, as row 0 of its
+    lag table; both are the same convention, written for their own data
+    layout.
+    """
+    blocked = isinstance(phi, (list, tuple))
+    ref = phi[0] if blocked else phi
+    dtype = ref.dtype if dtype is None else dtype
+    k = ref.shape[1]
+    keep = mx.concatenate([
+        mx.zeros((1, 1, 1, 1), dtype=dtype),
+        mx.ones((1, k - 1, 1, 1), dtype=dtype)], axis=1)
+
+    def fix(p_b, q_b):
+        eye = mx.eye(q_b.shape[-1], dtype=dtype)
+        return p_b * keep, q_b * keep + (1.0 - keep) * eye
+
+    if blocked:
+        pairs = [fix(a, b) for a, b in zip(phi, q)]
+        return [a for a, _ in pairs], [b for _, b in pairs]
+    return fix(phi, q)
 
 
 def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
@@ -200,9 +225,18 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     the *fixed* ``yerr^2`` rather than the jitter-dependent ``r_var``: the
     jitter's contribution stays inside the well-conditioned ratio.
     """
-    hphi = mx.sum(h[:, None, :, None] * phi, axis=-2)      # (n, K, m)
-    qh = mx.sum(q * h[:, None, None, :], axis=-1)          # (n, K, m)
-    s_q = mx.sum(h[:, None, :] * qh, axis=-1) + r_var      # (n, K)
+    # Written as per-plane multiply-adds rather than `mx.sum` over a
+    # broadcast product.  The reduction kernels over a size-m axis cost
+    # 10.5 ms per block against ~5 ms for the unrolled form; measured
+    # end to end at 1024 chains x N = 1e4, compiled, in one window:
+    # forward 112.3 -> 82.9 ms (min of 15), gradient unchanged at ~1039 ms,
+    # peak memory 1.44 -> 1.34 GiB forward and 5.44 -> 5.27 GiB with the
+    # gradient.  `m` is a trace-time constant, so the loop unrolls into the
+    # graph and nothing here is dynamic.
+    _m = h.shape[-1]
+    hphi = sum(h[:, None, i, None] * phi[:, :, i, :] for i in range(_m))
+    qh = sum(q[:, :, :, j] * h[:, None, None, j] for j in range(_m))
+    s_q = sum(h[:, None, i] * qh[:, :, i] for i in range(_m)) + r_var
     if s_floor is not None:
         # h Q h^T is a variance, hence non-negative in exact arithmetic, but
         # float32 can round it slightly negative in the dense-cadence corner.
@@ -215,7 +249,7 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     k = qh * inv_s[..., None]                              # gain, (n, K, m)
 
     a_mat = phi - outer(k, hphi)
-    c_mat = _sym(q - outer(k, qh))
+    c_mat = sym(q - outer(k, qh))
     # A leaf's information matrix is rank one -- J = z z^T with
     # z = (h Phi)^T / sqrt(S) -- and its information vector is g z with
     # g = y / sqrt(S).  Nothing downstream *needs* that structure, but
@@ -265,13 +299,13 @@ def combine(e1: Element, e2: Element) -> Element:
 
     l1 = chol(e1.C)
     x = matmul(mx.swapaxes(l1, -1, -2), matmul(e2.J, l1))
-    s = ident + _sym(x)
+    s = ident + sym(x)
     ls = chol(s)
     y = tri_solve_right(ls, l1)                    # Y Ls^T = L1
     m_mat = sym_from_factor(y)                     # (I + C1 J2)^-1 C1
     g = ident - matmul(m_mat, e2.J)                # (I + C1 J2)^-1
     v = matmul(e2.J, y)
-    jt = _sym(e2.J - sym_from_factor(v))           # (I + J2 C1)^-1 J2
+    jt = sym(e2.J - sym_from_factor(v))           # (I + J2 C1)^-1 J2
 
     a = matmul(e2.A, matmul(g, e1.A))
     g_b1 = matvec(g, e1.b)                         # G b1 -- the ell term
@@ -279,11 +313,11 @@ def combine(e1: Element, e2: Element) -> Element:
     # composite mean is A2 (G b1 + M eta2) + b2, while the ell cross term is
     # eta2^T G b1 alone.  Folding them together double-counts eta2^T M eta2.
     b = matvec(e2.A, g_b1 + matvec(m_mat, e2.eta)) + e2.b
-    c = _sym(matmul(e2.A, matmul(m_mat, mx.swapaxes(e2.A, -1, -2)))) + e2.C
+    c = sym(matmul(e2.A, matmul(m_mat, mx.swapaxes(e2.A, -1, -2)))) + e2.C
 
     gt_eta = matvec(mx.swapaxes(g, -1, -2), e2.eta - matvec(e2.J, e1.b))
     eta = matvec(mx.swapaxes(e1.A, -1, -2), gt_eta) + e1.eta
-    j = _sym(matmul(mx.swapaxes(e1.A, -1, -2), matmul(jt, e1.A))) + e1.J
+    j = sym(matmul(mx.swapaxes(e1.A, -1, -2), matmul(jt, e1.A))) + e1.J
 
     log_det = mx.log(ls[..., 0, 0])
     for i in range(1, m):
@@ -331,7 +365,7 @@ def combine_leaf(e1: Element, e2: Element, r1: LeafRank1) -> Element:
     a = matmul(e2.A, g_a1)
     b = matvec(e2.A, e1.b + p * (beta * inv_a)[..., None]) + e2.b
     m_mat = e1.C - outer(p, p) * inv_a[..., None, None]
-    c = _sym(matmul(e2.A, matmul(m_mat, mx.swapaxes(e2.A, -1, -2)))) + e2.C
+    c = sym(matmul(e2.A, matmul(m_mat, mx.swapaxes(e2.A, -1, -2)))) + e2.C
     eta = za1 * (beta * inv_a)[..., None] + e1.eta
     j = outer(za1, za1) * inv_a[..., None, None] + e1.J
     ell = (e1.ell + e2.ell + 0.5 * g * g
@@ -557,7 +591,7 @@ def expand_leaf(parts: LeafParts):
     q = _block_diag(*parts.q_blocks)
     k, z, g = parts.kappa, parts.z, parts.g
     return (Element(A=phi - outer(k, z), b=k * g[..., None],
-                    C=_sym(q - outer(k, k)), eta=g[..., None] * z,
+                    C=sym(q - outer(k, k)), eta=g[..., None] * z,
                     J=outer(z, z), ell=parts.ell),
             LeafRank1(z=z, g=g))
 
@@ -598,7 +632,7 @@ def combine_leaf_blocked(e1: Element, parts: LeafParts) -> Element:
     c = _bmm_right_t(_bmm_left(phi_b, m_mat), phi_b)
     c = c - outer(y, kappa) - outer(kappa, y) \
         + outer(kappa, kappa) * (mx.sum(z * mz, axis=-1) - 1.0)[..., None, None]
-    c = _sym(_add_block_diag(c, q_b))
+    c = sym(_add_block_diag(c, q_b))
 
     eta = za1 * (beta * inv_a)[..., None] + e1.eta
     j = outer(za1, za1) * inv_a[..., None, None] + e1.J
