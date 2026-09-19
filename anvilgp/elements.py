@@ -49,6 +49,7 @@ from .linalg import (chol, matmul, matvec, outer, quad_form,
 __all__ = ["Element", "LeafRank1", "LeafParts", "leaf_elements", "leaf_parts",
            "expand_leaf", "combine", "combine_leaf", "combine_leaf_blocked",
            "tree_reduce", "chunked_reduce", "chunked_reduce_blocked",
+           "prefix_scan",
            "identity_element", "use_blocked_leaves"]
 
 
@@ -663,3 +664,35 @@ def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16) -> Element:
         return Element(*(getattr(acc, f)[:, 0] for f in Element._fields))
     return tree_reduce(acc)
 
+
+
+def prefix_scan(e: Element) -> Element:
+    """Running composition along axis 1: ``out[:, j] = e[:,0] * ... * e[:,j]``.
+
+    The reduction gives log L; the *prefix* gives what the backward pass
+    needs, which is the state each block starts from.
+
+    The connection that makes this useful: the first element of the series
+    has ``A = 0``, ``J = 0``, ``eta = 0``, and composition preserves that, so
+    every prefix element also has them zero.  What is left in a prefix is
+    ``(b, C)`` -- and those *are* the Kalman filtered mean and covariance
+    after that block, with ``ell`` the log-likelihood accumulated so far.  So
+    one prefix scan over the ~1e2 block elements hands every block both its
+    starting filter state and its starting log-likelihood, with no storage
+    of anything per observation.
+
+    Sequential in the block index on purpose: there are tens to hundreds of
+    blocks, so a Blelloch scan would buy nothing over a Python loop whose
+    body is one batched :func:`combine`.
+    """
+    k = e.A.shape[1]
+    if k == 1:
+        return e
+    acc = Element(*(getattr(e, f)[:, 0] for f in Element._fields))
+    outs = [acc]
+    for j in range(1, k):
+        acc = combine(acc, Element(*(getattr(e, f)[:, j]
+                                     for f in Element._fields)))
+        outs.append(acc)
+    return Element(*(mx.stack([getattr(o, f) for o in outs], axis=1)
+                     for f in Element._fields))
