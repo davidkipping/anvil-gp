@@ -60,6 +60,7 @@ approximate one.
 | `likelihood.py` | `GPLogLike`: the anvil engine contract |
 | `priors.py` | parametrisation, default priors, periodogram initialiser |
 | `oracle.py` | dense float64 Cholesky oracle, `predict`, celerite2 wrapper |
+| `metal.py` | fused Metal scan kernel — M3's pass 1, forward only |
 | `anvil.py` | engine integration (lazy import; core stays mlx + numpy only) |
 
 Kernel set: `RealTerm`, `SHOTerm`, `Matern32Term`, `Matern52Term`,
@@ -86,11 +87,10 @@ log-normaliser reduces to the Kalman prediction-error form. `chunked_reduce`
 exploits that: fold sub-blocks of 16 observations sequentially with the cheap
 composition, then tree-reduce only the sub-block roots.
 
-One algebra, two executors: run the same code float64-on-CPU and it is the
-verification path; float32-on-GPU and it is the parity baseline for the fused
-Metal kernel of M3, which will execute the same composition on the same block
-boundaries — pass 1 condensing a sub-block in registers is precisely
-`combine_leaf` folded in a loop.
+One algebra, three executors: run the same code float64-on-CPU and it is the
+verification path; float32-on-GPU and it is the parity baseline; and the fused
+Metal kernel executes the *same* composition on the same block boundaries —
+its inner loop is precisely `combine_leaf` folded in registers.
 
 Full derivation, including the closed-form combine: [docs/statistical-foundation.md](docs/statistical-foundation.md).
 
@@ -117,7 +117,7 @@ that celerite2's Matérn-3/2 *converges to ours* as its `eps` shrinks
 (6.5e-3 → 6.5e-7 → 1.9e-10), which is what fixes the direction of the
 discrepancy.
 
-Beyond parity, the suite (203 tests, ~30 s) pins:
+Beyond parity, the suite (287 tests, ~47 s) pins:
 
 * the SSM identity `k(tau) = h Phi(tau) h^T` and the Lyapunov consistency
   `Q = I - Phi Phi^T` for all eleven term configurations;
@@ -127,6 +127,9 @@ Beyond parity, the suite (203 tests, ~30 s) pins:
   test passes;
 * tree reduction == chunked scan == left fold == sequential Kalman filter,
   values *and* gradients, at every sub-block length;
+* the **Metal kernel** against the dense float64 oracle and the MLX path, for
+  every term type, every block length from 1 to 1024, duplicate timestamps,
+  gaps, irregular cadence, a jitter and a mean model (`tests/test_metal.py`);
 * the rank-one `combine_leaf` against the general `combine`, to 1e-12;
 * combine's identity element and associativity;
 * the special functions against mpmath, *and* against the naive forms they
@@ -169,11 +172,61 @@ the innovation-variance cancellation — the cancellation-free process noise
 appears to have removed the hazard. That is one slice, not the map; M3 still
 owes the full feasibility survey.
 
-## Performance: where this actually stands
+## Performance: the fused Metal kernel
 
-**The fused Metal kernel is still not written**, but the pure-MLX reference is
-now ~30x faster than its first working version and beats a single-core CPU,
-though not yet a fully parallelised one. M2 Max, float32 GPU, compiled
+**M3's pass-1 kernel is in** (`anvilgp/metal.py`, forward only until M4 adds
+its VJP). It walks a block of observations with the running scan element **in
+registers**, so one element per *block* reaches memory instead of one per
+point. Against the MLX path, same problem, same answers:
+
+| config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
+|---|---:|---:|---:|---:|---:|
+| N=1e4, 1024 chains | 111.5 ms | **3.0 ms** | 37x | 1.16 GiB | 0.05 GiB |
+| N=1e4, 4096 chains | 466 ms | **6.7 ms** | 69x | 3.10 GiB | 0.21 GiB |
+| N=1e5, 1024 chains | 1166 ms | **16.4 ms** | 71x | 6.15 GiB | 0.41 GiB |
+
+Against celerite2 on the CPU, measured in the same session:
+
+| config | vs 1 core | vs 12 cores |
+|---|---:|---:|
+| N=1e4, 1024 chains | **142x faster** | **20x faster** |
+| N=1e5, 1024 chains | **264x faster** | **30x faster** |
+
+So the brief's **>=100x gate is cleared against the single-core loop**, and we
+are 20-30x ahead of a fully parallelised 12-core celerite2 — which was 2x
+*ahead* of us before this kernel. The brief predicted "~10-50 ms forward at
+1024 x 1e5"; the measurement is 16.4 ms, at the fast end of its own range.
+
+End to end, the same injection-recovery problem (1000 points, 1024 chains,
+2100 stretch steps) goes from **39.2 s to 4.6 s**, 180 -> **1,786 ESS/s**,
+with the posteriors agreeing (rho 6.956 vs 6.948).
+
+### What the kernel does and does not do
+
+It runs the composition, not the kernel-term algebra. `Phi` and `Q` arrive as
+a **table indexed by lag**, built by the float64-parity code in `terms.py`.
+Two reasons: the cancellation-free special functions are the most delicate
+numerics in the package and are pinned against mpmath, so re-deriving them in
+Metal Shading Language would put the thing most likely to be silently wrong
+in the place hardest to test; and real photometry has one cadence plus one lag
+per gap, so the table is a handful of rows that lives in cache.
+
+The first observation has no predecessor, and the *table* says so rather than
+the kernel special-casing it: row 0 holds `Phi = 0`, `Q = P_inf = I`, and
+`lag_index[0] = 0`. `ell` is accumulated with Kahan compensation in-thread,
+since a block is up to 4096 sequential adds with no tree to spread the error.
+
+Limits, stated: m <= 4 (the running element is `3m^2+2m+1` floats in
+registers — 17 at m = 2, 57 at m = 4, 209 at m = 8, which would spill);
+one jitter, not per-instrument; and an all-distinct-lag cadence degenerates
+the table to one row per point, which is correct but gives up the traffic
+saving. Larger m and in-kernel propagators are the obvious follow-ons.
+
+### The MLX reference path
+
+Still the differentiable path, the float64 verification path, and the thing
+the kernel is proved against. It is ~30x faster than its first working
+version and beats a single-core CPU, though not a fully parallelised one. M2 Max, float32 GPU, compiled
 forward, median of 25 in an isolated process, `block=4096`, realistic
 (regular-cadence-with-gaps) times:
 
@@ -479,13 +532,19 @@ Three more are worked around and pinned as regression tests
   bound; and the compiled-gradient limit, a hard structural result rather than
   a tuning number. Still owed: the Design-A probe comparison, the
   `metal::fast` accuracy study, and the ChEES leapfrog cost at scale.
-* **M3 — fused Metal blocked-scan kernel: not started.** It now has a
-  well-specified target: the same block boundaries, the same element algebra,
-  parity against `elements.py`, and it dissolves the compile limitation.
-* **M4 — checkpointed backward kernel + gradient parity at scale: not
-  started.** Gradients are correct today through autodiff on the reference
-  path (0.14% of float64 central differences, uniformly); M4 is about the
-  hand VJP for the fused kernel.
+* **M3 — fused Metal blocked-scan kernel: pass 1 done, forward only.**
+  37-71x over the MLX path, clearing the >=100x gate against the single-core
+  celerite2 loop and running 20-30x ahead of the 12-core one. 23 tests pin it
+  against the dense float64 oracle and the MLX path across every term type,
+  every block length, duplicate timestamps, gaps, irregular cadence, a jitter
+  and a mean model. Still owed: m > 4, per-instrument jitter in-kernel, the
+  float32 feasibility map, and `metal::fast` transcendentals.
+* **M4 — checkpointed backward kernel: not started, and now the critical
+  path.** Gradients are correct today through autodiff on the MLX path (0.14%
+  of float64 central differences); the fused kernel is forward-only and raises
+  a NotImplementedError naming the fix rather than failing obscurely. So the
+  gradient-free stretch move gets the 37-71x today and ChEES-HMC does not.
+  The VJP hook is already in place at `anvilgp/metal.py::_core_vjp`.
 * **M5 — joint validation, SBC calibration, docs: started.** The unbiasedness
   check across realisations is in `tests/test_calibration.py` and
   `examples/gp_injection_recovery.py` is the end-to-end fiducial. Still owed:

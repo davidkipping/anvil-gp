@@ -1,0 +1,188 @@
+"""The fused Metal scan kernel (M3 pass 1).
+
+The kernel is a *reimplementation* of the composition in Metal Shading
+Language, so it gets adjudicated the same way the MLX path was: against the
+dense float64 Cholesky, and against the MLX path itself, which is already
+pinned to celerite2.  Agreement has to hold for every term type, every block
+length, and with a jitter and a mean model in play -- a kernel that is right
+only for the configuration it was written against is not much use.
+"""
+
+import numpy as np
+import mlx.core as mx
+import pytest
+
+import anvilgp as ag
+from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from anvilgp.oracle import dense_loglike
+
+metal = pytest.importorskip("anvilgp.metal")
+pytestmark = pytest.mark.skipif(not metal.metal_available(),
+                                reason="mx.fast.metal_kernel unavailable")
+
+N = 384
+_rng = np.random.default_rng(11)
+T = np.arange(N) * 0.05                     # regular cadence, as real data
+YERR = np.full(N, 0.3)
+Y = _rng.standard_normal(N) * 0.9
+
+TERMS = [
+    ("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+    ("sho_critical", ag.SHOTerm(), [1.3, 4.0, 0.5]),
+    ("sho_overdamped", ag.SHOTerm(), [1.3, 4.0, 0.1]),
+    ("sho_highQ", ag.SHOTerm(), [1.3, 4.0, 100.0]),
+    ("matern32", ag.Matern32Term(), [1.1, 2.5]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+    ("real", ag.RealTerm(), [0.8, 0.5]),
+]
+
+
+def _build(term, kp, metal_on, blk=128, jitter=None, t=T, y=Y, yerr=YERR):
+    kernel = [KernelParam(link="const", value=float(x)) for x in kp]
+    jit = [KernelParam(link="const", value=float(jitter))] if jitter else []
+    pm = ParamMap(kernel=kernel, n_dim=1, jitter=jit)
+    return GPLogLike(None, t, None, y, yerr, term, pm,
+                     GPPolicy(block=1024, hi_block=1024, metal=metal_on,
+                              metal_block=blk))
+
+
+def _f32(gp, n_chains=3):
+    with mx.stream(mx.gpu):
+        out = np.array(gp(mx.zeros((n_chains, 1), dtype=mx.float32)),
+                       dtype=np.float64)
+    return out
+
+
+@pytest.mark.parametrize("name,term,kp", TERMS, ids=[c[0] for c in TERMS])
+def test_kernel_matches_the_mlx_path_and_the_dense_oracle(name, term, kp):
+    got = _f32(_build(term, kp, True))
+    ref = _f32(_build(term, kp, False))
+    gp = _build(term, kp, False)
+    dense = dense_loglike(term, np.array(kp), T, Y, YERR) - gp.log_norm_const
+    assert np.ptp(got) == 0.0, "identical chains must give identical answers"
+    assert abs(got[0] - ref[0]) < 0.02, (got[0], ref[0])
+    assert abs(got[0] - dense) < 0.05, (got[0], dense)
+
+
+@pytest.mark.parametrize("blk", [1, 7, 16, 64, 128, 512, 1024])
+def test_block_length_is_not_a_numerical_knob(blk):
+    """Every thread length must give the same answer, including blk = 1
+    (one observation per thread) and blk > N (one thread for everything)."""
+    ref = _f32(_build(ag.SHOTerm(), [1.3, 4.0, 3.0], False))[0]
+    got = _f32(_build(ag.SHOTerm(), [1.3, 4.0, 3.0], True, blk=blk))[0]
+    assert abs(got - ref) < 0.02, (blk, got, ref)
+
+
+def test_jitter_enters_the_kernels_observation_variance():
+    got = _f32(_build(ag.SHOTerm(), [1.3, 4.0, 3.0], True, jitter=0.45))[0]
+    gp = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], False, jitter=0.45)
+    dense = dense_loglike(ag.SHOTerm(), np.array([1.3, 4.0, 3.0]), T, Y, YERR,
+                          jitter=0.45) - gp.log_norm_const
+    assert abs(got - dense) < 0.05
+
+
+def test_duplicate_timestamps_and_gaps():
+    """dt = 0 and large gaps both go through the lag table, so the kernel
+    needs no special case -- but the table had better be built right."""
+    t = T.copy()
+    t[10] = t[9]                       # duplicate
+    t[200:] += 3.0                     # gap
+    t = np.sort(t)
+    got = _f32(_build(ag.SHOTerm(), [1.3, 4.0, 3.0], True, t=t))[0]
+    gp = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], False, t=t)
+    dense = dense_loglike(ag.SHOTerm(), np.array([1.3, 4.0, 3.0]), t, Y,
+                          YERR) - gp.log_norm_const
+    assert abs(got - dense) < 0.05
+
+
+def test_irregular_cadence_still_correct():
+    """Every lag distinct: the table degenerates to one row per point. Slow,
+    but it must not be wrong."""
+    t = np.sort(_rng.uniform(0.0, 20.0, N))
+    got = _f32(_build(ag.SHOTerm(), [1.3, 4.0, 3.0], True, t=t))[0]
+    gp = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], False, t=t)
+    dense = dense_loglike(ag.SHOTerm(), np.array([1.3, 4.0, 3.0]), t, Y,
+                          YERR) - gp.log_norm_const
+    assert abs(got - dense) < 0.05
+
+
+def test_mean_model_is_subtracted_before_the_kernel():
+    slope = 0.3
+
+    def mean_fn(v_mean, x):
+        return v_mean[:, 0:1] * x[None, :]
+
+    outs = []
+    for metal_on in (False, True):
+        pm = ParamMap(kernel=[KernelParam(link="const", value=v)
+                              for v in (1.3, 4.0, 3.0)], n_dim=1,
+                      mean=slice(0, 1))
+        gp = GPLogLike(mean_fn, T, T, Y, YERR, ag.SHOTerm(), pm,
+                       GPPolicy(block=1024, metal=metal_on, metal_block=128))
+        with mx.stream(mx.gpu):
+            outs.append(float(np.array(
+                gp(mx.array([[slope]], dtype=mx.float32)))[0]))
+    ref = dense_loglike(ag.SHOTerm(), np.array([1.3, 4.0, 3.0]), T,
+                        Y - slope * T, YERR)
+    gp0 = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], False)
+    assert abs(outs[1] - outs[0]) < 0.02
+    assert abs(outs[1] - (ref - gp0.log_norm_const)) < 0.05
+
+
+def test_chains_stay_independent_under_the_kernel():
+    refs = [1.0, 4.0, 3.0]
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate(refs)], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(metal=True, metal_block=64))
+    with mx.stream(mx.gpu):
+        u = mx.array(_rng.standard_normal((8, 3)).astype(np.float32) * 0.2)
+        full = np.array(gp(u))
+        alone = np.array(gp(u[5:6]))
+    assert abs(full[5] - alone[0]) < 1e-3 * max(1.0, abs(alone[0]))
+
+
+def test_eligibility_is_reported_not_silently_ignored():
+    """A configuration the kernel cannot serve must say so, so nobody
+    concludes it is on when it is not."""
+    four = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()
+    pm = ParamMap(kernel=[KernelParam(link="const", value=1.0)] * 12, n_dim=1)
+    gp = GPLogLike(None, T, None, Y, YERR, four, pm, GPPolicy(metal=True))
+    ok, why = gp.metal_eligible()
+    assert not ok and "register budget" in why
+
+    off = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], False)
+    ok, why = off.metal_eligible()
+    assert not ok and "off" in why
+
+    on = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], True)
+    assert on.metal_eligible()[0]
+
+
+def test_psd_failure_stays_finite_under_the_kernel():
+    pm = ParamMap(kernel=[KernelParam(link="log", index=0, ref=1e4),
+                          KernelParam(link="log", index=1, ref=1e6),
+                          KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
+                   GPPolicy(metal=True, metal_block=64))
+    with mx.stream(mx.gpu):
+        out = gp(mx.zeros((4, 3), dtype=mx.float32))
+        mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out)))
+
+
+def test_differentiating_the_kernel_says_what_to_do_instead():
+    """Forward-only until M4 -- but the error has to name the fix, not leave
+    the user with MLX's '[Primitive::vjp] Not implemented for CustomKernel'."""
+    refs = [1.0, 4.0, 3.0]
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate(refs)], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(metal=True, metal_block=64))
+    with mx.stream(mx.gpu):
+        u = mx.zeros((2, 3), dtype=mx.float32)
+        with pytest.raises(NotImplementedError, match="forward-only until M4"):
+            mx.eval(mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])[1][0])
+        # the forward path still works after the failed differentiation
+        assert bool(mx.all(mx.isfinite(gp(u))))

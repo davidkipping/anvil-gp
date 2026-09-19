@@ -44,7 +44,7 @@ import mlx.core as mx
 import numpy as np
 
 from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
-                       combine, leaf_elements, leaf_parts,
+                       combine, leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from .terms import Term
 
@@ -97,6 +97,16 @@ class GPPolicy:
     #: keep leaves in compact block form (None = decide from the term's block
     #: structure).  See :func:`anvilgp.elements.use_blocked_leaves`.
     blocked: bool | None = None
+    #: use the fused Metal scan kernel (:mod:`anvilgp.metal`).  **Forward
+    #: only** until M4 adds its VJP -- differentiating through it raises
+    #: rather than silently falling back, so a gradient sampler must leave
+    #: this off.  Measured 37-71x over the MLX path with 15-23x less peak
+    #: memory; see the README.
+    metal: bool = False
+    #: observations condensed per kernel thread.  Larger means fewer, longer
+    #: sequential walks and less work left for the MLX tree above; 1024 was
+    #: best at N = 1e4 and 4096 at N = 1e5.
+    metal_block: int = 1024
     #: floor on the leaf innovation variance, in units of the reference
     #: variance.  Positive-definiteness failure is a *defined* outcome:
     #: with thousands of chains, warmup will visit float32-infeasible
@@ -267,6 +277,15 @@ class GPLogLike:
         # is exact for itself, and neither needs a tolerance.
         self._uniq32 = self._distinct_lags(np.float32)
         self._uniq64 = self._distinct_lags(np.float64)
+        # Lag table for the Metal kernel.  Row 0 is reserved for the
+        # no-predecessor case (Phi = 0, Q = P_inf = I), so the kernel needs
+        # no special case for the first observation -- the table says it.
+        uniq32, inv32 = np.unique(self._dt64.astype(np.float32),
+                                  return_inverse=True)
+        lag = inv32.astype(np.int32) + 1
+        lag[0] = 0
+        self._metal_uniq_dt = mx.array(uniq32, dtype=mx.float32)
+        self._metal_lag = mx.array(lag)
         self.n_distinct_lags = (self.n_data if self._uniq32 is None
                                 else int(self._uniq32[0].size))
         self._y32 = mx.array(self._y64.astype(np.float32))
@@ -377,6 +396,46 @@ class GPLogLike:
         s_floor = self.policy.s_floor_rel * r_ref
         return phi, q, h, r, r_var, r_ref, s_floor
 
+    def metal_eligible(self) -> tuple[bool, str]:
+        """Whether the fused kernel can serve this problem, and why not."""
+        from .metal import MAX_STATE, metal_available
+        if not self.policy.metal:
+            return False, "GPPolicy.metal is off"
+        if self.term.n_state > MAX_STATE:
+            return False, (f"m = {self.term.n_state} exceeds the kernel's "
+                           f"register budget (max {MAX_STATE})")
+        if len(self.param_map.jitter) > 1:
+            return False, "per-instrument jitter is not in the kernel yet"
+        if not metal_available():
+            return False, "mx.fast.metal_kernel is unavailable here"
+        return True, ""
+
+    def _evaluate_metal(self, v: mx.array) -> mx.array:
+        """Design C: the kernel condenses blocks, MLX composes the roots."""
+        from .metal import scan_blocks
+        pm = self.param_map
+        n, m, dt = v.shape[0], self.term.n_state, v.dtype
+        phi, q, h = self.term.matrices(pm.kernel_params(v),
+                                       self._metal_uniq_dt)
+        pt = mx.concatenate(
+            [mx.zeros((n, 1, m, m), dtype=dt), phi], axis=1)
+        qt = mx.concatenate(
+            [mx.broadcast_to(mx.eye(m, dtype=dt), (n, 1, m, m)), q], axis=1)
+
+        r = mx.broadcast_to(self._y32, (n, self.n_data))
+        if self.mean_fn is not None and pm.mean is not None:
+            r = r - self.mean_fn(v[:, pm.mean], self._x_mean32)
+        off = pm.offsets(v, self._inst32)
+        if off is not None:
+            r = r - off
+        jit = pm.jitter_var(v, self._inst32)
+        jit2 = (mx.zeros((n, 0), dtype=dt) if jit is None
+                else mx.broadcast_to(jit, (n, 1)))
+
+        el = scan_blocks(pt, qt, self._metal_lag, h, r, self._rref32, jit2,
+                         self.policy.s_floor_rel, self.policy.metal_block)
+        return tree_reduce(el).ell
+
     def _evaluate(self, v, dt, y, rref, x_mean, idx, block, do_eval, uniq=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,)."""
         get_mat = self._matrices_fn(self.param_map.kernel_params(v), dt, uniq)
@@ -399,6 +458,9 @@ class GPLogLike:
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`."""
+        ok, _why = self.metal_eligible()
+        if ok:
+            return _sanitize(self._evaluate_metal(v))
         out = self._evaluate(
             v, self._dt32, self._y32, self._rref32, self._x_mean32,
             self._inst32, _pow2(self.policy.block), self.policy.eval_blocks,
