@@ -42,7 +42,7 @@ import numpy as np
 
 __all__ = [
     "sinc_gen", "cosm1_gen", "cos_gen", "sincm1", "damped_cos_sinc",
-    "gamma3", "exp_acc", "sincos",
+    "gamma3", "lower_gamma_reg", "exp_acc", "sincos",
 ]
 
 # ---------------------------------------------------------------------------
@@ -208,26 +208,54 @@ def sincm1(u: mx.array) -> mx.array:
 # regularised lower incomplete gamma:  gamma3(z) = 1 - e^{-z}(1 + z + z^2/2)
 # ---------------------------------------------------------------------------
 
-# gamma3(z) = int_0^z e^-t t^2/2 dt = sum_k (-1)^k z^{k+3} / (2 k! (k+3))
-_GAMMA3_C = [(-1.0) ** k / (2.0 * math.factorial(k) * (k + 3))
-             for k in range(_N_GAMMA)]
+# P(n+1, z) = 1 - e^{-z} sum_{j<=n} z^j/j!
+#           = z^{n+1} sum_k (-z)^k / (k! (n+1+k) n!)
+_GAMMA_C: dict[int, list[float]] = {}
+
+
+def _gamma_coeffs(n: int) -> list[float]:
+    if n not in _GAMMA_C:
+        _GAMMA_C[n] = [(-1.0) ** k
+                       / (math.factorial(k) * (n + 1 + k) * math.factorial(n))
+                       for k in range(_N_GAMMA)]
+    return _GAMMA_C[n]
+
+
+def lower_gamma_reg(n: int, z: mx.array) -> mx.array:
+    """Regularised lower incomplete gamma ``P(n+1, z)``, cancellation-free.
+
+    ``= 1 - e^{-z} sum_{j<=n} z^j/j!`` for ``z >= 0``, tending to
+    ``z^{n+1}/(n+1)!`` as ``z -> 0``.  The series form is used below
+    ``_Z_SERIES`` and the direct form above it.
+
+    This is the one function standing between the process noise and a total
+    loss of significance at ``lambda dt << 1``: the direct form *is* the
+    ``P_inf - Phi P_inf Phi^T`` cancellation, which at ``c dt = 1e-3``
+    leaves nothing at all in float32.  It is also bounded in [0, 1), so it
+    removes the ``e^{2 c dt}`` overflow the unscaled ``expm1`` form would
+    carry at large lag.  SHO needs ``n = 2``; Matern-5/2 needs up to 4.
+    """
+    small = z <= _Z_SERIES
+    zs = _safe(z, small, 0.0)
+    ser = _horner(zs, _gamma_coeffs(n))
+    for _ in range(n + 1):
+        ser = ser * zs
+    zb = _safe(z, mx.logical_not(small), 1.0)
+    tot, term = mx.ones_like(zb), mx.ones_like(zb)
+    for j in range(1, n + 1):
+        term = term * zb / j
+        tot = tot + term
+    return mx.where(small, ser, 1.0 - exp_acc(-zb) * tot)
 
 
 def gamma3(z: mx.array) -> mx.array:
     """``1 - e^{-z}(1 + z + z^2/2)`` for z >= 0; ``-> z^3/6`` as z -> 0.
 
-    The whole float32 viability of the SHO process noise rests on this one
-    function: the direct form is the ``P_inf - Phi P_inf Phi^T`` triple
-    cancellation, which at ``c dt = 1e-3`` leaves nothing at all in fp32.
-    Bounded in [0, 1), so it also removes the ``e^{2 c dt}`` overflow that
-    the unscaled ``expm1`` form would carry at large lag.
+    The ``n = 2`` case of :func:`lower_gamma_reg`, named because it is what
+    the SHO process noise asks for and what the float32 viability of that
+    process noise rests on.
     """
-    small = z <= _Z_SERIES
-    zs = _safe(z, small, 0.0)
-    ser = zs * zs * zs * _horner(zs, _GAMMA3_C)
-    zb = _safe(z, mx.logical_not(small), 1.0)
-    direct = 1.0 - exp_acc(-zb) * (1.0 + zb + 0.5 * zb * zb)
-    return mx.where(small, ser, direct)
+    return lower_gamma_reg(2, z)
 
 
 

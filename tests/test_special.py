@@ -150,3 +150,29 @@ def test_vjps_match_central_differences(fn, x0):
     fd = (float(np.array(fn(_f64([x0 + h])))[0])
           - float(np.array(fn(_f64([x0 - h])))[0])) / (2 * h)
     assert abs(ad - fd) < 1e-6 * max(1.0, abs(fd))
+
+
+@pytest.mark.parametrize("n", [2, 3, 4])
+def test_lower_gamma_reg_matches_mpmath(n):
+    """The general-n case, against arbitrary precision.
+
+    `gamma3` is the n = 2 case of this function; `terms.py` used to carry a
+    second copy for n up to 4, with its own series constants and its own
+    Horner loop.  One implementation, one oracle.
+    """
+    import mpmath as mpm
+
+    z = np.concatenate([[0.0], np.logspace(-12, 2.5, 120)])
+    got = np.array(sp.lower_gamma_reg(n, mx.array(z, dtype=mx.float64)),
+                   dtype=np.float64)
+    with mpm.workdps(50):
+        want = np.array([float(mpm.gammainc(n + 1, 0, mpm.mpf(v),
+                                            regularized=True)) for v in z])
+    err = np.abs(got - want) / np.maximum(np.abs(want), 1e-300)
+    assert np.max(err) < 1e-13, (n, float(np.max(err)))
+
+
+def test_gamma3_is_the_n2_case():
+    z = mx.array(np.concatenate([[0.0], np.logspace(-14, 3, 200)]),
+                 dtype=mx.float64)
+    assert float(mx.max(mx.abs(sp.gamma3(z) - sp.lower_gamma_reg(2, z)))) == 0.0

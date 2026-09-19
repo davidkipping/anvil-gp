@@ -46,6 +46,31 @@ from .linalg import matmul, matvec, outer, sym
 __all__ = ["filter_forward", "filter_backward", "blocked_backward"]
 
 
+def _predict_step(p_i, q_i, h, y_i, rv_i, mean, cov, floor_i=None):
+    """One filter prediction + innovation, shared by the sweep and the replay.
+
+    The checkpointing scheme *requires* that the backward sweep replay
+    exactly the forward it is differentiating -- not an equivalent
+    computation, the same one, down to the order of operations, or the
+    adjoint is the adjoint of a slightly different function.  Writing it
+    once makes that true by construction rather than by inspection.
+
+    Returns ``(mp, cp, ch, s, v, kg, floored)``; ``floored`` is the mask of
+    lanes where the innovation-variance floor bound, or None when no floor
+    is in force.
+    """
+    mp = matvec(p_i, mean)
+    cp = sym(matmul(p_i, matmul(cov, mx.swapaxes(p_i, -1, -2))) + q_i)
+    ch = matvec(cp, h)
+    s = mx.sum(h * ch, axis=-1) + rv_i
+    floored = None
+    if floor_i is not None:
+        floored = s < floor_i
+        s = mx.maximum(s, floor_i)
+    v = y_i - mx.sum(h * mp, axis=-1)
+    return mp, cp, ch, s, v, ch / s[:, None], floored
+
+
 def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
     """Run the filter, keeping every state.  Returns (states, logL).
 
@@ -71,15 +96,9 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
     states = [(mean, cov)]
     for i in range(k):
         p_i = phi[:, i]
-        mp = matvec(p_i, mean)
-        cp = matmul(p_i, matmul(cov, mx.swapaxes(p_i, -1, -2))) + q[:, i]
-        cp = sym(cp)
-        ch = matvec(cp, h)
-        s = mx.sum(h * ch, axis=-1) + r_var[:, i]
-        if s_floor is not None:
-            s = mx.maximum(s, s_floor[i])
-        v = y[:, i] - mx.sum(h * mp, axis=-1)
-        kg = ch / s[:, None]
+        mp, cp, ch, s, v, kg, _ = _predict_step(
+            p_i, q[:, i], h, y[:, i], r_var[:, i], mean, cov,
+            None if s_floor is None else s_floor[i])
         mean = mp + kg * v[:, None]
         cov = cp - outer(kg, ch)
         cov = sym(cov)
@@ -120,18 +139,11 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
     for i in range(k - 1, -1, -1):
         mean_prev, cov_prev = states[i]
         p_i = phi[:, i]
-        # -- replay the forward quantities this step needs --
-        mp = matvec(p_i, mean_prev)
-        cp = matmul(p_i, matmul(cov_prev, mx.swapaxes(p_i, -1, -2))) + q[:, i]
-        cp = sym(cp)
-        ch = matvec(cp, h)
-        s = mx.sum(h * ch, axis=-1) + r_var[:, i]
-        floored = None
-        if s_floor is not None:
-            floored = s < s_floor[i]
-            s = mx.maximum(s, s_floor[i])
-        v = y[:, i] - mx.sum(h * mp, axis=-1)
-        kg = ch / s[:, None]
+        # replay the forward quantities this step needs -- the SAME
+        # computation the forward ran, not an equivalent one
+        mp, cp, ch, s, v, kg, floored = _predict_step(
+            p_i, q[:, i], h, y[:, i], r_var[:, i], mean_prev, cov_prev,
+            None if s_floor is None else s_floor[i])
 
         # -- seeds: the only place ell enters --
         v_bar = -c[:, 0] * v / s

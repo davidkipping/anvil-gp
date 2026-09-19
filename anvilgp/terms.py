@@ -76,6 +76,7 @@ from .special import (
     damped_cos_sinc,
     exp_acc,
     gamma3,
+    lower_gamma_reg,
     sinc_gen,
     sincm1,
 )
@@ -386,42 +387,6 @@ class Matern52Term(Term):
         return sigma ** 2 * (1.0 + x + x * x / 3.0) * np.exp(-x)
 
 
-# lower incomplete gamma P(n+1, z) = 1 - e^{-z} sum_{j<=n} z^j/j!, as a
-# series for small z (cancellation-free) and directly for large z.  The n = 2
-# case is anvilgp.special.gamma3; the Matern-5/2 process noise needs n up to 4.
-_GAMMA_SERIES_N = 24
-_GAMMA_Z_SWITCH = 2.0
-
-
-def _lower_gamma_reg(n: int, z: mx.array) -> mx.array:
-    """``P(n+1, z) = 1 - e^{-z} sum_{j<=n} z^j/j!``, cancellation-free.
-
-    Series ``z^{n+1} sum_k (-z)^k / (k! (n+1+k) n!)`` below the switch; the
-    n = 2 case is :func:`anvilgp.special.gamma3`, and the same identity in
-    the same form -- this is the one function that stands between the
-    process noise and a total loss of significance at ``lambda dt << 1``.
-    """
-    coeffs = [(-1.0) ** k / (math.factorial(k) * (n + 1 + k)
-                             * math.factorial(n))
-              for k in range(_GAMMA_SERIES_N)]
-    small = z <= _GAMMA_Z_SWITCH
-    zs = mx.where(small, z, mx.zeros_like(z))
-    acc = mx.array(coeffs[-1], dtype=z.dtype) + 0.0 * zs
-    for c in reversed(coeffs[:-1]):
-        acc = acc * zs + c
-    ser = acc
-    for _ in range(n + 1):
-        ser = ser * zs
-    zb = mx.where(small, mx.ones_like(z), z)
-    term = mx.ones_like(zb)
-    tot = term
-    for j in range(1, n + 1):
-        term = term * zb / j
-        tot = tot + term
-    direct = 1.0 - exp_acc(-zb) * tot
-    return mx.where(small, ser, direct)
-
-
 # Whitening of the lambda-scaled Matern-5/2 state.  In the scaled frame
 # z = diag(1, 1/l, 1/l^2) y / sigma the stationary covariance is the *constant*
 # matrix W = [[1,0,-1/3],[0,1/3,0],[-1/3,0,1]] -- lambda- and sigma-free, but
@@ -480,7 +445,7 @@ def _matern52_matrices(sigma, lam, dt):
     # dt.  In the scaled frame q_c/(sigma^2 lambda^5) = 16/3 exactly (from
     # Var(y) = q_c int_0^inf (e^{-ls} s^2/2)^2 ds = 3 q_c/(16 l^5)).
     z = 2.0 * tau
-    mom = [_lower_gamma_reg(n, z) * (math.factorial(n) / 2.0 ** (n + 1))
+    mom = [lower_gamma_reg(n, z) * (math.factorial(n) / 2.0 ** (n + 1))
            for n in range(6)]
 
     def poly_int(ca, cb):
