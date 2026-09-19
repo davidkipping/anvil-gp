@@ -218,3 +218,33 @@ def test_overdamped_float32_loglike_tracks_float64_at_scale():
     with mx.stream(mx.gpu):
         lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
     assert abs(lo - hi) < 0.05, f"fp32 off by {lo - hi:.3f} log-units"
+
+
+@pytest.mark.slow
+def test_block_size_is_not_a_float32_precision_knob():
+    """``block`` trades memory for graph size.  It must not trade accuracy.
+
+    The per-block roots used to be folded left to right, accumulating
+    ``ell`` sequentially in float32 at magnitude |log L| ~ 1e5: 0.40
+    log-units of error at block 256 against 0.012 for a pairwise tree.  The
+    existing block-independence test runs in float64, where the fold is
+    harmless, so nothing caught it.
+    """
+    n = 100_000
+    r = np.random.default_rng(5)
+    t = np.sort(r.uniform(0.0, 2000.0, n))
+    y = r.standard_normal(n)
+    yerr = np.full(n, 0.3)
+
+    errs = []
+    for blk in (256, 1024, 4096):
+        gp = make(ag.SHOTerm(), [1.0, 4.0, 3.0], t=t, y=y, yerr=yerr,
+                  block=blk)
+        hi = float(np.array(gp.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
+        with mx.stream(mx.gpu):
+            lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
+        errs.append(lo - hi)
+
+    assert max(abs(e) for e in errs) < 0.05, errs
+    # and the choice of block must not move the answer at all
+    assert max(errs) - min(errs) < 1e-3, errs

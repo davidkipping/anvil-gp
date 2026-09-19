@@ -449,9 +449,20 @@ class GPLogLike:
         return tree_reduce(el).ell
 
     def _evaluate(self, v, dt, y, rref, x_mean, idx, block, do_eval, uniq=None):
-        """Blocked chunked-scan reduction over the whole series -> (n_chains,)."""
+        """Blocked chunked-scan reduction over the whole series -> (n_chains,).
+
+        The per-block roots are composed by a *pairwise tree*, not folded
+        left to right.  ``ell`` grows to the full ``|log L|`` along the way,
+        so a sequential fold accumulates it in float32 at magnitude ~1e5 and
+        the block size silently becomes a precision knob: measured at
+        N = 1e5, a left fold costs 0.10 log-units at ``block = 1024`` and
+        0.40 at ``block = 256``, against 0.012 for the tree.  (The existing
+        block-independence test runs in float64, where neither shows.)  The
+        Metal path has always composed its blocks this way; this makes the
+        MLX path agree.
+        """
         get_mat = self._matrices_fn(self.param_map.kernel_params(v), dt, uniq)
-        total: Element | None = None
+        roots: list[Element] = []
         for s in range(0, self.n_data, block):
             e = min(s + block, self.n_data)
             args = self.leaf_inputs(v, dt, y, rref, x_mean, idx, s, e, get_mat)
@@ -461,10 +472,16 @@ class GPLogLike:
             else:
                 root = chunked_reduce(*leaf_elements(*args),
                                       sub_len=self.sub_block)
-            total = root if total is None else combine(total, root)
             if do_eval:
-                mx.eval(total)
-        return total.ell
+                # bound peak memory: the block's leaf arrays die here, and
+                # the root that survives is one element per chain.
+                mx.eval(root)
+            roots.append(root)
+        if len(roots) == 1:
+            return roots[0].ell
+        stacked = Element(*(mx.stack([getattr(r, f) for r in roots], axis=1)
+                            for f in Element._fields))
+        return tree_reduce(stacked).ell
 
     # -- the anvil LogDensity contract ------------------------------------
 
