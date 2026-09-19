@@ -197,10 +197,17 @@ Against celerite2 on the CPU, measured in the same session:
 | N=1e4, 1024 chains | **142x faster** | **20x faster** |
 | N=1e5, 1024 chains | **264x faster** | **30x faster** |
 
-So the brief's **>=100x gate is cleared against the single-core loop**, and we
-are 20-30x ahead of a fully parallelised 12-core celerite2 — which was 2x
-*ahead* of us before this kernel. The brief predicted "~10-50 ms forward at
-1024 x 1e5"; the measurement is 16.4 ms, at the fast end of its own range.
+**The >=100x gate is not yet cleared.** The brief is explicit that "the honest
+>=100x denominator is the multiprocess one", and against a fully parallelised
+12-core celerite2 we are **20-30x**, not 100x. The single-core column is
+reported because it is the comparison most users' code actually makes (one
+CPU process, one chain at a time), not because it clears the gate. What the
+kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
+20-30x behind. Closing the remaining factor is future work; see
+"What is left" below.
+
+The brief predicted "~10-50 ms forward at 1024 x 1e5"; the measurement is
+16.4 ms, at the fast end of its own range.
 
 End to end, the same injection-recovery problem (1000 points, 1024 chains,
 2100 stretch steps) goes from **39.2 s to 4.6 s**, 180 -> **1,786 ESS/s**,
@@ -569,7 +576,15 @@ Three more are worked around and pinned as regression tests
   block's transfer map in parallel (~6x a sweep at m = 2, where the backward
   state has 5 components), compose them in a cheap scan over the ~1e2 blocks,
   then apply in parallel — which costs roughly 8x the forward, i.e. ~24 ms at
-  1024 chains x N = 1e4, against 2.7 s for the MLX gradient today.
+  1024 chains x N = 1e4, against **0.85 s** for the MLX gradient today
+  (min of 7, `block=4096`, gapped cadence), so roughly a **35x** payoff.
+
+  An earlier draft of this section quoted 2.7 s and a ~110x payoff. That
+  number came from `bench_reference.py`'s old `block=256` default, which is
+  not the recommended setting: at the same size and window, block 256 takes
+  2716 ms and block 4096 takes 851 ms. Block 4096 is 3.2x faster and costs
+  7.45 GiB against 3.35 GiB, so the two are a speed/memory trade and the
+  honest gradient baseline is the faster one.
 
   Also recorded, because it is the tempting shortcut and it is wrong: never
   reconstruct the forward state by running the filter *backwards* through the
