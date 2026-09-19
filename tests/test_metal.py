@@ -192,3 +192,37 @@ def test_differentiating_the_kernel_says_what_to_do_instead():
             mx.eval(mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])[1][0])
         # the forward path still works after the failed differentiation
         assert bool(mx.all(mx.isfinite(gp(u))))
+
+
+def test_per_instrument_offsets_under_the_kernel():
+    """The one reachable Metal branch nothing covered.
+
+    ``_evaluate_metal`` subtracts per-instrument offsets on its own code
+    path (it does not go through ``leaf_inputs``), so a bug there would not
+    show up in any MLX test.  Per-instrument *jitter* is refused by the
+    kernel; offsets are not, and must match.
+    """
+    inst = (np.arange(N) % 3).astype(np.int32)
+    kernel = [KernelParam(link="const", value=v) for v in (1.3, 4.0, 3.0)]
+    offs = [KernelParam(link="linear", index=i, ref=0.0, scale=1.0)
+            for i in range(3)]
+
+    def build(metal_on):
+        pm = ParamMap(kernel=kernel, n_dim=3, offset=offs, instrument=inst,
+                      jitter=[KernelParam(link="const", value=0.05)])
+        return GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                         GPPolicy(block=1024, hi_block=1024, metal=metal_on,
+                                  metal_block=128))
+
+    gp_m, gp_x = build(True), build(False)
+    assert gp_m.metal_eligible()[0]
+    u = mx.array(np.array([[0.3, -0.2, 0.1], [0.0, 0.0, 0.0]],
+                          dtype=np.float32))
+    with mx.stream(mx.gpu):
+        got = np.array(gp_m(u))
+        want = np.array(gp_x(u))
+    assert np.max(np.abs(got - want)) < 0.02, (got, want)
+    # and the offsets actually do something, so this is not a null test
+    with mx.stream(mx.gpu):
+        zero = np.array(gp_m(mx.zeros((1, 3), dtype=mx.float32)))
+    assert abs(float(zero[0]) - float(got[0])) > 1.0

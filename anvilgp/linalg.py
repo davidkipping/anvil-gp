@@ -35,8 +35,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 __all__ = ["chol", "tri_solve_right", "sym_from_factor", "quad_form",
-           "matvec", "matmul", "outer", "sym", "prefer_builtin", "diag_floor",
-           "FORCE_UNROLLED"]
+           "matvec", "matmul", "outer", "sym", "FORCE_UNROLLED"]
 
 
 #: state dimension at or below which the unrolled elementwise product beats

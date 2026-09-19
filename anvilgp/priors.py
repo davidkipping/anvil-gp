@@ -59,7 +59,7 @@ from .terms import (Matern32Term, Matern52Term, RealTerm, RotationTerm,
 
 __all__ = ["Hyper", "SpecHint", "default_hypers", "build_param_map",
            "make_log_prior", "periodogram_period", "data_references",
-           "auto_order_groups"]
+           "auto_order_groups", "jitter_hyper", "offset_hyper"]
 
 
 @dataclass

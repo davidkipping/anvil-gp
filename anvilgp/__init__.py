@@ -27,7 +27,7 @@ Layers:
 from __future__ import annotations
 
 from . import oracle, priors
-from .likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from .likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap, a64
 from .terms import (
     Matern32Term,
     Matern52Term,
@@ -41,7 +41,7 @@ from .terms import (
 __version__ = "0.1.0.dev0"
 
 __all__ = [
-    "GPLogLike", "GPPolicy", "ParamMap", "KernelParam",
+    "GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64",
     "priors", "oracle",
     "Term", "TermSum", "RealTerm", "SHOTerm",
     "Matern32Term", "Matern52Term", "RotationTerm",
