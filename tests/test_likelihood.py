@@ -23,7 +23,7 @@ from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam, ParamMap,
 from anvilgp.oracle import celerite2_loglike, dense_loglike
 
 mx.set_default_device(mx.cpu)
-c2t = pytest.importorskip("celerite2.terms")
+import celerite2.terms as c2t   # a declared test dep: never skip M1 parity
 
 N = 512
 _rng = np.random.default_rng(7)

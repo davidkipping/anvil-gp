@@ -16,7 +16,6 @@ import numpy as np
 import mlx.core as mx
 import pytest
 
-from anvilgp import linalg
 from anvilgp.adjoint import (blocked_backward, filter_backward,
                              filter_forward)
 from anvilgp.kalman import sequential_loglike
@@ -27,10 +26,8 @@ NAMES = ["phi", "q", "h", "y", "r_var"]
 
 
 @pytest.fixture(autouse=True)
-def unrolled():
-    linalg.FORCE_UNROLLED = True
-    yield
-    linalg.FORCE_UNROLLED = False
+def _unrolled(unrolled):
+    """Shared fixture from conftest.py, made autouse for this module."""
 
 
 def _problem(seed, n=3, k=9, m=2):

@@ -19,8 +19,18 @@ dependencies = [
 test = [
     "pytest>=7",
     "celerite2>=0.3",     # fp64 value oracle (CPU)
-    "jax[cpu]>=0.4",      # celerite2.jax gradient oracle (M4)
+    "mpmath>=1.3",        # arbitrary-precision oracle for special.py
+    "scipy>=1.10",        # expm, the brute-force Gaussian integral
 ]
+# `anvil` itself is deliberately NOT a dependency: it is imported lazily and
+# only by `anvilgp.anvil`, so the package tests without it.  Install it
+# separately for the integration tests (they skip if it is absent).
+#
+# NOTE ON MLX: the workarounds in elements._pairs and the compiled-gradient
+# limitation are specific to MLX 0.32.2 and are pinned by regression tests
+# that assert the *buggy* behaviour, so they will fail loudly when MLX fixes
+# them.  That is intentional -- no upper bound here, but expect test
+# failures rather than silence on a newer MLX.
 
 [tool.hatch.build.targets.wheel]
 packages = ["anvilgp"]

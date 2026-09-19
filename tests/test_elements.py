@@ -12,7 +12,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from anvilgp import linalg
 from anvilgp.elements import (Element, LeafRank1, chunked_reduce, combine,
                               combine_leaf, identity_element, leaf_elements,
                               tree_reduce)
@@ -23,12 +22,10 @@ M = 2
 
 
 @pytest.fixture(autouse=True)
-def unrolled():
+def _unrolled(unrolled):
     """Exercise the hand-rolled factorisation even in float64, so a bug in
-    the GPU route cannot hide behind the dtype switch."""
-    linalg.FORCE_UNROLLED = True
-    yield
-    linalg.FORCE_UNROLLED = False
+    the GPU route cannot hide behind the dtype switch.  (The fixture itself
+    lives in conftest.py; this makes it autouse for this module.)"""
 
 
 def _f(x):
@@ -58,7 +55,7 @@ def _log_element(e, x_out, x_in):
 
 
 def test_combine_against_numerical_integration():
-    dblquad = pytest.importorskip("scipy.integrate").dblquad
+    from scipy.integrate import dblquad   # declared test dep
     rng = np.random.default_rng(5)
     e1, e2 = _rand_element(rng), _rand_element(rng)
     out = combine(e1, e2)

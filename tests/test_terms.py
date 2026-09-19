@@ -142,7 +142,7 @@ def test_matern_terms_match_the_bessel_form():
     general Matern family formula via the modified Bessel function K_nu is
     the outside opinion.
     """
-    sp_special = pytest.importorskip("scipy.special")
+    import scipy.special as sp_special    # declared test dep
     tau = np.logspace(-6, 1.5, 60)
     sigma, rho = 1.3, 2.7
     for nu, term in ((1.5, ag.Matern32Term()), (2.5, ag.Matern52Term())):

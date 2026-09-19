@@ -19,7 +19,7 @@ def _f64(x):
 
 @pytest.fixture(scope="module")
 def mpm():
-    mpm = pytest.importorskip("mpmath")
+    import mpmath as mpm        # declared test dep: never skip silently
     mpm.mp.dps = 40
     return mpm
 

@@ -367,3 +367,25 @@ def test_numpy_scalars_in_kernel_params_do_not_poison_the_graph():
     with mx.stream(mx.gpu):
         out = np.array(gp(mx.zeros((2, 3), dtype=mx.float32)))
     assert np.all(np.isfinite(out))
+
+
+def test_param_map_constructors_match_the_long_form():
+    """`ParamMap.const` / `.log` are sugar; they must be exactly sugar."""
+    vals = (1.0, 4.0, 3.0)
+    short = ParamMap.const(vals, jitter=0.1)
+    long = ParamMap(kernel=[KernelParam(link="const", value=v) for v in vals],
+                    n_dim=1,
+                    jitter=[KernelParam(link="const", value=0.1)])
+    v = mx.zeros((3, 1), dtype=mx.float32)
+    assert np.array_equal(np.array(short.kernel_params(v)),
+                          np.array(long.kernel_params(v)))
+    assert np.array_equal(np.array(short.jitter_var(v, None)),
+                          np.array(long.jitter_var(v, None)))
+
+    short_l, long_l = ParamMap.log(vals), ParamMap(
+        kernel=[KernelParam(link="log", index=i, ref=r)
+                for i, r in enumerate(vals)], n_dim=3)
+    u = mx.array(_rng.standard_normal((3, 3)).astype(np.float32))
+    assert short_l.n_dim == long_l.n_dim == 3
+    assert np.array_equal(np.array(short_l.kernel_params(u)),
+                          np.array(long_l.kernel_params(u)))

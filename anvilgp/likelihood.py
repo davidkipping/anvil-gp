@@ -192,6 +192,32 @@ class ParamMap:
     #: increasing.  See :meth:`kernel_params`.
     order_groups: list[list[int]] | None = None
 
+    @classmethod
+    def const(cls, values, jitter=None, **kw) -> "ParamMap":
+        """A map whose kernel parameters are fixed host constants.
+
+        The parametrisation under test is often not the point -- parity and
+        oracle comparisons want a known kernel and an ignored ``v``.  This
+        is that, in one line instead of a list comprehension.
+        """
+        jit = ([] if jitter is None
+               else [KernelParam(link="const", value=float(jitter))])
+        return cls(kernel=[KernelParam(link="const", value=float(x))
+                           for x in values],
+                   n_dim=kw.pop("n_dim", 1), jitter=jit, **kw)
+
+    @classmethod
+    def log(cls, refs, **kw) -> "ParamMap":
+        """A map with one log-link parameter per reference, in order.
+
+        ``v[:, i]`` is then the log-offset of the i-th kernel parameter from
+        ``refs[i]``, which is the shipped parametrisation.
+        """
+        refs = list(refs)
+        return cls(kernel=[KernelParam(link="log", index=i, ref=float(r))
+                           for i, r in enumerate(refs)],
+                   n_dim=kw.pop("n_dim", len(refs)), **kw)
+
     def kernel_params(self, v: mx.array) -> mx.array:
         kp = mx.concatenate([k.apply(v) for k in self.kernel], axis=-1)
         if not self.order_groups:
