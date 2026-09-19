@@ -174,3 +174,86 @@ def test_block_seeds_come_from_the_prefix_state():
         mean, cov = st[-1]
         assert np.abs(np.array(mean) - np.array(whole[s + blk][0])).max() < 1e-13
         assert np.abs(np.array(cov) - np.array(whole[s + blk][1])).max() < 1e-13
+
+
+# -- the innovation-variance floor ----------------------------------------
+#
+# Both production forwards (elements.leaf_elements, the Metal kernel) and
+# the oracle (kalman.sequential_loglike) floor S.  This spec did not, so a
+# backward kernel written against it would have disagreed with the forward
+# it differentiates on exactly the lanes where positive-definiteness has
+# already failed -- the lanes a warmup chain visits.
+
+
+def _floored_problem(seed=4, n=3, k=9, m=2, frac=0.5):
+    """A problem whose floor binds on about ``frac`` of the observations."""
+    phi, q, h, y, rv, rr, cot = _problem(seed)
+    # put the floor in the middle of the realised S distribution
+    _, _ = filter_forward(phi, q, h, y, rv, rr)
+    s_vals = []
+    mean = mx.zeros((n, m), dtype=D)
+    cov = mx.zeros((n, m, m), dtype=D)
+    for i in range(k):
+        p_i = phi[:, i]
+        cp = mx.matmul(p_i, mx.matmul(cov, mx.swapaxes(p_i, -1, -2))) + q[:, i]
+        cp = 0.5 * (cp + mx.swapaxes(cp, -1, -2))
+        ch = mx.sum(cp * h[:, None, :], axis=-1)
+        s = mx.sum(h * ch, axis=-1) + rv[:, i]
+        s_vals.append(float(mx.mean(s)))
+        kg = ch / s[:, None]
+        v = y[:, i] - mx.sum(h * mx.sum(p_i * mean[:, None, :], axis=-1),
+                             axis=-1)
+        mean = mx.sum(p_i * mean[:, None, :], axis=-1) + kg * v[:, None]
+        cov = cp - kg[:, :, None] * ch[:, None, :]
+        cov = 0.5 * (cov + mx.swapaxes(cov, -1, -2))
+    floor = float(np.quantile(np.array(s_vals), frac))
+    return phi, q, h, y, rv, rr, cot, mx.array(np.full(k, floor), dtype=D)
+
+
+def test_the_floor_actually_binds_in_the_fixture():
+    """Guard the guard: a floor that never binds tests nothing."""
+    phi, q, h, y, rv, rr, _, sf = _floored_problem()
+    _, with_floor = filter_forward(phi, q, h, y, rv, rr, None, sf)
+    _, without = filter_forward(phi, q, h, y, rv, rr)
+    assert float(mx.max(mx.abs(with_floor - without))) > 1e-3
+
+
+def test_forward_with_floor_matches_the_oracle():
+    phi, q, h, y, rv, rr, _, sf = _floored_problem()
+    _, ell = filter_forward(phi, q, h, y, rv, rr, None, sf)
+    ref = sequential_loglike(phi, q, h, y, rv, rr, sf)
+    assert float(mx.max(mx.abs(ell - ref))) == 0.0
+
+
+def test_adjoint_with_floor_matches_autodiff():
+    """Where the floor binds, S is a constant and its cotangent is cut.
+
+    Without that cut the hand adjoint is not slightly wrong, it is orders of
+    magnitude wrong: the cotangent flows back into Phi, Q, h and r_var
+    through a path the forward severed.
+    """
+    phi, q, h, y, rv, rr, cot, sf = _floored_problem()
+    primals = [phi, q, h, y, rv]
+
+    def f(*p):
+        return sequential_loglike(p[0], p[1], p[2], p[3], p[4], rr, sf)
+
+    _, auto = mx.vjp(f, primals, [cot])
+    states, _ = filter_forward(phi, q, h, y, rv, rr, None, sf)
+    hand = filter_backward(phi, q, h, y, rv, rr, states, cot, sf)
+
+    for name, a, b in zip(NAMES, auto, hand):
+        scale = max(float(mx.max(mx.abs(a))), 1e-12)
+        err = float(mx.max(mx.abs(a - b))) / scale
+        assert err < 1e-12, f"{name}: {err:.2e}"
+
+
+@pytest.mark.parametrize("blk", [1, 2, 5, 9])
+def test_blocked_backward_with_floor_equals_the_whole_series_one(blk):
+    phi, q, h, y, rv, rr, cot, sf = _floored_problem()
+    states, _ = filter_forward(phi, q, h, y, rv, rr, None, sf)
+    want = filter_backward(phi, q, h, y, rv, rr, states, cot, sf)
+    got = blocked_backward(phi, q, h, y, rv, rr, cot, blk, sf)
+    for name, a, b in zip(NAMES, want, got):
+        scale = max(float(mx.max(mx.abs(a))), 1e-12)
+        assert float(mx.max(mx.abs(a - b))) / scale < 1e-12, name

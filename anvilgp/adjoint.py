@@ -46,7 +46,7 @@ from .linalg import matmul, matvec, outer
 __all__ = ["filter_forward", "filter_backward", "blocked_backward"]
 
 
-def filter_forward(phi, q, h, y, r_var, r_ref, init=None):
+def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
     """Run the filter, keeping every state.  Returns (states, logL).
 
     ``states`` is the list of ``(m_n, P_n)`` *after* each update, plus the
@@ -54,6 +54,14 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None):
     ``init`` seeds it -- for a block, with what the prefix scan says enters
     that block; for the whole series, with zeros (Phi = 0, Q = P_inf = I at
     the first observation makes that the stationary prior).
+
+    ``s_floor`` is the per-observation floor on the innovation variance,
+    exactly as :func:`anvilgp.kalman.sequential_loglike` and
+    :func:`anvilgp.elements.leaf_elements` apply it.  It is not optional
+    decoration: this function is the specification the Metal backward kernel
+    is written against, and a kernel that omitted the floor would disagree
+    with the forward it is differentiating precisely on the lanes where
+    positive-definiteness has already failed.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     dt = phi.dtype
@@ -68,6 +76,8 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None):
         cp = 0.5 * (cp + mx.swapaxes(cp, -1, -2))
         ch = matvec(cp, h)
         s = mx.sum(h * ch, axis=-1) + r_var[:, i]
+        if s_floor is not None:
+            s = mx.maximum(s, s_floor[i])
         v = y[:, i] - mx.sum(h * mp, axis=-1)
         kg = ch / s[:, None]
         mean = mp + kg * v[:, None]
@@ -78,7 +88,7 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None):
     return states, ell
 
 
-def filter_backward(phi, q, h, y, r_var, r_ref, states, cot):
+def filter_backward(phi, q, h, y, r_var, r_ref, states, cot, s_floor=None):
     """Adjoints of ``sequential_loglike`` w.r.t. (phi, q, h, y, r_var).
 
     ``cot`` is the cotangent on the returned log-likelihood, shape (n,).
@@ -89,11 +99,12 @@ def filter_backward(phi, q, h, y, r_var, r_ref, states, cot):
     dt = phi.dtype
     out = _backward_span(phi, q, h, y, r_var, r_ref, states, cot,
                          mx.zeros((n, m), dtype=dt),
-                         mx.zeros((n, m, m), dtype=dt))
+                         mx.zeros((n, m, m), dtype=dt), s_floor)
     return out[:5]
 
 
-def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar):
+def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
+                   s_floor=None):
     """One reverse sweep over a span, seeded by the adjoints leaving it.
 
     Returns the span's parameter adjoints plus the ``(mbar, Pbar)`` to hand
@@ -115,6 +126,10 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar):
         cp = 0.5 * (cp + mx.swapaxes(cp, -1, -2))
         ch = matvec(cp, h)
         s = mx.sum(h * ch, axis=-1) + r_var[:, i]
+        floored = None
+        if s_floor is not None:
+            floored = s < s_floor[i]
+            s = mx.maximum(s, s_floor[i])
         v = y[:, i] - mx.sum(h * mp, axis=-1)
         kg = ch / s[:, None]
 
@@ -137,6 +152,15 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar):
         # Kg = ch / S
         ch_bar = ch_bar + kg_bar / s[:, None]
         s_bar = s_bar - mx.sum(kg_bar * kg, axis=-1) / s
+        # S = max(h.ch + R, floor).  Where the floor binds, S is a constant
+        # -- it no longer depends on Phi, Q, h or r_var -- so its cotangent
+        # must be cut here, after everything that *divides* by S (which is
+        # just a number, floored or not) and before everything that feeds
+        # back into what produced it.  Omitting this is not a small error:
+        # on a problem where the floor binds it puts the hand adjoint orders
+        # of magnitude away from the true VJP.
+        if floored is not None:
+            s_bar = mx.where(floored, mx.zeros_like(s_bar), s_bar)
         # S = h.ch + R
         h_bar = h_bar + s_bar[:, None] * ch
         ch_bar = ch_bar + s_bar[:, None] * h
@@ -163,7 +187,7 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar):
             mx.stack(rv_cols[::-1], axis=1), m_bar, p_bar)
 
 
-def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk):
+def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk, s_floor=None):
     """The same adjoints, computed block by block -- the kernel's structure.
 
     Nothing per-observation is stored: each block replays its own ``blk``
@@ -189,7 +213,8 @@ def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk):
         seeds.append((mean, cov))
         e = min(s + blk, k)
         st, _ = filter_forward(phi[:, s:e], q[:, s:e], h, y[:, s:e],
-                              r_var[:, s:e], r_ref[s:e], (mean, cov))
+                              r_var[:, s:e], r_ref[s:e], (mean, cov),
+                              None if s_floor is None else s_floor[s:e])
         mean, cov = st[-1]
 
     m_bar = mx.zeros((n, m), dtype=dt)
@@ -198,11 +223,12 @@ def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk):
     phi_p, q_p, y_p, rv_p = [], [], [], []
     for s, seed in zip(reversed(starts), reversed(seeds)):
         e = min(s + blk, k)
+        sf = None if s_floor is None else s_floor[s:e]
         st, _ = filter_forward(phi[:, s:e], q[:, s:e], h, y[:, s:e],
-                               r_var[:, s:e], r_ref[s:e], seed)
+                               r_var[:, s:e], r_ref[s:e], seed, sf)
         pb, qb, hb, yb, rb, m_bar, p_bar = _backward_span(
             phi[:, s:e], q[:, s:e], h, y[:, s:e], r_var[:, s:e], r_ref[s:e],
-            st, cot, m_bar, p_bar)
+            st, cot, m_bar, p_bar, sf)
         phi_p.append(pb); q_p.append(qb); y_p.append(yb); rv_p.append(rb)
         h_bar = h_bar + hb
     return (mx.concatenate(phi_p[::-1], axis=1),
