@@ -145,7 +145,9 @@ white-noise likelihood is a sum over independent points. A GP factorisation
 is global-sequential over data, so `GPLogLike.hi` tiles over **chains**
 (<= 16 per float64 tile) and streams the data axis in recursion order. Peak
 working set is one block of elements: `n_tile x block x (3m^2 + 2m + 1)`
-numbers. The default 16-chain x 1024-point float64 tile at m = 4 is ~60 MB.
+numbers. The default 16-chain x 1024-point float64 tile at m = 4 holds
+7.5 MB of elements and peaks around 60 MB measured, the rest being the
+intermediates of the composition.
 
 ## Measured status
 
@@ -182,7 +184,7 @@ GP target without `mx.disable_compile()`. With it, 30 ChEES steps over 64
 chains complete in 7.2 s with zero divergences and a finite chain. The
 gradient-free stretch move never hits it.
 
-The proper fix is M3's fused Metal kernel, which replaces this graph with one
+The proper fix is M4's backward kernel, which replaces this graph with one
 hand-written kernel and a hand VJP — at which point there is nothing left for
 MLX to over-fuse.
 

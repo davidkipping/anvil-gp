@@ -365,8 +365,9 @@ class Matern52Term(Term):
 
     Parameters (natural units): ``sigma``, ``rho``.
 
-    v1 note: m = 3 breaks the block-diagonal 2x2 structure the fused Metal
-    kernel exploits, so this term is served by the reference path only.
+    Served by the fused Metal kernel like every other term with m <= 4: the
+    kernel runs the composition with a dense m x m element and never
+    exploited a 2x2 block structure, so m = 3 costs it nothing.
     """
 
     n_state: int = field(default=3, init=False)

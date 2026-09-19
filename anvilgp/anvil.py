@@ -21,8 +21,8 @@ Gradient samplers need one extra line today::
 anvil's ChEES kernel compiles its leapfrog step, and ``mx.compile`` over the
 *backward* pass of the m >= 2 element algebra exceeds Metal's argument-buffer
 limit (see docs/float32.md).  Forward-only compilation is fine, so the
-gradient-free stretch move needs nothing.  M3's fused Metal kernel removes
-the constraint.
+gradient-free stretch move needs nothing.  M4's backward kernel will
+remove the constraint; M3's forward kernel does not, being forward-only.
 """
 
 from __future__ import annotations
@@ -104,14 +104,53 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
                 seed_period: bool = False) -> GPTarget:
     """Build a ready-to-sample GP target with shipped defaults.
 
-    ``seed_period=True`` runs a host-side Lomb-Scargle first and centres a
-    rotation kernel's period reference on the peak, so chains start inside
-    one harmonic instead of spread across P, P/2 and 2P.
+    Parameters
+    ----------
+    term
+        The kernel, e.g. ``SHOTerm()`` or ``SHOTerm() + Matern32Term()``.
+    t, y, yerr
+        The data.  ``t`` must be sorted ascending (duplicates are legal);
+        ``yerr`` strictly positive; none of the three may contain a
+        non-finite value.
+    mean_fn
+        ``(params, x_mean) -> (n_chains, n_data)``, the mean model
+        evaluated batched over chains.  ``params`` is the slice of the
+        model vector named by ``mean_specs``.  Requires ``x_mean`` and
+        ``mean_specs``; supplying only some of the three is an error, not a
+        silent GP-only fit.
+    x_mean
+        Covariates the mean model is evaluated on.  Often just ``t``.
+    mean_specs
+        One :class:`~anvilgp.priors.SpecHint` per mean-model parameter,
+        giving its name, bounds and scale.  These occupy the leading
+        columns of the model vector; the GP's own parameters follow.
+    n_jitter, n_offset
+        How many per-instrument jitters and mean offsets to sample.  With
+        more than one of either, pass ``instrument``.
+    instrument
+        ``(n_data,)`` integers assigning each datum to an instrument.
+    order_groups
+        Defaults to :func:`~anvilgp.priors.auto_order_groups`, which
+        constrains the timescales of each same-type family in a sum to be
+        increasing.  Without it a k-term sum has k! permutation modes and
+        R-hat means nothing; pass ``[]`` to opt out deliberately.  Note the
+        ordered members sample a dimensionless *ratio*, so their bounds are
+        ratio bounds -- see :func:`~anvilgp.priors.auto_order_groups`.
+    policy
+        :class:`~anvilgp.likelihood.GPPolicy`.  ``GPPolicy(metal=True)``
+        turns on the fused kernel, which is forward-only until M4: the
+        returned target then declares ``supports_grad=False`` and a
+        gradient sampler refuses it up front.
+    seed_period
+        Run a host-side Lomb-Scargle first and centre a rotation kernel's
+        period reference on the peak, so chains start inside one harmonic
+        instead of spread across P, P/2 and 2P.
 
-    ``order_groups`` defaults to :func:`~anvilgp.priors.auto_order_groups`,
-    which constrains the timescales of each same-type family in a sum to be
-    increasing.  Without it a k-term sum has k! permutation modes and R-hat
-    means nothing; pass ``[]`` to opt out deliberately.
+    Returns
+    -------
+    GPTarget
+        With ``.target`` (hand to ``anvil.run``), ``.transform``,
+        ``.loglike``, ``.names``, ``.hypers`` and ``.param_map``.
     """
     engine = import_engine()
 

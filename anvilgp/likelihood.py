@@ -16,8 +16,10 @@ noise likelihood is a sum over independent points.  A GP factorisation is
 global-sequential over data, so ``.hi`` here tiles over **chains** (<= 16
 per fp64 tile) and streams the data axis in recursion order.  Peak working
 set is one block of elements: ``n_tile x block x (3m^2 + 2m + 1)`` numbers.
-The default 16-chain x 1024-point fp64 tile at m = 4 is ~60 MB; an untiled
-fp64 pass over 1024 chains x 1e5 points would transiently ask for ~50 GB.
+The default 16-chain x 1024-point fp64 tile at m = 4 holds 7.5 MB of
+elements and peaks around 60 MB measured, the rest being the intermediates
+of the composition; an untiled fp64 pass over 1024 chains x 1e5 points
+would transiently ask for ~50 GB.
 
 The gradient split
 ------------------
@@ -351,7 +353,7 @@ class GPLogLike:
         self.n_distinct_lags = (self.n_data if self._uniq32 is None
                                 else int(self._uniq32[0].size))
         self._y32 = mx.array(self._y64.astype(np.float32))
-        self._rref32 = mx.array((self._yerr64 ** 2).astype(np.float32))
+        self._r_ref32 = mx.array((self._yerr64 ** 2).astype(np.float32))
         self._x_mean32 = (None if self._x_mean64 is None
                           else mx.array(self._x_mean64.astype(np.float32)))
         inst = param_map.instrument
@@ -425,14 +427,17 @@ class GPLogLike:
         return lambda s, e: (mx.take(phi_u, inv[s:e], axis=1),
                              mx.take(q_u, inv[s:e], axis=1), h)
 
-    def leaf_inputs(self, v, dt, y, rref, x_mean, idx, s, e, get_mat=None):
+    def leaf_inputs(self, v, dt, y, r_ref, x_mean, idx, s, e, get_mat=None):
         """``(phi, q, h, residual, r_var, r_ref, s_floor)`` for one data block.
 
         Exactly the argument list of :func:`~anvilgp.elements.leaf_elements`
-        and :func:`~anvilgp.kalman.sequential_loglike`, so the tree reduction,
-        the sequential-filter oracle and (in M3) the Metal kernel all consume
-        byte-identical inputs and any disagreement between them is
-        attributable to the recursion alone.
+        and :func:`~anvilgp.kalman.sequential_loglike`, so the tree reduction
+        and the sequential-filter oracle consume byte-identical inputs and
+        any disagreement between them is attributable to the recursion
+        alone.  The Metal path does *not* come through here: it builds its
+        own lag table, residual and jitter in :meth:`_evaluate_metal`, and
+        is tied to this one by the parity tests rather than by sharing the
+        tuple.
         """
         pm = self.param_map
         dtype = v.dtype
@@ -465,7 +470,7 @@ class GPLogLike:
         if off is not None:
             r = r - off
 
-        r_ref = rref[s:e]
+        r_ref = r_ref[s:e]
         jit2 = pm.jitter_var(v, sub)
         r_var = r_ref if jit2 is None else r_ref + jit2
         r_var = mx.broadcast_to(r_var, r.shape)
@@ -490,13 +495,13 @@ class GPLogLike:
         """Design C: the kernel condenses blocks, MLX composes the roots."""
         from .metal import scan_blocks
         pm = self.param_map
-        n, m, dt = v.shape[0], self.term.n_state, v.dtype
+        n, m, dtype = v.shape[0], self.term.n_state, v.dtype
         phi, q, h = self.term.matrices(pm.kernel_params(v),
                                        self._metal_uniq_dt)
         pt = mx.concatenate(
-            [mx.zeros((n, 1, m, m), dtype=dt), phi], axis=1)
+            [mx.zeros((n, 1, m, m), dtype=dtype), phi], axis=1)
         qt = mx.concatenate(
-            [mx.broadcast_to(mx.eye(m, dtype=dt), (n, 1, m, m)), q], axis=1)
+            [mx.broadcast_to(mx.eye(m, dtype=dtype), (n, 1, m, m)), q], axis=1)
 
         r = mx.broadcast_to(self._y32, (n, self.n_data))
         if self.mean_fn is not None and pm.mean is not None:
@@ -505,14 +510,14 @@ class GPLogLike:
         if off is not None:
             r = r - off
         jit = pm.jitter_var(v, self._inst32)
-        jit2 = (mx.zeros((n, 0), dtype=dt) if jit is None
+        jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
                 else mx.broadcast_to(jit, (n, 1)))
 
-        el = scan_blocks(pt, qt, self._metal_lag, h, r, self._rref32, jit2,
+        el = scan_blocks(pt, qt, self._metal_lag, h, r, self._r_ref32, jit2,
                          self.policy.s_floor_rel, self.policy.metal_block)
         return tree_reduce(el).ell
 
-    def _evaluate(self, v, dt, y, rref, x_mean, idx, block, do_eval, uniq=None):
+    def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,).
 
         The per-block roots are composed by a *pairwise tree*, not folded
@@ -529,7 +534,7 @@ class GPLogLike:
         roots: list[Element] = []
         for s in range(0, self.n_data, block):
             e = min(s + block, self.n_data)
-            args = self.leaf_inputs(v, dt, y, rref, x_mean, idx, s, e, get_mat)
+            args = self.leaf_inputs(v, dt, y, r_ref, x_mean, idx, s, e, get_mat)
             if self.blocked:
                 root = chunked_reduce_blocked(leaf_parts(*args),
                                               sub_len=self.sub_block)
@@ -597,7 +602,7 @@ class GPLogLike:
         if self._metal_ok:
             return _sanitize(self._evaluate_metal(v))
         out = self._evaluate(
-            v, self._dt32, self._y32, self._rref32, self._x_mean32,
+            v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
             self._inst32, _pow2(self.policy.block), self.policy.eval_blocks,
             uniq=self._uniq32)
         return _sanitize(out)
@@ -649,13 +654,13 @@ class GPLogLike:
         out = np.zeros(n_chains, dtype=np.float64)
         dt = a64(self._dt64)
         y = a64(self._y64)
-        rref = a64(self._yerr64 ** 2)
+        r_ref = a64(self._yerr64 ** 2)
         xm = None if self._x_mean64 is None else a64(self._x_mean64)
         with mx.stream(mx.cpu):
             v64 = v.astype(mx.float64)
             for c in range(0, n_chains, pol.hi_chain_block):
                 vb = v64[c:c + pol.hi_chain_block]
-                acc = self._evaluate(vb, dt, y, rref, xm, self._inst32,
+                acc = self._evaluate(vb, dt, y, r_ref, xm, self._inst32,
                                      blk, True, uniq=self._uniq64)
                 mx.eval(acc)
                 out[c:c + vb.shape[0]] = np.array(acc, dtype=np.float64)

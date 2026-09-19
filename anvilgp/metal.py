@@ -103,7 +103,7 @@ _SRC = """
             qh[i] = s;
             sq += hv[i] * s;
         }
-        float rr = rref[t];
+        float rr = r_ref[t];
         sq += rr + jit2v;
         sq = max(sq, sfloor * rr);              // PSD failure is defined
 
@@ -234,7 +234,7 @@ def _kernel(m: int):
     if m not in _kernels:
         _kernels[m] = mx.fast.metal_kernel(
             name=f"anvilgp_scan_m{m}",
-            input_names=["phitab", "qtab", "lag", "hvec", "resid", "rref",
+            input_names=["phitab", "qtab", "lag", "hvec", "resid", "r_ref",
                          "jit2", "sfloor", "npts", "n_lags", "n_blocks",
                          "n_chains", "blk_len", "n_jit"],
             output_names=["out_A", "out_b", "out_C", "out_eta", "out_J",
@@ -269,14 +269,14 @@ def metal_available() -> bool:
     return _metal_ok
 
 
-def scan_blocks(phi_tab, q_tab, lag, hvec, resid, rref, jit2, s_floor_rel,
+def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
                 blk_len, n_blocks=None) -> Element:
     """Condense every block of ``blk_len`` observations into one element.
 
     ``phi_tab``/``q_tab``: (n_chains, n_lags, m, m) propagator and process
     noise indexed by lag, with row 0 reserved for the no-predecessor case.
     ``lag``: (npts,) int32.  ``resid``: (n_chains, npts) residuals.
-    ``rref``: (npts,) float32 reference variances.  ``jit2``: (n_chains, 1)
+    ``r_ref``: (npts,) float32 reference variances.  ``jit2``: (n_chains, 1)
     jitter variance, or a (n_chains, 0) array for none.
 
     Returns an :class:`~anvilgp.elements.Element` with batch shape
@@ -316,6 +316,6 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, rref, jit2, s_floor_rel,
             "GPPolicy(metal=False) for a differentiable likelihood (the MLX "
             "path), or a gradient-free sampler such as anvil's stretch move.")
 
-    outs = core(phi_tab, q_tab, lag, hvec, resid, rref, jit2)
+    outs = core(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2)
     return Element(A=outs[0], b=outs[1], C=outs[2], eta=outs[3], J=outs[4],
                    ell=outs[5])

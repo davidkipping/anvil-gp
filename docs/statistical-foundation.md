@@ -78,11 +78,15 @@ explicit inverse — MLX has no GPU `inv` (issue #1238) and no `cholesky` VJP
 symmetric:
 
     L1 = chol(C1)
-    S  = I + L1^T J2 L1          (SPD, all eigenvalues >= 1: no pivoting)
-    Y  = L1 chol(S)^{-T}
+    Sig = I + L1^T J2 L1         (SPD, all eigenvalues >= 1: no pivoting)
+    Y  = L1 chol(Sig)^{-T}
     M  = Y Y^T   = (I + C1 J2)^{-1} C1
     G  = I - M J2 = (I + C1 J2)^{-1}
     Jt = J2 - (J2 Y)(J2 Y)^T = (I + J2 C1)^{-1} J2
+
+(`Sig` is an `m x m` matrix.  The scalar `S` further down is a different
+object -- the one-step innovation variance `S = h Q h^T + r_var`, written
+`s_q` in `elements.py`.  They were both called `S` until 2026-09-19.)
 
     A   = A2 G A1
     b   = A2 (G b1 + M eta2) + b2
@@ -92,14 +96,15 @@ symmetric:
     ell = ell1 + ell2 - sum log diag(chol S)
                       - 1/2 b1^T Jt b1 + eta2^T G b1 + 1/2 eta2^T M eta2
 
-`log|I + C1 J2| = log|S|` by Sylvester's identity, so the log-determinant is
+`log|I + C1 J2| = log|Sig|` by Sylvester's identity, so the log-determinant is
 read straight off a factor that has already been computed.
 
 ### The rank-one special case, and why it matters
 
 When `e2` is a raw **leaf**, its information matrix is rank one —
 `J2 = z z^T` with `z = (h Phi)^T / sqrt(S)`, and `eta2 = g z` with
-`g = y / sqrt(S)`. Every inverse above then collapses under
+`g = y / sqrt(S)`, where `S = h Q h^T + r_var` is the scalar one-step
+innovation variance (`s_q` in the code). Every inverse above then collapses under
 Sherman–Morrison. With `p = C1 z` and `alpha = 1 + z^T p`:
 
     (I + C1 J2)^-1     = I - p z^T / alpha
@@ -119,7 +124,7 @@ remains is
 the normalised innovation and `alpha S` the innovation variance. Watching the
 filter fall out of the element algebra is a good sign the algebra is right.
 
-This is what `chunked_reduce` exploits, and what M3's fused kernel will run
+This is what `chunked_reduce` exploits, and what M3's fused kernel runs
 sequentially in registers: O(m^2) per observation with nothing to factor.
 
 It also means a leaf never has to be *assembled*. Storing `Phi` and `Q` as
@@ -180,7 +185,5 @@ Admissible only as a secondary cross-check, never as the likelihood:
 * No exposure-time integration of the kernel (long-cadence smearing).
   S+LEAF (2201.02440) is the v2 path.
 * No 2D / multiband GPs.
-* Matérn-5/2 (m = 3) breaks the block-diagonal 2x2 structure the fused
-  Metal kernel will exploit, so it is a reference-path term in v1.
 * `predict` / conditional mean is an offline float64 utility
   (`oracle.dense_predict`), deliberately outside the hot path.

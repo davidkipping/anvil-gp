@@ -95,7 +95,7 @@ class LeafParts(NamedTuple):
 
     with ``kappa = Q h^T / sqrt(S)``, ``z = (h Phi)^T / sqrt(S)`` and
     ``g = y / sqrt(S)``.  Storing the pieces costs ``2 sum m_i^2 + 2m + 2``
-    numbers against the dense element's ``3m^2 + 2m + 1``: identical at
+    numbers against the dense element's ``3m^2 + 2m + 1``: 14 against 17 at
     m = 2, 2.2x smaller at m = 4, 4.2x smaller at m = 8.  The leaf array is
     the largest object in the whole evaluation (1024 chains x 4096 points at
     m = 8 is 3.5 GB dense), so this is the dominant memory term.
@@ -168,8 +168,13 @@ def identity_element(batch: tuple[int, ...], m: int, dtype) -> Element:
 
 def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
                   r_var: mx.array, r_ref: mx.array,
-                  s_floor: mx.array | None = None) -> Element:
+                  s_floor: mx.array | None = None
+                  ) -> tuple[Element, "LeafRank1"]:
     """One element per observation, from the term matrices and the data.
+
+    Returns ``(element, rank1)``: the dense element, and the rank-one pieces
+    ``(kappa, z, g)`` that :func:`combine_leaf` needs to skip both
+    Choleskys.  Callers that only want the element take ``[0]``.
 
     ``phi``, ``q``: (n, K, m, m).  ``h``: (n, m).  ``y``: (n, K) residuals
     (data minus mean model).  ``r_var``: (n, K) observation variance
@@ -313,7 +318,7 @@ def combine_leaf(e1: Element, e2: Element, r1: LeafRank1) -> Element:
     the filter fall out of the element algebra is a good sign the algebra is
     right.
 
-    This is the composition the fused Metal kernel's pass 1 will run
+    This is the composition the fused Metal kernel's pass 1 runs
     sequentially in registers: O(m^2) per observation, nothing to factor.
     """
     z, g = r1.z, r1.g
@@ -417,7 +422,7 @@ def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16) -> Element:
     sub-block *sequentially* with the factorisation-free
     :func:`combine_leaf`, then :func:`tree_reduce` the sub-block roots with
     the general composition.  This is the Mamba/S5 chunked-scan pattern, and
-    the structure the fused Metal kernel of M3 will execute: pass 1 condenses
+    the structure the fused Metal kernel of M3 executes: pass 1 condenses
     a sub-block in registers, pass 2 composes the condensed elements.
 
     Why it is faster than a plain binary tree, even though it does the same
@@ -615,20 +620,20 @@ def _pad_parts_to_pow2(parts: LeafParts):
     if pad == k:
         return parts, k
     n, extra = parts.g.shape[0], pad - k
-    dt = parts.g.dtype
+    dtype = parts.g.dtype
 
     def grow_blocks(blocks, eye):
         out = []
         for b in blocks:
             mi = b.shape[-1]
-            fill = (mx.broadcast_to(mx.eye(mi, dtype=dt), (n, extra, mi, mi))
-                    if eye else mx.zeros((n, extra, mi, mi), dtype=dt))
+            fill = (mx.broadcast_to(mx.eye(mi, dtype=dtype), (n, extra, mi, mi))
+                    if eye else mx.zeros((n, extra, mi, mi), dtype=dtype))
             out.append(mx.concatenate([b, fill], axis=1))
         return out
 
     def grow_vec(v):
         return mx.concatenate(
-            [v, mx.zeros((n, extra) + v.shape[2:], dtype=dt)], axis=1)
+            [v, mx.zeros((n, extra) + v.shape[2:], dtype=dtype)], axis=1)
 
     return LeafParts(grow_blocks(parts.phi_blocks, True),
                      grow_blocks(parts.q_blocks, False),

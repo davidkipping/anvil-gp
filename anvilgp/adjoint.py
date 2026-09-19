@@ -64,10 +64,10 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
     positive-definiteness has already failed.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
-    dt = phi.dtype
-    mean = mx.zeros((n, m), dtype=dt) if init is None else init[0]
-    cov = mx.zeros((n, m, m), dtype=dt) if init is None else init[1]
-    ell = mx.zeros((n,), dtype=dt)
+    dtype = phi.dtype
+    mean = mx.zeros((n, m), dtype=dtype) if init is None else init[0]
+    cov = mx.zeros((n, m, m), dtype=dtype) if init is None else init[1]
+    ell = mx.zeros((n,), dtype=dtype)
     states = [(mean, cov)]
     for i in range(k):
         p_i = phi[:, i]
@@ -96,10 +96,10 @@ def filter_backward(phi, q, h, y, r_var, r_ref, states, cot, s_floor=None):
     ``mx.vjp`` and against float64 central differences.
     """
     n, m = phi.shape[0], phi.shape[-1]
-    dt = phi.dtype
+    dtype = phi.dtype
     out = _backward_span(phi, q, h, y, r_var, r_ref, states, cot,
-                         mx.zeros((n, m), dtype=dt),
-                         mx.zeros((n, m, m), dtype=dt), s_floor)
+                         mx.zeros((n, m), dtype=dtype),
+                         mx.zeros((n, m, m), dtype=dtype), s_floor)
     return out[:5]
 
 
@@ -111,10 +111,10 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
     to the span before it.  The whole-series case is this with zero seeds.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
-    dt = phi.dtype
+    dtype = phi.dtype
     c = cot[:, None]
 
-    h_bar = mx.zeros((n, m), dtype=dt)
+    h_bar = mx.zeros((n, m), dtype=dtype)
     phi_rows, q_rows, y_cols, rv_cols = [], [], [], []
 
     for i in range(k - 1, -1, -1):
@@ -204,11 +204,11 @@ def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk, s_floor=None):
     cheap scan over the ~1e2 blocks. See the M4 notes in the README.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
-    dt = phi.dtype
+    dtype = phi.dtype
     starts = list(range(0, k, blk))
 
     # forward once, keeping only the state entering each block
-    seeds, mean, cov = [], mx.zeros((n, m), dtype=dt), mx.zeros((n, m, m), dtype=dt)
+    seeds, mean, cov = [], mx.zeros((n, m), dtype=dtype), mx.zeros((n, m, m), dtype=dtype)
     for s in starts:
         seeds.append((mean, cov))
         e = min(s + blk, k)
@@ -217,9 +217,9 @@ def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk, s_floor=None):
                               None if s_floor is None else s_floor[s:e])
         mean, cov = st[-1]
 
-    m_bar = mx.zeros((n, m), dtype=dt)
-    p_bar = mx.zeros((n, m, m), dtype=dt)
-    h_bar = mx.zeros((n, m), dtype=dt)
+    m_bar = mx.zeros((n, m), dtype=dtype)
+    p_bar = mx.zeros((n, m, m), dtype=dtype)
+    h_bar = mx.zeros((n, m), dtype=dtype)
     phi_p, q_p, y_p, rv_p = [], [], [], []
     for s, seed in zip(reversed(starts), reversed(seeds)):
         e = min(s + blk, k)
