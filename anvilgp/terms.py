@@ -226,14 +226,22 @@ def _sho_matrices(sigma, omega0, qual, dt):
         mx.stack([-w * es, ec - a * es], axis=-1),
     ], axis=-2)
 
-    # E = e^{-2a}, recovered from the two damped products by the identity
-    # cos^2 + d^2 S^2 = 1 -- no second exponential, and exact for u >= 0
-    # where it is a sum of positives.  For u < 0 it *is* a cancellation
-    # (cosh^2 - sinh^2), but harmlessly so: in that regime E is exponentially
-    # smaller than the es*ec and es*es it is added to below, so its error is
-    # a negligible addend rather than the result.  Checked by the Lyapunov
-    # test at Q = 0.1 out to omega_0 dt = 100.
-    ee = ec * ec + u * es * es
+    # E = e^{-2a}.  Taken directly, not recovered from the identity
+    # cos^2 + d^2 S^2 = 1.
+    #
+    # That identity is exact for u >= 0, where it is a sum of positives, and
+    # it was used here to save an exponential.  For u < 0 it is
+    # cosh^2 - sinh^2, and the old comment argued the cancellation was
+    # harmless because E is then exponentially small next to the es*ec and
+    # es*es it is added to.  That argument is about the *value* of E and not
+    # about the *error* in computing it: the absolute error is ~eps phi^2
+    # es^2, and `tb` below multiplies it by 2a^2.  Measured in float32 at
+    # Q = 0.05: 3.0e-4 relative in Q11, which is 4.1 log-likelihood units at
+    # N = 16384 -- hundreds of times a Metropolis decision.  The default
+    # log_Q prior reaches Q = 0.05, so this is inside the sampled region.
+    #
+    # One extra exponential per lag, on a table of distinct lags, is nothing.
+    ee = exp_acc(-2.0 * a)
     a2 = a * a
     # Q11 = gamma3(2a) + E 2a (1 - sinc(4u)) + E 2a^2 (1 - sinc(u)^2).
     # Two equivalent forms for each bracket: the series form has no

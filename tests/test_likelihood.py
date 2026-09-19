@@ -187,3 +187,34 @@ def test_positive_definiteness_failure_is_finite_not_nan():
         val, grad = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
         mx.eval(out, val, grad)
     assert bool(mx.all(mx.isfinite(out))), "log-likelihood must stay finite"
+
+
+@pytest.mark.slow
+def test_overdamped_float32_loglike_tracks_float64_at_scale():
+    """The term-level fp32 loss of the overdamped corner, at N where it bites.
+
+    A 3e-4 relative error in Q11 is invisible at N = 512 and worth 4.1
+    log-likelihood units at N = 16384 -- hundreds of times the scale a
+    Metropolis decision runs on.  The conditions that expose it: Q well
+    below 1/2, a lag of order ten timescales (so each point is nearly
+    independent and the process-noise term carries the whole prediction),
+    and off-model data, since on model the per-point errors partly cancel
+    and warmup chains are not on model.
+    """
+    import math
+
+    n, qual, w0dt = 16384, 0.05, 10.0
+    rho = 1.0
+    dt = w0dt / (2.0 * math.pi / rho)
+    t = np.arange(n) * dt
+    rng = np.random.default_rng(11)
+    y = rng.standard_normal(n)          # white: deliberately off-model
+    yerr = np.full(n, 0.1)
+
+    gp = make(ag.SHOTerm(), [1.0, rho, qual], t=t, y=y, yerr=yerr, block=1024)
+    hi = float(np.array(gp.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
+    # on the GPU, which is where production runs: MLX's CPU float32 backend
+    # carries enough extra precision to hide this one entirely.
+    with mx.stream(mx.gpu):
+        lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
+    assert abs(lo - hi) < 0.05, f"fp32 off by {lo - hi:.3f} log-units"

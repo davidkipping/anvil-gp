@@ -216,3 +216,24 @@ def test_critical_damping_gradient_equals_its_one_sided_limits():
     # the one-sided limits agree with each other, and with the value at 1/2
     assert np.max(np.abs(below - above)) < 1e-5
     assert np.max(np.abs(at - 0.5 * (below + above))) < 1e-5
+
+
+@pytest.mark.parametrize("qual", [0.05, 0.1, 0.2])
+def test_overdamped_process_noise_is_accurate_in_float32(qual):
+    """Q11 must not lose digits in the overdamped corner.
+
+    `ee = e^{-2a}` used to be recovered from `ec^2 + u es^2`, which for
+    u < 0 is cosh^2 - sinh^2.  The value of E is exponentially small there,
+    but its *error* is ~eps phi^2 es^2 and gets multiplied by 2a^2, so
+    float32 lost up to 3e-4 relative at Q = 0.05.  The default log_Q prior
+    reaches Q = 0.05, so this was inside the sampled region.
+    """
+    term = ag.SHOTerm()
+    omega0 = 1.0
+    for w0dt in (1.0, 2.0, 5.0, 10.0, 20.0, 40.0):
+        dt = np.array([w0dt / omega0])
+        ref = _mats(term, [1.0, omega0, qual], dt)[1][0, 0, 0]
+        P32 = mx.array(np.array([[1.0, omega0, qual]]), dtype=mx.float32)
+        T32 = mx.array(dt, dtype=mx.float32)
+        got = float(np.array(term.matrices(P32, T32)[1])[0, 0, 0, 0])
+        assert abs(got - ref) / abs(ref) < 1e-6, (qual, w0dt, got, ref)
