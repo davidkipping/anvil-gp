@@ -151,3 +151,68 @@ def test_matern_terms_match_the_bessel_form():
                   * x ** nu * sp_special.kv(nu, x))
         got = term.value_np(np.array([sigma, rho]), tau)
         assert np.max(np.abs(got - bessel)) / sigma ** 2 < 1e-12, nu
+
+
+# -- gradient finiteness ---------------------------------------------------
+#
+# A term can have exactly-correct values and a NaN gradient, and no value
+# test can see it.  That is not hypothetical: every Matern-3/2 kernel had a
+# NaN gradient w.r.t. rho until 2026-09-19, because Matern32Term fixes
+# Q = 1/2, which makes `dsq` in `_sho_matrices` exactly zero, and the
+# derivative of sqrt at 0 is infinite even when its cotangent is zero.
+#
+# So: differentiate every term at its nominal parameters and demand the
+# gradient be finite.  Q = 1/2 exactly is included deliberately -- it is the
+# measure-zero point a sampler hits only if it is unlucky or if a term puts
+# it there by construction, which is exactly what Matern-3/2 does.
+
+GRAD_CASES = CASES + [
+    ("sho_critical_exact", ag.SHOTerm(), [1.0, 1.0, 0.5]),
+    ("matern32_short", ag.Matern32Term(), [1.0, 0.3]),
+    ("matern32_long", ag.Matern32Term(), [1.0, 5.0]),
+    ("sum_with_matern32", ag.Matern32Term() + ag.SHOTerm(),
+     [1.0, 1.0, 1.0, 2.0, 3.0]),
+]
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float64])
+@pytest.mark.parametrize("name,term,p", GRAD_CASES,
+                         ids=[c[0] for c in GRAD_CASES])
+def test_term_matrices_have_finite_gradients(name, term, p, dtype):
+    """d(Phi, Q, h)/d(params) must be finite at nominal parameters."""
+    dt = mx.array(np.array([0.0, 0.01, 0.1, 1.0, 10.0]), dtype=dtype)
+    P = mx.array(np.array([p], dtype=np.float64), dtype=dtype)
+
+    def f(pp):
+        phi, q, h = term.matrices(pp, dt)
+        return mx.sum(phi) + mx.sum(q) + mx.sum(h)
+
+    _, grad = mx.vjp(f, [P], [mx.array(1.0, dtype=dtype)])
+    g = np.array(grad[0], dtype=np.float64)
+    assert np.all(np.isfinite(g)), f"non-finite gradient for {name}: {g}"
+
+
+def test_critical_damping_gradient_equals_its_one_sided_limits():
+    """Q = 1/2 is not a special case, so its gradient must not be one.
+
+    The value is smooth through critical damping by construction; the
+    gradient must be too.  Approaching from either side pins it.
+    """
+    dt = mx.array(np.array([0.0, 0.05, 0.5, 2.0, 20.0]), dtype=D)
+
+    def g(qual):
+        P = mx.array(np.array([[1.0, 1.0, qual]]), dtype=D)
+
+        def f(pp):
+            phi, q, h = ag.SHOTerm().matrices(pp, dt)
+            return mx.sum(phi) + mx.sum(q * q)
+
+        _, grad = mx.vjp(f, [P], [mx.array(1.0, dtype=D)])
+        return np.array(grad[0], dtype=np.float64).ravel()
+
+    at = g(0.5)
+    below, above = g(0.5 - 1e-7), g(0.5 + 1e-7)
+    assert np.all(np.isfinite(at))
+    # the one-sided limits agree with each other, and with the value at 1/2
+    assert np.max(np.abs(below - above)) < 1e-5
+    assert np.max(np.abs(at - 0.5 * (below + above))) < 1e-5

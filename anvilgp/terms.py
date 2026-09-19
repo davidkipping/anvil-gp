@@ -197,7 +197,14 @@ def _sho_matrices(sigma, omega0, qual, dt):
     # difference does not cancel as Q -> 1/2.  It vanishes *exactly* there,
     # which is the point: d never appears alone, only through u = d^2 dt^2.
     dsq = omega0 * omega0 * ((two_q - 1.0) * (two_q + 1.0)) / (two_q * two_q)
-    absd = mx.sqrt(mx.abs(dsq))
+    # |d|, used *only* by the overdamped branch (u < 0) below.  The argument
+    # is masked to 1 wherever dsq >= 0 rather than passed as |dsq|, because
+    # d(sqrt)/dx is infinite at 0 and MLX propagates that through a zero
+    # cotangent as 0 * inf = NaN.  dsq is exactly 0 at Q = 1/2 -- which
+    # Matern32Term sets on every chain -- so |dsq| gave every Matern-3/2
+    # gradient a NaN while its value stayed correct.  The mask is free: the
+    # lanes it changes are exactly the lanes damped_cos_sinc discards.
+    absd = mx.sqrt(mx.where(dsq < 0.0, -dsq, mx.ones_like(dsq)))
 
     a = c * dt                                    # (n, K), >= 0
     u = dsq * dt * dt                             # (n, K), any sign
