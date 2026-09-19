@@ -43,19 +43,22 @@ import mlx.core as mx
 
 from .linalg import matmul, matvec, outer
 
-__all__ = ["filter_forward", "filter_backward"]
+__all__ = ["filter_forward", "filter_backward", "blocked_backward"]
 
 
-def filter_forward(phi, q, h, y, r_var, r_ref):
+def filter_forward(phi, q, h, y, r_var, r_ref, init=None):
     """Run the filter, keeping every state.  Returns (states, logL).
 
     ``states`` is the list of ``(m_n, P_n)`` *after* each update, plus the
-    zero state it began from, which the backward sweep consumes in reverse.
+    state it began from, which the backward sweep consumes in reverse.
+    ``init`` seeds it -- for a block, with what the prefix scan says enters
+    that block; for the whole series, with zeros (Phi = 0, Q = P_inf = I at
+    the first observation makes that the stationary prior).
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     dt = phi.dtype
-    mean = mx.zeros((n, m), dtype=dt)
-    cov = mx.zeros((n, m, m), dtype=dt)
+    mean = mx.zeros((n, m), dtype=dt) if init is None else init[0]
+    cov = mx.zeros((n, m, m), dtype=dt) if init is None else init[1]
     ell = mx.zeros((n,), dtype=dt)
     states = [(mean, cov)]
     for i in range(k):
@@ -82,18 +85,25 @@ def filter_backward(phi, q, h, y, r_var, r_ref, states, cot):
     Hand-derived; :mod:`tests.test_adjoint` checks every output against
     ``mx.vjp`` and against float64 central differences.
     """
+    n, m = phi.shape[0], phi.shape[-1]
+    dt = phi.dtype
+    out = _backward_span(phi, q, h, y, r_var, r_ref, states, cot,
+                         mx.zeros((n, m), dtype=dt),
+                         mx.zeros((n, m, m), dtype=dt))
+    return out[:5]
+
+
+def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar):
+    """One reverse sweep over a span, seeded by the adjoints leaving it.
+
+    Returns the span's parameter adjoints plus the ``(mbar, Pbar)`` to hand
+    to the span before it.  The whole-series case is this with zero seeds.
+    """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     dt = phi.dtype
     c = cot[:, None]
 
-    phi_bar = mx.zeros_like(phi)
-    q_bar = mx.zeros_like(q)
     h_bar = mx.zeros((n, m), dtype=dt)
-    y_bar = mx.zeros((n, k), dtype=dt)
-    rv_bar = mx.zeros((n, k), dtype=dt)
-
-    m_bar = mx.zeros((n, m), dtype=dt)
-    p_bar = mx.zeros((n, m, m), dtype=dt)
     phi_rows, q_rows, y_cols, rv_cols = [], [], [], []
 
     for i in range(k - 1, -1, -1):
@@ -148,8 +158,54 @@ def filter_backward(phi, q, h, y, r_var, r_ref, states, cot):
         phi_rows.append(pb + outer(mp_bar, mean_prev))
         m_bar = matvec(mx.swapaxes(p_i, -1, -2), mp_bar)
 
-    phi_bar = mx.stack(phi_rows[::-1], axis=1)
-    q_bar = mx.stack(q_rows[::-1], axis=1)
-    y_bar = mx.stack(y_cols[::-1], axis=1)
-    rv_bar = mx.stack(rv_cols[::-1], axis=1)
-    return phi_bar, q_bar, h_bar, y_bar, rv_bar
+    return (mx.stack(phi_rows[::-1], axis=1), mx.stack(q_rows[::-1], axis=1),
+            h_bar, mx.stack(y_cols[::-1], axis=1),
+            mx.stack(rv_cols[::-1], axis=1), m_bar, p_bar)
+
+
+def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk):
+    """The same adjoints, computed block by block -- the kernel's structure.
+
+    Nothing per-observation is stored: each block replays its own ``blk``
+    forward states from the state it inherits, sweeps back, and hands
+    ``(mbar, Pbar)`` to the block before it.  This is what the Metal backward
+    kernel does per thread, so verifying it here against
+    :func:`filter_backward` validates the *scheme* before any kernel exists.
+
+    It is sequential in the block index, which is the one structural problem
+    left for the kernel: the forward blocks are independent, the backward
+    ones are chained through ``(mbar, Pbar)``.  The way out is the same trick
+    that made the forward parallel -- a block's backward sweep is an *affine*
+    map on ``(mbar, Pbar)``, so the maps compose, and the composition is a
+    cheap scan over the ~1e2 blocks. See the M4 notes in the README.
+    """
+    n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
+    dt = phi.dtype
+    starts = list(range(0, k, blk))
+
+    # forward once, keeping only the state entering each block
+    seeds, mean, cov = [], mx.zeros((n, m), dtype=dt), mx.zeros((n, m, m), dtype=dt)
+    for s in starts:
+        seeds.append((mean, cov))
+        e = min(s + blk, k)
+        st, _ = filter_forward(phi[:, s:e], q[:, s:e], h, y[:, s:e],
+                              r_var[:, s:e], r_ref[s:e], (mean, cov))
+        mean, cov = st[-1]
+
+    m_bar = mx.zeros((n, m), dtype=dt)
+    p_bar = mx.zeros((n, m, m), dtype=dt)
+    h_bar = mx.zeros((n, m), dtype=dt)
+    phi_p, q_p, y_p, rv_p = [], [], [], []
+    for s, seed in zip(reversed(starts), reversed(seeds)):
+        e = min(s + blk, k)
+        st, _ = filter_forward(phi[:, s:e], q[:, s:e], h, y[:, s:e],
+                               r_var[:, s:e], r_ref[s:e], seed)
+        pb, qb, hb, yb, rb, m_bar, p_bar = _backward_span(
+            phi[:, s:e], q[:, s:e], h, y[:, s:e], r_var[:, s:e], r_ref[s:e],
+            st, cot, m_bar, p_bar)
+        phi_p.append(pb); q_p.append(qb); y_p.append(yb); rv_p.append(rb)
+        h_bar = h_bar + hb
+    return (mx.concatenate(phi_p[::-1], axis=1),
+            mx.concatenate(q_p[::-1], axis=1), h_bar,
+            mx.concatenate(y_p[::-1], axis=1),
+            mx.concatenate(rv_p[::-1], axis=1))

@@ -17,7 +17,8 @@ import mlx.core as mx
 import pytest
 
 from anvilgp import linalg
-from anvilgp.adjoint import filter_backward, filter_forward
+from anvilgp.adjoint import (blocked_backward, filter_backward,
+                             filter_forward)
 from anvilgp.kalman import sequential_loglike
 
 mx.set_default_device(mx.cpu)
@@ -142,3 +143,34 @@ def test_prefix_scan_is_the_kalman_filter_state():
         assert np.abs(np.array(pre.b)[:, n] - np.array(mean)).max() < 1e-13
         assert np.abs(np.array(pre.C)[:, n] - np.array(cov)).max() < 1e-13
     assert abs(float(np.array(pre.ell)[0, -1]) - float(np.array(ell)[0])) < 1e-12
+
+
+@pytest.mark.parametrize("blk", [1, 3, 5, 7, 20, 64])
+def test_blocked_backward_equals_the_whole_series_one(blk):
+    """The scheme the Metal kernel implements: each block replays its own
+    forward states from what it inherits and hands (mbar, Pbar) back.  Must
+    be exact at every block length, including blk = 1 and blk > N."""
+    phi, q, h, y, rv, rr, cot = _problem(5, k=20)
+    _, ad = mx.vjp(lambda a, b, c, d, e: sequential_loglike(a, b, c, d, e, rr),
+                   [phi, q, h, y, rv], [cot])
+    got = blocked_backward(phi, q, h, y, rv, rr, cot, blk)
+    for name, a, b in zip(NAMES, ad, got):
+        a, b = np.array(a), np.array(b)
+        assert np.max(np.abs(a - b)) / max(1.0, np.abs(a).max()) < 1e-11, name
+
+
+def test_block_seeds_come_from_the_prefix_state():
+    """A block's replay must start from the filter state entering it -- if
+    the seed were wrong, only the first block would be right."""
+    phi, q, h, y, rv, rr, cot = _problem(6, k=16)
+    whole, _ = filter_forward(phi, q, h, y, rv, rr)
+    blk = 4
+    mean = mx.zeros_like(whole[0][0])
+    cov = mx.zeros_like(whole[0][1])
+    for s in range(0, 16, blk):
+        st, _ = filter_forward(phi[:, s:s + blk], q[:, s:s + blk], h,
+                               y[:, s:s + blk], rv[:, s:s + blk], rr[s:s + blk],
+                               (mean, cov))
+        mean, cov = st[-1]
+        assert np.abs(np.array(mean) - np.array(whole[s + blk][0])).max() < 1e-13
+        assert np.abs(np.array(cov) - np.array(whole[s + blk][1])).max() < 1e-13

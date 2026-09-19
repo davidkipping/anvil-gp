@@ -61,6 +61,7 @@ approximate one.
 | `priors.py` | parametrisation, default priors, periodogram initialiser |
 | `oracle.py` | dense float64 Cholesky oracle, `predict`, celerite2 wrapper |
 | `metal.py` | fused Metal scan kernel — M3's pass 1, forward only |
+| `adjoint.py` | hand-derived backward recursion — M4's specification |
 | `anvil.py` | engine integration (lazy import; core stays mlx + numpy only) |
 
 Kernel set: `RealTerm`, `SHOTerm`, `Matern32Term`, `Matern52Term`,
@@ -117,7 +118,7 @@ that celerite2's Matérn-3/2 *converges to ours* as its `eps` shrinks
 (6.5e-3 → 6.5e-7 → 1.9e-10), which is what fixes the direction of the
 discrepancy.
 
-Beyond parity, the suite (287 tests, ~47 s) pins:
+Beyond parity, the suite (307 tests, ~47 s) pins:
 
 * the SSM identity `k(tau) = h Phi(tau) h^T` and the Lyapunov consistency
   `Q = I - Phi Phi^T` for all eleven term configurations;
@@ -130,6 +131,10 @@ Beyond parity, the suite (287 tests, ~47 s) pins:
 * the **Metal kernel** against the dense float64 oracle and the MLX path, for
   every term type, every block length from 1 to 1024, duplicate timestamps,
   gaps, irregular cadence, a jitter and a mean model (`tests/test_metal.py`);
+* the **backward recursion** against `mx.vjp` *and* float64 central
+  differences, and its blocked form against its whole-series form
+  (`tests/test_adjoint.py`) — the kernel cannot be checked against autodiff,
+  which is exactly why it needs a specification that can;
 * the rank-one `combine_leaf` against the general `combine`, to 1e-12;
 * combine's identity element and associativity;
 * the special functions against mpmath, *and* against the naive forms they
@@ -539,12 +544,37 @@ Three more are worked around and pinned as regression tests
   every block length, duplicate timestamps, gaps, irregular cadence, a jitter
   and a mean model. Still owed: m > 4, per-instrument jitter in-kernel, the
   float32 feasibility map, and `metal::fast` transcendentals.
-* **M4 — checkpointed backward kernel: not started, and now the critical
-  path.** Gradients are correct today through autodiff on the MLX path (0.14%
-  of float64 central differences); the fused kernel is forward-only and raises
-  a NotImplementedError naming the fix rather than failing obscurely. So the
-  gradient-free stretch move gets the 37-71x today and ChEES-HMC does not.
-  The VJP hook is already in place at `anvilgp/metal.py::_core_vjp`.
+* **M4 — checkpointed backward kernel: foundation done, kernel next.** The
+  mathematics is derived and verified; what remains is the Metal port and one
+  structural problem, described below. Gradients are correct today through
+  autodiff on the MLX path, so ChEES-HMC works — just without the kernel's
+  speed. The VJP hook is in place at `anvilgp/metal.py::_core_vjp`.
+
+  Done: `anvilgp/adjoint.py` holds the hand-derived adjoint of the filter
+  log-likelihood, matching `mx.vjp` to ~1e-16 relative on all five inputs
+  (Phi, Q, h, y, r_var) at m = 1, 2, 3, 4, and matching float64 central
+  differences independently. `blocked_backward` then shows the *kernel's*
+  scheme is exact: each block replays its own forward states from the state
+  it inherits and hands `(mbar, Pbar)` back, storing nothing per observation,
+  and the result is identical at every block length from 1 to beyond N.
+  `elements.prefix_scan` supplies those inherited states.
+
+  **The structural problem, and the way out.** The forward blocks are
+  independent; the backward ones are chained through `(mbar, Pbar)`, and a
+  block's sweep needs its own `L` forward states held locally, so `L` must
+  stay small (~32 at m = 2) — which means hundreds of blocks and no
+  sequential launch schedule that performs. The resolution is the same trick
+  that made the forward parallel: **a block's backward sweep is an affine map
+  on `(mbar, Pbar)`**, so the maps compose. Three passes — compute each
+  block's transfer map in parallel (~6x a sweep at m = 2, where the backward
+  state has 5 components), compose them in a cheap scan over the ~1e2 blocks,
+  then apply in parallel — which costs roughly 8x the forward, i.e. ~24 ms at
+  1024 chains x N = 1e4, against 2.7 s for the MLX gradient today.
+
+  Also recorded, because it is the tempting shortcut and it is wrong: never
+  reconstruct the forward state by running the filter *backwards* through the
+  propagator. That divides by `Phi`, which underflowed on the way forward at
+  exactly the lags where it would now overflow — every gap in the data.
 * **M5 — joint validation, SBC calibration, docs: started.** The unbiasedness
   check across realisations is in `tests/test_calibration.py` and
   `examples/gp_injection_recovery.py` is the end-to-end fiducial. Still owed:
