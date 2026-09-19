@@ -142,3 +142,40 @@ def test_make_target_orders_a_two_sho_sum_by_default():
         (128, gt.param_map.n_dim)).astype(np.float32) * 1.5)
     kp = np.array(gt.param_map.kernel_params(v))
     assert np.all(kp[:, 4] > kp[:, 1])
+
+
+@pytest.mark.parametrize("v_hi", [-2.0, -0.5, 0.0, 0.5, 2.0])
+def test_ordering_ratio_does_not_depend_on_the_time_unit(v_hi):
+    """The same data in days, hours and seconds must give the same physics.
+
+    The ordered member used to be ``x_lo * (1 + x_hi)`` with ``x_hi`` a
+    timescale in the user's unit, so a pure number was added to a
+    dimensionful one.  The implied ratio was 1.4 in days and 3.9e4 in
+    seconds for identical data: an accidental, invisible prior change on
+    every ordered term after the first.
+    """
+    term = ag.SHOTerm() + ag.SHOTerm()
+    n = 500
+    r = np.random.default_rng(0)
+    y = r.standard_normal(n)
+
+    ratios, scaled = [], []
+    for scale in (1.0, 24.0, 86400.0):          # days, hours, seconds
+        t = np.arange(n) * 0.02 * scale
+        yerr = np.full(n, 0.1)
+        hyp = priors.default_hypers(term, t, y, yerr)
+        pm, _, _ = priors.build_param_map(
+            hyp, order_groups=priors.auto_order_groups(term))
+        v = np.zeros((1, pm.n_dim))
+        v[0, 4] = v_hi                          # the ordered rho
+        kp = np.array(pm.kernel_params(mx.array(v, dtype=mx.float64)))[0]
+        rho1, rho2 = float(kp[1]), float(kp[4])
+        assert rho2 > rho1, "ordering must hold in every unit"
+        ratios.append(rho2 / rho1)
+        scaled.append((rho1 / scale, rho2 / scale))
+
+    assert max(ratios) - min(ratios) < 1e-12 * max(ratios), ratios
+    # and both timescales are equivariant: the same physical durations
+    for a, b in zip(scaled[1:], scaled[:-1]):
+        assert abs(a[0] - b[0]) < 1e-9 * b[0]
+        assert abs(a[1] - b[1]) < 1e-9 * b[1]

@@ -216,6 +216,15 @@ def auto_order_groups(term: Term) -> list[list[int]]:
     Returns positions in the *kernel parameter vector*, ready to hand to
     ``ParamMap(order_groups=...)``.  Empty unless the term is a sum with at
     least two members of the same type.
+
+    **What the bounds mean for an ordered member.**  For the first member of
+    a group the sampled quantity is the timescale itself, so
+    :func:`_log_rho_bounds` applies as written: log-uniform on
+    ``[2 dt_med, T/2]``.  For every member after it the sampled quantity is
+    the dimensionless *ratio* to the one before, and the same bounds become
+    bounds on that ratio: ``exp(v)`` runs over ``[2 dt_med, T/2] / rho_ref``
+    and the timescale is ``rho_prev * (1 + exp(v))``.  At ``v = 0`` the
+    ratio is exactly 2 whatever unit the epochs are in.
     """
     if not isinstance(term, TermSum):
         return []

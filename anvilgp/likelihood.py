@@ -180,15 +180,27 @@ class ParamMap:
         # k! identical posterior modes under permutation of the terms, which
         # makes every convergence diagnostic meaningless and lets chains
         # label-switch forever.  Reinterpreting each subsequent member of a
-        # group as a *ratio* -- x_j <- x_i (1 + x_j), with x_j > 0 from the
-        # log link -- makes the ordering hold by construction, with no
-        # rejection and no discontinuity for the sampler to trip over.
-        # (anvil's Transform layer has no ordered-vector transform; this
-        # keeps the fix local instead of requiring an engine change.)
+        # group as a *ratio* -- x_j <- x_i (1 + r_j) with r_j > 0 -- makes
+        # the ordering hold by construction, with no rejection and no
+        # discontinuity for the sampler to trip over.  (anvil's Transform
+        # layer has no ordered-vector transform; this keeps the fix local
+        # instead of requiring an engine change.)
+        #
+        # ``r_j`` must be DIMENSIONLESS.  It used to be ``x_j`` itself, a
+        # timescale in the user's time unit, so ``1 + x_j`` added a pure
+        # number to a quantity with units and the whole prior moved when the
+        # data were expressed in hours instead of days: the ratio at v = 0
+        # was 1.4 in days and 3.9e4 in seconds, and the documented
+        # ``[2 dt, T/2]`` bound on every ordered member after the first was
+        # simply false.  Dividing by the column's own host reference fixes
+        # the units: for a log link ``x_j / ref = exp(v_j)``, so the
+        # sampled bounds are already ratio bounds and need no rescaling.
         cols = [kp[:, i:i + 1] for i in range(kp.shape[1])]
         for group in self.order_groups:
             for lo, hi in zip(group[:-1], group[1:]):
-                cols[hi] = cols[lo] * (1.0 + cols[hi])
+                k = self.kernel[hi]
+                unit = float(k.ref) if k.link == "log" else 1.0
+                cols[hi] = cols[lo] * (1.0 + cols[hi] / unit)
         return mx.concatenate(cols, axis=-1)
 
     @staticmethod
