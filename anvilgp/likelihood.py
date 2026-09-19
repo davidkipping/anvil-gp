@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 import numpy as np
 
+from .special import exp_acc
 from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
                        combine, leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
@@ -137,14 +138,20 @@ class KernelParam:
     value: float = 0.0
 
     def apply(self, v: mx.array) -> mx.array:
+        # exp_acc, not mx.exp: MLX's float64 exp is only float32-accurate
+        # (~7e-7 relative), which would put a float32 floor under the whole
+        # ".hi" verification path -- measured at 2.1e-4 log-likelihood units
+        # at N = 2048 with a log link, i.e. 1e-2 at N = 1e5, which is the
+        # size of the float32 error .hi exists to measure.  In float32
+        # exp_acc *is* the native op, so the production path is unchanged.
         n = v.shape[0]
         if self.link == "const":
             return mx.full((n, 1), self.value, dtype=v.dtype)
         col = v[:, self.index:self.index + 1]
         if self.link == "log":
-            return self.ref * mx.exp(col)
+            return self.ref * exp_acc(col)
         if self.link == "logit":
-            return mx.sigmoid(col)
+            return 1.0 / (1.0 + exp_acc(-col))
         if self.link == "linear":
             return self.ref + self.scale * col
         raise ValueError(f"unknown link {self.link!r}")

@@ -248,3 +248,33 @@ def test_block_size_is_not_a_float32_precision_knob():
     assert max(abs(e) for e in errs) < 0.05, errs
     # and the choice of block must not move the answer at all
     assert max(errs) - min(errs) < 1e-3, errs
+
+
+def test_float64_path_is_float64_accurate_through_a_log_link():
+    """``.hi`` is the reference everything else is measured against.
+
+    Every parity test in this file uses ``link="const"``, which never
+    touches an exponential.  Through a log link the path used ``mx.exp``,
+    whose float64 implementation in MLX is only float32-accurate (~7e-7
+    relative): 2.0e-6 log-units at N = 2048, which scales to ~1e-2 at
+    N = 1e5 -- the same size as the float32 error ``.hi`` exists to
+    measure.  ``exp_acc`` is the accurate one, and is the native op in
+    float32 so the production path is untouched.
+    """
+    n = 2048
+    r = np.random.default_rng(3)
+    t = np.sort(r.uniform(0.0, 100.0, n))
+    y = r.standard_normal(n)
+    yerr = np.full(n, 0.2)
+    refs = (1.0, 4.0, 3.0)
+    v = np.array([[0.3, -0.4, 0.7]])
+
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=ref)
+                          for i, ref in enumerate(refs)], n_dim=3)
+    gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                   GPPolicy(block=1024, hi_block=1024))
+    got = float(np.array(gp.hi_absolute(a64(v)))[0])
+
+    natural = np.array([ref * np.exp(x) for ref, x in zip(refs, v[0])])
+    want = dense_loglike(ag.SHOTerm(), natural, t, y, yerr)
+    assert abs(got - want) < 1e-8, f"{got - want:+.3e} at |logL| = {abs(want):.0f}"
