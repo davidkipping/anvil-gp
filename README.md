@@ -194,9 +194,16 @@ point. Against the MLX path, same problem, same answers:
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| N=1e4, 1024 chains | 111.5 ms | **3.0 ms** | 37x | 1.16 GiB | 0.05 GiB |
-| N=1e4, 4096 chains | 466 ms | **6.7 ms** | 69x | 3.10 GiB | 0.21 GiB |
-| N=1e5, 1024 chains | 1166 ms | **16.4 ms** | 71x | 6.15 GiB | 0.41 GiB |
+| N=1e4, 1024 chains | 82.6 ms | **2.9 ms** | 28x | 1.34 GiB | 0.05 GiB |
+| N=1e4, 4096 chains | 353 ms | **6.4 ms** | 55x | 3.85 GiB | 0.21 GiB |
+| N=1e5, 1024 chains | 838 ms | **16.3 ms** | 51x | 1.00 GiB | 0.41 GiB |
+
+(Minimum of 15 sustained evaluations, compiled, gapped cadence with three
+distinct lags, `block=4096`, `metal_block` 1024 at N=1e4 and 4096 at 1e5,
+all six rows measured in one window. The speedups are smaller than the
+37-71x first reported here because the MLX path itself got 1.35x faster in
+the meantime — see "Unroll the leaf reductions" in the history. The kernel
+is unchanged.)
 
 Against celerite2 on the CPU, measured in the same session:
 
@@ -245,19 +252,20 @@ saving. Larger m and in-kernel propagators are the obvious follow-ons.
 ### The MLX reference path
 
 Still the differentiable path, the float64 verification path, and the thing
-the kernel is proved against. It is ~30x faster than its first working
-version and beats a single-core CPU, though not a fully parallelised one. M2 Max, float32 GPU, compiled
-forward, median of 25 in an isolated process, `block=4096`, realistic
-(regular-cadence-with-gaps) times:
+the kernel is proved against. It is ~40x faster than its first working
+version and beats a single-core CPU, though not a fully parallelised one.
+M2 Max, float32 GPU, compiled forward, **minimum of 15** sustained
+evaluations, `block=4096`, realistic (regular-cadence-with-gaps) times, all
+rows in one window:
 
 | config | first version | now | vs celerite2, 1 core | vs celerite2, 12 cores |
 |---|---:|---:|---:|---:|
-| N=1e4, 1024 chains, m=2 (SHO) | 3428 ms | **112 ms** | 3.8x faster | 1.9x slower |
-| N=1e5, 1024 chains, m=2 | — | **1190 ms** | 3.6x faster | 2.5x slower |
-| N=1e5, 256 chains, m=2 | 8719 ms | **367 ms** | 3.3x faster | 2.4x slower |
-| N=1e4, 4096 chains, m=2 | — | **471 ms** | 3.7x faster | 1.9x slower |
-| N=1e4, 1024 chains, m=4 (rotation) | — | **357 ms** | — | — |
-| N=1e4, 1024 chains, m=8 (4 SHO) | — | **1043 ms** | — | — |
+| N=1e4, 1024 chains, m=2 (SHO) | 3428 ms | **82.6 ms** | 5.2x faster | 1.4x slower |
+| N=1e5, 1024 chains, m=2 | — | **838 ms** | 5.2x faster | 1.7x slower |
+| N=1e5, 256 chains, m=2 | 8719 ms | **268 ms** | 4.0x faster | 2.2x slower |
+| N=1e4, 4096 chains, m=2 | — | **353 ms** | 4.9x faster | 1.5x slower |
+| N=1e4, 1024 chains, m=4 (rotation) | — | **316 ms** | — | — |
+| N=1e4, 1024 chains, m=8 (4 SHO) | — | **1046 ms** | — | — |
 
 celerite2 fp64 on this machine, measured in the same session
 (`benchmarks/bench_vs_celerite2.py`): 0.428 ms per evaluation at N=1e4 and
@@ -265,8 +273,8 @@ celerite2 fp64 on this machine, measured in the same session
 single-core loop. A 12-core `multiprocessing` pool gets 7.2-8.9x of the
 theoretical 12x (60-74% efficiency), giving 59 ms and 486 ms.
 
-**So: yes, a fully parallelised CPU celerite2 is still ~2x faster than the
-MLX reference path.** Against a single core we are ~3.7x faster. Both
+**So: yes, a fully parallelised CPU celerite2 is still ~1.5x faster than the
+MLX reference path.** Against a single core we are ~5x faster. Both
 comparisons are against exact float64 on the CPU versus float32 on the GPU
 with a separate float64 verification path. The >=100x gate is Milestone 3's,
 and the multiprocess figure is its denominator.
@@ -278,7 +286,8 @@ throttling. Diagnostics:
 
 * 80 consecutive evaluations under sustained load: 110.5 ms, flat, min 107.5
   and max 112.5 — no warm-up ramp, no decay. So the steady state an MCMC run
-  actually sees is the fast one.
+  actually sees is the fast one. (That was the pre-unroll code, which then
+  took 112 ms; the point is the flatness, not the absolute number.)
 * Six isolated processes, rested, 45 s cooldowns, in one bad window: 218,
   225, 229, 232, 223, 233 ms — consistently 2x slow, and tight within the
   window.
@@ -610,7 +619,7 @@ Three more are worked around and pinned as regression tests
   a tuning number. Still owed: the Design-A probe comparison, the
   `metal::fast` accuracy study, and the ChEES leapfrog cost at scale.
 * **M3 — fused Metal blocked-scan kernel: pass 1 done, forward only.**
-  37-71x over the MLX path and 20-30x ahead of a 12-core celerite2 pool,
+  28-55x over the MLX path and 20-30x ahead of a 12-core celerite2 pool,
   which is the brief's denominator, so the >=100x gate is **not** cleared
   (it is 142-264x against a single-core loop). 23 tests pin it against the
   dense float64 oracle and the MLX path across every term type, every block

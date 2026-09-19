@@ -19,7 +19,7 @@ import mlx.core as mx
 import numpy as np
 
 import anvilgp as ag
-from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from anvilgp.likelihood import GPLogLike, GPPolicy, ParamMap
 
 p = argparse.ArgumentParser()
 p.add_argument("--n-data", type=int, default=10_000)
@@ -31,6 +31,9 @@ p.add_argument("--repeat", type=int, default=5)
 p.add_argument("--no-compile", action="store_true")
 p.add_argument("--sub-block", type=int, default=None)
 p.add_argument("--cadence", choices=("regular","gapped","random"), default="gapped")
+p.add_argument("--metal", action="store_true",
+               help="use the fused Metal kernel (forward only)")
+p.add_argument("--metal-block", type=int, default=None)
 a = p.parse_args()
 
 TERMS = {"sho": (ag.SHOTerm(), [1.0, 4.0, 3.0]),
@@ -57,10 +60,15 @@ else:                                    # regular cadence with data gaps
     t = full[keep][:a.n_data]
 yerr = np.full(a.n_data, 0.3)
 y = rng.standard_normal(a.n_data) * 0.9
-pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
-                      for i, r in enumerate(refs)], n_dim=len(refs))
-gp = GPLogLike(None, t, None, y, yerr, term, pm,
-               GPPolicy(block=a.block, sub_block=a.sub_block))
+pm = ParamMap.log(refs)
+pol = GPPolicy(block=a.block, sub_block=a.sub_block, metal=a.metal,
+               **({} if a.metal_block is None
+                  else {"metal_block": a.metal_block}))
+gp = GPLogLike(None, t, None, y, yerr, term, pm, pol)
+if a.metal:
+    ok, why = gp.metal_eligible()
+    if not ok:
+        raise SystemExit(f"--metal requested but unusable: {why}")
 u = mx.array(rng.standard_normal((a.n_chains, len(refs))).astype(np.float32) * 0.01)
 
 # mx.compile is worth ~2.4x on the forward path now that the combine is
@@ -86,6 +94,7 @@ med = statistics.median(ts)
 best = min(ts)
 print(f"term={a.term} m={term.n_state} N={a.n_data} chains={a.n_chains} "
       f"block={a.block} sub={gp.sub_block} {a.cadence}({gp.n_distinct_lags} lags) "
+      f"{'METAL ' if a.metal else ''}"
       f"{'value+grad' if a.grad else ('forward' if a.no_compile else 'fwd-compiled')}: "
       f"{med*1e3:.1f} ms (min {best*1e3:.1f}, first call {trace*1e3:.0f} ms) "
       f"peak {mx.get_peak_memory()/2**30:.2f} GiB")
