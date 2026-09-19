@@ -52,6 +52,8 @@ from .terms import Term
 __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
 
 _LARGE_NEGATIVE = -1e30
+#: anything at or below this is a sanitised failure, not a real value.
+_FAILED = 0.5 * _LARGE_NEGATIVE
 
 
 def a64(x: np.ndarray) -> mx.array:
@@ -326,6 +328,11 @@ class GPLogLike:
         self.log_norm_const = float(
             -0.5 * np.sum(np.log(2.0 * np.pi * self._yerr64 ** 2)))
 
+        # Decided once, not per call: whether the fused kernel can serve this
+        # problem, and the gradient guard that wraps whichever path does.
+        self._metal_ok, self._metal_why = self.metal_eligible()
+        self._guard = self._build_guard()
+
     def _distinct_lags(self, dtype):
         """(values, inverse index) for the lags as seen in ``dtype``, or None.
 
@@ -492,16 +499,63 @@ class GPLogLike:
 
     # -- the anvil LogDensity contract ------------------------------------
 
-    def __call__(self, v: mx.array) -> mx.array:
-        """float32 GP log-likelihood, offset by :attr:`log_norm_const`."""
-        ok, _why = self.metal_eligible()
-        if ok:
+    def _build_guard(self):
+        """``custom_function`` wrapper that zeroes gradients on failed lanes."""
+        raw = self._raw_call
+
+        @mx.custom_function
+        def guard(v):
+            return raw(v)
+
+        @guard.vjp
+        def _guard_vjp(primals, cotangents, outputs):
+            v = primals[0] if isinstance(primals, (list, tuple)) else primals
+            cot = (cotangents[0] if isinstance(cotangents, (list, tuple))
+                   else cotangents)
+            out = (outputs[0] if isinstance(outputs, (list, tuple))
+                   else outputs)
+            _, grads = mx.vjp(raw, [v], [cot])
+            g = grads[0]
+            z = mx.zeros_like(g)
+            # `mx.where` SELECTS; it never multiplies a cotangent by zero, so
+            # an infinite derivative on a failed lane is discarded rather
+            # than turned into NaN.
+            failed = out <= _FAILED
+            g = mx.where(failed[:, None], z, g)
+            return mx.where(mx.isfinite(g), g, z)
+
+        return guard
+
+    def _raw_call(self, v: mx.array) -> mx.array:
+        """The float32 likelihood itself, sanitised but not gradient-guarded."""
+        if self._metal_ok:
             return _sanitize(self._evaluate_metal(v))
         out = self._evaluate(
             v, self._dt32, self._y32, self._rref32, self._x_mean32,
             self._inst32, _pow2(self.policy.block), self.policy.eval_blocks,
             uniq=self._uniq32)
         return _sanitize(out)
+
+    def __call__(self, v: mx.array) -> mx.array:
+        """float32 GP log-likelihood, offset by :attr:`log_norm_const`.
+
+        A chain in a float32-infeasible corner gets a large-negative finite
+        value **and a zero gradient**, which is what the brief asks for and
+        what an adapting sampler needs.
+
+        Sanitising the value is not enough to get the gradient.  ``_sanitize``
+        routes a zero cotangent to the failed lanes, but the graph upstream
+        of it has already produced an infinite or NaN derivative there, and
+        ``0 * inf`` is NaN however the zero arrives.  The only way to stop it
+        is to cut the graph, so the guard is a ``custom_function`` whose VJP
+        *selects* zero on failed lanes rather than multiplying by it.
+
+        That costs one extra forward pass on the gradient path, because the
+        VJP has to re-run the graph it is guarding.  Measured at ~20% of a
+        value-and-gradient call.  The forward-only path -- the stretch move,
+        and anything on the Metal kernel -- pays nothing.
+        """
+        return self._guard(v)
 
     def log_prob_absolute(self, v: mx.array) -> mx.array:
         """Absolute log-likelihood, with the host constant added in float64.

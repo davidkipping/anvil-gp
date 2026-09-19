@@ -187,6 +187,81 @@ def test_positive_definiteness_failure_is_finite_not_nan():
         val, grad = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
         mx.eval(out, val, grad)
     assert bool(mx.all(mx.isfinite(out))), "log-likelihood must stay finite"
+    # the brief asks for a zero gradient there, not merely a finite value.
+    # This assertion was missing: the test computed `grad` and never looked
+    # at it, and it was NaN.
+    assert bool(mx.all(mx.isfinite(grad[0]))), "gradient must stay finite"
+
+
+FAILURE_POINTS = [
+    ("all-huge", [30.0, 30.0, 30.0]),
+    ("sigma-huge", [30.0, 0.0, 0.0]),
+    ("all-tiny", [-30.0, -30.0, -30.0]),
+    ("rho-huge", [0.0, 30.0, 0.0]),
+    ("Q-huge", [0.0, 0.0, 30.0]),
+]
+
+
+@pytest.mark.parametrize("name,point", FAILURE_POINTS,
+                         ids=[c[0] for c in FAILURE_POINTS])
+def test_infeasible_corners_have_finite_gradients(name, point):
+    """Warmup visits these; a NaN there poisons the whole ensemble.
+
+    Sanitising the value does not sanitise the gradient.  `_sanitize` routes
+    a zero cotangent to the failed lanes, but the graph above it has already
+    produced an infinite derivative, and 0 * inf is NaN however the zero
+    arrives.  Two of these five points returned NaN gradients -- one of them
+    with a perfectly finite value -- until the guard was added.
+    """
+    pm = ParamMap(kernel=[KernelParam(link="log", index=0, ref=1e4),
+                          KernelParam(link="log", index=1, ref=1e6),
+                          KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
+                   GPPolicy(block=64))
+    u = mx.array(np.array([point], dtype=np.float32))
+    with mx.stream(mx.gpu):
+        out = gp(u)
+        _, grad = mx.vjp(gp, [u], [mx.ones((1,), dtype=mx.float32)])
+        mx.eval(out, grad)
+    assert bool(mx.all(mx.isfinite(out)))
+    g = np.array(grad[0])
+    assert np.all(np.isfinite(g)), f"{name}: {g}"
+    # and where the value itself was rejected, the gradient is exactly zero
+    if float(np.array(out)[0]) <= -1e29:
+        assert np.all(g == 0.0), f"{name}: rejected lane must have zero grad"
+
+
+def test_the_gradient_guard_leaves_healthy_lanes_untouched():
+    """The guard must be invisible wherever nothing failed."""
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate((1.0, 4.0, 3.0))], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(block=128))
+    u = mx.array(np.array([[0.2, -0.3, 0.5], [0.0, 0.0, 0.0]],
+                          dtype=np.float32))
+    with mx.stream(mx.gpu):
+        _, guarded = mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])
+        _, plain = mx.vjp(gp._raw_call, [u], [mx.ones((2,), dtype=mx.float32)])
+        mx.eval(guarded, plain)
+    assert np.array_equal(np.array(guarded[0]), np.array(plain[0]))
+
+
+def test_one_failed_chain_does_not_zero_its_neighbours():
+    """The mask is per lane, not per batch."""
+    pm = ParamMap(kernel=[KernelParam(link="log", index=0, ref=1e4),
+                          KernelParam(link="log", index=1, ref=1e6),
+                          KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
+    gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
+                   GPPolicy(block=64))
+    u = mx.array(np.array([[30.0, 30.0, 30.0], [0.0, 0.0, 0.0]],
+                          dtype=np.float32))
+    with mx.stream(mx.gpu):
+        out = gp(u)
+        _, grad = mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])
+        mx.eval(out, grad)
+    g = np.array(grad[0])
+    assert np.all(g[0] == 0.0), "the failed chain is zeroed"
+    assert np.any(g[1] != 0.0), "the healthy chain is not"
 
 
 @pytest.mark.slow
