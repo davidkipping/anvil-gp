@@ -423,3 +423,49 @@ def test_float32_holds_up_at_high_gp_amplitude(sig_over_yerr):
     assert abs(lo - hi) < 0.1, (
         f"MLX float32 off by {lo - hi:+.3f} log-units at "
         f"sigma/yerr = {sig_over_yerr:g}, |logL| = {abs(hi):.0f}")
+
+
+@pytest.mark.slow
+def test_the_joint_high_amplitude_long_correlation_corner():
+    """Amplitude and correlation length together, which neither axis alone
+    reaches.
+
+    The published error table scans amplitude at a fixed rho/dt and rho/dt
+    at a modest amplitude. The *product* is far worse than either: at
+    sigma_GP/yerr = 100 AND rho/dt = 1000, N = 32768, the MLX path is off
+    by ~1.5 log-units even after the reduction's float32 work, and the
+    error is not monotone in `sub_block` (64 measures worse than 32), so it
+    is not simple accumulation.
+
+    The fused kernel is fine there (~0.02), and `anvil.validate_precision`
+    warns on the MLX path and passes the kernel, so this is a *detected*
+    limitation rather than a silent wrong answer. It is a named deliverable
+    of M4, whose backward kernel makes the kernel path differentiable and
+    so removes the reason to use the MLX path at this size at all.
+
+    The test pins what is true today: the kernel is accurate here, and the
+    MLX path is not. If the MLX number improves, tighten it.
+    """
+    n, dt, qual, sig, rho = 32_768, 0.02, 3.0, 100.0, 1000.0 * 0.02
+    rng = np.random.default_rng(0)
+    t = np.arange(n) * dt
+    y = sample_ssm(ag.SHOTerm(), [sig, rho, qual], dt, n, rng)
+    y = y + rng.standard_normal(n)
+    yerr = np.full(n, 1.0)
+    pm = ParamMap.const([sig, rho, qual])
+
+    ref = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                    GPPolicy(block=4096))
+    hi = float(np.array(ref.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
+
+    kern = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                     GPPolicy(block=4096, metal=True))
+    with mx.stream(mx.gpu):
+        k32 = float(np.array(kern(mx.zeros((1, 1), dtype=mx.float32)))[0])
+        m32 = float(np.array(ref(mx.zeros((1, 1), dtype=mx.float32)))[0])
+
+    assert abs(k32 - hi) < 0.15, (
+        f"the kernel must hold this corner; got {k32 - hi:+.3f}")
+    # Documented, not asserted-good: if this ever drops below 0.3 the MLX
+    # path has been fixed and this guard should be tightened.
+    assert abs(m32 - hi) < 5.0, f"MLX unexpectedly far off: {m32 - hi:+.3f}"
