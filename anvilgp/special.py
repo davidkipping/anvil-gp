@@ -55,6 +55,9 @@ _U_SERIES = 2.0        # |d^2 dt^2| below which the trig series is used
 _Z_SERIES = 2.0        # |2 c dt| below which the gamma series is used
 _N_TRIG = 12           # series terms (converged to 4e-18 at |u| = 2)
 _N_GAMMA = 24          # series terms (converged to 4e-18 at z = 2)
+#: above this the regularised lower gamma is 1 to within a float32 ulp for
+#: every n we use, and the direct form's polynomial would overflow.
+_Z_DIRECT_SAT = 100.0
 
 
 def _horner(z: mx.array, coeffs) -> mx.array:
@@ -240,12 +243,21 @@ def lower_gamma_reg(n: int, z: mx.array) -> mx.array:
     ser = _horner(zs, _gamma_coeffs(n))
     for _ in range(n + 1):
         ser = ser * zs
-    zb = _safe(z, mx.logical_not(small), 1.0)
+    # The direct branch forms `sum_j z^j/j!`, which overflows float32 at
+    # z ~ 1e8 for n = 5 while `exp(-z)` has long since underflowed -- inf
+    # times zero, so a NaN where the answer is simply 1.  P(n+1, z) is
+    # within one float32 ulp of 1 for z >= 100 at every n we use (n <= 5:
+    # the neglected tail is e^-100 100^5/120 ~ 3e-36), so clamp the
+    # argument there.  Exact below the clamp, and it removes the NaN.
+    big = z > _Z_DIRECT_SAT
+    zb = _safe(mx.minimum(z, _Z_DIRECT_SAT), mx.logical_not(small), 1.0)
     tot, term = mx.ones_like(zb), mx.ones_like(zb)
     for j in range(1, n + 1):
         term = term * zb / j
         tot = tot + term
-    return mx.where(small, ser, 1.0 - exp_acc(-zb) * tot)
+    direct = 1.0 - exp_acc(-zb) * tot
+    direct = mx.where(big, mx.ones_like(direct), direct)
+    return mx.where(small, ser, direct)
 
 
 def gamma3(z: mx.array) -> mx.array:

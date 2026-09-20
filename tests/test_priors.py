@@ -214,3 +214,26 @@ def test_hi_prior_is_evaluated_at_float64():
         hi = tgt.target.log_prob_hi(u)
         assert hi.dtype == mx.float64
         assert bool(mx.all(mx.isfinite(hi)))
+
+
+def test_ordering_refuses_a_non_log_link():
+    """The ratio is dimensionless only through a log link.
+
+    With any other link the `1 +` adds a pure number to a timescale, which
+    is the unit-dependent bug the log path had. Refuse rather than repeat
+    it silently for a hand-built map.
+    """
+    kernel = [KernelParam(link="const", value=v)
+              for v in (1.0, 4.0, 3.0, 1.0, 8.0, 3.0)]
+    pm = ParamMap(kernel=kernel, n_dim=1, order_groups=[[1, 4]])
+    with pytest.raises(ValueError, match="require 'log'"):
+        pm.kernel_params(mx.zeros((2, 1), dtype=mx.float32))
+
+
+def test_zero_baseline_is_refused():
+    """One epoch, or all timestamps equal: no timescale to put a prior on."""
+    t = np.zeros(5)
+    y = np.arange(5.0)
+    yerr = np.full(5, 0.1)
+    with pytest.raises(ValueError, match="zero time"):
+        priors.default_hypers(ag.SHOTerm(), t, y, yerr)

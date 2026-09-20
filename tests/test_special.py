@@ -176,3 +176,19 @@ def test_gamma3_is_the_n2_case():
     z = mx.array(np.concatenate([[0.0], np.logspace(-14, 3, 200)]),
                  dtype=mx.float64)
     assert float(mx.max(mx.abs(sp.gamma3(z) - sp.lower_gamma_reg(2, z)))) == 0.0
+
+
+@pytest.mark.parametrize("n", [2, 3, 4, 5])
+def test_lower_gamma_is_finite_at_huge_arguments(n):
+    """The direct branch used to overflow float32 into a NaN.
+
+    `sum_j z^j/j!` overflows around z ~ 1e8 at n = 5 while `exp(-z)` has
+    long since underflowed, giving inf * 0 where the answer is simply 1.
+    Reachable only through an absurd lag, but the failure mode is a NaN
+    likelihood, so it is worth one clamp.
+    """
+    zs = mx.array(np.array([1e2, 1e6, 1e8, 1e12, 1e20, 1e30]),
+                  dtype=mx.float32)
+    got = np.array(sp.lower_gamma_reg(n, zs), dtype=np.float64)
+    assert np.all(np.isfinite(got)), got
+    assert np.allclose(got, 1.0, atol=1e-6)

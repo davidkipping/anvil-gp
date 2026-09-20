@@ -246,8 +246,17 @@ class ParamMap:
         for group in self.order_groups:
             for lo, hi in zip(group[:-1], group[1:]):
                 k = self.kernel[hi]
-                unit = float(k.ref) if k.link == "log" else 1.0
-                cols[hi] = cols[lo] * (1.0 + cols[hi] / unit)
+                if k.link != "log":
+                    # Only the log link gives a dimensionless ratio
+                    # (x/ref = exp(v)).  With any other link the `1 +` below
+                    # adds a pure number to a quantity carrying the user's
+                    # time unit, which silently changes the kernel and makes
+                    # the prior depend on whether t is in days or seconds.
+                    raise ValueError(
+                        f"ordered kernel parameter {hi} has link "
+                        f"{k.link!r}; ordering groups require 'log'. "
+                        "Drop it from order_groups, or give it a log link.")
+                cols[hi] = cols[lo] * (1.0 + cols[hi] / float(k.ref))
         return mx.concatenate(cols, axis=-1)
 
     @staticmethod
@@ -331,6 +340,15 @@ class GPLogLike:
                 "Sort your data and reorder y/yerr to match.")
         if np.any(self._yerr64 <= 0.0):
             raise ValueError("yerr must be strictly positive")
+        # The graph carries yerr^2, not yerr.  Below ~1e-19 that squares to
+        # a float32 denormal-or-zero, every innovation variance collapses,
+        # and the likelihood comes back -1e30 for every chain -- a flat
+        # posterior with no error.  Refuse it and say what to do.
+        if float(np.min(self._yerr64)) ** 2 < 1e-36:
+            raise ValueError(
+                f"yerr as small as {float(np.min(self._yerr64)):.3g} squares "
+                "to a float32 zero. Rescale y and yerr (the likelihood is "
+                "invariant up to a constant) or work in relative flux.")
 
         # A mean model needs all three of mean_fn, param_map.mean and
         # x_mean.  With any one missing the GP silently fits y itself: the

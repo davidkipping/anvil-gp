@@ -124,6 +124,13 @@ def _log_rho_bounds(ref: dict):
     lo, hi = 2.0 * ref["cadence"], 0.5 * ref["baseline"]
     if not hi > lo:                     # pathological, e.g. 3 data points
         lo, hi = 0.5 * ref["cadence"], 4.0 * ref["baseline"]
+    if not (lo > 0.0 and hi > 0.0):
+        # zero baseline: one epoch, or every timestamp identical.  There is
+        # no timescale to put a prior on.
+        raise ValueError(
+            "cannot choose a timescale prior: the data span zero time "
+            f"(baseline = {ref['baseline']:.3g}, cadence = "
+            f"{ref['cadence']:.3g}). Supply hyperparameters explicitly.")
     rho_ref = math.sqrt(lo * hi)
     return rho_ref, math.log(lo / rho_ref), math.log(hi / rho_ref)
 

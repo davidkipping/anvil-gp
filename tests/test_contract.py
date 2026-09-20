@@ -389,3 +389,15 @@ def test_param_map_constructors_match_the_long_form():
     assert short_l.n_dim == long_l.n_dim == 3
     assert np.array_equal(np.array(short_l.kernel_params(u)),
                           np.array(long_l.kernel_params(u)))
+
+
+def test_yerr_that_underflows_in_float32_is_refused():
+    """yerr^2 is what enters the graph; below ~1e-19 it squares to zero.
+
+    Every innovation variance then collapses and the likelihood is -1e30
+    for every chain: a flat posterior with no error reported. This is the
+    same silent-flat-likelihood failure the non-finite checks prevent.
+    """
+    with pytest.raises(ValueError, match="rescale|float32 zero"):
+        _gp(yerr=np.full(N, 1e-20))
+    _gp(yerr=np.full(N, 1e-15))          # fine
