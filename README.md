@@ -194,13 +194,21 @@ point. Against the MLX path, same problem, same answers:
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| N=1e4, 1024 chains | 82.6 ms | **2.9 ms** | 28x | 1.34 GiB | 0.05 GiB |
+| N=1e4, 1024 chains | 82.6 ms* | **2.9 ms** | 28x | 1.34 GiB | 0.05 GiB |
 | N=1e4, 4096 chains | 353 ms | **6.4 ms** | 55x | 3.85 GiB | 0.21 GiB |
 | N=1e5, 1024 chains | 838 ms | **16.3 ms** | 51x | 1.00 GiB | 0.41 GiB |
 
 (Minimum of 15 sustained evaluations, compiled, gapped cadence with three
-distinct lags, `block=4096`, `metal_block` 1024 at N=1e4 and 4096 at 1e5,
-all six rows measured in one window. The speedups are smaller than the
+distinct lags, `block=4096`, `metal_block` at its default.
+`benchmarks/verify_readme.py` re-checks every number here and refuses to
+report timings on a busy machine.
+
+**These MLX rows predate two changes that make them pessimistic**: the
+gradient guard moved to the input (it no longer re-runs the forward) and
+`sub_block` rose from 16 to 32 (measured 0.92x forward). Expect roughly
+76 ms and 920 ms rather than 82.6 and 1033. They have not been re-measured
+because this machine has been running a media-indexing daemon at ~300% CPU
+since the changes landed; run the verifier on a quiet one. The speedups are smaller than the
 37-71x first reported here because the MLX path itself got 1.35x faster in
 the meantime — see "Unroll the leaf reductions" in the history. The kernel
 is unchanged.)
