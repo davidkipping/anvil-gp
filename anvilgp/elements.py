@@ -610,13 +610,20 @@ def leaf_parts(phi_blocks, q_blocks, h, y, r_var, r_ref, s_floor=None):
     and ``eta`` are never formed, so the (chains x points) leaf array holds
     ``2 sum m_i^2 + 2m + 2`` numbers instead of ``3m^2 + 2m + 1``.
     """
+    # Per-plane multiply-adds rather than `mx.sum` over a broadcast product,
+    # for the same reason as `leaf_elements`: the reduction kernels over a
+    # size-m axis cost about twice the unrolled form.  The block sizes are
+    # trace-time constants, so both loops unroll into the graph.
     hphi = mx.concatenate(
-        [mx.sum(h[:, None, o:o + b.shape[-1], None] * b, axis=-2)
+        [sum(h[:, None, o + i, None] * b[:, :, i, :]
+             for i in range(b.shape[-1]))
          for b, o in zip(phi_blocks, _offsets(phi_blocks))], axis=-1)
     qh = mx.concatenate(
-        [mx.sum(b * h[:, None, None, o:o + b.shape[-1]], axis=-1)
+        [sum(b[:, :, :, j] * h[:, None, None, o + j]
+             for j in range(b.shape[-1]))
          for b, o in zip(q_blocks, _offsets(q_blocks))], axis=-1)
-    s_q = mx.sum(h[:, None, :] * qh, axis=-1) + r_var
+    s_q = sum(h[:, None, i] * qh[:, :, i]
+              for i in range(h.shape[-1])) + r_var
     if s_floor is not None:
         s_q = mx.maximum(s_q, s_floor)
     inv_rs = mx.rsqrt(s_q)
