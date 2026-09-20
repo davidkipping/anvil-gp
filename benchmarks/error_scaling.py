@@ -12,27 +12,37 @@ evaluating at ``y = 0``, which zeroes every quadratic contribution (``b``,
 
 Measured on an M2 Max, SHO with Q = 3, block 1024:
 
-    the RELATIVE error is flat at 3e-8 to 1.2e-6 -- a few times float32 eps
-    -- across three decades of N, four decades of tau/dt, and four decades
-    of sigma_GP/yerr.
+    along N and tau/dt the RELATIVE error is flat at 3e-8 to 1.2e-6, a few
+    times float32 eps.  Along sigma_GP/yerr it is NOT flat: see panel C.
 
 So the recursion is not compounding: what grows with N is ``|logL|`` itself,
 and the absolute error follows it.  The consequences are the useful part:
 
-* At N = 1e5 (``|logL| ~ 6e4``) the worst-case absolute error extrapolates
-  to ~7e-2 log-units -- an order of magnitude under the ~1-unit Metropolis
-  decision scale.
+* At N = 1e5 (``|logL| ~ 6e4``) with a modest amplitude the worst-case
+  absolute error extrapolates to ~7e-2 log-units -- an order of magnitude
+  under the ~1-unit Metropolis decision scale.  That extrapolation holds
+  along N and tau/dt only; along amplitude it does not (panel C).
 * At N = 1e6 it reaches ~0.7, i.e. the scale of the decision itself.  That
   is where anvil's ``reanchor_every`` earns its keep, or where the per-block
   roots want composing in float64 on the CPU stream (the blocked structure
   makes that cheap: ~1e3 roots, not 1e6 leaves).
-* Panel C is the interesting negative result.  The brief predicted a
-  float32-infeasible corner at ``sigma_GP/yerr`` of 10-300 with a timescale
-  far above the cadence; across that whole range the worst relative error
-  here is 4.3e-7, with no sign of the innovation-variance cancellation.
-  The cancellation-free process noise appears to have removed it.  This is
-  one slice, not the map -- M3 still owes the full ``(sigma/yerr,
-  timescale/cadence, Q)`` feasibility survey.
+* Panel C, measured (N = 25000, block 1024, on model): the relative error
+  grows from 8e-8 at ``sigma/yerr = 0.1`` to 6.5e-6 at 1000, and it is the
+  *quadratic* half that grows (4.6e-1 absolute against 1.6e-4 for the
+  log-determinant).  That is the ``g^2`` cancellation in the general
+  composition, and it is why ``sub_block`` is chosen for accuracy.
+* Panel C is the amplitude axis, and it is the one that bit.  An earlier
+  version of this script held the *data* at ``SIGMA = 1.0`` while scaling
+  the model ``sigma``, which makes the model mismatched rather than
+  high-amplitude: ``g = y/sqrt(S)`` then shrinks as sigma grows.  It
+  reported a flat 4.3e-7 across the range and concluded the brief's
+  predicted infeasible corner had been removed.  It had not been; the panel
+  could not see it.  Drawing the data on model (``oracle.sample_ssm``)
+  gives ``g^2 ~ 1e4`` at ``sigma/yerr = 100``, and the cancellation of
+  three such terms inside the general composition is the dominant float32
+  error in the package.  It is now bounded by the sub_block default rather
+  than absent; see ``_auto_sub_block``.  This is still one slice, not the
+  map -- M3 owes the full ``(sigma/yerr, timescale/cadence, Q)`` survey.
 
 Run:  .venv/bin/python benchmarks/error_scaling.py
 """
@@ -44,10 +54,13 @@ import numpy as np
 
 import anvilgp as ag
 from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap, a64
+from anvilgp.oracle import sample_ssm
 
 p = argparse.ArgumentParser()
 p.add_argument("--block", type=int, default=1024)
 p.add_argument("--cadence", type=float, default=0.02)
+p.add_argument("--n-amp", type=int, default=25_000,
+               help="N for the on-model amplitude panel C")
 args = p.parse_args()
 
 SIGMA, QUAL, YERR = 1.0, 3.0, 0.3
@@ -113,11 +126,25 @@ for ratio in (2.0, 10.0, 100.0, 1000.0, 8000.0, 40000.0):
     ld, qd, tot, ref = split_error(t, y, yerr, [SIGMA, rho, QUAL], args.block)
     row(f"{ratio:>8.0f} {rho/(n*args.cadence):>8.3f}", ld, qd, tot, ref)
 
-print("\nC. error vs sigma_GP/yerr at fixed N = 8000, rho = 100 dt")
+# Panel C draws its data ON MODEL, at the amplitude being tested.  An
+# earlier version held the data at SIGMA = 1.0 while scaling the model
+# sigma, which makes the model *mismatched* rather than high-amplitude:
+# the normalised innovation g = y/sqrt(S) then shrinks as sigma grows, so
+# g^2 never exceeded ~10 and the panel reported a flat 4.3e-7 with "no sign
+# of the innovation-variance cancellation".  On model, g^2 reaches ~1e4 at
+# sigma/yerr = 100 and the cancellation in the general composition is the
+# dominant float32 error in the whole package.
+print("\nC. error vs sigma_GP/yerr, ON MODEL, at fixed N and rho = 100 dt")
 print(f"{'s/yerr':>8s} " + HDR)
 rho = 100.0 * args.cadence
+n_c = args.n_amp
 for ratio in (0.1, 1.0, 10.0, 100.0, 1000.0):
-    t, y, yerr = make(n, args.cadence, rho)
-    ld, qd, tot, ref = split_error(t, y, yerr, [ratio * YERR, rho, QUAL],
+    sigma_c = ratio * YERR
+    rng_c = np.random.default_rng(4)
+    t = np.arange(n_c) * args.cadence
+    y = sample_ssm(ag.SHOTerm(), [sigma_c, rho, QUAL], args.cadence, n_c,
+                   rng_c) + YERR * rng_c.standard_normal(n_c)
+    yerr = np.full(n_c, YERR)
+    ld, qd, tot, ref = split_error(t, y, yerr, [sigma_c, rho, QUAL],
                                    args.block)
     row(f"{ratio:>8.1f}", ld, qd, tot, ref)

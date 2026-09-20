@@ -92,8 +92,13 @@ def sample_ssm(term, p, dt, n, rng):
     cadence, one lag, so ``dt`` is a scalar.
     """
     import mlx.core as mx
-    pp = mx.array([list(p)], dtype=mx.float64)
-    phi, q, h = term.matrices(pp, mx.array([dt], dtype=mx.float64))
+    # float64 does not exist on Metal, and the default stream is the GPU in
+    # any normal session, so pin this to the CPU rather than asking every
+    # caller to remember.
+    with mx.stream(mx.cpu):
+        pp = mx.array([list(p)], dtype=mx.float64)
+        phi, q, h = term.matrices(pp, mx.array([dt], dtype=mx.float64))
+        mx.eval(phi, q, h)
     Phi = np.array(phi, dtype=np.float64)[0, 0]
     Q = np.array(q, dtype=np.float64)[0, 0]
     H = np.array(h, dtype=np.float64)[0]
