@@ -511,19 +511,22 @@ marked as an estimate.
 ### End to end
 
 `examples/gp_injection_recovery.py` fits an SHO kernel plus a jitter to 1000
-points with **1024 chains**, 5800 stretch steps in **15.2 s on the fused
-kernel** (1,346 ESS/s) or **85.5 s on the MLX graph** (200 ESS/s), against
-12 ESS/s for the same example before any of this work (256 chains, 684 s).
-Both paths recover all four parameters, and agree:
+points with **1024 chains**, 5800 stretch steps, in ~15 s on the fused
+kernel or ~86 s on the MLX graph, against 684 s for the same example before
+any of this work (at 256 chains). Both paths recover all four parameters,
+and now agree to three decimals on every one:
 
-| parameter | posterior (Metal) | truth | z |
-|---|---:|---:|---:|
-| σ_GP | 1.139 ± 0.285 | 1.5 | −1.26 |
-| ρ | 6.950 ± 0.480 | 7.3 | −0.73 |
-| Q | 6.14 ± 5.49 | 8.0 | −0.34 |
-| jitter | 0.1133 ± 0.0457 | 0.12 | −0.15 |
+| parameter | Metal | MLX | truth | z |
+|---|---:|---:|---:|---:|
+| σ_GP | 1.139 ± 0.285 | 1.138 ± 0.285 | 1.5 | −1.27 |
+| ρ | 6.950 ± 0.480 | 6.951 ± 0.481 | 7.3 | −0.72 |
+| Q | 6.14 ± 5.49 | 6.11 ± 5.67 | 8.0 | −0.33 |
+| jitter | 0.1133 ± 0.0457 | 0.1133 ± 0.0456 | 0.12 | −0.15 |
 
-min ESS 20,422, max R-hat 1.037. σ_GP sits low because *this draw's* realised
+min ESS 20,422 (Metal) and 20,683 (MLX), max R-hat 1.037 on both. The MLX
+column is worth noting: before the float32 work in the reduction it gave
+Q = 6.51 ± 13.6 and min ESS 17,120 — a posterior width 2.5x the kernel's,
+from rounding rather than from anything statistical. σ_GP sits low because *this draw's* realised
 RMS is 1.118 against a process value of 1.518 — with ~5.5 correlation times in
 the baseline a single realisation scatters that much, and the posterior is
 correctly tracking the data. `tests/test_calibration.py` is what establishes
