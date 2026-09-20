@@ -107,7 +107,7 @@ class GPPolicy:
     #: use the fused Metal scan kernel (:mod:`anvilgp.metal`).  **Forward
     #: only** until M4 adds its VJP -- differentiating through it raises
     #: rather than silently falling back, so a gradient sampler must leave
-    #: this off.  Measured 28-55x over the MLX path with 9-27x less peak
+    #: this off.  Measured 25-53x over the MLX path with 2-25x less peak
     #: memory; see the README.
     metal: bool = False
     #: observations condensed per kernel thread, or None to pick from N.

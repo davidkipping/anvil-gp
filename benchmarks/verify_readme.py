@@ -9,10 +9,12 @@ still hold.
     .venv/bin/python benchmarks/verify_readme.py            # all of them
     .venv/bin/python benchmarks/verify_readme.py --quick    # skip N = 1e5
 
-**Run it on a quiet machine.** Wall times on an M2 Max swing by 2x with
-background load -- a media-indexing daemon alone is worth 1.5x -- so this
-prints the load average first and refuses to call anything a regression
-above 4.0. Accuracy rows are unaffected by load and always checked.
+**Timings are gated on a measured stability check, not on the load
+average.** Wall times on an M2 Max can swing 2x with background load, but
+the load average is a poor proxy: a CPU-bound indexer can sit at 14 while
+the GPU is perfectly steady. So this runs one cheap workload three times
+first and reports the spread of the three minima. Above 10% it declines to
+judge the timing rows; accuracy rows are load-independent and always run.
 """
 import argparse
 import os
@@ -33,9 +35,6 @@ p.add_argument("--tol", type=float, default=0.25,
 a = p.parse_args()
 
 LOAD = os.getloadavg()[0]
-print(f"load average (1 min): {LOAD:.1f}"
-      + ("" if LOAD < 4.0 else "   <-- TOO HIGH: timings are not meaningful"))
-print()
 
 
 def gapped(n):
@@ -104,9 +103,9 @@ def fp32_error(n, sig_over_yerr, metal, sub_block=None):
 #: (label, claimed, getter, kind).  `kind` "time" rows are skipped as
 #: unverifiable when the machine is loaded; "acc" rows always run.
 CLAIMS = [
-    ("MLX forward, 1e4 x 1024", 76.0, lambda: forward(10_000, 1024, False), "time"),
+    ("MLX forward, 1e4 x 1024", 73.8, lambda: forward(10_000, 1024, False), "time"),
     ("Metal forward, 1e4 x 1024", 2.9, lambda: forward(10_000, 1024, True), "time"),
-    ("MLX value+grad, 1e4 x 1024", 920.0, lambda: gradient(10_000, 1024), "time"),
+    ("MLX value+grad, 1e4 x 1024", 880.0, lambda: gradient(10_000, 1024), "time"),
     ("fp32 err, N=25e3, sig/yerr=100 (MLX)", 0.06,
      lambda: fp32_error(25_000, 100.0, False), "acc"),
     ("fp32 err, N=25e3, sig/yerr=100 (Metal)", 0.03,
@@ -114,17 +113,37 @@ CLAIMS = [
 ]
 if not a.quick:
     CLAIMS += [
-        ("MLX forward, 1e5 x 1024", 770.0, lambda: forward(100_000, 1024, False), "time"),
-        ("Metal forward, 1e5 x 1024", 13.3, lambda: forward(100_000, 1024, True), "time"),
+        ("MLX forward, 1e5 x 1024", 693.0, lambda: forward(100_000, 1024, False), "time"),
+        ("Metal forward, 1e5 x 1024", 13.2, lambda: forward(100_000, 1024, True), "time"),
         ("fp32 err, N=1e5, sig/yerr=30 (MLX)", 0.20,
          lambda: fp32_error(100_000, 30.0, False), "acc"),
     ]
 
+def stability():
+    """Spread of three independent minima on one cheap workload."""
+    rng = np.random.default_rng(0)
+    t = gapped(10_000)
+    y = rng.standard_normal(10_000) * 0.9
+    gp = GPLogLike(None, t, None, y, np.full(10_000, 0.3), ag.SHOTerm(),
+                   ParamMap.log([1.0, 4.0, 3.0]), GPPolicy(block=4096))
+    u = mx.array(rng.standard_normal((1024, 3)).astype(np.float32) * 0.01)
+    f = mx.compile(gp.__call__)
+    with mx.stream(mx.gpu):
+        mins = [timed(lambda: f(u), 10) for _ in range(3)]
+    return min(mins), (max(mins) - min(mins)) / min(mins)
+
+
+base, spread = stability()
+print(f"load average (1 min): {LOAD:.1f}")
+print(f"stability probe: {base:.1f} ms, spread across 3 rounds {spread:.1%}"
+      + ("" if spread <= 0.10 else "   <-- too noisy to judge timings"))
+print()
+
 print(f"{'claim':>40s} {'README':>9s} {'measured':>9s}   verdict")
 worst = 0.0
 for label, claimed, fn, kind in CLAIMS:
-    if kind == "time" and LOAD >= 4.0:
-        print(f"{label:>40s} {claimed:>9.1f} {'--':>9s}   skipped (machine busy)")
+    if kind == "time" and spread > 0.10:
+        print(f"{label:>40s} {claimed:>9.1f} {'--':>9s}   skipped (too noisy)")
         continue
     got = fn()
     ratio = got / claimed
@@ -136,5 +155,6 @@ for label, claimed, fn, kind in CLAIMS:
 print()
 print("Accuracy rows are absolute log-unit errors and must not grow; timing")
 print("rows are minima and allowed {:.0%} slack.".format(a.tol))
-if LOAD >= 4.0:
-    print("Timings were skipped. Re-run when the load average is under 4.")
+if spread > 0.10:
+    print("Timings were skipped: the stability probe varied by "
+          f"{spread:.0%}. Re-run when it is under 10%.")

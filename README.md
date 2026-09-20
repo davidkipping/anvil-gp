@@ -194,35 +194,30 @@ point. Against the MLX path, same problem, same answers:
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| N=1e4, 1024 chains | 82.6 ms* | **2.9 ms** | 28x | 1.34 GiB | 0.05 GiB |
-| N=1e4, 4096 chains | 353 ms | **6.4 ms** | 55x | 3.85 GiB | 0.21 GiB |
-| N=1e5, 1024 chains | 838 ms | **16.3 ms** | 51x | 1.00 GiB | 0.41 GiB |
+| N=1e4, 1024 chains | 73.8 ms | **2.95 ms** | 25x | 1.20 GiB | 0.05 GiB |
+| N=1e4, 4096 chains | 326 ms | **6.38 ms** | 51x | 3.74 GiB | 0.21 GiB |
+| N=1e5, 1024 chains | 693 ms | **13.2 ms** | 53x | 0.82 GiB | 0.40 GiB |
 
-(Minimum of 15 sustained evaluations, compiled, gapped cadence with three
-distinct lags, `block=4096`, `metal_block` at its default.
-`benchmarks/verify_readme.py` re-checks every number here and refuses to
-report timings on a busy machine.
-
-**These MLX rows predate two changes that make them pessimistic**: the
-gradient guard moved to the input (it no longer re-runs the forward) and
-`sub_block` rose from 16 to 32 (measured 0.92x forward). Expect roughly
-76 ms and 920 ms rather than 82.6 and 1033. They have not been re-measured
-because this machine has been running a media-indexing daemon at ~300% CPU
-since the changes landed; run the verifier on a quiet one. The speedups are smaller than the
-37-71x first reported here because the MLX path itself got 1.35x faster in
-the meantime — see "Unroll the leaf reductions" in the history. The kernel
-is unchanged.)
+(Minimum of 12 sustained evaluations, compiled, gapped cadence with three
+distinct lags, `block=4096`, `metal_block` at its default, all rows in one
+window on 2026-09-20. `benchmarks/verify_readme.py` re-checks every number
+here; it gates on a measured stability probe rather than on the load
+average, which is a poor proxy — a CPU-bound indexer can sit at 14 while
+the GPU is steady to 0.6%.) The speedups are smaller than the
+37-71x first reported here because the MLX path itself got faster in the
+meantime, twice — see "Unroll the leaf reductions" and the sub_block change
+in the history. The kernel is unchanged.)
 
 Against celerite2 on the CPU, measured in the same session:
 
 | config | vs 1 core | vs 12 cores |
 |---|---:|---:|
-| N=1e4, 1024 chains | **142x faster** | **20x faster** |
-| N=1e5, 1024 chains | **264x faster** | **30x faster** |
+| N=1e4, 1024 chains | **144x faster** | **20x faster** |
+| N=1e5, 1024 chains | **329x faster** | **37x faster** |
 
 **The >=100x gate is not yet cleared.** The brief is explicit that "the honest
 >=100x denominator is the multiprocess one", and against a fully parallelised
-12-core celerite2 we are **20-30x**, not 100x. The single-core column is
+12-core celerite2 we are **20-37x**, not 100x. The single-core column is
 reported because it is the comparison most users' code actually makes (one
 CPU process, one chain at a time), not because it clears the gate. What the
 kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
@@ -233,8 +228,8 @@ The brief predicted "~10-50 ms forward at 1024 x 1e5"; the measurement is
 16.4 ms, at the fast end of its own range.
 
 End to end, `examples/gp_injection_recovery.py` (1000 points, 1024 chains,
-5800 stretch steps) goes from **85.5 s to 15.2 s**, 200 -> **1,346 ESS/s**,
-with the posteriors agreeing (rho 6.950 vs 6.955). Run it either way:
+5800 stretch steps) goes from **91 s to 15.7 s**, 226 -> **1,300 ESS/s**,
+with the posteriors agreeing to three decimals. Run it either way:
 
 ```bash
 .venv/bin/python examples/gp_injection_recovery.py           # MLX graph
@@ -273,12 +268,12 @@ rows in one window:
 
 | config | first version | now | vs celerite2, 1 core | vs celerite2, 12 cores |
 |---|---:|---:|---:|---:|
-| N=1e4, 1024 chains, m=2 (SHO) | 3428 ms | **82.6 ms** | 5.2x faster | 1.4x slower |
-| N=1e5, 1024 chains, m=2 | — | **838 ms** | 5.2x faster | 1.7x slower |
-| N=1e5, 256 chains, m=2 | 8719 ms | **268 ms** | 4.0x faster | 2.2x slower |
-| N=1e4, 4096 chains, m=2 | — | **353 ms** | 4.9x faster | 1.5x slower |
-| N=1e4, 1024 chains, m=4 (rotation) | — | **316 ms** | — | — |
-| N=1e4, 1024 chains, m=8 (4 SHO) | — | **1046 ms** | — | — |
+| N=1e4, 1024 chains, m=2 (SHO) | 3428 ms | **73.8 ms** | 5.8x faster | 1.3x slower |
+| N=1e5, 1024 chains, m=2 | — | **693 ms** | 6.2x faster | 1.4x slower |
+| N=1e5, 256 chains, m=2 | 8719 ms | **351 ms** | 3.1x faster | 2.9x slower |
+| N=1e4, 4096 chains, m=2 | — | **326 ms** | 5.4x faster | 1.4x slower |
+| N=1e4, 1024 chains, m=4 (rotation) | — | **276 ms** | — | — |
+| N=1e4, 1024 chains, m=8 (4 SHO) | — | **942 ms** | — | — |
 
 celerite2 fp64 on this machine, measured in the same session
 (`benchmarks/bench_vs_celerite2.py`): 0.428 ms per evaluation at N=1e4 and
@@ -286,8 +281,8 @@ celerite2 fp64 on this machine, measured in the same session
 single-core loop. A 12-core `multiprocessing` pool gets 7.2-8.9x of the
 theoretical 12x (60-74% efficiency), giving 59 ms and 486 ms.
 
-**So: yes, a fully parallelised CPU celerite2 is still ~1.5x faster than the
-MLX reference path.** Against a single core we are ~5x faster. Both
+**So: yes, a fully parallelised CPU celerite2 is still ~1.4x faster than the
+MLX reference path.** Against a single core we are ~6x faster. Both
 comparisons are against exact float64 on the CPU versus float32 on the GPU
 with a separate float64 verification path. The >=100x gate is Milestone 3's,
 and the multiprocess figure is its denominator.
@@ -511,9 +506,9 @@ marked as an estimate.
 ### End to end
 
 `examples/gp_injection_recovery.py` fits an SHO kernel plus a jitter to 1000
-points with **1024 chains**, 5800 stretch steps, in ~15 s on the fused
-kernel or ~86 s on the MLX graph, against 684 s for the same example before
-any of this work (at 256 chains). Both paths recover all four parameters,
+points with **1024 chains**, 5800 stretch steps, in **15.7 s** on the fused
+kernel (1,300 ESS/s) or **91 s** on the MLX graph (226 ESS/s), against
+684 s for the same example before any of this work (at 256 chains). Both paths recover all four parameters,
 and now agree to three decimals on every one:
 
 | parameter | Metal | MLX | truth | z |
@@ -655,9 +650,9 @@ Three more are worked around and pinned as regression tests
   a tuning number. Still owed: the Design-A probe comparison, the
   `metal::fast` accuracy study, and the ChEES leapfrog cost at scale.
 * **M3 — fused Metal blocked-scan kernel: pass 1 done, forward only.**
-  28-55x over the MLX path and 20-30x ahead of a 12-core celerite2 pool,
+  25-53x over the MLX path and 20-37x ahead of a 12-core celerite2 pool,
   which is the brief's denominator, so the >=100x gate is **not** cleared
-  (it is 142-264x against a single-core loop). `tests/test_metal.py` pins
+  (it is 144-329x against a single-core loop). `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
   model. Still owed: m > 4, per-instrument jitter in-kernel, the float32
