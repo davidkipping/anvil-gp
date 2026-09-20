@@ -110,10 +110,11 @@ class GPPolicy:
     #: this off.  Measured 28-55x over the MLX path with 9-27x less peak
     #: memory; see the README.
     metal: bool = False
-    #: observations condensed per kernel thread.  Larger means fewer, longer
-    #: sequential walks and less work left for the MLX tree above; 1024 was
-    #: best at N = 1e4 and 4096 at N = 1e5.
-    metal_block: int = 1024
+    #: observations condensed per kernel thread, or None to pick from N.
+    #: Larger means fewer, longer sequential walks and less work left for
+    #: the MLX tree above, which is launch-bound and is most of the
+    #: remaining wall time at small N.  See :func:`_auto_metal_block`.
+    metal_block: int | None = None
     #: floor on the leaf innovation variance, in units of the reference
     #: variance.  Positive-definiteness failure is a *defined* outcome:
     #: with thousands of chains, warmup will visit float32-infeasible
@@ -423,6 +424,10 @@ class GPLogLike:
         self.log_norm_const = float(
             -0.5 * np.sum(np.log(2.0 * np.pi * self._yerr64 ** 2)))
 
+        self.metal_block = (self.policy.metal_block
+                            if self.policy.metal_block is not None
+                            else _auto_metal_block(self.n_data))
+
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
         self._metal_ok, self._metal_why = self.metal_eligible()
@@ -553,7 +558,7 @@ class GPLogLike:
                 else mx.broadcast_to(jit, (n, 1)))
 
         el = scan_blocks(pt, qt, self._metal_lag, h, r, self._r_ref32, jit2,
-                         self.policy.s_floor_rel, self.policy.metal_block)
+                         self.policy.s_floor_rel, self.metal_block)
         return tree_reduce(el).ell
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
@@ -751,6 +756,34 @@ def _auto_sub_block(m: int) -> int:
     if m <= 6:
         return 32
     return 64
+
+
+def _auto_metal_block(n_data: int) -> int:
+    """Default observations per kernel thread.
+
+    Two costs pull against each other: a longer block means fewer, longer
+    sequential walks in registers (good, the kernel's whole point), but also
+    fewer threads to fill the GPU with (bad below a few thousand threads).
+    Aim for a few dozen blocks per chain -- N/12 rounded to a power of two,
+    clamped to [1024, 8192].
+
+    Measured, whole compiled path at 1024 chains, interleaved in one window:
+
+        N        512    1024    2048    4096    8192   16384    rule
+        1e4      3.5     2.9     3.1                            1024
+        3e4      6.7     6.2     4.9     5.7                    2048
+        1e5     17.5    17.2    17.2    16.6    13.3    22.2     8192
+
+    The rule picks the best column at every size; the old fixed 1024 was
+    1.26x off at N = 3e4 and 1.29x off at N = 1e5.
+    """
+    target = max(1.0, n_data / 12.0)
+    p = 1
+    while p * 2 <= target:            # largest power of two <= target
+        p *= 2
+    if target - p > 2 * p - target:   # round to the *nearest*, not up
+        p *= 2
+    return max(1024, min(8192, p))
 
 
 def _pow2(n: int) -> int:

@@ -226,3 +226,27 @@ def test_per_instrument_offsets_under_the_kernel():
     with mx.stream(mx.gpu):
         zero = np.array(gp_m(mx.zeros((1, 3), dtype=mx.float32)))
     assert abs(float(zero[0]) - float(got[0])) > 1.0
+
+
+@pytest.mark.parametrize("n_data,want", [(10_000, 1024), (30_000, 2048),
+                                         (100_000, 8192)])
+def test_auto_metal_block_matches_the_measured_optimum(n_data, want):
+    """The default must track N, not sit at a constant.
+
+    Measured on an M2 Max at 1024 chains, whole compiled path, interleaved:
+    the best block is 1024 at N = 1e4, 2048 at 3e4 and 8192 at 1e5. A fixed
+    1024 was 1.26x and 1.29x off at the two larger sizes.
+    """
+    from anvilgp.likelihood import _auto_metal_block
+    assert _auto_metal_block(n_data) == want
+
+
+def test_metal_block_is_resolved_on_the_instance():
+    """`GPPolicy.metal_block=None` must become a concrete value."""
+    auto = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
+                     ParamMap.const([1.3, 4.0, 3.0]), GPPolicy(metal=True))
+    assert isinstance(auto.metal_block, int) and auto.metal_block >= 1024
+    fixed = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
+                      ParamMap.const([1.3, 4.0, 3.0]),
+                      GPPolicy(metal=True, metal_block=512))
+    assert fixed.metal_block == 512

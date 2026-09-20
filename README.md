@@ -435,7 +435,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 | field | default | change it when |
 |---|---|---|
 | `metal` | `False` | you want the ~40x forward kernel and do not need gradients. `m <= 4`, one jitter. Warns if it cannot be honoured. |
-| `metal_block` | `1024` | N >= 1e5: 4096 is better, 8192 better still (13.1 vs 16.5 ms at N=1e5). |
+| `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
 | `eval_blocks` | `False` | you are memory-bound and can give up `mx.compile`. The `.hi` path sets it itself. |
@@ -481,6 +481,17 @@ marked as an estimate.
   inside `terms._sho_matrices`. Running the front end eager and the rest
   compiled measured 1.15-1.25x on the gradient; worth more in a quiet
   window. Moot once M4 lands.
+* **Per-block gradient checkpointing: measured, and not taken.**
+  `mx.checkpoint` around each block's `leaf_inputs -> chunked_reduce` trades
+  time for the leaf arrays the backward pass would otherwise hold. Measured
+  at 512 chains x N = 3e4: peak 6.26 -> 2.61 GiB for 1559 -> 1901 ms, i.e.
+  2.4x the memory for 22% of the time. `block` already gives a coarser
+  memory lever at a similar price, and M4 replaces this path, so it is not
+  worth a policy knob. Recorded because the obvious implementation is
+  **wrong**: build the `get_mat` closure outside the checkpointed function
+  and MLX treats the term matrices as constants, so the gradient silently
+  loses the whole kernel-parameter path — measured 337 absolute against a
+  correct gradient, with the *value* still bit-identical. Build it inside.
 * **Symmetric storage for C and J.** 15 numbers instead of 17 at m = 2, 45
   instead of 57 at m = 4. Marginal in MLX, and immaterial in the kernel
   (block outputs are 0.05 GiB) — kept here only so nobody re-derives it.
