@@ -238,14 +238,48 @@ def test_auto_metal_block_matches_the_measured_optimum(n_data, want):
     1024 was 1.26x and 1.29x off at the two larger sizes.
     """
     from anvilgp.likelihood import _auto_metal_block
-    assert _auto_metal_block(n_data) == want
+    assert _auto_metal_block(n_data, 2) == want
+
+
+@pytest.mark.parametrize("n_state,cap", [(2, 8192), (3, 2048), (4, 1024)])
+def test_auto_metal_block_caps_long_blocks_at_high_state_dimension(n_state,
+                                                                   cap):
+    """A thread walks its whole block, so block length is a time limit.
+
+    Per-observation work grows like m^3, and macOS kills a command buffer
+    that runs too long. At N = 1e5 and 512 chains the uncapped rule chose
+    8192 for every m; at m = 4 that is not slow, it is
+    "[METAL] Command buffer execution failed: Impacting Interactivity",
+    and 4096 fails too while 2048 failed in one run and not another. The
+    cap keeps every state dimension inside the watchdog with margin.
+    """
+    from anvilgp.likelihood import _auto_metal_block
+    assert _auto_metal_block(1_000_000, n_state) == cap
+    assert _auto_metal_block(10_000, n_state) <= cap
+
+
+@pytest.mark.slow
+def test_the_kernel_survives_a_large_high_state_problem():
+    """The configuration that the uncapped block rule killed."""
+    n, n_chains = 100_000, 512
+    rng = np.random.default_rng(0)
+    t = np.sort(rng.uniform(0.0, 300.0, n))
+    y = rng.standard_normal(n) * 0.9
+    refs = [1.0, 7.0, 3.0, 1.0, 0.4]
+    gp = GPLogLike(None, t, None, y, np.full(n, 0.3), ag.RotationTerm(),
+                   ParamMap.log(refs), GPPolicy(block=4096, metal=True))
+    assert gp.metal_block <= 1024, "m = 4 must not get a long block"
+    u = mx.array(rng.standard_normal((n_chains, 5)).astype(np.float32) * 0.01)
+    with mx.stream(mx.gpu):
+        out = np.array(gp(u))
+    assert np.all(np.isfinite(out))
 
 
 def test_metal_block_is_resolved_on_the_instance():
     """`GPPolicy.metal_block=None` must become a concrete value."""
     auto = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
                      ParamMap.const([1.3, 4.0, 3.0]), GPPolicy(metal=True))
-    assert isinstance(auto.metal_block, int) and auto.metal_block >= 1024
+    assert isinstance(auto.metal_block, int) and 256 <= auto.metal_block <= 8192
     fixed = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
                       ParamMap.const([1.3, 4.0, 3.0]),
                       GPPolicy(metal=True, metal_block=512))

@@ -139,15 +139,26 @@ print(f"stability probe: {base:.1f} ms, spread across 3 rounds {spread:.1%}"
       + ("" if spread <= 0.10 else "   <-- too noisy to judge timings"))
 print()
 
+# Two interleaved passes, best of both. Conditions drift during a run, and
+# a short row (the Metal kernel is ~13 ms at N = 1e5) is far more sensitive
+# to one scheduling hiccup than a long one; a single pass reported 24.8 ms
+# for a row that measures 13.8 when timed on its own.
+results = {}
+for _ in range(2):
+    for label, claimed, fn, kind in CLAIMS:
+        if kind == "time" and spread > 0.10:
+            continue
+        got = fn()
+        prev = results.get(label)
+        results[label] = got if prev is None else min(prev, got)
+
 print(f"{'claim':>40s} {'README':>9s} {'measured':>9s}   verdict")
-worst = 0.0
 for label, claimed, fn, kind in CLAIMS:
-    if kind == "time" and spread > 0.10:
+    if label not in results:
         print(f"{label:>40s} {claimed:>9.1f} {'--':>9s}   skipped (too noisy)")
         continue
-    got = fn()
+    got = results[label]
     ratio = got / claimed
-    worst = max(worst, ratio)
     ok = ratio <= 1.0 + a.tol
     print(f"{label:>40s} {claimed:>9.3g} {got:>9.3g}   "
           f"{'ok' if ok else 'OVER'} ({ratio:.2f}x)")

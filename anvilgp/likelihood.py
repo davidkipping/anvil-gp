@@ -426,7 +426,8 @@ class GPLogLike:
 
         self.metal_block = (self.policy.metal_block
                             if self.policy.metal_block is not None
-                            else _auto_metal_block(self.n_data))
+                            else _auto_metal_block(self.n_data,
+                                                   kernel_spec.n_state))
 
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
@@ -758,14 +759,26 @@ def _auto_sub_block(m: int) -> int:
     return 64
 
 
-def _auto_metal_block(n_data: int) -> int:
+#: longest block we will hand one thread, by state dimension.  A thread
+#: walks its whole block sequentially, so block length sets how long a
+#: single command buffer runs, and macOS kills one that runs too long
+#: ("Impacting Interactivity").  Per-observation work grows like m^3, so
+#: the safe length falls as m rises.  Measured at N = 1e5: m = 2 is fine at
+#: 8192 (13 ms); m = 4 at 4096 and 8192 is *killed* at 512 chains, and 2048
+#: sits close enough to the edge that it failed in one run and not another.
+_MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048}
+_MAX_METAL_BLOCK_HI_M = 1024
+
+
+def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
     """Default observations per kernel thread.
 
     Two costs pull against each other: a longer block means fewer, longer
     sequential walks in registers (good, the kernel's whole point), but also
     fewer threads to fill the GPU with (bad below a few thousand threads).
-    Aim for a few dozen blocks per chain -- N/12 rounded to a power of two,
-    clamped to [1024, 8192].
+    Aim for a few dozen blocks per chain -- N/12 rounded to a power of two --
+    then cap by state dimension so a single thread cannot run long enough
+    for the GPU watchdog to kill the command buffer.
 
     Measured, whole compiled path at 1024 chains, interleaved in one window:
 
@@ -774,8 +787,14 @@ def _auto_metal_block(n_data: int) -> int:
         3e4      6.7     6.2     4.9     5.7                    2048
         1e5     17.5    17.2    17.2    16.6    13.3    22.2     8192
 
-    The rule picks the best column at every size; the old fixed 1024 was
-    1.26x off at N = 3e4 and 1.29x off at N = 1e5.
+    and at m = 4 (rotation), where the cap binds:
+
+        N = 1e4, 1024 chains:  256:110  512:102  1024:65  2048:63  4096:83
+        N = 1e5,  512 chains:  256:173  512:156  1024:187  2048:191
+                               4096: KILLED     8192: KILLED
+
+    The uncapped rule picked 8192 at N = 1e5 for every m, which is a hard
+    failure at m = 4 rather than a slow path.
     """
     target = max(1.0, n_data / 12.0)
     p = 1
@@ -783,7 +802,8 @@ def _auto_metal_block(n_data: int) -> int:
         p *= 2
     if target - p > 2 * p - target:   # round to the *nearest*, not up
         p *= 2
-    return max(1024, min(8192, p))
+    cap = _MAX_METAL_BLOCK.get(n_state, _MAX_METAL_BLOCK_HI_M)
+    return max(256, min(cap, p))
 
 
 def _pow2(n: int) -> int:
