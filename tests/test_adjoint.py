@@ -251,3 +251,39 @@ def test_blocked_backward_with_floor_equals_the_whole_series_one(blk):
     for name, a, b in zip(NAMES, want, got):
         scale = max(float(mx.max(mx.abs(a))), 1e-12)
         assert float(mx.max(mx.abs(a - b))) / scale < 1e-12, name
+
+
+def test_the_floor_convention_differs_from_production_and_is_documented():
+    """A latent mismatch that M4 must resolve before any kernel is written.
+
+    This spec floors the *filter* innovation variance
+    ``S = h (Phi P Phi^T + Q) h^T + r_var``; ``elements.leaf_elements`` and
+    the Metal forward kernel floor the *leaf* quantity
+    ``s_q = h Q h^T + r_var``.  They differ by ``alpha >= 1``, so they bind
+    on different lanes.  Production never binds either, which is why this
+    has gone unnoticed; a backward kernel written against this convention
+    would differentiate a function the forward does not compute, on exactly
+    the lanes the package documents as sensitive.
+
+    The test pins the discrepancy rather than hiding it, so that whoever
+    resolves it has to delete this test deliberately.
+    """
+    from anvilgp.elements import chunked_reduce, leaf_elements
+
+    phi, q, h, y, rv, rr, _ = _problem(0)
+    k = phi.shape[1]
+
+    no_floor = mx.max(mx.abs(
+        sequential_loglike(phi, q, h, y, rv, rr, None)
+        - chunked_reduce(*leaf_elements(phi, q, h, y, rv, rr, None),
+                         sub_len=1).ell))
+    assert float(no_floor) < 1e-10, "with no floor the two must agree"
+
+    high = mx.full((k,), 4.0, dtype=D)
+    with_floor = mx.max(mx.abs(
+        sequential_loglike(phi, q, h, y, rv, rr, high)
+        - chunked_reduce(*leaf_elements(phi, q, h, y, rv, rr, high),
+                         sub_len=1).ell))
+    assert float(with_floor) > 1e-3, (
+        "if this now agrees, the conventions have been unified -- good; "
+        "delete this test and the note in filter_forward's docstring")

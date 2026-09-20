@@ -81,12 +81,25 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
     the first observation makes that the stationary prior).
 
     ``s_floor`` is the per-observation floor on the innovation variance,
-    exactly as :func:`anvilgp.kalman.sequential_loglike` and
-    :func:`anvilgp.elements.leaf_elements` apply it.  It is not optional
-    decoration: this function is the specification the Metal backward kernel
-    is written against, and a kernel that omitted the floor would disagree
-    with the forward it is differentiating precisely on the lanes where
-    positive-definiteness has already failed.
+    applied exactly as :func:`anvilgp.kalman.sequential_loglike` applies it.
+    It is not optional decoration: this function is the specification the
+    Metal backward kernel is written against, and a kernel that omitted the
+    floor would disagree with the forward it is differentiating precisely on
+    the lanes where positive-definiteness has already failed.
+
+    **But it is not the same quantity that production floors, and that has
+    to be settled before the kernel is written.**  Here and in
+    ``kalman.py`` the floor lands on the *filter* innovation variance
+    ``S = h (Phi P Phi^T + Q) h^T + r_var``.  In
+    :func:`anvilgp.elements.leaf_elements` -- and in the Metal forward
+    kernel, which is what a gradient would actually differentiate -- it
+    lands on the *leaf* quantity ``s_q = h Q h^T + r_var``.  The two differ
+    by ``alpha = 1 + z^T C1 z >= 1``, so they bind on different lanes: with
+    a floor high enough to bind, the two paths disagree by ~0.1 log-units
+    in float64.  In production neither binds (``s_floor_rel = 1e-6`` against
+    ``r_var >= r_ref``), so this is latent rather than live, and
+    ``tests/test_adjoint.py`` cannot see it because both sides there use the
+    filter convention.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     dtype = phi.dtype
