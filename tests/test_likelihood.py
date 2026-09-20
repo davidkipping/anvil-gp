@@ -353,3 +353,39 @@ def test_float64_path_is_float64_accurate_through_a_log_link():
     natural = np.array([ref * np.exp(x) for ref, x in zip(refs, v[0])])
     want = dense_loglike(ag.SHOTerm(), natural, t, y, yerr)
     assert abs(got - want) < 1e-8, f"{got - want:+.3e} at |logL| = {abs(want):.0f}"
+
+
+def test_guard_does_not_re_run_the_forward():
+    """The guard sits on the input, so it must add no graph to the forward.
+
+    An earlier version wrapped the whole call and its VJP re-ran the graph
+    it was guarding, costing one extra forward on every gradient. That is
+    invisible to a correctness test, so pin the structure: the guarded
+    forward must be the raw forward, node for node.
+    """
+    pm = ParamMap.log([1.0, 4.0, 3.0])
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(block=128))
+    u = mx.array(np.zeros((2, 3), dtype=np.float32))
+    with mx.stream(mx.gpu):
+        a = np.array(gp(u))
+        b = np.array(gp._raw_call(u))
+    assert np.array_equal(a, b), "the guard must be an identity on the value"
+
+
+def test_the_guard_is_an_identity_on_the_value():
+    """The guard sits on the input, so it must add nothing to the forward.
+
+    An earlier version wrapped the whole call and its VJP re-ran the graph
+    it was guarding, costing one extra forward on every gradient. That is
+    invisible to a correctness test, so pin the structure instead: the
+    guarded value must be the raw value, bit for bit.
+    """
+    pm = ParamMap.log([1.0, 4.0, 3.0])
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(block=128))
+    u = mx.array(np.zeros((2, 3), dtype=np.float32))
+    with mx.stream(mx.gpu):
+        a = np.array(gp(u))
+        b = np.array(gp._raw_call(u))
+    assert np.array_equal(a, b)

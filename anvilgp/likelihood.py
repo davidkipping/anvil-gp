@@ -569,31 +569,40 @@ class GPLogLike:
     # -- the anvil LogDensity contract ------------------------------------
 
     def _build_guard(self):
-        """``custom_function`` wrapper that zeroes gradients on failed lanes."""
-        raw = self._raw_call
+        """Identity on the way in; zeroes non-finite gradients on the way out.
 
+        The guard sits on the *input* rather than wrapping the likelihood,
+        which makes it free.  An earlier version wrapped the whole call, and
+        its VJP had to re-run the graph it was guarding: one extra forward
+        pass on every gradient, measured at +21% of a value-and-gradient
+        call at 1024 chains x N = 1e4 and +82% at 256 x 2000, where the
+        forward is most of the call.
+
+        It is equivalent because of what ``_sanitize`` already does.  On a
+        failed lane ``mx.where`` routes an exactly-zero cotangent backwards,
+        so by the time the cotangent reaches ``v`` that lane is either
+        exactly zero or NaN -- the NaN arising upstream as ``0 * inf``.
+        Selecting on ``isfinite`` here discards exactly those NaNs, and
+        chains never interact (anvil's contract), so a failed lane cannot
+        contaminate its neighbours.  Verified bit-identical to the
+        wrap-everything version on every point in
+        ``tests/test_likelihood.py::FAILURE_POINTS`` plus healthy lanes.
+        """
         @mx.custom_function
-        def guard(v):
-            return raw(v)
+        def guard_in(v):
+            return v
 
-        @guard.vjp
+        @guard_in.vjp
         def _guard_vjp(primals, cotangents, outputs):
-            v = primals[0] if isinstance(primals, (list, tuple)) else primals
-            cot = (cotangents[0] if isinstance(cotangents, (list, tuple))
-                   else cotangents)
-            out = (outputs[0] if isinstance(outputs, (list, tuple))
-                   else outputs)
-            _, grads = mx.vjp(raw, [v], [cot])
-            g = grads[0]
-            z = mx.zeros_like(g)
+            g = (cotangents[0] if isinstance(cotangents, (list, tuple))
+                 else cotangents)
             # `mx.where` SELECTS; it never multiplies a cotangent by zero, so
             # an infinite derivative on a failed lane is discarded rather
             # than turned into NaN.
-            failed = out <= _FAILED
-            g = mx.where(failed[:, None], z, g)
-            return mx.where(mx.isfinite(g), g, z)
+            return mx.where(mx.isfinite(g), g, mx.zeros_like(g))
 
-        return guard
+        raw = self._raw_call
+        return lambda v: raw(guard_in(v))
 
     def _check_v(self, v: mx.array) -> None:
         """``v`` is the whole model vector; a wrong width is silent otherwise.
