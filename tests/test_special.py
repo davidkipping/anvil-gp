@@ -9,7 +9,6 @@ import pytest
 
 from anvilgp import special as sp
 
-mx.set_default_device(mx.cpu)
 D = mx.float64
 
 

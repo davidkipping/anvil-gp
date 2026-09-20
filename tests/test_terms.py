@@ -18,7 +18,6 @@ import pytest
 
 import anvilgp as ag
 
-mx.set_default_device(mx.cpu)
 D = mx.float64
 
 DT = np.concatenate([[0.0], np.logspace(-9, 2, 30)])

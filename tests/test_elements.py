@@ -13,10 +13,10 @@ import numpy as np
 import pytest
 
 from anvilgp.elements import (Element, LeafRank1, chunked_reduce, combine,
+                              first_point,
                               combine_leaf, identity_element, leaf_elements,
                               tree_reduce)
 
-mx.set_default_device(mx.cpu)
 D = mx.float64
 M = 2
 
@@ -99,10 +99,7 @@ def _leaves(rng, k, term, p):
     y = rng.standard_normal((1, k))
     P = mx.array(np.array([p]), dtype=D)
     phi, q, h = term.matrices(P, mx.array(dt, dtype=D))
-    keep = mx.concatenate([mx.zeros((1, 1, 1, 1), dtype=D),
-                           mx.ones((1, k - 1, 1, 1), dtype=D)], axis=1)
-    phi = phi * keep
-    q = q * keep + (1.0 - keep) * mx.eye(term.n_state, dtype=D)
+    phi, q = first_point(phi, q)
     return leaf_elements(phi, q, h, mx.array(y, dtype=D),
                          mx.full((1, k), 0.09, dtype=D),
                          mx.full((k,), 0.09, dtype=D))     # (Element, LeafRank1)
@@ -139,10 +136,7 @@ def test_tree_gradient_equals_the_left_fold_gradient(k):
 
     def build(P):
         phi, q, h = term.matrices(P, mx.array(dt, dtype=D))
-        keep = mx.concatenate([mx.zeros((1, 1, 1, 1), dtype=D),
-                               mx.ones((1, k - 1, 1, 1), dtype=D)], axis=1)
-        phi = phi * keep
-        q = q * keep + (1.0 - keep) * mx.eye(2, dtype=D)
+        phi, q = first_point(phi, q)
         return leaf_elements(phi, q, h, y, mx.full((1, k), 0.09, dtype=D),
                              mx.full((k,), 0.09, dtype=D))
 
@@ -223,10 +217,7 @@ def test_chunked_reduce_gradient_matches_finite_differences(sub_len):
 
     def f(P):
         phi, q, h = term.matrices(P, mx.array(dt, dtype=D))
-        keep = mx.concatenate([mx.zeros((1, 1, 1, 1), dtype=D),
-                               mx.ones((1, k - 1, 1, 1), dtype=D)], axis=1)
-        phi = phi * keep
-        q = q * keep + (1.0 - keep) * mx.eye(2, dtype=D)
+        phi, q = first_point(phi, q)
         lv, r1 = leaf_elements(phi, q, h, y, mx.full((1, k), 0.09, dtype=D),
                                mx.full((k,), 0.09, dtype=D))
         return chunked_reduce(lv, r1, sub_len=sub_len).ell
@@ -272,10 +263,7 @@ def _both_leaf_forms(rng, k, term, p):
     y = mx.array(rng.standard_normal((1, k)), dtype=D)
     P = mx.array(np.array([p]), dtype=D)
     phi_b, q_b, h = term.matrices_blocks(P, mx.array(dt, dtype=D))
-    keep = mx.concatenate([mx.zeros((1, 1, 1, 1), dtype=D),
-                           mx.ones((1, k - 1, 1, 1), dtype=D)], axis=1)
-    phi_b = [b * keep for b in phi_b]
-    q_b = [b * keep + (1.0 - keep) * mx.eye(b.shape[-1], dtype=D) for b in q_b]
+    phi_b, q_b = first_point(phi_b, q_b)
     rv, rr = mx.full((1, k), 0.09, dtype=D), mx.full((k,), 0.09, dtype=D)
     dense = leaf_elements(_block_diag(*phi_b), _block_diag(*q_b), h, y, rv, rr)
     return dense, leaf_parts(phi_b, q_b, h, y, rv, rr)

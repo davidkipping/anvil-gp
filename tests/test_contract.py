@@ -13,9 +13,6 @@ from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam, ParamMap,
                                 a64)
 from anvilgp.oracle import dense_loglike
 
-# float64 arrays cannot be *created* on the GPU stream, so the module default
-# is the CPU and the float32 paths opt into the GPU explicitly.
-mx.set_default_device(mx.cpu)
 
 N = 384
 _rng = np.random.default_rng(21)

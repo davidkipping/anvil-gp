@@ -22,7 +22,6 @@ from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam, ParamMap,
                                 a64)
 from anvilgp.oracle import celerite2_loglike, dense_loglike, sample_ssm
 
-mx.set_default_device(mx.cpu)
 import celerite2.terms as c2t   # a declared test dep: never skip M1 parity
 
 N = 512

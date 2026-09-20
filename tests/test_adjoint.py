@@ -18,9 +18,9 @@ import pytest
 
 from anvilgp.adjoint import (blocked_backward, filter_backward,
                              filter_forward)
+from anvilgp.elements import first_point
 from anvilgp.kalman import sequential_loglike
 
-mx.set_default_device(mx.cpu)
 D = mx.float64
 NAMES = ["phi", "q", "h", "y", "r_var"]
 
@@ -123,10 +123,7 @@ def test_prefix_scan_is_the_kalman_filter_state():
     y = mx.array(rng.standard_normal((1, k)), dtype=D)
     p = mx.array(np.array([[1.3, 4.0, 3.0]]), dtype=D)
     phi, q, h = ag.SHOTerm().matrices(p, mx.array(dt, dtype=D))
-    keep = mx.concatenate([mx.zeros((1, 1, 1, 1), dtype=D),
-                           mx.ones((1, k - 1, 1, 1), dtype=D)], axis=1)
-    phi = phi * keep
-    q = q * keep + (1.0 - keep) * mx.eye(2, dtype=D)
+    phi, q = first_point(phi, q)
     rv = mx.full((1, k), 0.09, dtype=D)
     rr = mx.full((k,), 0.09, dtype=D)
     pre = prefix_scan(leaf_elements(phi, q, h, y, rv, rr)[0])

@@ -23,7 +23,6 @@ import anvilgp as ag
 from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap, a64
 from anvilgp.oracle import dense_covariance
 
-mx.set_default_device(mx.cpu)
 
 N = 800
 BASELINE = 40.0

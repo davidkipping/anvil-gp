@@ -1,12 +1,11 @@
 """Shared test scaffolding.
 
-Three things were repeated across every test module and are now here: the
-default device, the unrolled-linalg switch, and a float64 central-difference
-helper.  Nothing in this file changes what is tested -- it only stops nine
-copies of the same four lines drifting apart.
+Two things were repeated across every test module and are now here: the
+default device and the unrolled-linalg switch.  Nothing in this file
+changes what is tested -- it only stops ten copies of the same lines
+drifting apart.
 """
 
-import numpy as np
 import mlx.core as mx
 import pytest
 
@@ -33,21 +32,3 @@ def unrolled():
         yield
     finally:
         linalg.FORCE_UNROLLED = False
-
-
-def central_diff(f, x0, i, h=None, dtype=np.float64):
-    """d f / d x0[i] by a float64 central difference.
-
-    ``f`` takes a numpy array and returns a float.  ``h`` defaults to a
-    step scaled to the coordinate, which is what keeps the truncation and
-    rounding errors balanced.
-    """
-    x0 = np.asarray(x0, dtype=dtype)
-    if h is None:
-        h = 1e-5 * max(1.0, abs(float(x0.ravel()[i])))
-    flat = x0.ravel()
-    up, dn = flat.copy(), flat.copy()
-    up[i] += h
-    dn[i] -= h
-    return (f(up.reshape(x0.shape)) - f(dn.reshape(x0.shape))) / (2.0 * h)
-

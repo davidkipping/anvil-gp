@@ -10,7 +10,6 @@ import anvilgp as ag
 from anvilgp import priors
 from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
 
-mx.set_default_device(mx.cpu)
 
 rng = np.random.default_rng(3)
 N = 400

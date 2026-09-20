@@ -18,7 +18,6 @@ from anvilgp.likelihood import a64
 # the CPU; the device-specific checks below opt into the GPU explicitly.  Set
 # here rather than relying on another test module having done it -- these
 # tests must hold when this file is run on its own.
-mx.set_default_device(mx.cpu)
 
 
 def test_mx_array_silently_downcasts_float64_numpy():
