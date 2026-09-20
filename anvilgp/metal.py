@@ -9,8 +9,10 @@ block of observations with the running element **in registers** writes none
 of it: one element per *block* reaches memory instead of one per point.
 
 This is Design C's pass 1.  Pass 2 -- composing the ~N/L block elements per
-chain -- stays in MLX, where it is a handful of tree levels over a small
-array and costs nothing worth fusing.
+chain -- stays in MLX for now.  It is a handful of tree levels over a small
+array, but they are launch-bound: at N = 1e4 that reduction is most of the
+remaining wall time of the whole path, so folding it into the kernel is an
+M4 work item rather than the non-issue this note once called it.
 
 What the kernel does *not* do, deliberately
 -------------------------------------------

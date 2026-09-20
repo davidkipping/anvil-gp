@@ -167,17 +167,28 @@ rounding rather than a defect.
 
 ## Compiled gradients: a hard MLX limit
 
-`mx.compile` over the **backward** pass of the element algebra fails for
+`mx.compile` over the **backward** pass of the whole likelihood fails for
 m ≥ 2 with *"Too many inputs/outputs fused in the Metal Compiled
 primitive which exhausted the available argument buffers for the kernel"*.
-MLX fuses the unrolled Cholesky's long dependent elementwise chain into one
-Metal kernel with more buffer arguments than the hardware allows.
+MLX fuses a long dependent elementwise chain into one Metal kernel with
+more buffer arguments than its limit of 24 arrays per fused group allows.
 
 Characterised:
 
 * structural, not size-dependent — identical failure at N = 128 and N = 1000;
-* absent at m = 1 (`RealTerm`), where the Cholesky is a single `sqrt`;
-* forward-only compilation is unaffected at every size and every m.
+* absent at m = 1 (`RealTerm`);
+* forward-only compilation is unaffected at every size and every m;
+* **it is not the Cholesky.** An earlier version of this note blamed the
+  unrolled factorisation, which made the problem look unfixable. Bisected
+  2026-09-19: `chol`, `combine`, `combine_leaf`, `leaf_elements` and the
+  whole leaf → fold → tree chain each compile under `mx.vjp` on their own,
+  and so does `(phi_table, q_table, h) → ell` end to end. What fails is
+  the front end — `kernel_params` plus `terms.matrices`, i.e. the fused
+  chain inside `_sho_matrices` (`damped_cos_sinc`, `gamma3`, `sincm1` and
+  their ~20 intermediates). Splitting the VJP at the term-matrix table
+  therefore recovers most of it; that is tracked in the README's "What is
+  left" rather than done, because M4's backward kernel removes the graph it
+  would optimise.
 
 anvil's ChEES kernel compiles its leapfrog step, so ChEES-HMC cannot run on a
 GP target without `mx.disable_compile()`. With it, 30 ChEES steps over 64

@@ -30,7 +30,8 @@ on-GPU and it is the parity baseline for the fused Metal kernel, which
 executes the *same* composition on the same block boundaries.
 
 **Blocked.**  Leaves are built and reduced one data block at a time, with
-the per-block roots composed left-to-right.  The block loop bounds peak
+the per-block roots composed by a pairwise tree (a left fold made the block
+size a float32 precision knob; see ``GPLogLike._evaluate``).  The block loop bounds peak
 memory (an element is ``3m^2 + 2m + 1`` numbers, so 1024 chains x 4096
 points x m=4 is already ~1 GB in fp32) and is exactly the structure the
 Metal fast path uses -- pass 1 condenses a block, pass 2 composes the block
@@ -142,7 +143,8 @@ def use_blocked_leaves(block_sizes) -> bool:
     thermally sensitive -- the same A/B on a heat-soaked machine put m = 8 at
     2.36x -- so it decides the default but nothing rests on it.  The
     **memory** effect is large, monotone and reproducible: 5x at m = 10,
-    where the dense leaf array alone is 12 GiB.  At many-chain sizes that is
+    where the dense leaf array alone is 5 GiB (~12 GiB peak with the
+    composition's intermediates).  At many-chain sizes that is
     the difference between running and not.
 
     Note also that an *eager* microbenchmark of a single composition ranks

@@ -123,15 +123,17 @@ def test_linalg_is_cpu_only_and_has_no_vjp():
 
 
 def test_compiled_value_and_grad_exhausts_metal_argument_buffers():
-    """``mx.compile`` over the *backward* pass of the m >= 2 element algebra
+    """``mx.compile`` over the *backward* pass of the whole likelihood
     fails with "Too many inputs/outputs fused in the Metal Compiled
     primitive".
 
     Structural, not size-dependent: it fails identically at N = 128 and
-    N = 1000, and disappears at m = 1 where the Cholesky is a single sqrt.
-    MLX fuses the long dependent elementwise chain of the unrolled
-    factorisation's backward pass into one Metal kernel whose argument
-    buffer count exceeds the hardware limit.
+    N = 1000, and disappears at m = 1.  MLX fuses a long dependent
+    elementwise chain into one Metal kernel whose argument count exceeds
+    its limit of 24 arrays per fused group.  Bisected 2026-09-19: the
+    element algebra is NOT the culprit -- chol, combine, combine_leaf and
+    the whole leaf/fold/tree chain each compile under mx.vjp on their own.
+    The offending group is in the front end, inside terms._sho_matrices.
 
     It matters because anvil's ChEES kernel compiles its leapfrog step, so
     the gradient sampler cannot run on a GP target without either

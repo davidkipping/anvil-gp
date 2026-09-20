@@ -331,10 +331,11 @@ def test_float64_path_is_float64_accurate_through_a_log_link():
     Every parity test in this file uses ``link="const"``, which never
     touches an exponential.  Through a log link the path used ``mx.exp``,
     whose float64 implementation in MLX is only float32-accurate (~7e-7
-    relative): 2.0e-6 log-units at N = 2048, which scales to ~1e-2 at
-    N = 1e5 -- the same size as the float32 error ``.hi`` exists to
-    measure.  ``exp_acc`` is the accurate one, and is the native op in
-    float32 so the production path is untouched.
+    relative): 2.0e-6 log-units at N = 2048, 4.8e-6 at N = 8192, so about
+    sqrt(N) and ~1e-5 at N = 1e5.  Small in absolute terms, but ``.hi`` is
+    the reference every precision claim here is measured against, and it
+    should not be the limiting term.  ``exp_acc`` is the accurate one, and
+    is the native op in float32 so the production path is untouched.
     """
     n = 2048
     r = np.random.default_rng(3)

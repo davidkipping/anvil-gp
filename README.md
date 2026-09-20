@@ -126,7 +126,7 @@ that celerite2's Matérn-3/2 *converges to ours* as its `eps` shrinks
 (6.5e-3 → 6.5e-7 → 1.9e-10), which is what fixes the direction of the
 discrepancy.
 
-Beyond parity, the suite (381 tests, ~85 s) pins:
+Beyond parity, the suite pins (it runs in ~2 minutes):
 
 * the SSM identity `k(tau) = h Phi(tau) h^T` and the Lyapunov consistency
   `Q = I - Phi Phi^T` for all twelve term configurations;
@@ -355,7 +355,9 @@ attention. Three things were measured, and two of them contradicted the
 obvious guess:
 
 **The leaf array is the memory.** A dense leaf holds `3m^2 + 2m + 1` numbers
-per (chain, point); at 1024 chains x 4096 points x m = 10 that is 12 GiB.
+per (chain, point); at 1024 chains x 4096 points x m = 10 that is 5 GiB
+of leaf array, and ~12 GiB peak once the composition's intermediates are
+counted.
 Storing the *pieces* instead — `Phi` and `Q` as blocks, plus
 `kappa = Q h^T/sqrt(S)`, `z = (h Phi)^T/sqrt(S)`, `g = y/sqrt(S)` — costs
 `2 sum m_i^2 + 2m + 2`, and every component is recoverable
@@ -464,15 +466,21 @@ marked as an estimate.
   launch overhead of the general `combine`. A one-thread-per-chain Metal
   fold would put the whole path near 1.9 ms. M4 needs an in-kernel pass 2
   anyway.
-* **Leaf-formation unroll (measured, MLX path).** The three
-  `mx.sum`-over-broadcast reductions in `leaf_elements` cost 10.5 ms per
-  block; writing them as per-plane multiply-adds gives 111 -> 85 ms forward
-  and cuts gradient peak memory 7.45 -> 5.27 GiB. No numeric change.
-* **Bit-reversed leaf permutation (measured 2.0x, MLX path).** Storing each
+* **Bit-reversed leaf permutation (measured, MLX path).** Storing each
   block's leaves in fold-step order makes every fold step a contiguous slab
-  and every tree level a contiguous halving: 111 -> 55 ms forward at
-  N = 1e4, 1149 -> 541 at N = 1e5. Deferred because M4 replaces the path it
-  optimises.
+  and every tree level a contiguous halving. Measured 85 -> 55 ms forward
+  at N = 1e4 over the already-unrolled code, and 1.15x on the gradient.
+  Deferred: it rewrites the reduction's index plumbing, which is where the
+  `_pairs` workaround for MLX's strided-slice VJP bug lives, and M4
+  replaces the path it optimises.
+* **Compile the gradient by splitting the VJP at the term-matrix table.**
+  `mx.compile` over the whole backward pass fails, but bisection shows the
+  element algebra is not the cause — `chol`, `combine`, `combine_leaf` and
+  the whole leaf → fold → tree chain each compile under `mx.vjp`, as does
+  `(phi_table, q_table, h) → ell` end to end. The offending fused group is
+  inside `terms._sho_matrices`. Running the front end eager and the rest
+  compiled measured 1.15-1.25x on the gradient; worth more in a quiet
+  window. Moot once M4 lands.
 * **Symmetric storage for C and J.** 15 numbers instead of 17 at m = 2, 45
   instead of 57 at m = 4. Marginal in MLX, and immaterial in the kernel
   (block outputs are 0.05 GiB) — kept here only so nobody re-derives it.
@@ -627,13 +635,12 @@ Three more are worked around and pinned as regression tests
 * **M3 — fused Metal blocked-scan kernel: pass 1 done, forward only.**
   28-55x over the MLX path and 20-30x ahead of a 12-core celerite2 pool,
   which is the brief's denominator, so the >=100x gate is **not** cleared
-  (it is 142-264x against a single-core loop). 23 tests pin it against the
-  dense float64 oracle and the MLX path across every term type, every block
+  (it is 142-264x against a single-core loop). `tests/test_metal.py` pins
+  it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
   model. Still owed: m > 4, per-instrument jitter in-kernel, the float32
-  feasibility map, the thread-layout and pass-2 work listed under "What is
-  left" (1.5-1.9x, measured), and a test for Metal plus per-instrument
-  offsets, which is the one reachable branch nothing covers.
+  feasibility map, and the thread-layout and pass-2 work listed under "What
+  is left" (1.5-1.9x, measured).
 * **M4 — checkpointed backward kernel: foundation done, kernel next.** The
   mathematics is derived and verified; what remains is the Metal port and one
   structural problem, described below. Gradients are correct today through
@@ -713,7 +720,7 @@ Three more are worked around and pinned as regression tests
 python -m venv .venv
 .venv/bin/pip install -e ".[test]"        # mlx, numpy; celerite2, mpmath, scipy for tests
 .venv/bin/pip install -e ../anvil         # for the engine integration only
-.venv/bin/python -m pytest tests -q       # 381 tests, ~85 s
+.venv/bin/python -m pytest tests -q       # ~2 min; -m 'not slow' for ~40 s
 .venv/bin/python examples/gp_injection_recovery.py
 ```
 

@@ -19,8 +19,8 @@ Gradient samplers need one extra line today::
     mx.disable_compile()
 
 anvil's ChEES kernel compiles its leapfrog step, and ``mx.compile`` over the
-*backward* pass of the m >= 2 element algebra exceeds Metal's argument-buffer
-limit (see docs/float32.md).  Forward-only compilation is fine, so the
+*backward* pass of the whole likelihood exceeds MLX's fused-group limit
+(the front end, not the element algebra; see docs/float32.md).  Forward-only compilation is fine, so the
 gradient-free stretch move needs nothing.  M4's backward kernel will
 remove the constraint; M3's forward kernel does not, being forward-only.
 """

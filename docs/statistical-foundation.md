@@ -93,7 +93,7 @@ object -- the one-step innovation variance `S = h Q h^T + r_var`, written
     C   = A2 M A2^T + C2
     eta = A1^T G^T (eta2 - J2 b1) + eta1
     J   = A1^T Jt A1 + J1
-    ell = ell1 + ell2 - sum log diag(chol S)
+    ell = ell1 + ell2 - sum log diag(chol Sig)
                       - 1/2 b1^T Jt b1 + eta2^T G b1 + 1/2 eta2^T M eta2
 
 `log|I + C1 J2| = log|Sig|` by Sylvester's identity, so the log-determinant is

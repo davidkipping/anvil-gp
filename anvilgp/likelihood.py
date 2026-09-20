@@ -138,7 +138,7 @@ class KernelParam:
     """
 
     link: str = "log"
-    index: int = -1
+    index: int | None = None
     ref: float = 1.0
     scale: float = 1.0
     value: float = 0.0
@@ -152,11 +152,18 @@ class KernelParam:
         self.value = float(self.value)
 
     def apply(self, v: mx.array) -> mx.array:
+        if self.link != "const" and self.index is None:
+            raise ValueError(
+                f"KernelParam(link={self.link!r}) needs an `index`: which "
+                "column of v it reads. Only link='const' may omit it.")
         # exp_acc, not mx.exp: MLX's float64 exp is only float32-accurate
-        # (~7e-7 relative), which would put a float32 floor under the whole
-        # ".hi" verification path -- measured at 2.1e-4 log-likelihood units
-        # at N = 2048 with a log link, i.e. 1e-2 at N = 1e5, which is the
-        # size of the float32 error .hi exists to measure.  In float32
+        # (~7e-7 relative), which puts a float32-sized floor under the
+        # ".hi" verification path.  Measured against a dense fp64 Cholesky
+        # through a log link: 2.0e-6 log-units at N = 2048 and 4.8e-6 at
+        # N = 8192, i.e. growing about as sqrt(N), so ~1e-5 at N = 1e5.
+        # With exp_acc the same comparison is 1.7e-10, four orders better.
+        # Small in absolute terms, but .hi is the *reference* -- it should
+        # not be the thing limiting what it can certify.  In float32
         # exp_acc *is* the native op, so the production path is unchanged.
         n = v.shape[0]
         if self.link == "const":
@@ -763,9 +770,12 @@ def _sanitize(x: mx.array) -> mx.array:
     must get a large-negative *finite* log-likelihood and be rejected, not
     a NaN that poisons the whole ensemble's adaptation.
 
-    Both branches are sanitised: the good branch sees a finite value even on
-    failed lanes, so ``mx.where``'s VJP contributes zero rather than
-    ``0 * inf``.
+    This makes the **value** finite.  It does not on its own make the
+    gradient finite: ``mx.where``'s VJP does route an exactly-zero
+    cotangent to the failed lane, but the graph above has already produced
+    an infinite derivative there, and ``0 * inf`` is NaN however the zero
+    arrives.  Cutting that is the input-side guard's job; see
+    :meth:`GPLogLike.__call__`.
     """
     bad = mx.logical_not(mx.isfinite(x))
     safe = mx.where(bad, mx.zeros_like(x), x)

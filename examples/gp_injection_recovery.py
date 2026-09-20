@@ -14,8 +14,8 @@ count rather than by data, so 1024 chains cost only ~1.6x what 256 do:
 
 The gradient-free stretch move is used deliberately.  ChEES-HMC needs one
 extra line today (`mx.disable_compile()`), because anvil compiles its
-leapfrog step and `mx.compile` over the *backward* pass of the m >= 2 element
-algebra exceeds Metal's argument-buffer limit -- see docs/float32.md.
+leapfrog step and `mx.compile` over the *backward* pass of the whole
+likelihood exceeds MLX's fused-group limit -- see docs/float32.md.
 
 Run:  .venv/bin/python examples/gp_injection_recovery.py
 """
