@@ -657,7 +657,11 @@ Three more are worked around and pinned as regression tests
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
   model. Still owed: m > 4, per-instrument jitter in-kernel, the float32
   feasibility map, and the thread-layout and pass-2 work listed under "What
-  is left" (1.5-1.9x, measured).
+  is left" (1.5-1.9x, measured). The feasibility map now has evidence that
+  it matters: amplitude and correlation length are **not separable**. At
+  `sigma/yerr = 100` *and* `rho/dt = 1000` the MLX path is off by 1.5
+  log-units where either axis alone stays under 0.2, while the kernel holds
+  0.02. See `test_the_joint_high_amplitude_long_correlation_corner`.
 * **M4 — checkpointed backward kernel: foundation done, kernel next.** The
   mathematics is derived and verified; what remains is the Metal port and one
   structural problem, described below. Gradients are correct today through

@@ -31,6 +31,17 @@ and the absolute error follows it.  The consequences are the useful part:
   *quadratic* half that grows (4.6e-1 absolute against 1.6e-4 for the
   log-determinant).  That is the ``g^2`` cancellation in the general
   composition, and it is why ``sub_block`` is chosen for accuracy.
+* **The axes are not separable, and these panels cannot show that.** B
+  scans ``rho/dt`` at a modest amplitude and C scans amplitude at
+  ``rho = 100 dt``.  Their *product* is far worse than either: at
+  ``sigma/yerr = 100`` AND ``rho/dt = 1000``, N = 32768, the MLX path is
+  off by **1.5 log-units** and is not monotone in ``sub_block`` (64
+  measures -4.5 against -1.5 at 32), while the fused kernel is at 0.02.
+  ``validate_precision`` warns on the MLX path there and passes the
+  kernel, so it is detected rather than silent;
+  ``test_the_joint_high_amplitude_long_correlation_corner`` pins it.  The
+  full 2-D ``(sigma/yerr, rho/dt)`` map is the M3 deliverable still owed,
+  and this is the evidence that it is worth doing.
 * Panel C is the amplitude axis, and it is the one that bit.  An earlier
   version of this script held the *data* at ``SIGMA = 1.0`` while scaling
   the model ``sigma``, which makes the model mismatched rather than
