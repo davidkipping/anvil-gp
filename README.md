@@ -641,12 +641,19 @@ Three more are worked around and pinned as regression tests
   speed, and only with `mx.disable_compile()`. The VJP hook is in place at
   `anvilgp/metal.py::_core_vjp`.
 
-  Two practical limits to know before relying on it: a gradient at the
-  brief's realistic kernel (rotation + granulation, m = 6) costs 8.8 s per
-  call at 256 chains and N = 1e4, and a ChEES run started deep in the
-  infeasible region with anvil's default leapfrog cap exhausts Metal's
-  buffer limit. Cap `max_leapfrog` until the kernel lands. The stretch move
-  has neither problem.
+  Two practical limits to know before relying on it. A gradient at the
+  brief's realistic kernel (rotation + granulation, m = 6) costs seconds
+  per call at 256 chains and N = 1e4. And a ChEES chain started deep in a
+  bounded parameter's prior tail never moves again — not because of
+  anything here (the GP likelihood and its gradient stay finite well past
+  the point where anvil's own transform returns `-inf`) but because the
+  transform's Jacobian gradient reaches ~6e8 there against ~5e2 for a
+  healthy chain, and ChEES adapts one step size for the whole ensemble.
+  Capping `max_leapfrog` does not help; an earlier version of this note
+  claimed it was a Metal buffer limit, which was wrong. Full measurements
+  and suggested fixes: [docs/anvil-chees-boundary.md](docs/anvil-chees-boundary.md).
+  The healthy chains are unaffected, which is the part anvil-gp owes, and
+  the stretch move has neither problem.
 
   Done: `anvilgp/adjoint.py` holds the hand-derived adjoint of the filter
   log-likelihood, matching `mx.vjp` to ~1e-16 relative on all five inputs

@@ -157,3 +157,63 @@ def test_chains_started_in_the_infeasible_region_recover():
     assert np.all(np.isfinite(final))
     assert np.all(final > -1e29), (
         f"{int((final <= -1e29).sum())} chains never left the dead region")
+
+
+@pytest.mark.slow
+def test_a_stuck_chain_does_not_poison_the_ensemble_under_chees():
+    """What anvil-gp owes a gradient sampler deep in the prior tail.
+
+    The contract is not that every chain recovers -- that is the sampler's
+    business, and ChEES cannot do it here for a reason that belongs to
+    anvil's transform (see docs/anvil-chees-boundary.md).  The contract is
+    that a chain out there returns a finite value and a finite gradient, so
+    the *rest* of the ensemble keeps sampling.  A NaN would take all of it.
+
+    Half the ensemble starts at u = 15, which is ~15 sigma into the prior:
+    log-probability around -9000 against -800 for a healthy chain, and a
+    transform Jacobian gradient of ~6e8 against ~5e2.
+    """
+    anvil = pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+
+    rng = np.random.default_rng(5)
+    n = 400
+    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    yerr = np.full(n, YERR)
+    cov = dense_covariance(ag.SHOTerm(), np.array([SIGMA, RHO, QUAL]), t,
+                           yerr, jitter=JIT)
+    y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
+    tgt = make_target(ag.SHOTerm(), t, y, yerr)
+    dim = tgt.transform.dim
+
+    # value and gradient stay finite right up to where the transform itself
+    # saturates (float32 sigmoid hits exactly 1 near u = 18)
+    with mx.stream(mx.gpu):
+        for val in (5.0, 10.0, 15.0, 17.0):
+            u = mx.array(np.full((2, dim), val, dtype=np.float32))
+            lp = tgt.target.log_prob(u)
+            _, g = mx.vjp(tgt.target.log_prob, [u],
+                          [mx.ones((2,), dtype=mx.float32)])
+            mx.eval(lp, g)
+            assert bool(mx.all(mx.isfinite(lp))), val
+            assert bool(mx.all(mx.isfinite(g[0]))), val
+
+    n_chains, half = 16, 8
+    u0 = rng.standard_normal((n_chains, dim)).astype(np.float32) * 0.3
+    u0[:half] = 15.0
+
+    mx.disable_compile()                 # required for ChEES on a GP target
+    try:
+        with mx.stream(mx.gpu):
+            res = anvil.run(anvil.ChEESHMC(tgt.target, max_leapfrog=16),
+                            tgt.target, mx.array(u0), n_warmup=60,
+                            n_samples=20, seed=3, progress=False)
+            last = np.array(res.final_state["u"])
+            final = np.array(tgt.target.log_prob(mx.array(last)))
+    finally:
+        mx.enable_compile()
+
+    assert np.all(np.isfinite(final)), "no chain may go non-finite"
+    moved = np.abs(last - u0).max(axis=1)
+    assert np.all(moved[half:] > 1e-3), (
+        "the healthy half must keep sampling regardless of the stuck half")
