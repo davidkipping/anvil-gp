@@ -79,10 +79,21 @@ class LeafRank1(NamedTuple):
     ``z = (h Phi)^T / sqrt(S)`` and ``g = y / sqrt(S)``.  Carrying these
     alongside the assembled element is what lets :func:`combine_leaf` skip
     both Cholesky factorisations.
+
+    ``ld`` is the leaf's log-determinant term ``-1/2 log(S / r_ref)``, i.e.
+    its ``ell`` *without* the ``-g^2/2``.  It is carried separately because
+    ``combine_leaf`` needs exactly that: the assembled ``ell`` is
+    ``ld - g^2/2`` and the composition immediately adds ``+g^2/2`` back, so
+    forming either one costs a cancellation that ``g^2`` makes expensive.
+    At sigma_GP/yerr = 100 on-model, ``g^2 ~ 1e4`` against an ``ld`` of
+    order 1, so the round trip through the sum loses four digits at every
+    observation.  The dense ``Element.ell`` keeps the full value, because
+    the general :func:`combine` (and hence the pure-tree path) needs it.
     """
 
     z: mx.array
     g: mx.array
+    ld: mx.array
 
 
 class LeafParts(NamedTuple):
@@ -108,6 +119,8 @@ class LeafParts(NamedTuple):
     z: mx.array
     g: mx.array
     ell: mx.array
+    #: the log-determinant half of ``ell``; see :class:`LeafRank1`.
+    ld: mx.array
 
     @property
     def sizes(self):
@@ -262,9 +275,10 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     eta = g[..., None] * z
     b = k * y[..., None]
 
-    ell = -0.5 * (mx.log(s_q / r_ref) + g * g)
+    ld = -0.5 * mx.log(s_q / r_ref)
+    ell = ld - 0.5 * g * g
     return Element(A=a_mat, b=b, C=c_mat, eta=eta, J=j_mat, ell=ell), \
-        LeafRank1(z=z, g=g)
+        LeafRank1(z=z, g=g, ld=ld)
 
 
 def combine(e1: Element, e2: Element) -> Element:
@@ -368,7 +382,10 @@ def combine_leaf(e1: Element, e2: Element, r1: LeafRank1) -> Element:
     c = sym(matmul(e2.A, matmul(m_mat, mx.swapaxes(e2.A, -1, -2)))) + e2.C
     eta = za1 * (beta * inv_a)[..., None] + e1.eta
     j = outer(za1, za1) * inv_a[..., None, None] + e1.J
-    ell = (e1.ell + e2.ell + 0.5 * g * g
+    # `r1.ld`, not `e2.ell + g^2/2`: the leaf's ell is `ld - g^2/2` and this
+    # sum puts the `g^2/2` straight back, so the two cancel exactly in real
+    # arithmetic and lose four digits in float32 whenever g^2 >> ld.
+    ell = (e1.ell + r1.ld
            + 0.5 * mx.log(inv_a) - 0.5 * beta * beta * inv_a)
     return Element(A=a, b=b, C=c, eta=eta, J=j, ell=ell)
 
@@ -445,8 +462,36 @@ def _pad_to_pow2(e: Element, r1: LeafRank1):
     r1 = LeafRank1(
         z=mx.concatenate([r1.z, mx.zeros(extra + (e.m,), dtype=r1.z.dtype)],
                          axis=1),
-        g=mx.concatenate([r1.g, mx.zeros(extra, dtype=r1.g.dtype)], axis=1))
+        g=mx.concatenate([r1.g, mx.zeros(extra, dtype=r1.g.dtype)], axis=1),
+        ld=mx.concatenate([r1.ld, mx.zeros(extra, dtype=r1.ld.dtype)],
+                          axis=1))
     return e, r1, pad
+
+
+def _fold_ell_tree(acc, step, lo):
+    """Sequential fold whose ``ell`` is summed by a tree, not accumulated.
+
+    ``ell`` is a pure accumulator: no matrix recursion in :func:`combine` or
+    :func:`combine_leaf` reads it, so its additions can be reordered freely.
+    That matters because the running ``ell`` reaches the full ``|log L|``
+    (order 1e4-1e5 at production sizes) while each increment is order 1, so
+    a sequential float32 fold rounds at ``eps |log L|`` per step and those
+    roundings do not cancel.  Measured on-model at sigma_GP/yerr = 100,
+    N = 25000, sub_block 1024: +0.99 log-units sequential against -0.02 for
+    the same walk with the increments summed pairwise.
+
+    So: zero the accumulator's ``ell`` before each step, which makes the
+    step return its own increment, and add the increments up at the end.
+    ``step(acc, j)`` performs one composition.
+    """
+    zero = mx.zeros_like(acc.ell)
+    deltas = [acc.ell]
+    acc = acc._replace(ell=zero)
+    for j in range(1, lo):
+        acc = step(acc, j)
+        deltas.append(acc.ell)
+        acc = acc._replace(ell=zero)
+    return acc._replace(ell=mx.sum(mx.stack(deltas, axis=-1), axis=-1))
 
 
 def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16) -> Element:
@@ -485,12 +530,17 @@ def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16) -> Element:
               for f in Element._fields}
     zr = mx.reshape(r1.z, (n, n_sub, lo, e.m))
     gr = mx.reshape(r1.g, (n, n_sub, lo))
+    ldr = mx.reshape(r1.ld, (n, n_sub, lo))
 
     acc = Element(*(fields[f][:, :, 0] for f in Element._fields))
-    for j in range(1, lo):
+
+    def step(a, j):
         leaf = Element(*(fields[f][:, :, j] for f in Element._fields))
-        acc = combine_leaf(acc, leaf, LeafRank1(z=zr[:, :, j], g=gr[:, :, j]))
-    return tree_reduce(acc)
+        return combine_leaf(a, leaf,
+                            LeafRank1(z=zr[:, :, j], g=gr[:, :, j],
+                                      ld=ldr[:, :, j]))
+
+    return tree_reduce(_fold_ell_tree(acc, step, lo))
 
 # ---------------------------------------------------------------------------
 # block-structured leaves: same algebra, Phi's zeros never touched
@@ -570,10 +620,11 @@ def leaf_parts(phi_blocks, q_blocks, h, y, r_var, r_ref, s_floor=None):
     if s_floor is not None:
         s_q = mx.maximum(s_q, s_floor)
     inv_rs = mx.rsqrt(s_q)
+    g_v = y * inv_rs
+    ld = -0.5 * mx.log(s_q / r_ref)
     return LeafParts(phi_blocks=phi_blocks, q_blocks=q_blocks,
                      kappa=qh * inv_rs[..., None], z=hphi * inv_rs[..., None],
-                     g=y * inv_rs,
-                     ell=-0.5 * (mx.log(s_q / r_ref) + (y * inv_rs) ** 2))
+                     g=g_v, ell=ld - 0.5 * g_v * g_v, ld=ld)
 
 
 def _offsets(blocks):
@@ -593,7 +644,7 @@ def expand_leaf(parts: LeafParts):
     return (Element(A=phi - outer(k, z), b=k * g[..., None],
                     C=sym(q - outer(k, k)), eta=g[..., None] * z,
                     J=outer(z, z), ell=parts.ell),
-            LeafRank1(z=z, g=g))
+            LeafRank1(z=z, g=g, ld=parts.ld))
 
 
 def combine_leaf_blocked(e1: Element, parts: LeafParts) -> Element:
@@ -636,7 +687,8 @@ def combine_leaf_blocked(e1: Element, parts: LeafParts) -> Element:
 
     eta = za1 * (beta * inv_a)[..., None] + e1.eta
     j = outer(za1, za1) * inv_a[..., None, None] + e1.J
-    ell = (e1.ell + parts.ell + 0.5 * g * g
+    # see combine_leaf: `parts.ld`, never `parts.ell + g^2/2`
+    ell = (e1.ell + parts.ld
            + 0.5 * mx.log(inv_a) - 0.5 * beta * beta * inv_a)
     return Element(A=a, b=b, C=c, eta=eta, J=j, ell=ell)
 
@@ -672,7 +724,8 @@ def _pad_parts_to_pow2(parts: LeafParts):
     return LeafParts(grow_blocks(parts.phi_blocks, True),
                      grow_blocks(parts.q_blocks, False),
                      grow_vec(parts.kappa), grow_vec(parts.z),
-                     grow_vec(parts.g), grow_vec(parts.ell)), pad
+                     grow_vec(parts.g), grow_vec(parts.ell),
+                     grow_vec(parts.ld)), pad
 
 
 def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16) -> Element:
@@ -689,12 +742,13 @@ def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16) -> Element:
 
     phi_r = [resh(b) for b in parts.phi_blocks]
     q_r = [resh(b) for b in parts.q_blocks]
-    ka, zr, gr, er = (resh(parts.kappa), resh(parts.z),
-                      resh(parts.g), resh(parts.ell))
+    ka, zr, gr, er, ldr = (resh(parts.kappa), resh(parts.z), resh(parts.g),
+                           resh(parts.ell), resh(parts.ld))
 
     def slice_j(j):
         return LeafParts([b[:, :, j] for b in phi_r], [b[:, :, j] for b in q_r],
-                         ka[:, :, j], zr[:, :, j], gr[:, :, j], er[:, :, j])
+                         ka[:, :, j], zr[:, :, j], gr[:, :, j], er[:, :, j],
+                         ldr[:, :, j])
 
     acc, _ = expand_leaf(slice_j(0))
     for j in range(1, lo):

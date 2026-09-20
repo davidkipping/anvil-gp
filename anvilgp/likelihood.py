@@ -699,9 +699,30 @@ class GPLogLike:
 
 
 def _auto_sub_block(m: int) -> int:
-    """Default chunked-scan sub-block length for a state dimension."""
-    if m <= 4:
-        return 16
+    """Default chunked-scan sub-block length.
+
+    Chosen for *accuracy* first, speed second, because the two agree here.
+    The fold inside a sub-block is a cheap rank-one composition; the tree
+    above it is the expensive general one, and the general one is also
+    where float32 loses digits -- it cancels three terms of order ``g^2``
+    against each other, and ``g = y/sqrt(S)`` reaches ~100 on-model when
+    the GP amplitude is 100x the error bars.  So the residual error scales
+    with the *number* of general compositions, ``N / sub_block``.
+
+    Measured on-model at N = 1e5, sigma_GP/yerr = 30, and at
+    1024 chains x N = 1e4 for the wall times (interleaved, same window):
+
+        sub_block     error        forward     value+grad
+            16        -0.63         1.00x         1.00x
+            32        -0.17         0.92x         1.06x
+            64        -0.09         0.99x         1.38x
+           128        -0.043        1.49x         2.20x
+
+    32 is the knee: essentially free on both paths and 3.7x more accurate
+    than 16.  Past it accuracy is still bought, but with real time.  Raise
+    it by hand for a large, high-amplitude problem -- ``validate_precision``
+    on your own data is the thing to trust, and it will say so.
+    """
     if m <= 6:
         return 32
     return 64

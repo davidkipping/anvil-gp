@@ -190,7 +190,8 @@ def test_combine_leaf_equals_the_general_combine():
     for i in range(1, k):
         gen = combine(gen, at(i))
         fast = combine_leaf(fast, at(i),
-                            LeafRank1(z=r1.z[:, i], g=r1.g[:, i]))
+                            LeafRank1(z=r1.z[:, i], g=r1.g[:, i],
+                                      ld=r1.ld[:, i]))
     for f in Element._fields:
         a, b = np.array(getattr(gen, f)), np.array(getattr(fast, f))
         assert np.max(np.abs(a - b)) < 1e-12 * max(1.0, np.abs(a).max()), f
@@ -203,7 +204,8 @@ def test_combine_leaf_accepts_the_identity_padding():
     lv, r1 = _leaves(rng, 8, ag.SHOTerm(), [1.3, 4.0, 3.0])
     acc = Element(*[getattr(lv, f)[:, 0] for f in Element._fields])
     ident = identity_element((1,), M, D)
-    zero = LeafRank1(z=mx.zeros((1, M), dtype=D), g=mx.zeros((1,), dtype=D))
+    zero = LeafRank1(z=mx.zeros((1, M), dtype=D), g=mx.zeros((1,), dtype=D),
+                     ld=mx.zeros((1,), dtype=D))
     out = combine_leaf(acc, ident, zero)
     for f in Element._fields:
         assert np.max(np.abs(np.array(getattr(out, f))
@@ -309,12 +311,13 @@ def test_blocked_composition_equals_the_dense_one(name, cls, p):
         return LeafParts([b[:, i] for b in parts.phi_blocks],
                          [b[:, i] for b in parts.q_blocks],
                          parts.kappa[:, i], parts.z[:, i], parts.g[:, i],
-                         parts.ell[:, i])
+                         parts.ell[:, i], parts.ld[:, i])
 
     dense_acc = blocked_acc = at(0)
     for i in range(1, k):
         dense_acc = combine_leaf(dense_acc, at(i),
-                                 LeafRank1(z=r1.z[:, i], g=r1.g[:, i]))
+                                 LeafRank1(z=r1.z[:, i], g=r1.g[:, i],
+                                      ld=r1.ld[:, i]))
         blocked_acc = combine_leaf_blocked(blocked_acc, parts_at(i))
     for f in Element._fields:
         a = np.array(getattr(dense_acc, f))

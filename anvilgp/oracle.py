@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["dense_covariance", "dense_loglike", "dense_predict",
+__all__ = ["dense_covariance", "dense_loglike", "dense_predict", "sample_ssm",
            "celerite2_loglike"]
 
 
@@ -76,3 +76,33 @@ def celerite2_loglike(c2term, t, y, yerr, jitter=0.0) -> float:
     gp.compute(np.asarray(t, np.float64),
                yerr=np.sqrt(np.asarray(yerr, np.float64) ** 2 + jitter ** 2))
     return float(gp.log_likelihood(np.asarray(y, np.float64)))
+
+
+def sample_ssm(term, p, dt, n, rng):
+    """Draw ``n`` on-model observations from a term's own state-space model.
+
+    O(n) and exact in float64, so it reaches the N where float32 error in
+    the reduction becomes visible.  :func:`dense_covariance` plus a Cholesky
+    is O(n^3) and stops a couple of thousand points short of that.
+
+    On-model data is the honest input for a precision test.  Off-model
+    residuals are large and the quadratic form dominates; on model the
+    log-determinant and the quadratic form very nearly cancel, and what
+    survives that cancellation is what a sampler actually sees.  Regular
+    cadence, one lag, so ``dt`` is a scalar.
+    """
+    import mlx.core as mx
+    pp = mx.array([list(p)], dtype=mx.float64)
+    phi, q, h = term.matrices(pp, mx.array([dt], dtype=mx.float64))
+    Phi = np.array(phi, dtype=np.float64)[0, 0]
+    Q = np.array(q, dtype=np.float64)[0, 0]
+    H = np.array(h, dtype=np.float64)[0]
+    w, V = np.linalg.eigh(0.5 * (Q + Q.T))
+    LQ = V * np.sqrt(np.maximum(w, 0.0))
+    m = Phi.shape[0]
+    x = rng.standard_normal(m)
+    out = np.empty(n)
+    for i in range(n):
+        out[i] = H @ x
+        x = Phi @ x + LQ @ rng.standard_normal(m)
+    return out

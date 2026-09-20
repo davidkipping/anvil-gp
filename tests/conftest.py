@@ -50,3 +50,4 @@ def central_diff(f, x0, i, h=None, dtype=np.float64):
     up[i] += h
     dn[i] -= h
     return (f(up.reshape(x0.shape)) - f(dn.reshape(x0.shape))) / (2.0 * h)
+

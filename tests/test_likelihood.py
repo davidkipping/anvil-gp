@@ -20,7 +20,7 @@ import anvilgp as ag
 from anvilgp.kalman import sequential_loglike
 from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam, ParamMap,
                                 a64)
-from anvilgp.oracle import celerite2_loglike, dense_loglike
+from anvilgp.oracle import celerite2_loglike, dense_loglike, sample_ssm
 
 mx.set_default_device(mx.cpu)
 import celerite2.terms as c2t   # a declared test dep: never skip M1 parity
@@ -389,3 +389,37 @@ def test_the_guard_is_an_identity_on_the_value():
         a = np.array(gp(u))
         b = np.array(gp._raw_call(u))
     assert np.array_equal(a, b)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("sig_over_yerr", [10.0, 100.0])
+def test_float32_holds_up_at_high_gp_amplitude(sig_over_yerr):
+    """The precision that matters is at high GP amplitude, on-model.
+
+    ``g = y / sqrt(S)`` is the normalised innovation; the leaf's log-
+    normaliser carries ``-g^2/2`` and every composition carries terms of the
+    same size that cancel.  At sigma_GP/yerr = 100 on-model data those terms
+    are ~1e4, and what survives the cancellation in float32 reaches the
+    Metropolis decision scale.  The published error-scaling table missed
+    this because its data amplitude was held fixed while the model sigma
+    scaled, so ``g^2`` never exceeded ~10.
+
+    This is the *differentiable* path, so it is what a gradient sampler
+    would use.  The fused Metal kernel is checked at the same point.
+    """
+    n, dt, rho, qual = 25_000, 1.0, 100.0, 3.0
+    rng = np.random.default_rng(0)
+    t = np.arange(n) * dt
+    y = sample_ssm(ag.SHOTerm(), [sig_over_yerr, rho, qual], dt, n, rng)
+    y = y + rng.standard_normal(n)              # yerr = 1
+    yerr = np.full(n, 1.0)
+    pm = ParamMap.const([sig_over_yerr, rho, qual])
+
+    gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                   GPPolicy(block=4096))
+    hi = float(np.array(gp.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
+    with mx.stream(mx.gpu):
+        lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
+    assert abs(lo - hi) < 0.1, (
+        f"MLX float32 off by {lo - hi:+.3f} log-units at "
+        f"sigma/yerr = {sig_over_yerr:g}, |logL| = {abs(hi):.0f}")
