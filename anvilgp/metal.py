@@ -49,7 +49,8 @@ import mlx.core as mx
 from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
-           "metal_available", "MAX_STATE"]
+           "backward_blocks", "metal_available", "MAX_STATE",
+           "MAX_BWD_BLOCK"]
 
 #: Largest state dimension the kernel accepts.  The running element is
 #: ``3m^2 + 2m + 1`` floats held in registers -- 17 at m = 2, 57 at m = 4,
@@ -490,6 +491,307 @@ def reduce_blocks(el: Element) -> mx.array:
         output_shapes=[(n_chains,)], output_dtypes=[mx.float32],
         grid=(n_chains, 1, 1), threadgroup=(min(64, n_chains), 1, 1))
     return out[0]
+
+
+
+#: Stage E: the reverse sweep, one thread per (chain, block).
+#:
+#: A line-by-line transcription of ``adjoint._backward_span``, which is
+#: verified against ``mx.vjp`` to ~1e-16.  The thread replays its block
+#: forward from the state the prefix scan says it starts in, keeping every
+#: intermediate state, then sweeps back.  Keeping them all caps the block
+#: length at what registers hold (``LCAP``); stage F replaces that with
+#: checkpoints.
+#:
+#: Blocks are independent -- each seeds itself from ``adjoint.block_seeds``
+#: -- so this has the same launch shape as the forward kernel and needs no
+#: ordering between blocks.
+#:
+#: Never reconstruct a forward state by running the filter *backwards*
+#: through the propagator.  That divides by Phi, which underflowed on the
+#: way forward at exactly the lags where it would now overflow: every gap
+#: in the data.  Replay forward, always.
+_SRC_BWD = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    uint start = blk_i * (uint)blk_len;
+    if (start >= (uint)npts) return;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint L = stop - start;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] : 0.0f;
+    float cotv = cot[chain];
+
+    // ---- replay forward, keeping every state ----
+    float smean[LCAP][MDIM], scov[LCAP][MDIM][MDIM];
+    float mean[MDIM], cov[MDIM][MDIM];
+    uint ei = chain * (uint)n_blocks + blk_i;
+    for (uint i = 0; i < M; ++i) {
+        mean[i] = ent_m[ei * M + i];
+        for (uint j = 0; j < M; ++j) cov[i][j] = ent_C[ei * M * M + i * M + j];
+    }
+
+    for (uint t = 0; t < L; ++t) {
+        for (uint i = 0; i < M; ++i) {
+            smean[t][i] = mean[i];
+            for (uint j = 0; j < M; ++j) scov[t][i][j] = cov[i][j];
+        }
+        uint gi = start + t;
+        uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
+        float mp[MDIM], cp[MDIM][MDIM], ch[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += phitab[off + i * M + j] * mean[j];
+            mp[i] = a;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint u = 0; u < M; ++u) {
+                    float pu = phitab[off + i * M + u];
+                    for (uint w = 0; w < M; ++w)
+                        a += pu * cov[u][w] * phitab[off + j * M + w];
+                }
+                cp[i][j] = a + qtab[off + i * M + j];
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < i; ++j) {
+                float a = 0.5f * (cp[i][j] + cp[j][i]);
+                cp[i][j] = a; cp[j][i] = a;
+            }
+        float hch = 0.0f;
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += cp[i][j] * hv[j];
+            ch[i] = a; hch += hv[i] * a;
+        }
+        float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
+        float vv = resid[gi * (uint)n_chains + chain];
+        for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+        for (uint i = 0; i < M; ++i) {
+            float kg = ch[i] / sv;
+            mean[i] = mp[i] + kg * vv;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j)
+                cov[i][j] = cp[i][j] - (ch[i] / sv) * ch[j];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < i; ++j) {
+                float a = 0.5f * (cov[i][j] + cov[j][i]);
+                cov[i][j] = a; cov[j][i] = a;
+            }
+    }
+
+    // ---- reverse sweep ----
+    float m_bar[MDIM], p_bar[MDIM][MDIM], h_bar[MDIM];
+    for (uint i = 0; i < M; ++i) {
+        m_bar[i] = seed_m[ei * M + i];
+        h_bar[i] = 0.0f;
+        for (uint j = 0; j < M; ++j)
+            p_bar[i][j] = seed_C[ei * M * M + i * M + j];
+    }
+
+    for (int tt = (int)L - 1; tt >= 0; --tt) {
+        uint t = (uint)tt, gi = start + t;
+        uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
+        float Ph[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) Ph[i][j] = phitab[off + i * M + j];
+
+        // replay this step's forward quantities from the stored state
+        float mp[MDIM], cp[MDIM][MDIM], ch[MDIM], kg[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += Ph[i][j] * smean[t][j];
+            mp[i] = a;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint u = 0; u < M; ++u)
+                    for (uint w = 0; w < M; ++w)
+                        a += Ph[i][u] * scov[t][u][w] * Ph[j][w];
+                cp[i][j] = a + qtab[off + i * M + j];
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < i; ++j) {
+                float a = 0.5f * (cp[i][j] + cp[j][i]);
+                cp[i][j] = a; cp[j][i] = a;
+            }
+        float hch = 0.0f;
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += cp[i][j] * hv[j];
+            ch[i] = a; hch += hv[i] * a;
+        }
+        bool clamped = hch < 0.0f;
+        float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
+        float vv = resid[gi * (uint)n_chains + chain];
+        for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+        for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
+
+        // seeds -- the only place ell enters
+        float v_bar = -cotv * vv / sv;
+        float s_bar = cotv * (vv * vv - sv) / (2.0f * sv * sv);
+
+        // P' = Cp - Kg ch^T ;  m' = mp + Kg v
+        float kg_bar[MDIM], ch_bar[MDIM], mp_bar[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f, b = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                a += p_bar[i][j] * ch[j];
+                b += p_bar[j][i] * kg[j];
+            }
+            kg_bar[i] = -a + m_bar[i] * vv;
+            ch_bar[i] = -b;
+            mp_bar[i] = m_bar[i];
+        }
+        for (uint i = 0; i < M; ++i) v_bar += kg[i] * m_bar[i];
+
+        // v = y - h.mp
+        out_dy[gi * (uint)n_chains + chain] = v_bar;
+        for (uint i = 0; i < M; ++i) {
+            h_bar[i] -= v_bar * mp[i];
+            mp_bar[i] -= v_bar * hv[i];
+        }
+        // Kg = ch / S
+        for (uint i = 0; i < M; ++i) {
+            ch_bar[i] += kg_bar[i] / sv;
+            s_bar -= kg_bar[i] * kg[i] / sv;
+        }
+        // S = max(h.ch, 0) + R : r_var takes s_bar whatever the clamp did
+        out_drv[gi * (uint)n_chains + chain] = s_bar;
+        float hch_bar = clamped ? 0.0f : s_bar;
+        for (uint i = 0; i < M; ++i) {
+            h_bar[i] += hch_bar * ch[i];
+            ch_bar[i] += hch_bar * hv[i];
+        }
+        // ch = Cp h
+        float cp_bar[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                cp_bar[i][j] = p_bar[i][j] + ch_bar[i] * hv[j];
+                a += cp[j][i] * ch_bar[j];
+            }
+            h_bar[i] += a;
+        }
+        // Cp = sym(Phi P Phi^T + Q): the forward symmetrises, so Q's
+        // adjoint -- and P's -- is the SYMMETRISED Cp adjoint
+        float cs[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j)
+                cs[i][j] = 0.5f * (cp_bar[i][j] + cp_bar[j][i]);
+
+        uint om = (chain * (uint)npts + gi) * M * M;
+        float pc[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint u = 0; u < M; ++u) a += Ph[i][u] * scov[t][u][j];
+                pc[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint u = 0; u < M; ++u) a += 2.0f * cs[i][u] * pc[u][j];
+                out_dphi[om + i * M + j] = a + mp_bar[i] * smean[t][j];
+                out_dq[om + i * M + j] = cs[i][j];
+            }
+        float nb[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint u = 0; u < M; ++u)
+                    for (uint w = 0; w < M; ++w)
+                        a += Ph[u][i] * cs[u][w] * Ph[w][j];
+                nb[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                p_bar[i][j] = 0.5f * (nb[i][j] + nb[j][i]);
+                a += Ph[j][i] * mp_bar[j];
+            }
+            m_bar[i] = a;
+        }
+    }
+
+    for (uint i = 0; i < M; ++i) out_dh[ei * M + i] = h_bar[i];
+"""
+
+
+_bwd_kernels: dict = {}
+
+
+def _bwd_kernel(m: int, lcap: int):
+    key = (m, lcap)
+    if key not in _bwd_kernels:
+        _bwd_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_bwd_m{m}_L{lcap}",
+            input_names=["phitab", "qtab", "lag", "hvec", "resid", "r_ref",
+                         "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
+                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                         "n_jit"],
+            output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
+                          "out_drv"],
+            source=_SRC_BWD.replace("MDIM", str(m)).replace("LCAP",
+                                                            str(lcap)),
+        )
+    return _bwd_kernels[key]
+
+
+
+MAX_BWD_BLOCK = 32
+"""Longest block the stage-E backward kernel will take.
+
+It keeps every forward state of its block in thread-local storage --
+``(m + m^2)`` floats per observation -- so the block length is bounded by
+what a thread can hold.  Stage F replaces this with checkpoints and lifts
+the bound.
+"""
+
+
+def backward_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
+                    ent_m, ent_C, seed_m, seed_C, blk_len):
+    """Reverse sweep for every (chain, block), independently.
+
+    ``ent_m``/``ent_C`` are the filter state each block starts from and
+    ``seed_m``/``seed_C`` the ``(m_bar, P_bar)`` it inherits, both
+    ``(n_chains, n_blocks, ...)`` -- from
+    :func:`anvilgp.elements.prefix_scan` and
+    :func:`anvilgp.adjoint.block_seeds`.  Returns the five adjoints of
+    :func:`anvilgp.adjoint.filter_backward`, with ``dphi``/``dq`` per
+    observation (stage F accumulates them per lag instead, which is what
+    makes them affordable at production N).
+    """
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts = resid.shape[0]
+    if m > MAX_STATE:
+        raise ValueError(f"metal backward supports m <= {MAX_STATE}, got {m}")
+    if blk_len > MAX_BWD_BLOCK:
+        raise ValueError(
+            f"blk_len {blk_len} exceeds MAX_BWD_BLOCK {MAX_BWD_BLOCK}: the "
+            "stage-E kernel holds every forward state of its block")
+    n_blocks = (npts + blk_len - 1) // blk_len
+    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    shapes = [(n_chains, npts, m, m), (n_chains, npts, m, m),
+              (n_chains, n_blocks, m), (npts, n_chains), (npts, n_chains)]
+    outs = _bwd_kernel(m, blk_len)(
+        inputs=[phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
+                ent_m, ent_C, seed_m, seed_C,
+                int(npts), int(n_lags), int(n_blocks), int(n_chains),
+                int(blk_len), int(n_jit)],
+        output_shapes=shapes, output_dtypes=[mx.float32] * 5,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    return outs
 
 
 def metal_available() -> bool:

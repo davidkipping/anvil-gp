@@ -389,3 +389,122 @@ def test_in_kernel_fold_matches_the_mlx_tree(name, term, kp, blk):
     assert el.b.shape[1] > 1, "the fixture must have several blocks"
     scale = max(np.max(np.abs(tree)), 1.0)
     assert np.max(np.abs(tree - kern)) / scale < 1e-5, (tree, kern)
+
+
+# -- stage E: the reverse sweep in the kernel ------------------------------
+
+_BWD_TERMS = [
+    ("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+    ("matern32", ag.Matern32Term(), [1.1, 2.5]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+]
+
+
+def _bwd_case(term, p, k, blk, n_chains=3, cadence="regular", seed=0):
+    """Run the kernel sweep and the float64 spec on the same problem."""
+    from anvilgp.adjoint import block_seeds, filter_backward, filter_forward
+    from anvilgp.elements import (Element, leaf_elements, prefix_scan,
+                                  suffix_scan, tree_reduce)
+    from anvilgp.metal import backward_blocks
+
+    rng = np.random.default_rng(seed)
+    if cadence == "gapped":
+        t = np.sort(rng.uniform(0.0, 8.0, k))
+        t[k // 2:] += 20.0
+    elif cadence == "dupes":
+        t = np.repeat(np.sort(rng.uniform(0.0, 8.0, k // 2)), 2)[:k]
+    else:
+        t = np.arange(k) * 0.3
+    dt = np.concatenate([[0.0], np.diff(t)])
+    uniq, inv = np.unique(dt.astype(np.float32), return_inverse=True)
+    lag = mx.concatenate([mx.zeros((1,), dtype=mx.int32),
+                          mx.array(inv.astype(np.int32) + 1)[1:]])
+
+    m = term.n_state
+    P = mx.array(np.tile(np.array(p, np.float32), (n_chains, 1)))
+    phi_u, q_u, h = term.matrices(P, mx.array(uniq.astype(np.float32)))
+    z = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+    eye = mx.broadcast_to(mx.eye(m, dtype=mx.float32), (n_chains, 1, m, m))
+    pt = mx.concatenate([z, phi_u], axis=1)
+    qt = mx.concatenate([eye, q_u], axis=1)
+    phi, q = mx.take(pt, lag, axis=1), mx.take(qt, lag, axis=1)
+
+    y = mx.array(rng.standard_normal(k).astype(np.float32))
+    rrv = mx.full((k,), 0.09, dtype=mx.float32)
+    yv = mx.broadcast_to(y, (n_chains, k))
+    rv = mx.broadcast_to(rrv, (n_chains, k))
+    cot = mx.array(rng.standard_normal(n_chains).astype(np.float32))
+
+    states, _ = filter_forward(phi, q, h, yv, rv, rrv)
+    want = filter_backward(phi, q, h, yv, rv, rrv, states, cot)
+
+    starts = list(range(0, k, blk))
+    blocks = []
+    for s0 in starts:
+        e0 = min(s0 + blk, k)
+        el, r1 = leaf_elements(phi[:, s0:e0], q[:, s0:e0], h, yv[:, s0:e0],
+                               rv[:, s0:e0], rrv[s0:e0])
+        blocks.append(tree_reduce(el))
+    be = Element(*(mx.stack([getattr(b, f) for b in blocks], axis=1)
+                   for f in Element._fields))
+    pre, suf = prefix_scan(be), suffix_scan(be)
+    nb = len(starts)
+    ent_m = mx.stack([mx.zeros((n_chains, m), dtype=mx.float32)]
+                     + [pre.b[:, i] for i in range(nb - 1)], axis=1)
+    ent_C = mx.stack([mx.zeros((n_chains, m, m), dtype=mx.float32)]
+                     + [pre.C[:, i] for i in range(nb - 1)], axis=1)
+    sm, sc = [], []
+    for i in range(nb):
+        a, b = block_seeds(pre.b[:, i], pre.C[:, i],
+                           Element(*(getattr(suf, f)[:, i + 1]
+                                     for f in Element._fields)), cot)
+        sm.append(a)
+        sc.append(b)
+
+    with mx.stream(mx.gpu):
+        o = backward_blocks(pt, qt, lag, h, mx.swapaxes(yv, 0, 1), rrv,
+                            mx.zeros((n_chains, 0), dtype=mx.float32), cot,
+                            ent_m, ent_C, mx.stack(sm, axis=1),
+                            mx.stack(sc, axis=1), blk)
+        mx.eval(o)
+    got = [o[0], o[1], mx.sum(o[2], axis=1),
+           mx.swapaxes(o[3], 0, 1), mx.swapaxes(o[4], 0, 1)]
+    return [float(mx.max(mx.abs(a - b))) / max(float(mx.max(mx.abs(a))), 1e-20)
+            for a, b in zip(want, got)]
+
+
+@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
+                         ids=[c[0] for c in _BWD_TERMS])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
+def test_backward_kernel_matches_the_specification(name, term, p, cadence):
+    """Stage E: the Metal reverse sweep against `adjoint.filter_backward`.
+
+    The kernel is float32 and the specification float64, so the tolerance
+    is a float32 one. That it is *arithmetic* rather than a transcription
+    error is pinned by the next test: at two observations, where nothing
+    accumulates, the agreement is 1e-7.
+
+    For scale: the MLX float32 gradient's own error on `dh` at the
+    high-amplitude corner is ~2.9e-4, so 1e-4 here is not a weak bound.
+    """
+    for k, blk in ((24, 8), (30, 16)):
+        errs = _bwd_case(term, p, k, blk, cadence=cadence)
+        for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
+            assert e < 1e-4, f"{name}/{cadence} k={k} blk={blk} {nm}: {e:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
+                         ids=[c[0] for c in _BWD_TERMS])
+def test_backward_kernel_arithmetic_is_exact_before_accumulation(
+        name, term, p):
+    """Two observations, one block: nothing accumulates, so any gap is a bug.
+
+    This is what separates "float32 adds up" from "the transcription of
+    `_backward_span` is wrong". At k = 2 every adjoint agrees to float32
+    epsilon; the 1e-4 tolerance above is what accumulation costs over 30
+    observations across a data gap.
+    """
+    errs = _bwd_case(term, p, 2, 2)
+    for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
+        assert e < 1e-5, f"{name} {nm}: {e:.2e}"

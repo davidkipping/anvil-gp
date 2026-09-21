@@ -60,7 +60,7 @@ value.
 | B | Thread and residual layout | 1 | Opus | **DONE** -- bit-identical; 1.16-1.24x whole-path |
 | C | Block reduction into the kernel | 1.5 | Opus | **DONE** -- scalar boundary; 1.10-1.68x |
 | D | Suffix scan and closed-form seed, in MLX | 1.5 | Opus | **DONE** -- worst 2.0e-15 on random problems, 6.6e-14 on real terms with gaps and duplicates |
-| E | Backward kernel, single block | 2 | Opus | matches `adjoint.py` on all five inputs; matches autodiff |
+| E | Backward kernel, single block | 2 | Opus | **DONE** -- 1e-7 at k = 2 (arithmetic exact), < 1e-4 float32 over four terms x three cadences |
 | F | Backward kernel, all blocks, checkpointed | 3 | Fable | == E at one block, == `adjoint.py` at every block count |
 | G | Wire up, measure, ChEES end to end | 1 | Opus | gradient rows in `verify_readme.py`; joint corner improves |
 | R | Adversarial review: what did I not see | 0.5 | Fable | -- |
@@ -76,6 +76,29 @@ happens to be worth 2.2 of the 3.0 ms at N = 1e4.
 the propagator. That divides by `Phi`, which underflowed on the way forward
 at exactly the lags where it would now overflow: every gap in the data.
 Replay forward, always.
+
+## Stage E notes, for stage F
+
+The kernel keeps every forward state of its block, `(m + m^2)` floats per
+observation, so `MAX_BWD_BLOCK = 32`.  Stage F replaces that with
+checkpoints and lifts the bound.
+
+It also writes `dphi`/`dq` **per observation**, which is fine for a test
+and impossible at production N: `(n_chains, npts, m, m)` is 1.6 GB at
+N = 1e5, 1024 chains, m = 2.  Stage F must accumulate them **per lag**
+instead -- `(n_chains, n_blocks, n_lags, m, m)`, which is under a megabyte
+at three lags -- and that is the change most likely to hit the register
+budget, since the accumulator is indexed by a runtime lag id.
+
+Measured agreement against the float64 specification, float32 kernel:
+
+    k = 2, one block (nothing accumulates)      1e-7   -- arithmetic exact
+    k = 24-30, four terms x three cadences    < 1e-4   -- float32 accumulation
+
+The second is dominated by `dh`, which sums over every observation, and by
+the gapped cadence, where the propagator underflows across the gap. For
+scale, the MLX float32 gradient's own `dh` error at the high-amplitude
+corner is ~2.9e-4.
 
 ## What failure looks like, stated in advance
 
