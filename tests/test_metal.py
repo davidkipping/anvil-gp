@@ -349,3 +349,43 @@ def test_the_differentiation_boundary_encloses_the_reduction():
 
     assert seen["shape"] == (n_chains,), (
         f"the boundary must return one scalar per chain; got {seen['shape']}")
+
+
+@pytest.mark.parametrize("name,term,kp", TERMS, ids=[c[0] for c in TERMS])
+@pytest.mark.parametrize("blk", [64, 256])
+def test_in_kernel_fold_matches_the_mlx_tree(name, term, kp, blk):
+    """Pass 2 is a kernel now; it must fold exactly what the tree folded.
+
+    The fold carries only (b, C, ell). It can because the first
+    observation has no predecessor, so the first block's element has
+    A = J = eta = 0 and `combine` preserves all three -- A_out = A2 G A1,
+    eta_out = A1^T gt_eta + eta1 and J_out = A1^T jt A1 + J1 each vanish
+    when the accumulator's do. If that ever stops holding, this test is
+    what catches it.
+    """
+    from anvilgp.elements import tree_reduce
+    from anvilgp.metal import reduce_blocks, scan_blocks
+
+    gp = _build(term, kp, True, blk=blk)
+    n_chains = 4
+    v = mx.array(_rng.standard_normal((n_chains, 1)).astype(np.float32) * 0.0)
+    m = term.n_state
+    phi, q, h = term.matrices(gp.param_map.kernel_params(v),
+                              gp._metal_uniq_dt)
+    pt = mx.concatenate([mx.zeros((n_chains, 1, m, m), dtype=v.dtype), phi],
+                        axis=1)
+    qt = mx.concatenate(
+        [mx.broadcast_to(mx.eye(m, dtype=v.dtype), (n_chains, 1, m, m)), q],
+        axis=1)
+    r = mx.broadcast_to(gp._y32[:, None], (gp.n_data, n_chains))
+    j2 = mx.zeros((n_chains, 0), dtype=v.dtype)
+
+    with mx.stream(mx.gpu):
+        el = scan_blocks(pt, qt, gp._metal_lag, h, r, gp._r_ref32, j2,
+                         gp.policy.s_floor_rel, blk)
+        tree = np.array(tree_reduce(el).ell, dtype=np.float64)
+        kern = np.array(reduce_blocks(el), dtype=np.float64)
+
+    assert el.b.shape[1] > 1, "the fixture must have several blocks"
+    scale = max(np.max(np.abs(tree)), 1.0)
+    assert np.max(np.abs(tree - kern)) / scale < 1e-5, (tree, kern)

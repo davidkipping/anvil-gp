@@ -194,9 +194,9 @@ point. Against the MLX path, same problem, same answers:
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| N=1e4, 1024 chains | 73.8 ms | **2.95 ms** | 25x | 1.20 GiB | 0.05 GiB |
-| N=1e4, 4096 chains | 326 ms | **6.38 ms** | 51x | 3.74 GiB | 0.21 GiB |
-| N=1e5, 1024 chains | 693 ms | **13.2 ms** | 53x | 0.82 GiB | 0.40 GiB |
+| N=1e4, 1024 chains | 75.1 ms | **1.67 ms** | 45x | 1.20 GiB | 0.04 GiB |
+| N=1e4, 4096 chains | 326 ms | **4.40 ms** | 74x | 3.74 GiB | 0.16 GiB |
+| N=1e5, 1024 chains | 719 ms | **11.5 ms** | 63x | 0.82 GiB | 0.39 GiB |
 
 (Minimum of 12 sustained evaluations, compiled, gapped cadence with three
 distinct lags, `block=4096`, `metal_block` at its default, all rows in one
@@ -212,12 +212,12 @@ Against celerite2 on the CPU, measured in the same session:
 
 | config | vs 1 core | vs 12 cores |
 |---|---:|---:|
-| N=1e4, 1024 chains | **144x faster** | **20x faster** |
-| N=1e5, 1024 chains | **329x faster** | **37x faster** |
+| N=1e4, 1024 chains | **255x faster** | **35x faster** |
+| N=1e5, 1024 chains | **376x faster** | **42x faster** |
 
 **The >=100x gate is not yet cleared.** The brief is explicit that "the honest
 >=100x denominator is the multiprocess one", and against a fully parallelised
-12-core celerite2 we are **20-37x**, not 100x. The single-core column is
+12-core celerite2 we are **35-42x**, not 100x. The single-core column is
 reported because it is the comparison most users' code actually makes (one
 CPU process, one chain at a time), not because it clears the gate. What the
 kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
@@ -464,11 +464,6 @@ marked as an estimate.
   13.3 -> 8.6 ms at N = 1e5 and 20.8 -> 11.1 ms at m = 4, with `ell`
   bit-identical. Cheap, and the backward kernel inherits it, so it belongs
   with M4.
-* **Pass 2 in the kernel.** Reducing the per-block elements in MLX costs
-  2.2 ms of the 3.0 ms whole path at N = 1e4 (6.3 of 26.8 at m = 4) — pure
-  launch overhead of the general `combine`. A one-thread-per-chain Metal
-  fold would put the whole path near 1.9 ms. M4 needs an in-kernel pass 2
-  anyway.
 * **Bit-reversed leaf permutation (measured, MLX path).** Storing each
   block's leaves in fold-step order makes every fold step a contiguous slab
   and every tree level a contiguous halving. Measured 85 -> 55 ms forward
@@ -650,9 +645,9 @@ Three more are worked around and pinned as regression tests
   a tuning number. Still owed: the Design-A probe comparison, the
   `metal::fast` accuracy study, and the ChEES leapfrog cost at scale.
 * **M3 — fused Metal blocked-scan kernel: pass 1 done, forward only.**
-  25-53x over the MLX path and 20-37x ahead of a 12-core celerite2 pool,
+  45-74x over the MLX path and 35-42x ahead of a 12-core celerite2 pool,
   which is the brief's denominator, so the >=100x gate is **not** cleared
-  (it is 144-329x against a single-core loop). `tests/test_metal.py` pins
+  (it is 255-376x against a single-core loop). `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
   model. Still owed: m > 4, per-instrument jitter in-kernel, the float32

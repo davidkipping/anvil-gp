@@ -9,10 +9,9 @@ block of observations with the running element **in registers** writes none
 of it: one element per *block* reaches memory instead of one per point.
 
 This is Design C's pass 1.  Pass 2 -- composing the ~N/L block elements per
-chain -- stays in MLX for now.  It is a handful of tree levels over a small
-array, but they are launch-bound: at N = 1e4 that reduction is most of the
-remaining wall time of the whole path, so folding it into the kernel is an
-M4 work item rather than the non-issue this note once called it.
+chain -- is a second kernel, `reduce_blocks`.  It was an MLX tree until
+2026-09-20; those levels are launch-bound, costing a flat ~5.1 ms whatever
+the block count, which was 79% of the whole path at N = 1e4.
 
 What the kernel does *not* do, deliberately
 -------------------------------------------
@@ -47,10 +46,10 @@ from __future__ import annotations
 import mlx.core as mx
 
 
-from .elements import Element, tree_reduce
+from .elements import Element
 
-__all__ = ["scan_blocks", "scan_loglike", "metal_available",
-           "MAX_STATE"]
+__all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
+           "metal_available", "MAX_STATE"]
 
 #: Largest state dimension the kernel accepts.  The running element is
 #: ``3m^2 + 2m + 1`` floats held in registers -- 17 at m = 2, 57 at m = 4,
@@ -269,6 +268,230 @@ def _kernel(m: int):
     return _kernels[m]
 
 
+
+#: Pass 2: fold a chain's block elements into one log-likelihood.
+#:
+#: One thread per chain, sequential over the ~10-100 blocks.  The MLX tree
+#: this replaces was launch-bound, costing a flat ~5.1 ms whatever the block
+#: count -- 79% of the whole path at N = 1e4.
+#:
+#: The fold carries only ``(b, C, ell)``.  It can, because the first
+#: observation has no predecessor, so the first block's element has
+#: ``A = 0``, ``J = 0``, ``eta = 0``, and `combine` preserves all three:
+#: ``A_out = A2 G A1``, ``eta_out = A1^T gt_eta + eta1`` and
+#: ``J_out = A1^T jt A1 + J1`` are each zero when the accumulator's are.
+#: So three of the six fields need never be computed here.
+_SRC_REDUCE = """
+    uint chain = thread_position_in_grid.x;
+    if (chain >= (uint)n_chains) return;
+    const uint M = MDIM;
+    uint base = chain * (uint)n_blocks;
+
+    // accumulator: the prefix element, whose A, J and eta are zero
+    float bv[MDIM], Cm[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        bv[i] = in_b[base * M + i];
+        for (uint j = 0; j < M; ++j)
+            Cm[i][j] = in_C[base * M * M + i * M + j];
+    }
+    float ell = in_ell[base], ell_c = 0.0f;      // Kahan, as pass 1
+
+    for (uint k = 1; k < (uint)n_blocks; ++k) {
+        uint ov = (base + k) * M, om = (base + k) * M * M;
+        float A2[MDIM][MDIM], C2[MDIM][MDIM], J2[MDIM][MDIM];
+        float b2[MDIM], et2[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            b2[i] = in_b[ov + i];
+            et2[i] = in_eta[ov + i];
+            for (uint j = 0; j < M; ++j) {
+                A2[i][j] = in_A[om + i * M + j];
+                C2[i][j] = in_C[om + i * M + j];
+                J2[i][j] = in_J[om + i * M + j];
+            }
+        }
+
+        // L1 = chol(C1), with linalg.diag_floor's eps*trace/m pivot floor
+        float tr = 0.0f;
+        for (uint i = 0; i < M; ++i) tr += Cm[i][i];
+        float fl = 1.1920929e-7f * tr / (float)M + 3.0e-38f;
+        float L1[MDIM][MDIM];
+        for (uint j = 0; j < M; ++j) {
+            float d = Cm[j][j];
+            for (uint t = 0; t < j; ++t) d -= L1[j][t] * L1[j][t];
+            L1[j][j] = metal::precise::sqrt(max(d, fl));
+            float inv = 1.0f / L1[j][j];
+            for (uint i = j + 1; i < M; ++i) {
+                float a = Cm[i][j];
+                for (uint t = 0; t < j; ++t) a -= L1[i][t] * L1[j][t];
+                L1[i][j] = a * inv;
+            }
+            for (uint i = 0; i < j; ++i) L1[i][j] = 0.0f;
+        }
+
+        // S = I + sym(L1^T J2 L1)
+        float T[MDIM][MDIM], X[MDIM][MDIM], S[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += J2[i][t] * L1[t][j];
+                T[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += L1[t][i] * T[t][j];
+                X[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j)
+                S[i][j] = (i == j ? 1.0f : 0.0f) + 0.5f * (X[i][j] + X[j][i]);
+
+        // Ls = chol(S); eigenvalues are >= 1 so no pivoting is needed
+        float tr2 = 0.0f;
+        for (uint i = 0; i < M; ++i) tr2 += S[i][i];
+        float fl2 = 1.1920929e-7f * tr2 / (float)M + 3.0e-38f;
+        float Ls[MDIM][MDIM];
+        for (uint j = 0; j < M; ++j) {
+            float d = S[j][j];
+            for (uint t = 0; t < j; ++t) d -= Ls[j][t] * Ls[j][t];
+            Ls[j][j] = metal::precise::sqrt(max(d, fl2));
+            float inv = 1.0f / Ls[j][j];
+            for (uint i = j + 1; i < M; ++i) {
+                float a = S[i][j];
+                for (uint t = 0; t < j; ++t) a -= Ls[i][t] * Ls[j][t];
+                Ls[i][j] = a * inv;
+            }
+            for (uint i = 0; i < j; ++i) Ls[i][j] = 0.0f;
+        }
+
+        // Y solves Y Ls^T = L1 -- forward substitution over columns, the
+        // same order as linalg.tri_solve_right, so M = Y Y^T is symmetric
+        // by construction rather than by symmetrising afterwards.
+        float Y[MDIM][MDIM];
+        for (uint c = 0; c < M; ++c)
+            for (uint r = 0; r < M; ++r) {
+                float a = L1[r][c];
+                for (uint t = 0; t < c; ++t) a -= Ls[c][t] * Y[r][t];
+                Y[r][c] = a / Ls[c][c];
+            }
+
+        float Mm[MDIM][MDIM], G[MDIM][MDIM], V[MDIM][MDIM], Jt[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += Y[i][t] * Y[j][t];
+                Mm[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += Mm[i][t] * J2[t][j];
+                G[i][j] = (i == j ? 1.0f : 0.0f) - a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += J2[i][t] * Y[t][j];
+                V[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += V[i][t] * V[j][t];
+                Jt[i][j] = J2[i][j] - a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < i; ++j) {
+                float a = 0.5f * (Jt[i][j] + Jt[j][i]);
+                Jt[i][j] = a; Jt[j][i] = a;
+            }
+
+        float Gb1[MDIM], Met[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f, b = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                a += G[i][j] * bv[j];
+                b += Mm[i][j] * et2[j];
+            }
+            Gb1[i] = a; Met[i] = b;
+        }
+
+        // ell: log|S| off the factor, then the three quadratic cross terms
+        float logdet = 0.0f, qb = 0.0f, ce = 0.0f, qe = 0.0f;
+        for (uint i = 0; i < M; ++i) {
+            logdet += metal::precise::log(Ls[i][i]);
+            float t1 = 0.0f, t2 = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                t1 += Jt[i][j] * bv[j];
+                t2 += Mm[i][j] * et2[j];
+            }
+            qb += bv[i] * t1;
+            qe += et2[i] * t2;
+            ce += et2[i] * Gb1[i];
+        }
+        float add = in_ell[base + k] - logdet - 0.5f * qb + ce + 0.5f * qe;
+        float yk = add - ell_c;
+        float tk = ell + yk;
+        ell_c = (tk - ell) - yk;
+        ell = tk;
+
+        // b <- A2 (G b1 + M eta2) + b2 ;  C <- sym(A2 M A2^T) + C2
+        float nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = b2[i];
+            for (uint j = 0; j < M; ++j) a += A2[i][j] * (Gb1[j] + Met[j]);
+            nb[i] = a;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += A2[i][t] * Mm[t][j];
+                AM[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += AM[i][t] * A2[j][t];
+                nC[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i) {
+            bv[i] = nb[i];
+            for (uint j = 0; j < M; ++j)
+                Cm[i][j] = 0.5f * (nC[i][j] + nC[j][i]) + C2[i][j];
+        }
+    }
+    out_ell[chain] = ell;
+"""
+
+
+_reduce_kernels: dict = {}
+
+
+def _reduce_kernel(m: int):
+    if m not in _reduce_kernels:
+        _reduce_kernels[m] = mx.fast.metal_kernel(
+            name=f"anvilgp_reduce_m{m}",
+            input_names=["in_A", "in_b", "in_C", "in_eta", "in_J", "in_ell",
+                         "n_blocks", "n_chains"],
+            output_names=["out_ell"],
+            source=_SRC_REDUCE.replace("MDIM", str(m)),
+        )
+    return _reduce_kernels[m]
+
+
+def reduce_blocks(el: Element) -> mx.array:
+    """Fold ``(n_chains, n_blocks)`` block elements to ``(n_chains,)``."""
+    n_chains, n_blocks, m = el.b.shape[0], el.b.shape[1], el.b.shape[-1]
+    if n_blocks == 1:
+        return el.ell[:, 0]
+    out = _reduce_kernel(m)(
+        inputs=[el.A, el.b, el.C, el.eta, el.J, el.ell,
+                int(n_blocks), int(n_chains)],
+        output_shapes=[(n_chains,)], output_dtypes=[mx.float32],
+        grid=(n_chains, 1, 1), threadgroup=(min(64, n_chains), 1, 1))
+    return out[0]
+
+
 def metal_available() -> bool:
     """Probe: can the fused kernel actually run here?"""
     global _metal_ok
@@ -344,16 +567,16 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
     output to one scalar per chain, and a scalar cotangent is exactly what
     ``filter_backward`` takes.
 
-    The reduction itself is still MLX.  Moving it into the kernel is a
-    speed item (it is most of the remaining wall time at small N, being
-    launch-bound), not a correctness one, and it needs a Cholesky in MSL.
-    It does not change this boundary.
+    Both passes are kernels: :func:`scan_blocks` condenses the blocks and
+    :func:`reduce_blocks` folds them.  The MLX tree this replaced was
+    launch-bound, costing a flat ~5.1 ms whatever the block count, which
+    was 79% of the whole path at N = 1e4.
     """
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
         el = scan_blocks(phi_t, q_t, lg, hv, rs, rr, j2, s_floor_rel,
                          blk_len)
-        return tree_reduce(el).ell
+        return reduce_blocks(el)
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):

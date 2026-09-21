@@ -103,8 +103,8 @@ def fp32_error(n, sig_over_yerr, metal, sub_block=None):
 #: (label, claimed, getter, kind).  `kind` "time" rows are skipped as
 #: unverifiable when the machine is loaded; "acc" rows always run.
 CLAIMS = [
-    ("MLX forward, 1e4 x 1024", 73.8, lambda: forward(10_000, 1024, False), "time"),
-    ("Metal forward, 1e4 x 1024", 2.9, lambda: forward(10_000, 1024, True), "time"),
+    ("MLX forward, 1e4 x 1024", 75.1, lambda: forward(10_000, 1024, False), "time"),
+    ("Metal forward, 1e4 x 1024", 1.67, lambda: forward(10_000, 1024, True), "time"),
     ("MLX value+grad, 1e4 x 1024", 880.0, lambda: gradient(10_000, 1024), "time"),
     ("fp32 err, N=25e3, sig/yerr=100 (MLX)", 0.06,
      lambda: fp32_error(25_000, 100.0, False), "acc"),
@@ -113,8 +113,8 @@ CLAIMS = [
 ]
 if not a.quick:
     CLAIMS += [
-        ("MLX forward, 1e5 x 1024", 693.0, lambda: forward(100_000, 1024, False), "time"),
-        ("Metal forward, 1e5 x 1024", 13.2, lambda: forward(100_000, 1024, True), "time"),
+        ("MLX forward, 1e5 x 1024", 719.0, lambda: forward(100_000, 1024, False), "time"),
+        ("Metal forward, 1e5 x 1024", 11.5, lambda: forward(100_000, 1024, True), "time"),
         ("fp32 err, N=1e5, sig/yerr=30 (MLX)", 0.20,
          lambda: fp32_error(100_000, 30.0, False), "acc"),
     ]
