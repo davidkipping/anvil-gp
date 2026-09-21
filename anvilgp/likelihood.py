@@ -104,10 +104,9 @@ class GPPolicy:
     #: keep leaves in compact block form (None = decide from the term's block
     #: structure).  See :func:`anvilgp.elements.use_blocked_leaves`.
     blocked: bool | None = None
-    #: use the fused Metal scan kernel (:mod:`anvilgp.metal`).  **Forward
-    #: only** until M4 adds its VJP -- differentiating through it raises
-    #: rather than silently falling back, so a gradient sampler must leave
-    #: this off.  Measured 25-53x over the MLX path with 2-25x less peak
+    #: use the fused Metal scan kernel (:mod:`anvilgp.metal`).
+    #: Differentiable since M4: the kernel carries its own VJP, so a
+    #: gradient sampler can use it too.  Measured 25-53x over the MLX path with 2-25x less peak
     #: memory; see the README.
     metal: bool = False
     #: observations condensed per kernel thread, or None to pick from N.

@@ -188,14 +188,11 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         with mx.stream(mx.cpu):
             return loglike.hi(v) + log_prior(v.astype(mx.float64))
 
-    # The fused Metal kernel is forward-only until M4, so a target running
-    # on it cannot be handed to a gradient sampler.  Declare that up front:
-    # anvil's ChEES kernel checks `supports_grad` in its constructor and
-    # refuses with its own message, instead of the NotImplementedError
-    # surfacing from inside mx.vjp several minutes into a run.
+    # Both paths are differentiable since M4: the fused kernel has its own
+    # VJP (the checkpointed backward sweep), so a gradient sampler can take
+    # either.
     target = engine.TransformedLogDensity(
-        model_log_prob, transform, model_log_prob_hi=model_log_prob_hi,
-        supports_grad=not loglike._metal_ok)
+        model_log_prob, transform, model_log_prob_hi=model_log_prob_hi)
     return GPTarget(target=target, transform=transform, loglike=loglike,
                     names=[s.name for s in mean_specs] + names,
                     hypers=hypers + jitters + offsets, param_map=pm)

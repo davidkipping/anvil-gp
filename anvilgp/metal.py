@@ -1527,19 +1527,39 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
-        # M4 replaces this with the checkpointed backward kernel.  The
-        # cotangent arriving here is on a scalar per chain, which is what
-        # `adjoint.filter_backward` is derived for; the seed for each
-        # block comes from the closed form in docs/m4-plan.md, so the
-        # blocks are independent and need no chain between them.
+        # M4.  The cotangent arriving here is on a scalar per chain, which
+        # is what `adjoint.filter_backward` is derived for.  Each block's
+        # seed comes from the closed form (docs/m4-plan.md), so the blocks
+        # are independent and need no chain between them -- same launch
+        # shape as the forward.
         #
         # Never reconstruct forward state by running the filter backwards
         # through the propagator: that divides by Phi, which underflowed on
         # the way forward at exactly the lags where it would now overflow,
-        # which is every gap in the data.  Replay forward, always.
-        raise NotImplementedError(
-            "the fused Metal scan is forward-only until M4. Use "
-            "GPPolicy(metal=False) for a differentiable likelihood (the MLX "
-            "path), or a gradient-free sampler such as anvil's stretch move.")
+        # which is every gap in the data.  Replay forward, always -- which
+        # is why the block elements are recomputed here.
+        p_t, q_t, lg, hv, rs, rr, j2 = primals
+        cot = cotangents[0] if isinstance(cotangents, (list, tuple)) \
+            else cotangents
+
+        el = scan_blocks(p_t, q_t, lg, hv, rs, rr, j2, s_floor_rel, blk_len)
+        ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot)
+        d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
+            p_t, q_t, lg, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m, seed_C,
+            blk_len)
+
+        # `lag` is an integer index and `r_ref` is the data's own yerr^2 --
+        # neither is ever a function of the sampled parameters, so neither
+        # needs a cotangent.  `jit2` does: S = max(h Cp h^T, 0) + r_ref +
+        # jit2, so d/d(jit2) is the sum of the r_var cotangents, which is
+        # exactly what the kernel accumulates per block.
+        # `metal_eligible` admits at most one jitter, and the kernel reads
+        # column 0, so the whole per-block sum belongs to it.
+        n_jit = j2.shape[1] if j2.ndim == 2 else 0
+        d_j2 = (mx.zeros_like(j2) if n_jit == 0
+                else mx.sum(d_rv, axis=1)[:, None])
+        return (mx.sum(d_phi, axis=1), mx.sum(d_q, axis=1),
+                mx.zeros_like(lg), mx.sum(d_h, axis=1), d_y,
+                mx.zeros_like(rr), d_j2)
 
     return core(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2)

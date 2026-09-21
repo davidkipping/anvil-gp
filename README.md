@@ -187,10 +187,11 @@ owes the full feasibility survey.
 
 ## Performance: the fused Metal kernel
 
-**M3's pass-1 kernel is in** (`anvilgp/metal.py`, forward only until M4 adds
-its VJP). It walks a block of observations with the running scan element **in
-registers**, so one element per *block* reaches memory instead of one per
-point. Against the MLX path, same problem, same answers:
+**The kernel is in, and differentiable** (`anvilgp/metal.py`). It walks a
+block of observations with the running scan element **in registers**, so one
+element per *block* reaches memory instead of one per point, and M4's
+checkpointed backward sweep gives it its own VJP. Against the MLX path,
+same problem, same answers:
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
@@ -235,6 +236,31 @@ with the posteriors agreeing to three decimals. Run it either way:
 .venv/bin/python examples/gp_injection_recovery.py           # MLX graph
 METAL=1 .venv/bin/python examples/gp_injection_recovery.py   # fused kernel
 ```
+
+
+### Gradients
+
+M4 landed: the kernel carries its own VJP, so a gradient sampler can use it.
+
+| config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
+|---|---:|---:|---:|---:|---:|
+| value+grad, N=1e4, 1024 chains | 884 ms | **8.9 ms** | 99x | 6.10 GiB | 0.17 GiB |
+| value+grad, N=1e5, 1024 chains | 15.4 s | **58 ms** | 264x | 34.5 GiB | 1.61 GiB |
+
+The gradient matches float64 central differences to ~1e-7 on every
+parameter including the jitter, and the two paths agree with each other to
+~1e-6 relative.
+
+End to end, ChEES-HMC on the injection-recovery problem (1500 points, 64
+chains, 300 iterations) runs in **4.0 s on the kernel against 126 s on the
+MLX graph**, and samples better for it: minimum ESS 239 against 94.
+
+Three passes, all with the forward's launch shape because the backward
+blocks are **independent**: the forward kernel emits one element per block;
+one thread per chain folds those into each block's entry state and its
+seed, in closed form; and one thread per (chain, block) replays its block
+from checkpoints and sweeps back. The seed is the part that removes the
+chain -- see [docs/m4-plan.md](docs/m4-plan.md).
 
 ### What the kernel does and does not do
 
@@ -571,6 +597,13 @@ Details and measurements: [docs/float32.md](docs/float32.md).
 
 ### Known limitation: compiled gradients
 
+**M4 does not remove this, and I checked rather than assumed.** The fused
+kernel's VJP is a `custom_function`, so `mx.compile` never sees the element
+algebra's backward graph — but the failure was never there. It is in the
+*front end*, `terms._sho_matrices`, which both paths share, so
+`mx.disable_compile()` is still required for ChEES-HMC on either. What M4
+changes is the cost of the gradient once it runs, not whether it compiles.
+
 `mx.compile` over the **backward** pass of the whole likelihood fails with
 *"Too many inputs/outputs fused in the Metal Compiled primitive"* for m ≥ 2.
 MLX fuses a long dependent elementwise chain into a single Metal kernel whose
@@ -599,12 +632,10 @@ import mlx.core as mx
 mx.disable_compile()          # before anvil.run(ChEESHMC(...), ...)
 ```
 
-The gradient-free stretch move is unaffected. **M4's** backward kernel
-replaces this graph with a single hand-written kernel and moots the issue
-entirely, which is why the fix here is a documented workaround rather than a
-restructuring of code that is about to be superseded. (M3's forward kernel
-does not help: it is forward-only, so a gradient still traverses the MLX
-graph.)
+The gradient-free stretch move is unaffected, and so is the forward path.
+The fix is still the one-line workaround: the over-fused group is in
+`terms._sho_matrices`, so splitting the VJP at the term-matrix table is
+what would remove it, and that is tracked under "What is left".
 
 ### Silent MLX behaviours
 

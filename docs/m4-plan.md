@@ -62,7 +62,7 @@ value.
 | D | Suffix scan and closed-form seed, in MLX | 1.5 | Opus | **DONE** -- worst 2.0e-15 on random problems, 6.6e-14 on real terms with gaps and duplicates |
 | E | Backward kernel, single block | 2 | Opus | **DONE** -- 1e-7 at k = 2 (arithmetic exact), < 1e-4 float32 over four terms x three cadences |
 | F | Backward kernel, all blocks, checkpointed | 3 | Fable | **DONE** -- == E to 1.5e-7; == spec to 2e-5 at blocks up to 256 (9e-4 in the gapped m = 4 corner); m = 4 runs at N = 1e5 |
-| G | Wire up, measure, ChEES end to end | 1 | Opus | gradient rows in `verify_readme.py`; joint corner improves |
+| G | Wire up, measure, ChEES end to end | 1 | Opus | **DONE** -- gradient 99x at N=1e4, 264x at N=1e5; ChEES 4.0 s vs 126 s |
 | R | Adversarial review: what did I not see | 0.5 | Fable | -- |
 
 **Why C is a prerequisite and not an optimisation.** The custom function
@@ -145,6 +145,24 @@ corner is ~2.9e-4.
   real light curves.
 * `dh` costing measurable HMC efficiency rather than just paper accuracy
   means fewer blocks, which the occupancy data says is free.
+
+## Outcome, measured
+
+|                                | MLX      | Metal    | speedup |
+|--------------------------------|---------:|---------:|--------:|
+| value+grad, N=1e4, 1024 chains |   884 ms |   8.9 ms |     99x |
+| value+grad, N=1e5, 1024 chains |   15.4 s |    58 ms |    264x |
+| peak memory, N=1e5             | 34.5 GiB | 1.61 GiB |      21x |
+| ChEES, 300 iters, 64 chains    |    126 s |    4.0 s |     31x |
+
+The gradient matches float64 central differences to ~1e-7 on every
+parameter including the jitter, and the two paths agree to ~1e-6.
+
+**One prediction in this plan was wrong.** It said M4 would remove the
+need for `mx.disable_compile()`. It does not: the over-fused group is in
+`terms._sho_matrices`, the front end both paths share, not in the element
+algebra the kernel replaces. Tested, not assumed. Splitting the VJP at the
+term-matrix table is what would remove it.
 
 ## Expected outcome
 

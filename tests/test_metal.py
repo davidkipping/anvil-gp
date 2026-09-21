@@ -13,7 +13,8 @@ import mlx.core as mx
 import pytest
 
 import anvilgp as ag
-from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam,
+                                ParamMap, a64)
 from anvilgp.oracle import dense_loglike
 
 metal = pytest.importorskip("anvilgp.metal")
@@ -176,22 +177,6 @@ def test_psd_failure_stays_finite_under_the_kernel():
         out = gp(mx.zeros((4, 3), dtype=mx.float32))
         mx.eval(out)
     assert bool(mx.all(mx.isfinite(out)))
-
-
-def test_differentiating_the_kernel_says_what_to_do_instead():
-    """Forward-only until M4 -- but the error has to name the fix, not leave
-    the user with MLX's '[Primitive::vjp] Not implemented for CustomKernel'."""
-    refs = [1.0, 4.0, 3.0]
-    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
-                          for i, r in enumerate(refs)], n_dim=3)
-    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(metal=True, metal_block=64))
-    with mx.stream(mx.gpu):
-        u = mx.zeros((2, 3), dtype=mx.float32)
-        with pytest.raises(NotImplementedError, match="forward-only until M4"):
-            mx.eval(mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])[1][0])
-        # the forward path still works after the failed differentiation
-        assert bool(mx.all(mx.isfinite(gp(u))))
 
 
 def test_per_instrument_offsets_under_the_kernel():
@@ -678,3 +663,70 @@ def test_full_kernel_gradient_path_matches_the_specification(name, term, p):
     errs = _e2e_errors(c, seeds)
     for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
         assert e < 2e-4, f"{name} {nm}: {e:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
+                         ids=[c[0] for c in _BWD_TERMS])
+def test_the_kernel_is_differentiable(name, term, p):
+    """M4: the kernel carries its own VJP, and it agrees with the MLX path.
+
+    Both are float32 on the same problem, so this is the arithmetic
+    comparison a user actually cares about: swapping `metal` on or off must
+    not move the gradient.
+    """
+    n = 1500
+    rng = np.random.default_rng(3)
+    t = np.sort(rng.uniform(0.0, 40.0, n))
+    y = rng.standard_normal(n) * 0.9
+    yerr = np.full(n, 0.3)
+    pm = ParamMap.log(p)
+    u = mx.array(rng.standard_normal((4, len(p))).astype(np.float32) * 0.1)
+    ones = mx.ones((4,), dtype=mx.float32)
+
+    got = {}
+    for metal in (False, True):
+        gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                       GPPolicy(block=1024, metal=metal))
+        with mx.stream(mx.gpu):
+            v, g = mx.vjp(gp, [u], [ones])
+            mx.eval(v, g)
+        got[metal] = np.array(g[0])
+
+    a, b = got[False], got[True]
+    assert np.all(np.isfinite(b))
+    rel = np.max(np.abs(a - b)) / max(np.max(np.abs(a)), 1e-20)
+    assert rel < 1e-4, f"{name}: metal vs MLX gradient {rel:.2e}"
+
+
+def test_kernel_gradient_matches_float64_central_differences():
+    """The independent check: no shared code with the MLX path at all."""
+    n = 600
+    rng = np.random.default_rng(4)
+    t = np.sort(rng.uniform(0.0, 30.0, n))
+    y = rng.standard_normal(n) * 0.9
+    yerr = np.full(n, 0.3)
+    refs = [1.0, 4.0, 3.0]
+    kern = [KernelParam(link="log", index=i, ref=r)
+            for i, r in enumerate(refs)]
+    pm = ParamMap(kernel=kern, n_dim=4,
+                  jitter=[KernelParam(link="log", index=3, ref=0.1)])
+    gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                   GPPolicy(block=256, metal=True, hi_block=256))
+    v0 = rng.standard_normal(4) * 0.15
+    with mx.stream(mx.gpu):
+        _, g = mx.vjp(gp, [mx.array(v0[None].astype(np.float32))],
+                      [mx.ones((1,), dtype=mx.float32)])
+        mx.eval(g)
+    got = np.array(g[0])[0]
+
+    fd = np.zeros(4)
+    for i in range(4):
+        h = 1e-5 * max(1.0, abs(v0[i]))
+        up, dn = v0.copy(), v0.copy()
+        up[i] += h
+        dn[i] -= h
+        with mx.stream(mx.cpu):
+            fd[i] = (float(np.array(gp.hi(a64(up[None])))[0])
+                     - float(np.array(gp.hi(a64(dn[None])))[0])) / (2 * h)
+    rel = np.max(np.abs(got - fd)) / max(np.max(np.abs(fd)), 1e-20)
+    assert rel < 1e-5, f"{rel:.2e}\n kernel {got}\n fd     {fd}"

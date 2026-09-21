@@ -70,12 +70,13 @@ def forward(n, n_chains, metal):
         return timed(lambda: f(u), a.repeat)
 
 
-def gradient(n, n_chains):
+def gradient(n, n_chains, metal=False):
     rng = np.random.default_rng(0)
     t = gapped(n)
     y = rng.standard_normal(n) * 0.9
     gp = GPLogLike(None, t, None, y, np.full(n, 0.3), ag.SHOTerm(),
-                   ParamMap.log([1.0, 4.0, 3.0]), GPPolicy(block=4096))
+                   ParamMap.log([1.0, 4.0, 3.0]),
+                   GPPolicy(block=4096, metal=metal))
     u = mx.array(rng.standard_normal((n_chains, 3)).astype(np.float32) * 0.01)
     ones = mx.ones((n_chains,), dtype=mx.float32)
     with mx.stream(mx.gpu):
@@ -106,6 +107,8 @@ CLAIMS = [
     ("MLX forward, 1e4 x 1024", 75.1, lambda: forward(10_000, 1024, False), "time"),
     ("Metal forward, 1e4 x 1024", 1.67, lambda: forward(10_000, 1024, True), "time"),
     ("MLX value+grad, 1e4 x 1024", 880.0, lambda: gradient(10_000, 1024), "time"),
+    ("Metal value+grad, 1e4 x 1024", 8.9,
+     lambda: gradient(10_000, 1024, True), "time"),
     ("fp32 err, N=25e3, sig/yerr=100 (MLX)", 0.06,
      lambda: fp32_error(25_000, 100.0, False), "acc"),
     ("fp32 err, N=25e3, sig/yerr=100 (Metal)", 0.005,
@@ -115,6 +118,8 @@ if not a.quick:
     CLAIMS += [
         ("MLX forward, 1e5 x 1024", 719.0, lambda: forward(100_000, 1024, False), "time"),
         ("Metal forward, 1e5 x 1024", 11.5, lambda: forward(100_000, 1024, True), "time"),
+        ("Metal value+grad, 1e5 x 1024", 58.2,
+         lambda: gradient(100_000, 1024, True), "time"),
         ("fp32 err, N=1e5, sig/yerr=30 (MLX)", 0.20,
          lambda: fp32_error(100_000, 30.0, False), "acc"),
     ]
