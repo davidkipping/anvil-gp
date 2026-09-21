@@ -61,7 +61,7 @@ value.
 | C | Block reduction into the kernel | 1.5 | Opus | **DONE** -- scalar boundary; 1.10-1.68x |
 | D | Suffix scan and closed-form seed, in MLX | 1.5 | Opus | **DONE** -- worst 2.0e-15 on random problems, 6.6e-14 on real terms with gaps and duplicates |
 | E | Backward kernel, single block | 2 | Opus | **DONE** -- 1e-7 at k = 2 (arithmetic exact), < 1e-4 float32 over four terms x three cadences |
-| F | Backward kernel, all blocks, checkpointed | 3 | Fable | == E at one block, == `adjoint.py` at every block count |
+| F | Backward kernel, all blocks, checkpointed | 3 | Fable | **DONE** -- == E to 1.5e-7; == spec to 2e-5 at blocks up to 256 (9e-4 in the gapped m = 4 corner); m = 4 runs at N = 1e5 |
 | G | Wire up, measure, ChEES end to end | 1 | Opus | gradient rows in `verify_readme.py`; joint corner improves |
 | R | Adversarial review: what did I not see | 0.5 | Fable | -- |
 
@@ -76,6 +76,39 @@ happens to be worth 2.2 of the 3.0 ms at N = 1e4.
 the propagator. That divides by `Phi`, which underflowed on the way forward
 at exactly the lags where it would now overflow: every gap in the data.
 Replay forward, always.
+
+## Stage F notes, for stage G
+
+**The seed scans had to move into the kernel, and did.** The plan put them
+in stage G; measured at N = 1e5 the MLX `prefix_scan`/`suffix_scan`/
+`block_seeds` cost 33 ms at m = 2 (against a 33 ms backward kernel) and
+**1.44 s** at m = 4 (against 211 ms), and the 1.4 s version is also what
+tripped the GPU watchdog in an earlier timing loop, not the kernel.
+`block_seeds_kernel` does prefix, suffix and seeds in one launch, one
+thread per chain: 0.75 ms at m = 2, 7.7 ms at m = 4.
+
+Whole gradient path (forward elements -> seeds -> backward), production
+size, one window:
+
+    m = 2, N = 1e5, 1024 chains, 13 blocks:   44 ms   = 3.9x the forward
+    m = 4, N = 1e5,  512 chains, 98 blocks:  270 ms   = 4.8x the forward
+
+The backward kernel alone is 2.9x / 3.8x the forward, as designed.  The
+per-lag accumulation is flush-on-change: a run of one lag accumulates in
+registers and is written to the thread's own ``(chain, block, lag)`` slot
+when the lag changes, so there is no runtime-indexed register array and no
+cap on ``n_lags``.
+
+**The ill-conditioned corner is named.** Rotation (m = 4) is where the
+seed's float32 sensitivity shows: seed kernel and MLX seeds differ at 1e-4
+(2e-5 on duplicates, 1e-4 across a 20-unit gap), and the end-to-end
+adjoints at up to 9e-4 across the gap, against ~1e-6 for every other term
+and cadence.  The tests hold m = 4 to a stated looser bound rather than
+pretending it is not there.
+
+Chain-blocking (splitting chains across launches) was measured and is not
+needed for the watchdog at these sizes, and *hurts* when it is not needed
+-- m = 3 at 4 launches of 128 chains took 255 ms against 68 ms in one.
 
 ## Stage E notes, for stage F
 

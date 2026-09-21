@@ -49,7 +49,8 @@ import mlx.core as mx
 from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
-           "backward_blocks", "metal_available", "MAX_STATE",
+           "backward_blocks", "backward_ckpt", "block_seeds_kernel",
+           "metal_available", "MAX_STATE",
            "MAX_BWD_BLOCK"]
 
 #: Largest state dimension the kernel accepts.  The running element is
@@ -792,6 +793,650 @@ def backward_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
     return outs
+
+
+
+#: One Kalman step at global index ``gi``, updating ``mean``/``cov`` in
+#: place.  Spliced into the stage-F kernel twice -- the checkpoint-writing
+#: replay and the sub-block replay -- so both are byte-for-byte the same
+#: arithmetic the sweep then differentiates.
+_FWD_STEP = """
+        {
+            uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
+            float mp[MDIM], cp[MDIM][MDIM], ch[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += phitab[off + i * M + j] * mean[j];
+                mp[i] = a;
+            }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u) {
+                        float pu = phitab[off + i * M + u];
+                        for (uint w = 0; w < M; ++w)
+                            a += pu * cov[u][w] * phitab[off + j * M + w];
+                    }
+                    cp[i][j] = a + qtab[off + i * M + j];
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < i; ++j) {
+                    float a = 0.5f * (cp[i][j] + cp[j][i]);
+                    cp[i][j] = a; cp[j][i] = a;
+                }
+            float hch = 0.0f;
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += cp[i][j] * hv[j];
+                ch[i] = a; hch += hv[i] * a;
+            }
+            float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
+            float vv = resid[gi * (uint)n_chains + chain];
+            for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+            for (uint i = 0; i < M; ++i) mean[i] = mp[i] + (ch[i] / sv) * vv;
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j)
+                    cov[i][j] = cp[i][j] - (ch[i] / sv) * ch[j];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < i; ++j) {
+                    float a = 0.5f * (cov[i][j] + cov[j][i]);
+                    cov[i][j] = a; cov[j][i] = a;
+                }
+        }
+"""
+
+#: Stage F: the checkpointed reverse sweep, one thread per (chain, block).
+#:
+#: Stage E held every forward state of its block and so capped the block at
+#: 32 observations.  Here the thread replays its block once writing a
+#: checkpoint every ``SLEN`` steps to device memory, then walks the
+#: sub-blocks in reverse: reload the checkpoint, replay ``SLEN`` states into
+#: registers, sweep them back.  Two forward replays plus one sweep, and the
+#: block can be as long as the forward's.
+#:
+#: ``dphi``/``dq`` are accumulated **per lag**, not per observation: the
+#: per-observation array is 1.6 GB at N = 1e5 x 1024 chains.  A run of one
+#: lag is accumulated in registers and flushed to the thread's own
+#: ``(chain, block, lag)`` slot when the lag changes -- real photometry has
+#: one cadence plus one lag per gap, so ~14 flushes per 1e5 points.  Each
+#: thread zeroes its own slots first and then does read-modify-write, and
+#: no other thread touches them, so there is nothing to synchronise.
+_SRC_BWD_CKPT = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    const uint SL = SLEN;
+    uint start = blk_i * (uint)blk_len;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint L = stop - start;
+    uint ei = chain * (uint)n_blocks + blk_i;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] : 0.0f;
+    float cotv = cot[chain];
+
+    // this thread's per-lag accumulator slots: zero them, we own them
+    for (uint l = 0; l < (uint)n_lags; ++l)
+        for (uint i = 0; i < M * M; ++i) {
+            out_dphi[(ei * (uint)n_lags + l) * M * M + i] = 0.0f;
+            out_dq[(ei * (uint)n_lags + l) * M * M + i] = 0.0f;
+        }
+
+    // ---- pass 1: replay forward, checkpoint every SL ----
+    float mean[MDIM], cov[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        mean[i] = ent_m[ei * M + i];
+        for (uint j = 0; j < M; ++j) cov[i][j] = ent_C[ei * M * M + i * M + j];
+    }
+    const uint CK = M + M * M;
+    uint ckb = ei * (uint)n_ckpt;
+    for (uint t = 0; t < L; ++t) {
+        if (t % SL == 0) {
+            uint cb = (ckb + t / SL) * CK;
+            for (uint i = 0; i < M; ++i) {
+                ckpt[cb + i] = mean[i];
+                for (uint j = 0; j < M; ++j) ckpt[cb + M + i * M + j] = cov[i][j];
+            }
+        }
+        uint gi = start + t;
+        FWD_STEP
+    }
+
+    // ---- pass 2: sub-blocks in reverse ----
+    float m_bar[MDIM], p_bar[MDIM][MDIM], h_bar[MDIM];
+    for (uint i = 0; i < M; ++i) {
+        m_bar[i] = seed_m[ei * M + i];
+        h_bar[i] = 0.0f;
+        for (uint j = 0; j < M; ++j) p_bar[i][j] = seed_C[ei * M * M + i * M + j];
+    }
+    float drv_acc = 0.0f;
+    uint cur_lag = 0xFFFFFFFFu;
+    float acc_p[MDIM][MDIM], acc_q[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) { acc_p[i][j] = 0.0f; acc_q[i][j] = 0.0f; }
+
+    uint n_sub = (L + SL - 1) / SL;
+    for (int sbi = (int)n_sub - 1; sbi >= 0; --sbi) {
+        uint sb = (uint)sbi;
+        uint t0 = sb * SL, t1 = min(t0 + SL, L);
+
+        uint cb = (ckb + sb) * CK;
+        for (uint i = 0; i < M; ++i) {
+            mean[i] = ckpt[cb + i];
+            for (uint j = 0; j < M; ++j) cov[i][j] = ckpt[cb + M + i * M + j];
+        }
+        float smean[SLEN][MDIM], scov[SLEN][MDIM][MDIM];
+        for (uint t = t0; t < t1; ++t) {
+            uint li = t - t0;
+            for (uint i = 0; i < M; ++i) {
+                smean[li][i] = mean[i];
+                for (uint j = 0; j < M; ++j) scov[li][i][j] = cov[i][j];
+            }
+            uint gi = start + t;
+            FWD_STEP
+        }
+
+        for (int tt = (int)t1 - 1; tt >= (int)t0; --tt) {
+            uint t = (uint)tt, li = t - t0, gi = start + t;
+            uint lg = (uint)lag[gi];
+            uint off = (chain * (uint)n_lags + lg) * M * M;
+            float Ph[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) Ph[i][j] = phitab[off + i * M + j];
+
+            float mp[MDIM], cp[MDIM][MDIM], ch[MDIM], kg[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += Ph[i][j] * smean[li][j];
+                mp[i] = a;
+            }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u)
+                        for (uint w = 0; w < M; ++w)
+                            a += Ph[i][u] * scov[li][u][w] * Ph[j][w];
+                    cp[i][j] = a + qtab[off + i * M + j];
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < i; ++j) {
+                    float a = 0.5f * (cp[i][j] + cp[j][i]);
+                    cp[i][j] = a; cp[j][i] = a;
+                }
+            float hch = 0.0f;
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += cp[i][j] * hv[j];
+                ch[i] = a; hch += hv[i] * a;
+            }
+            bool clamped = hch < 0.0f;
+            float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
+            float vv = resid[gi * (uint)n_chains + chain];
+            for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+            for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
+
+            float v_bar = -cotv * vv / sv;
+            float s_bar = cotv * (vv * vv - sv) / (2.0f * sv * sv);
+
+            float kg_bar[MDIM], ch_bar[MDIM], mp_bar[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f, b = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    a += p_bar[i][j] * ch[j];
+                    b += p_bar[j][i] * kg[j];
+                }
+                kg_bar[i] = -a + m_bar[i] * vv;
+                ch_bar[i] = -b;
+                mp_bar[i] = m_bar[i];
+            }
+            for (uint i = 0; i < M; ++i) v_bar += kg[i] * m_bar[i];
+
+            out_dy[gi * (uint)n_chains + chain] = v_bar;
+            for (uint i = 0; i < M; ++i) {
+                h_bar[i] -= v_bar * mp[i];
+                mp_bar[i] -= v_bar * hv[i];
+            }
+            for (uint i = 0; i < M; ++i) {
+                ch_bar[i] += kg_bar[i] / sv;
+                s_bar -= kg_bar[i] * kg[i] / sv;
+            }
+            drv_acc += s_bar;
+            float hch_bar = clamped ? 0.0f : s_bar;
+            for (uint i = 0; i < M; ++i) {
+                h_bar[i] += hch_bar * ch[i];
+                ch_bar[i] += hch_bar * hv[i];
+            }
+            float cp_bar[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    cp_bar[i][j] = p_bar[i][j] + ch_bar[i] * hv[j];
+                    a += cp[j][i] * ch_bar[j];
+                }
+                h_bar[i] += a;
+            }
+            float cs[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j)
+                    cs[i][j] = 0.5f * (cp_bar[i][j] + cp_bar[j][i]);
+
+            // flush the per-lag accumulator when the lag changes
+            if (lg != cur_lag) {
+                if (cur_lag != 0xFFFFFFFFu) {
+                    uint ob = (ei * (uint)n_lags + cur_lag) * M * M;
+                    for (uint i = 0; i < M; ++i)
+                        for (uint j = 0; j < M; ++j) {
+                            out_dphi[ob + i * M + j] += acc_p[i][j];
+                            out_dq[ob + i * M + j] += acc_q[i][j];
+                        }
+                }
+                cur_lag = lg;
+                for (uint i = 0; i < M; ++i)
+                    for (uint j = 0; j < M; ++j) { acc_p[i][j] = 0.0f; acc_q[i][j] = 0.0f; }
+            }
+            float pc[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u) a += Ph[i][u] * scov[li][u][j];
+                    pc[i][j] = a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u) a += 2.0f * cs[i][u] * pc[u][j];
+                    acc_p[i][j] += a + mp_bar[i] * smean[li][j];
+                    acc_q[i][j] += cs[i][j];
+                }
+            float nb[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u)
+                        for (uint w = 0; w < M; ++w)
+                            a += Ph[u][i] * cs[u][w] * Ph[w][j];
+                    nb[i][j] = a;
+                }
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    p_bar[i][j] = 0.5f * (nb[i][j] + nb[j][i]);
+                    a += Ph[j][i] * mp_bar[j];
+                }
+                m_bar[i] = a;
+            }
+        }
+    }
+    if (cur_lag != 0xFFFFFFFFu) {
+        uint ob = (ei * (uint)n_lags + cur_lag) * M * M;
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                out_dphi[ob + i * M + j] += acc_p[i][j];
+                out_dq[ob + i * M + j] += acc_q[i][j];
+            }
+    }
+    for (uint i = 0; i < M; ++i) out_dh[ei * M + i] = h_bar[i];
+    out_drv[ei] = drv_acc;
+"""
+
+
+_bwd_ckpt_kernels: dict = {}
+
+#: sub-block length by state dimension: what a thread can hold in
+#: ``smean``/``scov`` alongside the sweep's own working set.
+_SUB_LEN = {1: 32, 2: 32, 3: 16, 4: 8}
+
+
+def _bwd_ckpt_kernel(m: int, slen: int):
+    key = (m, slen)
+    if key not in _bwd_ckpt_kernels:
+        body = _SRC_BWD_CKPT.replace("FWD_STEP", _FWD_STEP)
+        _bwd_ckpt_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_bwd_ckpt_m{m}_s{slen}",
+            input_names=["phitab", "qtab", "lag", "hvec", "resid", "r_ref",
+                         "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
+                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                         "n_jit", "n_ckpt"],
+            output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
+                          "out_drv", "ckpt"],
+            source=body.replace("MDIM", str(m)).replace("SLEN", str(slen)),
+        )
+    return _bwd_ckpt_kernels[key]
+
+
+def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
+                  ent_m, ent_C, seed_m, seed_C, blk_len, sub_len=None):
+    """Checkpointed reverse sweep for every (chain, block), independently.
+
+    Same contract as :func:`backward_blocks` but with no cap on
+    ``blk_len``, and ``dphi``/``dq`` returned **per lag**,
+    ``(n_chains, n_blocks, n_lags, m, m)``, summed over blocks by the
+    caller.  ``dh`` and ``drv`` come per ``(chain, block)``; ``dy`` per
+    observation, ``(npts, n_chains)``, since it feeds the mean model.
+    """
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts = resid.shape[0]
+    if m > MAX_STATE:
+        raise ValueError(f"metal backward supports m <= {MAX_STATE}, got {m}")
+    slen = _SUB_LEN.get(m, 8) if sub_len is None else int(sub_len)
+    n_blocks = (npts + blk_len - 1) // blk_len
+    n_ckpt = (blk_len + slen - 1) // slen
+    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    shapes = [(n_chains, n_blocks, n_lags, m, m),
+              (n_chains, n_blocks, n_lags, m, m),
+              (n_chains, n_blocks, m), (npts, n_chains), (n_chains, n_blocks),
+              (n_chains, n_blocks, n_ckpt, m + m * m)]
+    outs = _bwd_ckpt_kernel(m, slen)(
+        inputs=[phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
+                ent_m, ent_C, seed_m, seed_C,
+                int(npts), int(n_lags), int(n_blocks), int(n_chains),
+                int(blk_len), int(n_jit), int(n_ckpt)],
+        output_shapes=shapes, output_dtypes=[mx.float32] * 6,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    return outs[:5]
+
+
+
+#: The `combine` core shared by the suffix step and the seed: from the
+#: earlier element's ``(b1, C1)`` and the later one's ``(J2, et2)``, form
+#: ``Mm = (I + C1 J2)^-1 C1``, ``G = (I + C1 J2)^-1``,
+#: ``Jt = (I + J2 C1)^-1 J2`` and ``r = G^T (et2 - J2 b1)`` -- the last two
+#: are what both consumers need.  Same Cholesky route as `reduce_blocks`.
+_COMBINE_CORE = """
+            float trc = 0.0f;
+            for (uint i = 0; i < M; ++i) trc += C1[i][i];
+            float flc = 1.1920929e-7f * trc / (float)M + 3.0e-38f;
+            float L1[MDIM][MDIM];
+            for (uint j = 0; j < M; ++j) {
+                float d = C1[j][j];
+                for (uint t = 0; t < j; ++t) d -= L1[j][t] * L1[j][t];
+                L1[j][j] = metal::precise::sqrt(max(d, flc));
+                float inv = 1.0f / L1[j][j];
+                for (uint i = j + 1; i < M; ++i) {
+                    float a = C1[i][j];
+                    for (uint t = 0; t < j; ++t) a -= L1[i][t] * L1[j][t];
+                    L1[i][j] = a * inv;
+                }
+                for (uint i = 0; i < j; ++i) L1[i][j] = 0.0f;
+            }
+            float T[MDIM][MDIM], X[MDIM][MDIM], S[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += J2[i][t] * L1[t][j];
+                    T[i][j] = a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += L1[t][i] * T[t][j];
+                    X[i][j] = a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j)
+                    S[i][j] = (i == j ? 1.0f : 0.0f) + 0.5f * (X[i][j] + X[j][i]);
+            float trs = 0.0f;
+            for (uint i = 0; i < M; ++i) trs += S[i][i];
+            float fls = 1.1920929e-7f * trs / (float)M + 3.0e-38f;
+            float Ls[MDIM][MDIM];
+            for (uint j = 0; j < M; ++j) {
+                float d = S[j][j];
+                for (uint t = 0; t < j; ++t) d -= Ls[j][t] * Ls[j][t];
+                Ls[j][j] = metal::precise::sqrt(max(d, fls));
+                float inv = 1.0f / Ls[j][j];
+                for (uint i = j + 1; i < M; ++i) {
+                    float a = S[i][j];
+                    for (uint t = 0; t < j; ++t) a -= Ls[i][t] * Ls[j][t];
+                    Ls[i][j] = a * inv;
+                }
+                for (uint i = 0; i < j; ++i) Ls[i][j] = 0.0f;
+            }
+            float Y[MDIM][MDIM];
+            for (uint c = 0; c < M; ++c)
+                for (uint rr = 0; rr < M; ++rr) {
+                    float a = L1[rr][c];
+                    for (uint t = 0; t < c; ++t) a -= Ls[c][t] * Y[rr][t];
+                    Y[rr][c] = a / Ls[c][c];
+                }
+            float Mm[MDIM][MDIM], G[MDIM][MDIM], V[MDIM][MDIM], Jt[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += Y[i][t] * Y[j][t];
+                    Mm[i][j] = a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += Mm[i][t] * J2[t][j];
+                    G[i][j] = (i == j ? 1.0f : 0.0f) - a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += J2[i][t] * Y[t][j];
+                    V[i][j] = a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += V[i][t] * V[j][t];
+                    Jt[i][j] = J2[i][j] - a;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < i; ++j) {
+                    float a = 0.5f * (Jt[i][j] + Jt[j][i]);
+                    Jt[i][j] = a; Jt[j][i] = a;
+                }
+            float rr_[MDIM], jb[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += J2[i][j] * b1[j];
+                jb[i] = et2[i] - a;
+            }
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += G[j][i] * jb[j];
+                rr_[i] = a;
+            }
+"""
+
+#: Seeds for the backward kernel, one thread per chain.
+#:
+#: Three sequential folds over a chain's ~10-100 block elements, all in one
+#: launch: the prefix, giving the filter state each block *starts* from
+#: (``ent``); the suffix, giving the future after each block as ``(J,
+#: eta)``; and the closed form of `adjoint.block_seeds` from the two.
+#: This replaces `prefix_scan`/`suffix_scan`/`block_seeds` in MLX, which
+#: build ~2 x n_blocks sequential compositions in the graph: 42 ms at
+#: m = 2 and 1.5 s at m = 4 for N = 1e5, against a backward kernel of 33
+#: and 112 ms.  Here the whole thing is ~0.1 ms.
+_SRC_SEEDS = """
+    uint chain = thread_position_in_grid.x;
+    if (chain >= (uint)n_chains) return;
+    const uint M = MDIM;
+    uint base = chain * (uint)n_blocks;
+
+    // ---- prefix: fold (b, C) forward, emitting the ENTRY state of each
+    // block, i.e. the state after the previous one; block 0 enters at 0.
+    float bv[MDIM], Cm[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        ent_m[base * M + i] = 0.0f;
+        for (uint j = 0; j < M; ++j) ent_C[base * M * M + i * M + j] = 0.0f;
+        bv[i] = in_b[base * M + i];
+        for (uint j = 0; j < M; ++j) Cm[i][j] = in_C[base * M * M + i * M + j];
+    }
+    for (uint k = 1; k < (uint)n_blocks; ++k) {
+        // entry of block k = exit of block k-1 = current accumulator
+        for (uint i = 0; i < M; ++i) {
+            ent_m[(base + k) * M + i] = bv[i];
+            for (uint j = 0; j < M; ++j)
+                ent_C[(base + k) * M * M + i * M + j] = Cm[i][j];
+        }
+        uint ov = (base + k) * M, om = (base + k) * M * M;
+        float C1[MDIM][MDIM], J2[MDIM][MDIM], A2[MDIM][MDIM], C2[MDIM][MDIM];
+        float b1[MDIM], et2[MDIM], b2[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            b1[i] = bv[i]; b2[i] = in_b[ov + i]; et2[i] = in_eta[ov + i];
+            for (uint j = 0; j < M; ++j) {
+                C1[i][j] = Cm[i][j];
+                J2[i][j] = in_J[om + i * M + j];
+                A2[i][j] = in_A[om + i * M + j];
+                C2[i][j] = in_C[om + i * M + j];
+            }
+        }
+        COMBINE_CORE
+        // b <- A2 (G b1 + Mm eta2) + b2 ;  C <- sym(A2 Mm A2^T) + C2
+        float Gb1[MDIM], Met[MDIM], nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f, b = 0.0f;
+            for (uint j = 0; j < M; ++j) { a += G[i][j] * b1[j]; b += Mm[i][j] * et2[j]; }
+            Gb1[i] = a; Met[i] = b;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float a = b2[i];
+            for (uint j = 0; j < M; ++j) a += A2[i][j] * (Gb1[j] + Met[j]);
+            nb[i] = a;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += A2[i][t] * Mm[t][j];
+                AM[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += AM[i][t] * A2[j][t];
+                nC[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i) {
+            bv[i] = nb[i];
+            for (uint j = 0; j < M; ++j) Cm[i][j] = 0.5f * (nC[i][j] + nC[j][i]) + C2[i][j];
+        }
+    }
+    // exit state of the last block, needed for its (zero) seed below
+    float xb[MDIM], xC[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) { xb[i] = bv[i]; for (uint j = 0; j < M; ++j) xC[i][j] = Cm[i][j]; }
+
+    // ---- suffix: fold (J, eta) backward.  suf[k] = blocks k..B-1;
+    // suf[B] = identity.  Stored per block in scratch.
+    float Jm[MDIM][MDIM], ev[MDIM];
+    for (uint i = 0; i < M; ++i) { ev[i] = 0.0f; for (uint j = 0; j < M; ++j) Jm[i][j] = 0.0f; }
+    for (int kk = (int)n_blocks - 1; kk >= 0; --kk) {
+        uint k = (uint)kk;
+        // store suf[k+1] (the accumulator BEFORE absorbing block k)
+        uint sv_ = (base + k) * M, sm_ = (base + k) * M * M;
+        for (uint i = 0; i < M; ++i) {
+            suf_eta[sv_ + i] = ev[i];
+            for (uint j = 0; j < M; ++j) suf_J[sm_ + i * M + j] = Jm[i][j];
+        }
+        uint ov = (base + k) * M, om = (base + k) * M * M;
+        float C1[MDIM][MDIM], J2[MDIM][MDIM], A1[MDIM][MDIM], J1[MDIM][MDIM];
+        float b1[MDIM], et2[MDIM], e1[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            b1[i] = in_b[ov + i]; e1[i] = in_eta[ov + i]; et2[i] = ev[i];
+            for (uint j = 0; j < M; ++j) {
+                C1[i][j] = in_C[om + i * M + j];
+                A1[i][j] = in_A[om + i * M + j];
+                J1[i][j] = in_J[om + i * M + j];
+                J2[i][j] = Jm[i][j];
+            }
+        }
+        COMBINE_CORE
+        // eta <- A1^T r + eta1 ;  J <- sym(A1^T Jt A1) + J1
+        float ne[MDIM], JA[MDIM][MDIM], nJ[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = e1[i];
+            for (uint j = 0; j < M; ++j) a += A1[j][i] * rr_[j];
+            ne[i] = a;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += Jt[i][t] * A1[t][j];
+                JA[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += A1[t][i] * JA[t][j];
+                nJ[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i) {
+            ev[i] = ne[i];
+            for (uint j = 0; j < M; ++j) Jm[i][j] = 0.5f * (nJ[i][j] + nJ[j][i]) + J1[i][j];
+        }
+    }
+
+    // ---- seeds: block k from its EXIT state (entry of k+1; the stored
+    // exit for the last) and suf[k+1]
+    float cotv = cot[chain];
+    for (uint k = 0; k < (uint)n_blocks; ++k) {
+        float C1[MDIM][MDIM], J2[MDIM][MDIM];
+        float b1[MDIM], et2[MDIM];
+        uint sv_ = (base + k) * M, sm_ = (base + k) * M * M;
+        if (k + 1 < (uint)n_blocks) {
+            for (uint i = 0; i < M; ++i) {
+                b1[i] = ent_m[(base + k + 1) * M + i];
+                for (uint j = 0; j < M; ++j) C1[i][j] = ent_C[(base + k + 1) * M * M + i * M + j];
+            }
+        } else {
+            for (uint i = 0; i < M; ++i) { b1[i] = xb[i]; for (uint j = 0; j < M; ++j) C1[i][j] = xC[i][j]; }
+        }
+        for (uint i = 0; i < M; ++i) {
+            et2[i] = suf_eta[sv_ + i];
+            for (uint j = 0; j < M; ++j) J2[i][j] = suf_J[sm_ + i * M + j];
+        }
+        COMBINE_CORE
+        for (uint i = 0; i < M; ++i) {
+            seed_m[sv_ + i] = cotv * rr_[i];
+            for (uint j = 0; j < M; ++j)
+                seed_C[sm_ + i * M + j] = 0.5f * cotv * (rr_[i] * rr_[j] - Jt[i][j]);
+        }
+    }
+"""
+
+
+_seed_kernels: dict = {}
+
+
+def _seed_kernel(m: int):
+    if m not in _seed_kernels:
+        body = _SRC_SEEDS.replace("COMBINE_CORE", _COMBINE_CORE)
+        _seed_kernels[m] = mx.fast.metal_kernel(
+            name=f"anvilgp_seeds_m{m}",
+            input_names=["in_A", "in_b", "in_C", "in_eta", "in_J", "cot",
+                         "n_blocks", "n_chains"],
+            output_names=["ent_m", "ent_C", "seed_m", "seed_C", "suf_J",
+                          "suf_eta"],
+            source=body.replace("MDIM", str(m)),
+        )
+    return _seed_kernels[m]
+
+
+def block_seeds_kernel(el: Element, cot: mx.array):
+    """``(ent_m, ent_C, seed_m, seed_C)`` for every (chain, block), in-kernel.
+
+    The entry state each block starts from and the ``(m_bar, P_bar)`` it
+    inherits, from the block elements the forward kernel emits.  One thread
+    per chain; see `_SRC_SEEDS`.
+    """
+    n_chains, n_blocks, m = el.b.shape[0], el.b.shape[1], el.b.shape[-1]
+    shapes = [(n_chains, n_blocks, m), (n_chains, n_blocks, m, m),
+              (n_chains, n_blocks, m), (n_chains, n_blocks, m, m),
+              (n_chains, n_blocks, m, m), (n_chains, n_blocks, m)]
+    outs = _seed_kernel(m)(
+        inputs=[el.A, el.b, el.C, el.eta, el.J, cot,
+                int(n_blocks), int(n_chains)],
+        output_shapes=shapes, output_dtypes=[mx.float32] * 6,
+        grid=(n_chains, 1, 1), threadgroup=(min(64, n_chains), 1, 1))
+    return outs[0], outs[1], outs[2], outs[3]
 
 
 def metal_available() -> bool:

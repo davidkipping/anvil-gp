@@ -508,3 +508,173 @@ def test_backward_kernel_arithmetic_is_exact_before_accumulation(
     errs = _bwd_case(term, p, 2, 2)
     for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
         assert e < 1e-5, f"{name} {nm}: {e:.2e}"
+
+
+# -- stage F: checkpointed sweep, per-lag adjoints, in-kernel seeds --------
+
+
+def _fwd_setup(term, p, k, blk, n_chains=3, cadence="regular", seed=1):
+    """Lag table, block elements and the float64 reference adjoints."""
+    from anvilgp.adjoint import filter_backward, filter_forward
+    from anvilgp.metal import scan_blocks
+
+    rng = np.random.default_rng(seed)
+    if cadence == "gapped":
+        t = np.sort(rng.uniform(0.0, 8.0, k))
+        t[k // 2:] += 20.0
+    elif cadence == "dupes":
+        t = np.sort(np.concatenate([rng.uniform(0.0, 8.0, (k + 1) // 2)] * 2))
+        t = t[:k]
+    else:
+        t = np.arange(k) * 0.3
+    dt = np.concatenate([[0.0], np.diff(t)])
+    uniq, inv = np.unique(dt.astype(np.float32), return_inverse=True)
+    lag_np = inv.astype(np.int32) + 1
+    lag_np[0] = 0
+    lag = mx.array(lag_np)
+
+    m = term.n_state
+    P = mx.array(np.tile(np.array(p, np.float32), (n_chains, 1)))
+    phi_u, q_u, h = term.matrices(P, mx.array(uniq.astype(np.float32)))
+    pt = mx.concatenate([mx.zeros((n_chains, 1, m, m), dtype=mx.float32),
+                         phi_u], axis=1)
+    qt = mx.concatenate([mx.broadcast_to(mx.eye(m, dtype=mx.float32),
+                                         (n_chains, 1, m, m)), q_u], axis=1)
+    y = mx.array(rng.standard_normal(k).astype(np.float32))
+    rrv = mx.full((k,), 0.09, dtype=mx.float32)
+    yv = mx.broadcast_to(y, (n_chains, k))
+    rv = mx.broadcast_to(rrv, (n_chains, k))
+    cot = mx.array(rng.standard_normal(n_chains).astype(np.float32))
+    resid = mx.swapaxes(yv, 0, 1)
+    j2 = mx.zeros((n_chains, 0), dtype=mx.float32)
+
+    phi, q = mx.take(pt, lag, axis=1), mx.take(qt, lag, axis=1)
+    states, _ = filter_forward(phi, q, h, yv, rv, rrv)
+    want = filter_backward(phi, q, h, yv, rv, rrv, states, cot)
+    with mx.stream(mx.gpu):
+        el = scan_blocks(pt, qt, lag, h, resid, rrv, j2, 1e-6, blk)
+        mx.eval(el)
+    return dict(pt=pt, qt=qt, lag=lag, lag_np=lag_np, h=h, resid=resid,
+                rrv=rrv, j2=j2, cot=cot, el=el, want=want, blk=blk,
+                n_lags=pt.shape[1])
+
+
+def _per_lag(x_obs, lag_np, n_lags):
+    x = np.array(x_obs, dtype=np.float64)
+    out = np.zeros((x.shape[0], n_lags) + x.shape[2:])
+    for i in range(x.shape[1]):
+        out[:, lag_np[i]] += x[:, i]
+    return out
+
+
+def _rel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    return float(np.max(np.abs(a - b)) / max(np.max(np.abs(a)), 1e-20))
+
+
+def _e2e_errors(c, seeds):
+    from anvilgp.metal import backward_ckpt
+    with mx.stream(mx.gpu):
+        o = backward_ckpt(c["pt"], c["qt"], c["lag"], c["h"], c["resid"],
+                          c["rrv"], c["j2"], c["cot"], *seeds, c["blk"])
+        mx.eval(o)
+    w = c["want"]
+    return [_rel(_per_lag(w[0], c["lag_np"], c["n_lags"]), mx.sum(o[0], axis=1)),
+            _rel(_per_lag(w[1], c["lag_np"], c["n_lags"]), mx.sum(o[1], axis=1)),
+            _rel(w[2], mx.sum(o[2], axis=1)),
+            _rel(w[3], mx.swapaxes(o[3], 0, 1)),
+            _rel(np.sum(np.array(w[4], np.float64), axis=1), mx.sum(o[4], axis=1))]
+
+
+@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
+                         ids=[c[0] for c in _BWD_TERMS])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
+@pytest.mark.parametrize("k,blk", [(64, 32), (300, 100), (1000, 256)])
+def test_checkpointed_backward_matches_the_specification(
+        name, term, p, cadence, k, blk):
+    """Stage F: long blocks, checkpointed, per-lag adjoints -- vs adjoint.py.
+
+    Blocks of 100 and 256 are past stage E's cap of 32, so this is the
+    checkpoint scheme under test. The seeds here come from the MLX scans so
+    that the sweep is isolated from the seed kernel (tested separately).
+
+    Tolerance: float32 against a float64 spec. The gapped cadence at m = 4
+    is the ill-conditioned corner -- a 20-unit gap underflows the
+    propagator and the seed's cancellation amplifies the block elements'
+    float32 error -- and it is held to a looser bound and named as such.
+    """
+    from anvilgp.adjoint import block_seeds
+    from anvilgp.elements import Element, prefix_scan, suffix_scan
+
+    c = _fwd_setup(term, p, k, blk, cadence=cadence)
+    el, n = c["el"], c["cot"].shape[0]
+    m = term.n_state
+    pre, suf = prefix_scan(el), suffix_scan(el)
+    nb = el.b.shape[1]
+    ent_m = mx.concatenate([mx.zeros((n, 1, m), dtype=mx.float32),
+                            pre.b[:, :-1]], axis=1)
+    ent_C = mx.concatenate([mx.zeros((n, 1, m, m), dtype=mx.float32),
+                            pre.C[:, :-1]], axis=1)
+    sm, sc = block_seeds(pre.b, pre.C,
+                         Element(*(getattr(suf, f)[:, 1:]
+                                   for f in Element._fields)),
+                         mx.broadcast_to(c["cot"][:, None], (n, nb)))
+    errs = _e2e_errors(c, (ent_m, ent_C, sm, sc))
+    tol = 2e-3 if (cadence == "gapped" and m >= 4) else 1e-4
+    for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
+        assert e < tol, f"{name}/{cadence} k={k} blk={blk} {nm}: {e:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
+                         ids=[c[0] for c in _BWD_TERMS])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
+def test_seed_kernel_matches_the_mlx_scans(name, term, p, cadence):
+    """The in-kernel prefix, suffix and seeds against the MLX versions.
+
+    Both are float32 on the same block elements, so this is arithmetic
+    order only. The MLX scans it replaces cost 33 ms at m = 2 and 1.4 s at
+    m = 4 for N = 1e5; the kernel is under 8 ms at either.
+    """
+    from anvilgp.adjoint import block_seeds
+    from anvilgp.elements import Element, prefix_scan, suffix_scan
+    from anvilgp.metal import block_seeds_kernel
+
+    c = _fwd_setup(term, p, 300, 64, cadence=cadence)
+    el, n, m = c["el"], c["cot"].shape[0], term.n_state
+    with mx.stream(mx.gpu):
+        k_ent_m, k_ent_C, k_sm, k_sC = block_seeds_kernel(el, c["cot"])
+        mx.eval(k_ent_m, k_ent_C, k_sm, k_sC)
+    pre, suf = prefix_scan(el), suffix_scan(el)
+    nb = el.b.shape[1]
+    r_ent_m = mx.concatenate([mx.zeros((n, 1, m), dtype=mx.float32),
+                              pre.b[:, :-1]], axis=1)
+    r_ent_C = mx.concatenate([mx.zeros((n, 1, m, m), dtype=mx.float32),
+                              pre.C[:, :-1]], axis=1)
+    r_sm, r_sC = block_seeds(pre.b, pre.C,
+                             Element(*(getattr(suf, f)[:, 1:]
+                                       for f in Element._fields)),
+                             mx.broadcast_to(c["cot"][:, None], (n, nb)))
+    # m = 4 is the ill-conditioned dimension: 1e-4 in general, 1e-3 across
+    # a gap, 1e-5 for everything else.  Measured, not chosen.
+    tol = 1e-5 if m < 4 else (1e-3 if cadence == "gapped" else 1e-4)
+    for nm, a, b in (("ent_m", r_ent_m, k_ent_m), ("ent_C", r_ent_C, k_ent_C),
+                     ("seed_m", r_sm, k_sm), ("seed_C", r_sC, k_sC)):
+        assert _rel(a, b) < tol, f"{name}/{cadence} {nm}: {_rel(a, b):.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
+                         ids=[c[0] for c in _BWD_TERMS])
+def test_full_kernel_gradient_path_matches_the_specification(name, term, p):
+    """Forward kernel -> seed kernel -> backward kernel, no MLX in between.
+
+    This is the composition stage G wires into the VJP.
+    """
+    from anvilgp.metal import block_seeds_kernel
+
+    c = _fwd_setup(term, p, 1000, 128, cadence="dupes")
+    with mx.stream(mx.gpu):
+        seeds = block_seeds_kernel(c["el"], c["cot"])
+        mx.eval(*seeds)
+    errs = _e2e_errors(c, seeds)
+    for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
+        assert e < 2e-4, f"{name} {nm}: {e:.2e}"
