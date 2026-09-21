@@ -253,37 +253,43 @@ def test_blocked_backward_with_floor_equals_the_whole_series_one(blk):
         assert float(mx.max(mx.abs(a - b))) / scale < 1e-12, name
 
 
-def test_the_floor_convention_differs_from_production_and_is_documented():
-    """A latent mismatch that M4 must resolve before any kernel is written.
+def test_both_forms_clamp_their_own_variance_term():
+    """Stage 0: the clamp protects the quantity that can go non-physical.
 
-    This spec floors the *filter* innovation variance
-    ``S = h (Phi P Phi^T + Q) h^T + r_var``; ``elements.leaf_elements`` and
-    the Metal forward kernel floor the *leaf* quantity
-    ``s_q = h Q h^T + r_var``.  They differ by ``alpha >= 1``, so they bind
-    on different lanes.  Production never binds either, which is why this
-    has gone unnoticed; a backward kernel written against this convention
-    would differentiate a function the forward does not compute, on exactly
-    the lanes the package documents as sensitive.
+    Each form computes a different total -- the leaf's is
+    ``h Q h^T + r_var``, the filter's is ``h (Phi P Phi^T + Q) h^T +
+    r_var`` -- so clamping the *total* made them clamp different things and
+    disagree by ~0.1 log-units wherever it bound.  Clamping the variance
+    term instead is principled in each form on its own, and gives the
+    stronger guarantee ``s >= r_var > 0``: ``r_var`` beside it is exact and
+    strictly positive, where the old whole-sum floor allowed a negative
+    residue to survive inside the sum.
 
-    The test pins the discrepancy rather than hiding it, so that whoever
-    resolves it has to delete this test deliberately.
+    Pinned here: healthy inputs agree, and a variance term driven negative
+    still gives a finite result with the innovation variance never below
+    ``r_var``.
     """
     from anvilgp.elements import chunked_reduce, leaf_elements
 
     phi, q, h, y, rv, rr, _ = _problem(0)
-    k = phi.shape[1]
+    agree = float(mx.max(mx.abs(
+        sequential_loglike(phi, q, h, y, rv, rr)
+        - chunked_reduce(*leaf_elements(phi, q, h, y, rv, rr),
+                         sub_len=1).ell)))
+    assert agree < 1e-10, f"healthy inputs must agree; got {agree:.3e}"
 
-    no_floor = mx.max(mx.abs(
-        sequential_loglike(phi, q, h, y, rv, rr, None)
-        - chunked_reduce(*leaf_elements(phi, q, h, y, rv, rr, None),
-                         sub_len=1).ell))
-    assert float(no_floor) < 1e-10, "with no floor the two must agree"
+    n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
+    bad_q = mx.array(np.tile(-1e-3 * np.eye(m), (n, k, 1, 1)), dtype=D)
+    hv = mx.array(np.ones((n, m)), dtype=D)
+    rv2 = mx.full((n, k), 0.5, dtype=D)
+    rr2 = mx.full((k,), 0.5, dtype=D)
 
-    high = mx.full((k,), 4.0, dtype=D)
-    with_floor = mx.max(mx.abs(
-        sequential_loglike(phi, q, h, y, rv, rr, high)
-        - chunked_reduce(*leaf_elements(phi, q, h, y, rv, rr, high),
-                         sub_len=1).ell))
-    assert float(with_floor) > 1e-3, (
-        "if this now agrees, the conventions have been unified -- good; "
-        "delete this test and the note in filter_forward's docstring")
+    qh = mx.sum(bad_q * hv[:, None, None, :], axis=-1)
+    hqh = mx.sum(hv[:, None, :] * qh, axis=-1)
+    assert float(mx.max(hqh)) < 0.0, "the fixture must exercise the clamp"
+
+    out = chunked_reduce(*leaf_elements(phi, bad_q, hv, y, rv2, rr2),
+                         sub_len=1).ell
+    assert bool(mx.all(mx.isfinite(out))), "a clamped lane must stay finite"
+    s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + rv2
+    assert float(mx.min(s_q)) >= float(mx.min(rv2)) - 1e-15

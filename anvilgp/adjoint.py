@@ -62,13 +62,20 @@ def _predict_step(p_i, q_i, h, y_i, rv_i, mean, cov, floor_i=None):
     mp = matvec(p_i, mean)
     cp = sym(matmul(p_i, matmul(cov, mx.swapaxes(p_i, -1, -2))) + q_i)
     ch = matvec(cp, h)
-    s = mx.sum(h * ch, axis=-1) + rv_i
+    # Clamp the predicted variance term, not the sum -- see
+    # `elements.leaf_elements`.  `clamped` is the mask of lanes where it
+    # bound; the backward needs it, because there `h Cp h^T` is a constant
+    # and its cotangent must be cut.  `r_var` is NOT cut: it still flows
+    # through, which the old whole-sum clamp got wrong by zeroing it too.
+    hch = mx.sum(h * ch, axis=-1)
+    clamped = hch < 0.0
+    s = mx.maximum(hch, mx.zeros_like(hch)) + rv_i
     floored = None
     if floor_i is not None:
         floored = s < floor_i
         s = mx.maximum(s, floor_i)
     v = y_i - mx.sum(h * mp, axis=-1)
-    return mp, cp, ch, s, v, ch / s[:, None], floored
+    return mp, cp, ch, s, v, ch / s[:, None], (floored, clamped)
 
 
 def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
@@ -80,26 +87,24 @@ def filter_forward(phi, q, h, y, r_var, r_ref, init=None, s_floor=None):
     that block; for the whole series, with zeros (Phi = 0, Q = P_inf = I at
     the first observation makes that the stationary prior).
 
-    ``s_floor`` is the per-observation floor on the innovation variance,
-    applied exactly as :func:`anvilgp.kalman.sequential_loglike` applies it.
-    It is not optional decoration: this function is the specification the
-    Metal backward kernel is written against, and a kernel that omitted the
-    floor would disagree with the forward it is differentiating precisely on
-    the lanes where positive-definiteness has already failed.
+    The innovation variance is clamped on its *variance term*, not on the
+    total: ``S = max(h Cp h^T, 0) + r_var``.  That term is a variance,
+    non-negative in exact arithmetic and able to round negative in float32;
+    ``r_var`` beside it is exact and strictly positive, so the clamp leaves
+    ``S >= r_var > 0`` and the division is always safe.
 
-    **But it is not the same quantity that production floors, and that has
-    to be settled before the kernel is written.**  Here and in
-    ``kalman.py`` the floor lands on the *filter* innovation variance
-    ``S = h (Phi P Phi^T + Q) h^T + r_var``.  In
-    :func:`anvilgp.elements.leaf_elements` -- and in the Metal forward
-    kernel, which is what a gradient would actually differentiate -- it
-    lands on the *leaf* quantity ``s_q = h Q h^T + r_var``.  The two differ
-    by ``alpha = 1 + z^T C1 z >= 1``, so they bind on different lanes: with
-    a floor high enough to bind, the two paths disagree by ~0.1 log-units
-    in float64.  In production neither binds (``s_floor_rel = 1e-6`` against
-    ``r_var >= r_ref``), so this is latent rather than live, and
-    ``tests/test_adjoint.py`` cannot see it because both sides there use the
-    filter convention.
+    This matters for M4 specifically.  The Metal forward kernel and
+    :func:`anvilgp.elements.leaf_elements` clamp *their* variance term,
+    ``h Q h^T``, which is a different quantity from this one -- the two
+    forms compute different totals.  Clamping each form's own variance term
+    means each is principled on its own terms and the two agree exactly
+    whenever neither clamp fires, which is every healthy input.  Clamping
+    the totals instead, as an earlier version did, made them clamp
+    different things and disagree by ~0.1 log-units wherever it bound.
+
+    ``s_floor`` remains as a secondary whole-sum floor for tests.  It
+    cannot bind in production now that the primary clamp guarantees
+    ``S >= r_var >= r_ref``.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     dtype = phi.dtype
@@ -154,7 +159,7 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
         p_i = phi[:, i]
         # replay the forward quantities this step needs -- the SAME
         # computation the forward ran, not an equivalent one
-        mp, cp, ch, s, v, kg, floored = _predict_step(
+        mp, cp, ch, s, v, kg, (floored, clamped) = _predict_step(
             p_i, q[:, i], h, y[:, i], r_var[:, i], mean_prev, cov_prev,
             None if s_floor is None else s_floor[i])
 
@@ -177,19 +182,19 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
         # Kg = ch / S
         ch_bar = ch_bar + kg_bar / s[:, None]
         s_bar = s_bar - mx.sum(kg_bar * kg, axis=-1) / s
-        # S = max(h.ch + R, floor).  Where the floor binds, S is a constant
-        # -- it no longer depends on Phi, Q, h or r_var -- so its cotangent
-        # must be cut here, after everything that *divides* by S (which is
-        # just a number, floored or not) and before everything that feeds
-        # back into what produced it.  Omitting this is not a small error:
-        # on a problem where the floor binds it puts the hand adjoint orders
-        # of magnitude away from the true VJP.
+        # S = max(h.ch, 0) + R.  `r_var` is a plain addend, so its
+        # cotangent is `s_bar` whatever the clamps did -- record it first.
         if floored is not None:
+            # the secondary whole-sum floor: there S is wholly constant, so
+            # nothing downstream of it gets a cotangent, r_var included.
             s_bar = mx.where(floored, mx.zeros_like(s_bar), s_bar)
-        # S = h.ch + R
-        h_bar = h_bar + s_bar[:, None] * ch
-        ch_bar = ch_bar + s_bar[:, None] * h
         rv_cols.append(s_bar)
+        # ...but `h Cp h^T` is clamped on its own, so only *its* cotangent
+        # is cut, and only on the lanes where the clamp bound.  Cutting
+        # r_var's too (as the old whole-sum clamp did) was wrong.
+        hch_bar = mx.where(clamped, mx.zeros_like(s_bar), s_bar)
+        h_bar = h_bar + hch_bar[:, None] * ch
+        ch_bar = ch_bar + hch_bar[:, None] * h
         # ch = Cp h
         cp_bar = cp_bar + outer(ch_bar, h)
         h_bar = h_bar + matvec(mx.swapaxes(cp, -1, -2), ch_bar)

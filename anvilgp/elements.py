@@ -251,12 +251,21 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     _m = h.shape[-1]
     hphi = sum(h[:, None, i, None] * phi[:, :, i, :] for i in range(_m))
     qh = sum(q[:, :, :, j] * h[:, None, None, j] for j in range(_m))
-    s_q = sum(h[:, None, i] * qh[:, :, i] for i in range(_m)) + r_var
+    # `h Q h^T` is a variance, hence non-negative in exact arithmetic, but
+    # float32 can round it slightly negative in the dense-cadence corner.
+    # Clamp *it*, not the sum: `r_var` beside it is exact and strictly
+    # positive, so clamping the term that can go non-physical leaves
+    # `s_q >= r_var > 0` and the division is always safe.  Clamping the
+    # total instead (the old `max(s_q, 1e-6 r_ref)`) allowed a negative
+    # residue to survive inside the sum, and -- because the sequential
+    # filter's own total is a *different* quantity, `h (Phi P Phi^T + Q) h^T
+    # + r_var` -- made the two forms clamp different things and disagree by
+    # ~0.1 log-units wherever it bound.  See docs/m4-plan.md, stage 0.
+    hqh = sum(h[:, None, i] * qh[:, :, i] for i in range(_m))
+    s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + r_var
     if s_floor is not None:
-        # h Q h^T is a variance, hence non-negative in exact arithmetic, but
-        # float32 can round it slightly negative in the dense-cadence corner.
-        # Flooring makes positive-definiteness failure a defined outcome
-        # instead of a division that takes the whole ensemble with it.
+        # secondary guard, kept for tests; unreachable in production since
+        # s_q >= r_var >= r_ref and s_floor is a small fraction of r_ref.
         s_q = mx.maximum(s_q, s_floor)
 
     inv_s = 1.0 / s_q
@@ -624,8 +633,9 @@ def leaf_parts(phi_blocks, q_blocks, h, y, r_var, r_ref, s_floor=None):
         [sum(b[:, :, :, j] * h[:, None, None, o + j]
              for j in range(b.shape[-1]))
          for b, o in zip(q_blocks, _offsets(q_blocks))], axis=-1)
-    s_q = sum(h[:, None, i] * qh[:, :, i]
-              for i in range(h.shape[-1])) + r_var
+    # clamp the variance term, not the sum -- see `leaf_elements`
+    hqh = sum(h[:, None, i] * qh[:, :, i] for i in range(h.shape[-1]))
+    s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + r_var
     if s_floor is not None:
         s_q = mx.maximum(s_q, s_floor)
     inv_rs = mx.rsqrt(s_q)

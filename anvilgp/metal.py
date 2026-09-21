@@ -105,7 +105,14 @@ _SRC = """
             qh[i] = s;
             sq += hv[i] * s;
         }
+        // clamp the variance term, not the sum: h Q h^T is non-negative in
+        // exact arithmetic and can round negative in float32, while rr and
+        // the jitter beside it are exact and positive.  Leaves sq >= rr, so
+        // the division below is always safe, and matches what
+        // elements.leaf_elements clamps.  The sfloor line is a secondary
+        // guard that cannot bind once this one is in place.
         float rr = r_ref[t];
+        sq = max(sq, 0.0f);
         sq += rr + jit2v;
         sq = max(sq, sfloor * rr);              // PSD failure is defined
 

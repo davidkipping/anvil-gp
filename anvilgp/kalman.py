@@ -48,7 +48,11 @@ def sequential_loglike(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
         c_pred = 0.5 * (c_pred + mx.swapaxes(c_pred, -1, -2))
 
         ch = mx.sum(c_pred * h[:, None, :], axis=-1)          # (n, m)
-        s = mx.sum(h * ch, axis=-1) + r_var[:, i]             # (n,)
+        # clamp the predicted variance term, not the sum: `r_var` is exact
+        # and strictly positive, so this leaves s >= r_var > 0.  Matches
+        # `elements.leaf_elements`, which clamps its own variance term.
+        hch = mx.sum(h * ch, axis=-1)                         # (n,)
+        s = mx.maximum(hch, mx.zeros_like(hch)) + r_var[:, i]
         if s_floor is not None:
             s = mx.maximum(s, s_floor[i])
         v = y[:, i] - mx.sum(h * m_pred, axis=-1)
