@@ -538,7 +538,7 @@ class GPLogLike:
 
     def _evaluate_metal(self, v: mx.array) -> mx.array:
         """Design C: the kernel condenses blocks, MLX composes the roots."""
-        from .metal import scan_blocks
+        from .metal import scan_loglike
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
         phi, q, h = self.term.matrices(pm.kernel_params(v),
@@ -563,9 +563,12 @@ class GPLogLike:
         jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
                 else mx.broadcast_to(jit, (n, 1)))
 
-        el = scan_blocks(pt, qt, self._metal_lag, h, r, self._r_ref32, jit2,
-                         self.policy.s_floor_rel, self.metal_block)
-        return tree_reduce(el).ell
+        # scan_loglike, not scan_blocks + tree_reduce here: the
+        # differentiation boundary has to enclose the reduction so the
+        # custom function's output is one scalar per chain.  See its
+        # docstring.
+        return scan_loglike(pt, qt, self._metal_lag, h, r, self._r_ref32,
+                            jit2, self.policy.s_floor_rel, self.metal_block)
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,).

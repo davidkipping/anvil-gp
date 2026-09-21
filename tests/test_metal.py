@@ -317,3 +317,35 @@ def test_the_kernel_holds_high_amplitude_on_model(sig_over_yerr):
         lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
     assert abs(lo - hi) < 0.02, (
         f"kernel off by {lo - hi:+.4f} at sigma/yerr = {sig_over_yerr:g}")
+
+
+def test_the_differentiation_boundary_encloses_the_reduction():
+    """An M4 requirement, not tidiness: pin it so a refactor cannot undo it.
+
+    If the `custom_function` wrapped the kernel alone, its outputs would be
+    six element fields per block and its VJP would have to accept cotangents
+    on all six. That is a harder problem than the one `adjoint.py` solves.
+    Wrapping the reduction too makes the output one scalar per chain, and a
+    scalar cotangent is what `filter_backward` is derived for.
+    """
+    import anvilgp.metal as metal_mod
+
+    seen = {}
+    real = metal_mod.scan_loglike
+
+    def spy(*a, **kw):
+        out = real(*a, **kw)
+        seen["shape"] = out.shape
+        return out
+
+    n_chains = 6
+    metal_mod.scan_loglike = spy
+    try:
+        gp = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], True)
+        with mx.stream(mx.gpu):
+            mx.eval(gp(mx.zeros((n_chains, 1), dtype=mx.float32)))
+    finally:
+        metal_mod.scan_loglike = real
+
+    assert seen["shape"] == (n_chains,), (
+        f"the boundary must return one scalar per chain; got {seen['shape']}")

@@ -47,9 +47,10 @@ from __future__ import annotations
 import mlx.core as mx
 
 
-from .elements import Element
+from .elements import Element, tree_reduce
 
-__all__ = ["scan_blocks", "metal_available", "MAX_STATE"]
+__all__ = ["scan_blocks", "scan_loglike", "metal_available",
+           "MAX_STATE"]
 
 #: Largest state dimension the kernel accepts.  The running element is
 #: ``3m^2 + 2m + 1`` floats held in registers -- 17 at m = 2, 57 at m = 4,
@@ -321,26 +322,54 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
     scalars = [float(s_floor_rel), int(npts), int(n_lags), int(n_blocks),
                int(n_chains), int(blk_len), int(n_jit)]
 
+    outs = _kernel(m)(
+        inputs=[phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, *scalars],
+        output_shapes=shapes, output_dtypes=[mx.float32] * 6,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    return Element(A=outs[0], b=outs[1], C=outs[2], eta=outs[3], J=outs[4],
+                   ell=outs[5])
+
+
+def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
+                 blk_len) -> mx.array:
+    """``(n_chains,)`` log-likelihood: the kernel's blocks, reduced.
+
+    **This, not :func:`scan_blocks`, is where the differentiation boundary
+    sits**, and that is an M4 requirement rather than tidiness.  Wrapping
+    the kernel alone would leave a ``custom_function`` whose outputs are six
+    element fields per block, so its VJP would have to accept cotangents on
+    all six -- a harder problem, and not the one the verified recursion in
+    :mod:`anvilgp.adjoint` solves.  Wrapping the reduction too collapses the
+    output to one scalar per chain, and a scalar cotangent is exactly what
+    ``filter_backward`` takes.
+
+    The reduction itself is still MLX.  Moving it into the kernel is a
+    speed item (it is most of the remaining wall time at small N, being
+    launch-bound), not a correctness one, and it needs a Cholesky in MSL.
+    It does not change this boundary.
+    """
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
-        return _kernel(m)(
-            inputs=[phi_t, q_t, lg, hv, rs, rr, j2, *scalars],
-            output_shapes=shapes, output_dtypes=[mx.float32] * 6,
-            grid=(n_blocks * n_chains, 1, 1),
-            threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+        el = scan_blocks(phi_t, q_t, lg, hv, rs, rr, j2, s_floor_rel,
+                         blk_len)
+        return tree_reduce(el).ell
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
-        # M4 replaces this with the checkpointed backward kernel: block
-        # boundaries are the checkpoints and the reverse sweep recomputes
-        # within a block.  Never by inverse recursion -- dividing by the
-        # propagator overflows exactly where it underflowed, which is at
-        # every data gap.
+        # M4 replaces this with the checkpointed backward kernel.  The
+        # cotangent arriving here is on a scalar per chain, which is what
+        # `adjoint.filter_backward` is derived for; the seed for each
+        # block comes from the closed form in docs/m4-plan.md, so the
+        # blocks are independent and need no chain between them.
+        #
+        # Never reconstruct forward state by running the filter backwards
+        # through the propagator: that divides by Phi, which underflowed on
+        # the way forward at exactly the lags where it would now overflow,
+        # which is every gap in the data.  Replay forward, always.
         raise NotImplementedError(
             "the fused Metal scan is forward-only until M4. Use "
             "GPPolicy(metal=False) for a differentiable likelihood (the MLX "
             "path), or a gradient-free sampler such as anvil's stretch move.")
 
-    outs = core(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2)
-    return Element(A=outs[0], b=outs[1], C=outs[2], eta=outs[3], J=outs[4],
-                   ell=outs[5])
+    return core(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2)
