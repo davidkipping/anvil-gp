@@ -59,9 +59,15 @@ __all__ = ["scan_blocks", "metal_available", "MAX_STATE"]
 MAX_STATE = 4
 
 _SRC = """
-    uint blk_i = thread_position_in_grid.x;
-    uint chain = thread_position_in_grid.y;
-    if (blk_i >= (uint)n_blocks || chain >= (uint)n_chains) return;
+    // Flat grid, chains fastest.  Two reasons.  Adjacent lanes then hold
+    // adjacent chains, so the residual read below is coalesced; and the
+    // threadgroup is full whatever `n_blocks` is, where a
+    // (n_blocks, n_chains) grid with a (min(n_blocks,32),1,1) group ran
+    // 10-wide groups on a 10-block problem -- 31% of a SIMD width.
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
 
     const uint M = MDIM;
     uint start = blk_i * (uint)blk_len;
@@ -118,7 +124,7 @@ _SRC = """
 
         float inv_s = 1.0f / sq;
         float inv_rs = metal::precise::rsqrt(sq);
-        float yv = resid[chain * (uint)npts + t];
+        float yv = resid[t * (uint)n_chains + chain];
 
         // leaf, in the rank-one form: J2 = z z^T, eta2 = g z, b2 = kappa g
         float zz[MDIM], kk[MDIM];
@@ -293,7 +299,8 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
 
     ``phi_tab``/``q_tab``: (n_chains, n_lags, m, m) propagator and process
     noise indexed by lag, with row 0 reserved for the no-predecessor case.
-    ``lag``: (npts,) int32.  ``resid``: (n_chains, npts) residuals.
+    ``lag``: (npts,) int32.  ``resid``: **(npts, n_chains)** residuals --
+    time-major, so adjacent threads (adjacent chains) read adjacent floats.
     ``r_ref``: (npts,) float32 reference variances.  ``jit2``: (n_chains, 1)
     jitter variance, or a (n_chains, 0) array for none.
 
@@ -301,7 +308,7 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
     (n_chains, n_blocks), ready for :func:`anvilgp.elements.tree_reduce`.
     """
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
-    npts = resid.shape[1]
+    npts = resid.shape[0]          # resid is (npts, n_chains)
     if m > MAX_STATE:
         raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
     if n_blocks is None:
@@ -319,8 +326,8 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
         return _kernel(m)(
             inputs=[phi_t, q_t, lg, hv, rs, rr, j2, *scalars],
             output_shapes=shapes, output_dtypes=[mx.float32] * 6,
-            grid=(n_blocks, n_chains, 1),
-            threadgroup=(min(n_blocks, 32), 1, 1))
+            grid=(n_blocks * n_chains, 1, 1),
+            threadgroup=(min(64, n_blocks * n_chains), 1, 1))
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):

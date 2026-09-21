@@ -548,12 +548,17 @@ class GPLogLike:
         qt = mx.concatenate(
             [mx.broadcast_to(mx.eye(m, dtype=dtype), (n, 1, m, m)), q], axis=1)
 
-        r = mx.broadcast_to(self._y32, (n, self.n_data))
+        # Built time-major, (npts, n_chains), to match the kernel's flat
+        # chains-fastest grid: adjacent threads then read adjacent floats.
+        # Constructed transposed rather than transposed afterwards, which
+        # would be a full copy of the residual every call.
+        r = mx.broadcast_to(self._y32[:, None], (self.n_data, n))
         if self.mean_fn is not None and pm.mean is not None:
-            r = r - self.mean_fn(v[:, pm.mean], self._x_mean32)
+            r = r - mx.swapaxes(self.mean_fn(v[:, pm.mean], self._x_mean32),
+                                0, 1)
         off = pm.offsets(v, self._inst32)
         if off is not None:
-            r = r - off
+            r = r - mx.swapaxes(off, 0, 1)
         jit = pm.jitter_var(v, self._inst32)
         jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
                 else mx.broadcast_to(jit, (n, 1)))
