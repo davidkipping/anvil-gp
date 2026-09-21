@@ -55,11 +55,11 @@ value.
 
 | # | Stage | Days | Model | Gate |
 |---|---|---|---|---|
-| 0 | Clamp the non-physical term, not the total | 0.5 | Opus | float64 unchanged; both forms clamp their own quantity |
-| A | Split the log-determinant in the forward kernel | 0.5 | Opus | float64 unchanged; ~11x better in the demanding corner |
-| B | Thread and residual layout | 1 | Opus | `ell` bit-identical; 1.5-1.9x reproduced interleaved |
-| C | Block reduction into the kernel | 1.5 | Opus | the custom function returns one scalar per chain |
-| D | Suffix scan and closed-form seed, in MLX | 1.5 | Opus | seed == chained sweep to 1e-12 in float64, m = 1..4 |
+| 0 | Clamp the non-physical term, not the total | 0.5 | Opus | **DONE** |
+| A | Split the log-determinant in the forward kernel | 0.5 | Opus | **DONE** -- 11x at the default block |
+| B | Thread and residual layout | 1 | Opus | **DONE** -- bit-identical; 1.16-1.24x whole-path |
+| C | Block reduction into the kernel | 1.5 | Opus | **DONE** -- scalar boundary; 1.10-1.68x |
+| D | Suffix scan and closed-form seed, in MLX | 1.5 | Opus | **DONE** -- worst 2.0e-15 on random problems, 6.6e-14 on real terms with gaps and duplicates |
 | E | Backward kernel, single block | 2 | Opus | matches `adjoint.py` on all five inputs; matches autodiff |
 | F | Backward kernel, all blocks, checkpointed | 3 | Fable | == E at one block, == `adjoint.py` at every block count |
 | G | Wire up, measure, ChEES end to end | 1 | Opus | gradient rows in `verify_readme.py`; joint corner improves |
@@ -79,8 +79,11 @@ Replay forward, always.
 
 ## What failure looks like, stated in advance
 
-* Stage D's seed not matching at 1e-12 in float64 means the design is
-  wrong. Stop; do not proceed to a kernel.
+* ~~Stage D's seed not matching at 1e-12 in float64 means the design is
+  wrong.~~ **Cleared 2026-09-20**: worst 2.0e-15 over m = 1..4 and five
+  block configurations, 6.6e-14 over five real terms crossed with regular,
+  gapped and duplicate-timestamp cadences.  `independent_backward` in
+  `anvilgp/adjoint.py` is the specification stages E and F port.
 * Stage F unable to hold the register budget at m = 4 means a kernel
   gradient for m <= 2 with m = 3, 4 on the MLX path. That is still most
   real light curves.

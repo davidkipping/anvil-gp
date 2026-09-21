@@ -16,8 +16,9 @@ import numpy as np
 import mlx.core as mx
 import pytest
 
+import anvilgp as ag
 from anvilgp.adjoint import (blocked_backward, filter_backward,
-                             filter_forward)
+                             filter_forward, independent_backward)
 from anvilgp.elements import first_point
 from anvilgp.kalman import sequential_loglike
 
@@ -293,3 +294,84 @@ def test_both_forms_clamp_their_own_variance_term():
     assert bool(mx.all(mx.isfinite(out))), "a clamped lane must stay finite"
     s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + rv2
     assert float(mx.min(s_q)) >= float(mx.min(rv2)) - 1e-15
+
+
+# -- stage D: the backward blocks are independent -------------------------
+#
+# `blocked_backward` chains (m_bar, P_bar) from the last block to the
+# first, so the blocks must run in order.  `independent_backward` seeds
+# each block from the closed form in `block_seeds` instead, so they can run
+# in parallel -- which is what lets the Metal backward kernel have the same
+# launch shape as the forward one.  These tests are the gate: if the seed
+# is wrong, the design is wrong, and it is checkable here with no kernel.
+
+
+@pytest.mark.parametrize("m", [1, 2, 3, 4])
+@pytest.mark.parametrize("k,blk", [(24, 4), (24, 6), (32, 8), (20, 20)])
+def test_independent_blocks_equal_the_chained_sweep(m, k, blk):
+    """The stage D gate: 1e-12 in float64, every m, every block length."""
+    phi, q, h, y, rv, rr, cot = _problem(m * 31 + k + blk, k=k, m=m)
+    states, _ = filter_forward(phi, q, h, y, rv, rr)
+    want = filter_backward(phi, q, h, y, rv, rr, states, cot)
+    got = independent_backward(phi, q, h, y, rv, rr, cot, blk)
+    for name, a, b in zip(NAMES, want, got):
+        scale = max(float(mx.max(mx.abs(a))), 1e-30)
+        err = float(mx.max(mx.abs(a - b))) / scale
+        assert err < 1e-12, f"{name}: {err:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", [
+    ("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+    ("sum", ag.SHOTerm() + ag.SHOTerm(), [1.0, 4.0, 3.0, 0.5, 1.0, 2.0]),
+], ids=["sho", "matern52", "rotation", "sum"])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
+def test_independent_blocks_on_real_terms_and_awkward_cadences(
+        name, term, p, cadence):
+    """Gaps and duplicate timestamps are where the propagator misbehaves."""
+    from anvilgp.elements import first_point
+
+    k, rng = 21, np.random.default_rng(2)
+    if cadence == "gapped":
+        t = np.sort(rng.uniform(0.0, 12.0, k))
+        t[k // 2:] += 30.0
+    elif cadence == "dupes":
+        t = np.repeat(np.sort(rng.uniform(0.0, 12.0, k // 2)), 2)[:k]
+    else:
+        t = np.arange(k) * 0.3
+    dt = np.concatenate([[0.0], np.diff(t)])
+
+    phi, q, h = term.matrices(mx.array(np.array([p]), dtype=D),
+                              mx.array(dt, dtype=D))
+    phi, q = first_point(phi, q)
+    y = mx.array(np.random.default_rng(5).standard_normal((1, k)), dtype=D)
+    rv = mx.full((1, k), 0.09, dtype=D)
+    rr = mx.full((k,), 0.09, dtype=D)
+    cot = mx.ones((1,), dtype=D)
+
+    states, _ = filter_forward(phi, q, h, y, rv, rr)
+    want = filter_backward(phi, q, h, y, rv, rr, states, cot)
+    got = independent_backward(phi, q, h, y, rv, rr, cot, 7)
+    for nm, a, b in zip(NAMES, want, got):
+        scale = max(float(mx.max(mx.abs(a))), 1e-30)
+        assert float(mx.max(mx.abs(a - b))) / scale < 1e-11, nm
+
+
+def test_the_last_block_gets_a_zero_seed():
+    """Nothing follows it, so the suffix is the identity and the seed is 0.
+
+    Pinned because it is the boundary case the closed form has to get
+    right for `independent_backward` to agree with a chained sweep that
+    starts from exactly zero.
+    """
+    from anvilgp.adjoint import block_seeds
+    from anvilgp.elements import identity_element
+
+    phi, q, h, y, rv, rr, cot = _problem(0)
+    n, m = phi.shape[0], phi.shape[-1]
+    states, _ = filter_forward(phi, q, h, y, rv, rr)
+    mu, sigma = states[-1]
+    mb, pb = block_seeds(mu, sigma, identity_element((n,), m, D), cot)
+    assert float(mx.max(mx.abs(mb))) == 0.0
+    assert float(mx.max(mx.abs(pb))) == 0.0

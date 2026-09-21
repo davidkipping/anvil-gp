@@ -50,7 +50,7 @@ from .linalg import (chol, matmul, matvec, outer, quad_form, sym,
 __all__ = ["Element", "LeafRank1", "LeafParts", "first_point",
            "leaf_elements", "leaf_parts",
            "expand_leaf", "combine", "combine_leaf", "combine_leaf_blocked",
-           "tree_reduce", "chunked_reduce", "chunked_reduce_blocked",
+           "tree_reduce", "chunked_reduce", "suffix_scan", "chunked_reduce_blocked",
            "prefix_scan",
            "identity_element", "use_blocked_leaves"]
 
@@ -776,6 +776,35 @@ def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16) -> Element:
         return Element(*(getattr(acc, f)[:, 0] for f in Element._fields))
     return tree_reduce(acc)
 
+
+
+def suffix_scan(e: Element) -> Element:
+    """Running composition from the right, with an identity past the end.
+
+    ``out[:, j]`` is ``e[:, j] * e[:, j+1] * ... * e[:, k-1]`` and
+    ``out[:, k]`` is :func:`identity_element`, so the result has ``k + 1``
+    entries along axis 1.
+
+    The mirror of :func:`prefix_scan`, and needed for the same reason M4
+    needs that one.  A prefix gives the filter state a block starts from;
+    a suffix gives *the future as a Gaussian in that state*, which is what
+    turns the backward pass's seed into a closed form instead of a chain.
+    Only ``J`` and ``eta`` of the result are used there -- they carry the
+    information form of everything after the block -- but the recursion
+    that produces them needs the other fields, so the whole element is
+    composed.
+    """
+    k = e.A.shape[1]
+    n, m, dtype = e.A.shape[0], e.m, e.A.dtype
+    acc = identity_element((n,), m, dtype)
+    outs = [acc]
+    for j in range(k - 1, -1, -1):
+        acc = combine(Element(*(getattr(e, f)[:, j] for f in Element._fields)),
+                      acc)
+        outs.append(acc)
+    outs.reverse()
+    return Element(*(mx.stack([getattr(o, f) for o in outs], axis=1)
+                     for f in Element._fields))
 
 
 def prefix_scan(e: Element) -> Element:

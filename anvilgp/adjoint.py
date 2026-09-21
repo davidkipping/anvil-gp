@@ -41,9 +41,11 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .linalg import matmul, matvec, outer, sym
+from .linalg import (chol, matmul, matvec, outer, sym,
+                     sym_from_factor, tri_solve_right)
 
-__all__ = ["filter_forward", "filter_backward", "blocked_backward"]
+__all__ = ["filter_forward", "filter_backward", "blocked_backward",
+           "block_seeds", "independent_backward"]
 
 
 def _predict_step(p_i, q_i, h, y_i, rv_i, mean, cov, floor_i=None):
@@ -215,6 +217,109 @@ def _backward_span(phi, q, h, y, r_var, r_ref, states, cot, m_bar, p_bar,
     return (mx.stack(phi_rows[::-1], axis=1), mx.stack(q_rows[::-1], axis=1),
             h_bar, mx.stack(y_cols[::-1], axis=1),
             mx.stack(rv_cols[::-1], axis=1), m_bar, p_bar)
+
+
+def block_seeds(mu, sigma, suf, cot):
+    """The ``(m_bar, P_bar)`` a block inherits, in closed form.
+
+    ``mu``, ``sigma`` are the filter state *leaving* the block -- the
+    ``(b, C)`` of the prefix element through it -- and ``suf`` is the
+    composed element of everything after it, whose ``J`` and ``eta`` carry
+    the future as a Gaussian in that state.  ``cot`` is the cotangent on
+    the log-likelihood.
+
+    **This is what makes the backward blocks independent.**  The chained
+    route computes the same quantity by propagating ``(m_bar, P_bar)``
+    backwards from the end, which forces the blocks to run in order.  But
+    ``logL = combine(prefix, suffix).ell`` depends on the prefix only
+    through ``(b, C)``, so differentiating that closed form gives the seed
+    directly::
+
+        G = (I + Sigma J_s)^-1        Jt = (I + J_s Sigma)^-1 J_s
+        r = G^T (eta_s - J_s mu)
+        m_bar = cot r                 P_bar = (cot/2)(r r^T - Jt)
+
+    ``r`` is ``combine``'s own ``gt_eta`` and ``Jt`` its own ``jt``, so
+    this is arithmetic the package already owns.  Verified against the
+    chained sweep at ~1e-15 relative for m = 1..4 at every block boundary.
+
+    One numerical caution, measured: ``eta_s`` and ``J_s mu`` nearly cancel
+    on-model, so the seed amplifies the elements' float32 error by ~1e3.
+    Four of the five parameter adjoints are untouched; ``dh`` is not, and
+    the damage grows with the block count (0.6% at 8 blocks, 3% at 32).
+    Keep the block count near a dozen, which is also where the forward's
+    occupancy saturates.  See docs/m4-plan.md.
+    """
+    m = sigma.shape[-1]
+    ident = mx.eye(m, dtype=sigma.dtype)
+    l1 = chol(sigma)
+    x = matmul(mx.swapaxes(l1, -1, -2), matmul(suf.J, l1))
+    ls = chol(ident + sym(x))
+    y = tri_solve_right(ls, l1)
+    g = ident - matmul(sym_from_factor(y), suf.J)
+    jt = sym(suf.J - sym_from_factor(matmul(suf.J, y)))
+    r = matvec(mx.swapaxes(g, -1, -2), suf.eta - matvec(suf.J, mu))
+    m_bar = cot[..., None] * r
+    p_bar = (cot[..., None, None] * 0.5) * (outer(r, r) - jt)
+    return m_bar, p_bar
+
+
+def independent_backward(phi, q, h, y, r_var, r_ref, cot, blk, s_floor=None):
+    """The same adjoints as :func:`filter_backward`, blocks independent.
+
+    The specification the Metal backward kernel is written against.  Unlike
+    :func:`blocked_backward`, which chains ``(m_bar, P_bar)`` from the last
+    block to the first, every block here seeds itself from
+    :func:`block_seeds` and can therefore run in parallel -- exactly as the
+    forward blocks do.
+
+    Three steps: condense each block into an element, scan those elements
+    both ways to get each block's exit filter state and the suffix after
+    it, then sweep each block in reverse from its own seed.
+    """
+    from .elements import (Element, leaf_elements, prefix_scan, suffix_scan,
+                           tree_reduce)
+
+    n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
+    dtype = phi.dtype
+    starts = list(range(0, k, blk))
+
+    blocks = []
+    for s in starts:
+        e = min(s + blk, k)
+        el, r1 = leaf_elements(phi[:, s:e], q[:, s:e], h, y[:, s:e],
+                               r_var[:, s:e], r_ref[s:e],
+                               None if s_floor is None else s_floor[s:e])
+        blocks.append(tree_reduce(el))
+    be = Element(*(mx.stack([getattr(b, f) for b in blocks], axis=1)
+                   for f in Element._fields))
+
+    pre = prefix_scan(be)
+    suf = suffix_scan(be)
+
+    acc = {n_: [] for n_ in ("phi", "q", "y", "rv")}
+    h_bar = mx.zeros((n, m), dtype=dtype)
+    for i, s in enumerate(starts):
+        e = min(s + blk, k)
+        m_bar, p_bar = block_seeds(pre.b[:, i], pre.C[:, i],
+                                   Element(*(getattr(suf, f)[:, i + 1]
+                                             for f in Element._fields)), cot)
+        states, _ = filter_forward(
+            phi[:, s:e], q[:, s:e], h, y[:, s:e], r_var[:, s:e], r_ref[s:e],
+            (pre.b[:, i - 1], pre.C[:, i - 1]) if i else None,
+            None if s_floor is None else s_floor[s:e])
+        out = _backward_span(
+            phi[:, s:e], q[:, s:e], h, y[:, s:e], r_var[:, s:e], r_ref[s:e],
+            states, cot, m_bar, p_bar,
+            None if s_floor is None else s_floor[s:e])
+        acc["phi"].append(out[0]); acc["q"].append(out[1])
+        h_bar = h_bar + out[2]
+        acc["y"].append(out[3]); acc["rv"].append(out[4])
+
+    return (mx.concatenate(acc["phi"], axis=1),
+            mx.concatenate(acc["q"], axis=1), h_bar,
+            mx.concatenate(acc["y"], axis=1),
+            mx.concatenate(acc["rv"], axis=1))
 
 
 def blocked_backward(phi, q, h, y, r_var, r_ref, cot, blk, s_floor=None):
