@@ -108,7 +108,7 @@ CLAIMS = [
     ("MLX value+grad, 1e4 x 1024", 880.0, lambda: gradient(10_000, 1024), "time"),
     ("fp32 err, N=25e3, sig/yerr=100 (MLX)", 0.06,
      lambda: fp32_error(25_000, 100.0, False), "acc"),
-    ("fp32 err, N=25e3, sig/yerr=100 (Metal)", 0.03,
+    ("fp32 err, N=25e3, sig/yerr=100 (Metal)", 0.005,
      lambda: fp32_error(25_000, 100.0, True), "acc"),
 ]
 if not a.quick:

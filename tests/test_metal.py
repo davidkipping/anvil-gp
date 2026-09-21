@@ -284,3 +284,36 @@ def test_metal_block_is_resolved_on_the_instance():
                       ParamMap.const([1.3, 4.0, 3.0]),
                       GPPolicy(metal=True, metal_block=512))
     assert fixed.metal_block == 512
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("sig_over_yerr", [30.0, 100.0])
+def test_the_kernel_holds_high_amplitude_on_model(sig_over_yerr):
+    """The kernel's own g^2 round trip, the counterpart of the MLX fix.
+
+    The kernel formed `ell2 = -(log(S/r) + g^2)/2` and the composition
+    immediately added `+g^2/2` back. On-model at sigma_GP/yerr = 100 that
+    round-trips a quantity near 1e4 against a log-determinant of order 1,
+    and float32 loses four digits at every observation. Carrying the
+    log-determinant half separately is exact and measured 11x better at the
+    default block: -0.018 -> +0.002.
+    """
+    from anvilgp.oracle import sample_ssm
+
+    n, dt, qual, rho = 25_000, 1.0, 3.0, 100.0
+    rng = np.random.default_rng(0)
+    t = np.arange(n) * dt
+    y = sample_ssm(ag.SHOTerm(), [sig_over_yerr, rho, qual], dt, n, rng)
+    y = y + rng.standard_normal(n)
+    yerr = np.full(n, 1.0)
+    pm = ParamMap.const([sig_over_yerr, rho, qual])
+
+    ref = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                    GPPolicy(block=4096))
+    hi = float(np.array(ref.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
+    gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                   GPPolicy(block=4096, metal=True))
+    with mx.stream(mx.gpu):
+        lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
+    assert abs(lo - hi) < 0.02, (
+        f"kernel off by {lo - hi:+.4f} at sigma/yerr = {sig_over_yerr:g}")

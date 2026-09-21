@@ -134,7 +134,16 @@ _SRC = """
                 C2[i][j] = Qm[i][j] - kk[i] * qh[j];
             }
         }
-        float ell2 = -0.5f * (metal::precise::log(sq / rr) + gg * gg);
+        // Carry the log-determinant half separately.  The assembled leaf
+        // ell is `ld2 - g^2/2` and the composition below immediately adds
+        // `+g^2/2` back, so forming either one round-trips a quantity that
+        // reaches ~1e4 on-model at sigma_GP/yerr = 100 against an ld2 of
+        // order 1 -- four digits lost at every observation.  Same fix as
+        // elements.leaf_elements; measured 11x better at the default block
+        // in that corner.  `ell2` is still needed for the first point,
+        // whose element is the leaf itself.
+        float ld2 = -0.5f * metal::precise::log(sq / rr);
+        float ell2 = ld2 - 0.5f * gg * gg;
 
         if (first) {
             for (uint i = 0; i < M; ++i) {
@@ -213,7 +222,7 @@ _SRC = """
             }
         }
         // ell += ell2 + g^2/2 + log(1/alpha)/2 - beta^2/(2 alpha), Kahan
-        float add = ell2 + 0.5f * gg * gg
+        float add = ld2
                   + 0.5f * metal::precise::log(inv_a) - 0.5f * beta * bia;
         float yk = add - ell_c;
         float tk = ell + yk;
