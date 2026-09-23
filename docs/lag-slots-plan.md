@@ -11,7 +11,7 @@ into a buffer with one slot per `(chain, block, lag)`. That buffer is
 in the timestamps is a lag, so on a regular cadence the buffer is
 megabytes and on an irregular one it is N-sized: 2.2 GiB at 64 chains x
 N = 2e4, 40 GiB at 1024 chains x N = 1e5. Stage R of M4 fenced it at
-`metal.MAX_LAG_SLAB_BYTES` (2 GiB). This plan removes the need for the
+`metal.MAX_ADJOINT_BUFFER_BYTES` (2 GiB). This plan removes the need for the
 fence.
 
 ## What this plan is, and is not
@@ -185,7 +185,7 @@ if the second does not pay.
 | 0 | Pin the baseline | 0.25 | Opus | **DONE** -- above. Two cadences in the suite, 80 cases green, baseline and the front-end split measured. |
 | A | Chunk the front-end backward | 0.75 | Opus | **DONE** -- see below. 2.3x less peak and 5-6x faster at N = 1e5; regular cadences bit-identical; gradient within 1.7e-7. |
 | B | Host slot map | 0.25 | Opus | **DONE** -- `likelihood._slot_map`, built from the resolved `metal_block`. Counts match the table exactly (15/26/27/53/99,992); invariants pinned; 13x fewer slots than `blocks x lags` on an all-distinct cadence, 27.6 ms to build at N = 1e5. |
-| C | Kernel and VJP on slots | 0.5 | Opus | Per-lag adjoint sums equal the pre-change kernel's to 1e-6 at m = 1..4 on all five cadences. The fence, re-based on slots, stops tripping. |
+| C | Kernel and VJP on slots | 0.5 | Opus | **DONE** -- gradients match the pre-change kernel to 1.5e-7 over 32 cases; the headline case runs at 1.3x the forward's peak; reproducibility kept, which took two attempts. |
 | D | Measure and document | 0.25 | Opus | All-distinct gradient runs at 1e5 x 1024 within ~2x the forward's peak. `benchmarks/verify_readme.py` green. README, plan and memory corrected. |
 | R2 | Adversarial review of the slot map | 0.5 | **Fable** | Brief: assume the slot map is wrong and prove it. A wrong slot index gives a correct *value* and a silently wrong parameter gradient, because the forward is untouched -- the one failure class this suite has repeatedly missed on its own. Specifically: a slot map stale against `metal_block`; the scatter-add's determinism across runs; blocks whose lag set changes between value and gradient calls; and whether any test would fail if `slot_id` were permuted. |
 
@@ -239,7 +239,7 @@ takes the original code path.
 | distinct | 1e5 | 256 | 99,083 | 73 | 31.30 | **13.67** | 11,386 | **1,813** |
 | distinct | 1e5 | 512 | 99,083 | 146 | 61.66 | **27.30** | 27,547 | **4,868** |
 
-GiB and ms. The two largest rows needed `MAX_LAG_SLAB_BYTES` lifted to
+GiB and ms. The two largest rows needed `MAX_ADJOINT_BUFFER_BYTES` lifted to
 measure at all, since the kernel's own buffer refuses there first -- which
 is stages B-C. Regular-cadence gradients are **bit-identical** (relative
 difference exactly 0) and within timing noise; the chunked branch is not
@@ -314,3 +314,86 @@ slot, each block's range contiguous and exclusively its own,
 block length across `metal_block` of `None`, 256 and 1024.
 
 Nothing reads the map yet -- that is stage C. 562 tests pass.
+
+## Stage C, measured 2026-09-22
+
+The backward kernel flushes into one slot per `(block, lag)` pair that
+occurs. Two address changes, as the plan assumed: the thread zeroes
+`slot_start[b] .. slot_start[b+1]` instead of every lag, and flushes to
+`slot_id[gi]` instead of the lag. The VJP folds slots back into the
+per-lag table the term front end differentiates.
+
+### Correctness
+
+Against the **pre-change kernel**, 32 cases (4 terms covering m = 1, 2, 3,
+4 x 4 cadences x 2 block lengths): values bit-identical, gradients within
+**1.5e-7**. The float64 specification tests pass unchanged at their own
+tolerances.
+
+### Measured, whole gradient path
+
+| cadence | N | chains | slots | buffer before | buffer after | peak | time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| regular | 1e5 | 1024 | 14 | 0.001 | 0.000 | 1.61 | 68 ms |
+| distinct | 2e4 | 64 | 19,995 | 0.38 | 0.04 | 0.73 | 114 ms |
+| distinct | 2e4 | 512 | 19,995 | 3.05 | 0.31 | 2.24 | 675 ms |
+| distinct | 1e5 | 256 | 99,907 | 9.92 | 0.76 | 4.40 | 1.55 s |
+| distinct | 1e5 | 512 | 99,907 | 19.84 | 1.52 | 8.78 | 5.59 s |
+| distinct | 1e5 | 1024 | 99,907 | 39.67 | 3.05 | 17.5 | 10.2 s |
+
+GiB. The last row is the case the whole plan was for. It needed ~115 GiB
+and was refused; it now runs at **1.3x the forward's own peak** (13.2
+GiB), which meets stage D's gate a stage early. End to end against the
+stage 0 baseline, at 256 chains x N = 1e5: **31.3 -> 4.4 GiB and 11.4 ->
+1.5 s**, 7.1x smaller and 7.4x faster.
+
+`MAX_LAG_SLAB_BYTES` is renamed `MAX_ADJOINT_BUFFER_BYTES` and raised from
+2 to 8 GiB: it was sized when the buffer was the dominant cost, and at the
+old value it refused the 1024-chain case above, whose buffer is 17% of a
+run the machine handles.
+
+### Reproducibility nearly went, twice
+
+**MLX's scatter-add is not reproducible when indices repeat.** Folding
+slots to lags is a scatter, and a lag repeats across blocks on every
+regular cadence, so the obvious fold quietly cost the gradient its
+bit-reproducibility -- on the *common* path, not the irregular one this
+work is about. Measured directly: 14 slots over 3 lags is enough, while
+`mx.sum` over an axis is reproducible. The per-lag adjoints used to come
+from exactly such a sum.
+
+A slot is a `(block, lag)` pair, so within a block every lag is distinct
+and a lag repeats only across blocks. Ranking each slot within its lag
+gives groups that each have distinct lags. Two ways to use that, and
+**which is cheaper depends on the shape**:
+
+* few ranks -- an irregular cadence, where a lag occurs in one or two
+  blocks -- one scatter per rank, no intermediate;
+* many ranks over few lags -- a regular cadence, 3 lags over 98 blocks --
+  a padded `(n_lags, max_rank)` table and one `mx.sum`.
+
+The first attempt used the padded table everywhere, which materialises
+`n_chains x n_lags x max_rank x m^2`: 4.9 GiB of gather against a 0.8 GiB
+buffer at 256 chains x N = 1e5, and the measured peak went 4.40 -> 8.77
+GiB. `_MAX_FOLD_RANKS` now picks by shape. Both paths are reproducible;
+`test_the_per_lag_fold_is_reproducible` fails if the naive scatter returns.
+
+### A watchdog scare that was not ours
+
+While testing, `m = 4` at N = 1e5 and 512 chains started dying with
+Metal's "Impacting Interactivity" kill. Checking the **pre-stage-C**
+commit on the same machine: it dies too, and at 128 chains where stage C
+survives to 256. Pre-existing fragility, made marginally better here, and
+sensitive to what else is on the GPU -- the same case ran at 512 chains in
+404 ms during stage A on a quieter machine. Worth its own work; not a
+stage C regression, and not chased further.
+
+### Test hygiene
+
+`test_the_slot_buffer_admits_a_cadence_the_per_lag_buffer_refused` first
+asserted the production shape, needed ~20 GiB free, and failed once then
+passed on retry. It now uses 512 chains x N = 2e4 against the old 2 GiB
+fence, with the production figures recorded here instead. A flaky test
+teaches people to re-run rather than to look.
+
+570 tests pass.

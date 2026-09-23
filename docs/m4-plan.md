@@ -246,7 +246,7 @@ at 1e5.  Since stage 0 it cannot bind below 1, so `GPPolicy` now refuses
 **The per-lag adjoint buffer was unbounded.** `2 x chains x blocks x lags x
 m^2` floats: 21 MB on a regular cadence and 2.2 GiB on a random one at 64
 chains x N = 2e4, linear in chains, 42 GiB at production size.  Nothing
-checked it.  The VJP now refuses over `MAX_LAG_SLAB_BYTES` (2 GiB) with the
+checked it.  The VJP now refuses over `MAX_ADJOINT_BUFFER_BYTES` (2 GiB) with the
 arithmetic and the fix in the message.  The structural fix -- Jacobian
 tables by lag, parameter gradient accumulated in-kernel -- is in the
 README's "What is left".

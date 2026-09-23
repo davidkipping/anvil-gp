@@ -50,16 +50,21 @@ from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
            "backward_ckpt", "block_seeds_kernel",
-           "metal_available", "MAX_STATE", "MAX_LAG_SLAB_BYTES"]
+           "metal_available", "MAX_STATE", "MAX_ADJOINT_BUFFER_BYTES"]
 
-#: Largest per-lag adjoint slab the kernel gradient will allocate.  The
-#: backward accumulates ``dphi``/``dq`` per ``(chain, block, lag)`` -- two
-#: ``(n_chains, n_blocks, n_lags, m, m)`` float32 arrays -- which is small
-#: for photometry (one cadence plus a lag per gap) and N-sized for an
-#: irregular cadence, where every distinct float32 spacing is its own lag.
-#: 1024 chains x 13 blocks x 1e5 lags x m = 2 is 42 GiB.  Above this the
-#: VJP refuses with the arithmetic rather than allocating (stage R).
-MAX_LAG_SLAB_BYTES = 2 << 30
+#: Largest adjoint buffer the kernel gradient will allocate.  The backward
+#: accumulates ``dphi``/``dq`` into one slot per ``(block, lag)`` pair that
+#: *occurs* -- two ``(n_chains, n_slots, m, m)`` float32 arrays -- which is
+#: bounded by N however irregular the cadence.
+#:
+#: It was one slot per pair that could occur, ``n_blocks`` times larger,
+#: and this fence was 2 GiB because that shape reached 40 GiB at 1024
+#: chains x N = 1e5 and had to be refused.  With the slot layout the same
+#: problem needs 3.05 GiB of buffer inside a 17.5 GiB gradient whose
+#: forward is already 13.2 GiB, so the old value refused work that runs
+#: comfortably.  8 GiB keeps this a sanity check: it still stops 4096
+#: chains at m = 4, which would ask for 49 GiB.
+MAX_ADJOINT_BUFFER_BYTES = 8 << 30
 
 #: Largest state dimension the kernel accepts.  The running element is
 #: ``3m^2 + 2m + 1`` floats held in registers -- 17 at m = 2, 57 at m = 4,
@@ -614,11 +619,19 @@ _SRC_BWD_CKPT = """
     float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] : 0.0f;
     float cotv = cot[chain];
 
-    // this thread's per-lag accumulator slots: zero them, we own them
-    for (uint l = 0; l < (uint)n_lags; ++l)
+    // This thread's accumulator slots: the contiguous range block blk_i
+    // owns, at this chain's offset.  One slot per (block, lag) pair that
+    // *occurs*, where this was one per pair that could occur -- the same
+    // on a regular cadence and 13x fewer at N = 1e5 when every timestamp
+    // spacing is distinct, which is what makes the buffer affordable
+    // there.  No other thread touches this range (the blocks partition
+    // the slots), so there is still nothing to synchronise.
+    uint s_lo = (uint)slot_start[blk_i];
+    uint s_hi = (uint)slot_start[blk_i + 1];
+    for (uint sl = s_lo; sl < s_hi; ++sl)
         for (uint i = 0; i < M * M; ++i) {
-            out_dphi[(ei * (uint)n_lags + l) * M * M + i] = 0.0f;
-            out_dq[(ei * (uint)n_lags + l) * M * M + i] = 0.0f;
+            out_dphi[(chain * (uint)n_slots + sl) * M * M + i] = 0.0f;
+            out_dq[(chain * (uint)n_slots + sl) * M * M + i] = 0.0f;
         }
 
     // ---- pass 1: replay forward, checkpoint every SL ----
@@ -649,7 +662,7 @@ _SRC_BWD_CKPT = """
         for (uint j = 0; j < M; ++j) p_bar[i][j] = seed_C[ei * M * M + i * M + j];
     }
     float drv_acc = 0.0f;
-    uint cur_lag = 0xFFFFFFFFu;
+    uint cur_slot = 0xFFFFFFFFu;
     float acc_p[MDIM][MDIM], acc_q[MDIM][MDIM];
     for (uint i = 0; i < M; ++i)
         for (uint j = 0; j < M; ++j) { acc_p[i][j] = 0.0f; acc_q[i][j] = 0.0f; }
@@ -759,17 +772,21 @@ _SRC_BWD_CKPT = """
                 for (uint j = 0; j < M; ++j)
                     cs[i][j] = 0.5f * (cp_bar[i][j] + cp_bar[j][i]);
 
-            // flush the per-lag accumulator when the lag changes
-            if (lg != cur_lag) {
-                if (cur_lag != 0xFFFFFFFFu) {
-                    uint ob = (ei * (uint)n_lags + cur_lag) * M * M;
+            // Flush the accumulator when the slot changes.  Within a
+            // block the slot changes exactly when the lag does -- a slot
+            // *is* a (block, lag) pair -- so this is the same flush
+            // schedule as before, with the test on the thing written.
+            uint slt = (uint)slot_id[gi];
+            if (slt != cur_slot) {
+                if (cur_slot != 0xFFFFFFFFu) {
+                    uint ob = (chain * (uint)n_slots + cur_slot) * M * M;
                     for (uint i = 0; i < M; ++i)
                         for (uint j = 0; j < M; ++j) {
                             out_dphi[ob + i * M + j] += acc_p[i][j];
                             out_dq[ob + i * M + j] += acc_q[i][j];
                         }
                 }
-                cur_lag = lg;
+                cur_slot = slt;
                 for (uint i = 0; i < M; ++i)
                     for (uint j = 0; j < M; ++j) { acc_p[i][j] = 0.0f; acc_q[i][j] = 0.0f; }
             }
@@ -806,8 +823,8 @@ _SRC_BWD_CKPT = """
             }
         }
     }
-    if (cur_lag != 0xFFFFFFFFu) {
-        uint ob = (ei * (uint)n_lags + cur_lag) * M * M;
+    if (cur_slot != 0xFFFFFFFFu) {
+        uint ob = (chain * (uint)n_slots + cur_slot) * M * M;
         for (uint i = 0; i < M; ++i)
             for (uint j = 0; j < M; ++j) {
                 out_dphi[ob + i * M + j] += acc_p[i][j];
@@ -834,8 +851,9 @@ def _bwd_ckpt_kernel(m: int, slen: int):
             name=f"anvilgp_bwd_ckpt_m{m}_s{slen}",
             input_names=["phitab", "qtab", "lag", "hvec", "resid", "r_ref",
                          "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
+                         "slot_id", "slot_start",
                          "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                         "n_jit", "n_ckpt"],
+                         "n_jit", "n_ckpt", "n_slots"],
             output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
                           "out_drv", "ckpt"],
             source=body.replace("MDIM", str(m)).replace("SLEN", str(slen)),
@@ -844,14 +862,18 @@ def _bwd_ckpt_kernel(m: int, slen: int):
 
 
 def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
-                  ent_m, ent_C, seed_m, seed_C, blk_len, sub_len=None):
+                  ent_m, ent_C, seed_m, seed_C, slot_id, slot_start, n_slots,
+                  blk_len, sub_len=None):
     """Checkpointed reverse sweep for every (chain, block), independently.
 
     Inputs are the forward's table form plus the per-block entry state
     ``(ent_m, ent_C)`` and seed ``(seed_m, seed_C)`` from
     :func:`block_seeds_kernel`.  No cap on ``blk_len``.  ``dphi``/``dq``
-    are returned **per lag**, ``(n_chains, n_blocks, n_lags, m, m)``,
-    summed over blocks by the caller.  ``dh`` and ``drv`` come per
+    are returned **per slot**, ``(n_chains, n_slots, m, m)``, where a slot
+    is one ``(block, lag)`` pair that occurs -- ``slot_id``/``slot_start``
+    from :func:`anvilgp.likelihood._slot_map`.  The caller scatters them
+    into a per-lag table with ``slot_lag``; the blocks are already summed,
+    since distinct blocks own disjoint slots.  ``dh`` and ``drv`` come per
     ``(chain, block)``; ``dy`` per observation, ``(npts, n_chains)``, since
     it feeds the mean model.
 
@@ -870,15 +892,16 @@ def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
     n_blocks = (npts + blk_len - 1) // blk_len
     n_ckpt = (blk_len + slen - 1) // slen
     n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
-    shapes = [(n_chains, n_blocks, n_lags, m, m),
-              (n_chains, n_blocks, n_lags, m, m),
+    n_slots = int(n_slots)
+    shapes = [(n_chains, n_slots, m, m),
+              (n_chains, n_slots, m, m),
               (n_chains, n_blocks, m), (npts, n_chains), (n_chains, n_blocks),
               (n_chains, n_blocks, n_ckpt, m + m * m)]
     outs = _bwd_ckpt_kernel(m, slen)(
         inputs=[phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
-                ent_m, ent_C, seed_m, seed_C,
+                ent_m, ent_C, seed_m, seed_C, slot_id, slot_start,
                 int(npts), int(n_lags), int(n_blocks), int(n_chains),
-                int(blk_len), int(n_jit), int(n_ckpt)],
+                int(blk_len), int(n_jit), int(n_ckpt), int(n_slots)],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -1246,7 +1269,7 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
 
 
 def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
-                 blk_len) -> mx.array:
+                 blk_len, slots=None) -> mx.array:
     """``(n_chains,)`` log-likelihood: the kernel's blocks, reduced.
 
     **This, not :func:`scan_blocks`, is where the differentiation boundary
@@ -1287,25 +1310,37 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
             else cotangents
 
         n_chains, n_lags, m = p_t.shape[0], p_t.shape[1], p_t.shape[-1]
-        n_blocks = (rs.shape[0] + blk_len - 1) // blk_len
-        slab = 2 * n_chains * n_blocks * n_lags * m * m * 4
-        if slab > MAX_LAG_SLAB_BYTES:
+        npts = rs.shape[0]
+        if slots is None:
             raise ValueError(
-                f"the kernel gradient's per-lag adjoint slab would be "
-                f"{slab / 2**30:.1f} GiB (2 x {n_chains} chains x {n_blocks} "
-                f"blocks x {n_lags - 1} distinct lags x m^2 = {m * m} x 4 "
-                f"bytes), over MAX_LAG_SLAB_BYTES = "
-                f"{MAX_LAG_SLAB_BYTES / 2**30:.0f} GiB.  Every distinct "
-                f"float32 spacing in the timestamps is a lag, so an "
-                f"irregular cadence has N of them.  Bin the timestamps, "
-                f"raise metal_block (fewer blocks), or use "
-                f"GPPolicy(metal=False) for the gradient.")
+                "the kernel gradient needs the (block, lag) slot map; "
+                "`scan_loglike` was called without `slots`")
+        # n_slots arrives as a plain int: reading it off `slot_start`
+        # would force a device sync on every gradient call.
+        slot_id, slot_start, n_slots, fold_plan = slots
+
+        # The adjoint buffer is one slot per (block, lag) pair that occurs.
+        # It is bounded by N however irregular the cadence, so this fence
+        # is a sanity check rather than the wall it was when the buffer had
+        # a slot per pair that *could* occur (40 GiB at 1024 chains x
+        # N = 1e5, where the slots are 3 GiB).
+        slab = 2 * n_chains * n_slots * m * m * 4
+        if slab > MAX_ADJOINT_BUFFER_BYTES:
+            raise ValueError(
+                f"the kernel gradient's adjoint buffer would be "
+                f"{slab / 2**30:.1f} GiB (2 x {n_chains} chains x {n_slots} "
+                f"(block, lag) slots x m^2 = {m * m} x 4 bytes), over "
+                f"MAX_ADJOINT_BUFFER_BYTES = {MAX_ADJOINT_BUFFER_BYTES / 2**30:.0f} GiB. "
+                f"Every distinct float32 spacing in the timestamps is a "
+                f"lag, and this cadence has {n_lags - 1} of them over "
+                f"{npts} points.  Bin the timestamps, use fewer chains, or "
+                f"use GPPolicy(metal=False) for the gradient.")
 
         el = scan_blocks(p_t, q_t, lg, hv, rs, rr, j2, s_floor_rel, blk_len)
         ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
             p_t, q_t, lg, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m, seed_C,
-            blk_len)
+            slot_id, slot_start, n_slots, blk_len)
 
         # `lag` is an integer index and `r_ref` is the data's own yerr^2 --
         # neither is ever a function of the sampled parameters, so neither
@@ -1317,7 +1352,33 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
         n_jit = j2.shape[1] if j2.ndim == 2 else 0
         d_j2 = (mx.zeros_like(j2) if n_jit == 0
                 else mx.sum(d_rv, axis=1)[:, None])
-        return (mx.sum(d_phi, axis=1), mx.sum(d_q, axis=1),
+        # Slots -> the per-lag table the term front end differentiates.
+        # Distinct blocks own disjoint slots, so the blocks are already
+        # summed and this only regroups.  Applied one fold group at a
+        # time: each group's lags are distinct, which is what keeps the
+        # scatter reproducible -- see `likelihood._lag_fold_plan`.  The
+        # all-distinct cadence this work is for has exactly one group.
+        kind, plan = fold_plan
+        if kind == "dense":
+            # One gather through a (n_lags, max_rank) table of slot indices
+            # padded with a zero row, then one `mx.sum` -- which is
+            # reproducible where a repeated-index scatter is not.
+            pad = mx.zeros((n_chains, 1, m, m), dtype=d_phi.dtype)
+            d_phi_tab = mx.sum(
+                mx.take(mx.concatenate([d_phi, pad], axis=1), plan, axis=1),
+                axis=2)
+            d_q_tab = mx.sum(
+                mx.take(mx.concatenate([d_q, pad], axis=1), plan, axis=1),
+                axis=2)
+        else:
+            d_phi_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_phi.dtype)
+            d_q_tab = d_phi_tab
+            for sel, lags_of in plan:
+                d_phi_tab = d_phi_tab.at[:, lags_of].add(
+                    mx.take(d_phi, sel, axis=1))
+                d_q_tab = d_q_tab.at[:, lags_of].add(
+                    mx.take(d_q, sel, axis=1))
+        return (d_phi_tab, d_q_tab,
                 mx.zeros_like(lg), mx.sum(d_h, axis=1), d_y,
                 mx.zeros_like(rr), d_j2)
 

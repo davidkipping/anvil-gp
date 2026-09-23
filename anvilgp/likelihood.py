@@ -111,7 +111,7 @@ class GPPolicy:
     #: memory; see the README.  Limits: m <= 4, one jitter, and the
     #: gradient's per-lag buffer grows with the number of distinct
     #: timestamp spacings (``n_distinct_lags``; see
-    #: :data:`anvilgp.metal.MAX_LAG_SLAB_BYTES`).
+    #: :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES`).
     metal: bool = False
     #: observations condensed per kernel thread, or None to pick from N.
     #: Larger means fewer, longer sequential walks and less work left for
@@ -452,6 +452,12 @@ class GPLogLike:
         self._metal_slot_id = mx.array(sid)
         self._metal_slot_start = mx.array(sstart)
         self._metal_slot_lag = mx.array(slag)
+        # groups of slots with distinct lags, so the fold back to a per-lag
+        # table is a reproducible scatter -- see `_lag_fold_plan`
+        kind, plan = _lag_fold_plan(slag, int(lag.max()) + 1)
+        self._metal_fold_plan = (
+            (kind, mx.array(plan)) if kind == "dense"
+            else (kind, [(mx.array(a), mx.array(b)) for a, b in plan]))
         #: slots the backward's per-lag adjoint buffer actually needs, as
         #: against ``n_blocks x n_distinct_lags`` if every block used every
         #: lag.  Equal on a regular cadence; ~1/13 of it when every
@@ -667,7 +673,11 @@ class GPLogLike:
         # custom function's output is one scalar per chain.  See its
         # docstring.
         return scan_loglike(pt, qt, self._metal_lag, h, r, self._r_ref32,
-                            jit2, self.policy.s_floor_rel, self.metal_block)
+                            jit2, self.policy.s_floor_rel, self.metal_block,
+                            slots=(self._metal_slot_id,
+                                   self._metal_slot_start,
+                                   self.n_metal_slots,
+                                   self._metal_fold_plan))
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,).
@@ -892,7 +902,7 @@ def _slot_map(lag: np.ndarray, blk_len: int):
     a buffer with one slot per ``(chain, block, lag)``, which is fine when
     the timestamps have one cadence plus a lag per gap and N-sized when
     every spacing is distinct -- 40 GiB at 1024 chains x N = 1e5, which is
-    why :data:`anvilgp.metal.MAX_LAG_SLAB_BYTES` has to refuse.
+    why :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES` has to refuse.
 
     Most of that buffer is never written: a block of 8192 observations can
     touch at most 8192 lags, and usually touches one or two.  This maps
@@ -924,6 +934,66 @@ def _slot_map(lag: np.ndarray, blk_len: int):
     slot_start = np.searchsorted(
         slot_blk, np.arange(n_blocks + 1, dtype=np.int32)).astype(np.int32)
     return inv.astype(np.int32), slot_start, slot_lag
+
+
+#: Above this many blocks sharing one lag, fold through a padded table and
+#: one ``mx.sum`` rather than one scatter per rank.  Which way round is
+#: cheaper depends on the shape, and the two costs pull opposite ways: the
+#: padded gather materialises ``n_chains x n_lags x max_rank x m^2``
+#: floats, so it is right when ``n_lags`` is small and ``max_rank`` large
+#: (a regular cadence: 3 lags over 98 blocks, a few kilobytes), and wrong
+#: when ``n_lags`` is N and ``max_rank`` is 3 -- measured 4.9 GiB of
+#: gather against 0.8 GiB of buffer at 256 chains x N = 1e5.  Grouping by
+#: rank has no such intermediate but costs a launch per rank, so it wins
+#: exactly when the ranks are few.  Both are reproducible.
+_MAX_FOLD_RANKS = 8
+
+
+def _lag_fold_plan(slot_lag: np.ndarray, n_lags: int):
+    """How to fold per-slot adjoints back into a per-lag table, *reproducibly*.
+
+    The obvious fold is one scatter-add on ``slot_lag``, and **MLX's
+    scatter-add is not reproducible when indices repeat**: the accumulation
+    order across threads is not fixed, so two identical calls differ in the
+    last float32 digit.  Measured directly -- 14 slots over 3 lags is
+    already enough -- while ``mx.sum`` over an axis is reproducible.  The
+    per-lag adjoints used to come from such a sum, so scattering naively
+    would have quietly cost the gradient its bit-reproducibility, and on
+    the regular cadences that are the common case rather than on the
+    irregular ones this work is about.
+
+    A slot is a ``(block, lag)`` pair, so within one block every lag is
+    distinct and a lag repeats only across blocks.  Ranking each slot
+    within its lag gives a dense ``(n_lags, max_rank)`` table of slot
+    indices, padded with a sentinel row of zeros, which folds in one
+    ``mx.sum`` -- reproducible, and one launch rather than ``max_rank``.
+
+    Where every timestamp spacing is distinct, each lag occurs in one or
+    two blocks, so there are one or two groups.  A regular cadence stacks
+    every block on the same handful of lags, and the padded table is then
+    a few kilobytes.
+
+    Returns ``("groups", [(slots, lags), ...])`` when the slots stack no
+    more than :data:`_MAX_FOLD_RANKS` deep -- each group having distinct
+    lags, so each scatter is reproducible on its own -- and
+    ``("dense", table)`` of shape ``(n_lags, max_rank)`` otherwise.
+    """
+    n_slots = int(slot_lag.size)
+    if n_slots == 0:
+        return ("dense", np.zeros((n_lags, 1), dtype=np.int32))
+    order = np.argsort(slot_lag, kind="stable")
+    ordered = slot_lag[order]
+    rank = np.arange(n_slots) - np.searchsorted(ordered, ordered, side="left")
+    max_rank = int(rank.max()) + 1
+
+    if max_rank > _MAX_FOLD_RANKS:
+        table = np.full((n_lags, max_rank), n_slots, dtype=np.int32)
+        table[ordered, rank] = order            # sentinel stays where absent
+        return ("dense", table)
+
+    return ("groups", [(order[rank == r].astype(np.int32),
+                        ordered[rank == r].astype(np.int32))
+                       for r in range(max_rank)])
 
 
 #: Peak bytes MLX's backward through :meth:`Term.matrices` costs per byte of

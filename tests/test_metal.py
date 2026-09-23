@@ -451,9 +451,12 @@ def _fwd_setup(term, p, k, blk, n_chains=3, cadence="regular", seed=1):
     with mx.stream(mx.gpu):
         el = scan_blocks(pt, qt, lag, h, resid, rrv, j2, 1e-6, blk)
         mx.eval(el)
+    from anvilgp.likelihood import _slot_map
+    sid, sstart, slag = _slot_map(lag_np, blk)
     return dict(pt=pt, qt=qt, lag=lag, lag_np=lag_np, h=h, resid=resid,
                 rrv=rrv, j2=j2, cot=cot, el=el, want=want, blk=blk,
-                n_lags=pt.shape[1])
+                n_lags=pt.shape[1], slot_id=mx.array(sid),
+                slot_start=mx.array(sstart), slot_lag=slag)
 
 
 def _per_lag(x_obs, lag_np, n_lags):
@@ -469,15 +472,30 @@ def _rel(a, b):
     return float(np.max(np.abs(a - b)) / max(np.max(np.abs(a)), 1e-20))
 
 
+def _fold_slots(x_slots, slot_lag, n_lags):
+    """(n_chains, n_slots, m, m) -> (n_chains, n_lags, m, m).
+
+    The blocks are already summed: distinct blocks own disjoint slots, so
+    this only regroups.  Repeated `slot_lag` entries are the several blocks
+    that used one lag.
+    """
+    x = np.array(x_slots, dtype=np.float64)
+    out = np.zeros((x.shape[0], n_lags) + x.shape[2:])
+    np.add.at(out, (slice(None), slot_lag), x)
+    return out
+
+
 def _e2e_errors(c, seeds):
     from anvilgp.metal import backward_ckpt
     with mx.stream(mx.gpu):
         o = backward_ckpt(c["pt"], c["qt"], c["lag"], c["h"], c["resid"],
-                          c["rrv"], c["j2"], c["cot"], *seeds, c["blk"])
+                          c["rrv"], c["j2"], c["cot"], *seeds,
+                          c["slot_id"], c["slot_start"], c["slot_lag"].size,
+                          c["blk"])
         mx.eval(o)
-    w = c["want"]
-    return [_rel(_per_lag(w[0], c["lag_np"], c["n_lags"]), mx.sum(o[0], axis=1)),
-            _rel(_per_lag(w[1], c["lag_np"], c["n_lags"]), mx.sum(o[1], axis=1)),
+    w, sl, nl = c["want"], c["slot_lag"], c["n_lags"]
+    return [_rel(_per_lag(w[0], c["lag_np"], nl), _fold_slots(o[0], sl, nl)),
+            _rel(_per_lag(w[1], c["lag_np"], nl), _fold_slots(o[1], sl, nl)),
             _rel(w[2], mx.sum(o[2], axis=1)),
             _rel(w[3], mx.swapaxes(o[3], 0, 1)),
             _rel(np.sum(np.array(w[4], np.float64), axis=1), mx.sum(o[4], axis=1))]
@@ -724,14 +742,16 @@ def test_a_healthy_value_never_comes_with_a_dead_gradient():
     assert rel < 1e-2, f"kernel {g} vs float64 {fd}: rel {rel:.2e}"
 
 
-def test_the_kernel_gradient_refuses_an_unaffordable_lag_slab(monkeypatch):
-    """Stage R: the per-lag adjoint buffer is N-sized on an irregular
-    cadence and used to allocate silently -- 2.2 GiB at N = 2e4 and 64
-    chains, linear in chains.  The VJP now refuses over a budget, with the
-    arithmetic and the fix in the message, and the forward is unaffected.
+def test_the_kernel_gradient_refuses_an_unaffordable_adjoint_buffer(
+        monkeypatch):
+    """The fence is still there, and still names the cadence.
+
+    It is a sanity check now rather than the wall it was: the buffer is one
+    slot per (block, lag) pair that occurs, which is bounded by N however
+    irregular the timestamps, where a slot per pair that *could* occur was
+    N x blocks.  See the test below for what that changes.
     """
     import anvilgp.metal as metal_mod
-
     from anvilgp.likelihood import GPLogLike, ParamMap
 
     rng = np.random.default_rng(3)
@@ -744,11 +764,59 @@ def test_the_kernel_gradient_refuses_an_unaffordable_lag_slab(monkeypatch):
     u = mx.zeros((4, 3), dtype=mx.float32)
     with mx.stream(mx.gpu):
         mx.eval(gp(u))                                # the forward is fine
-    monkeypatch.setattr(metal_mod, "MAX_LAG_SLAB_BYTES", 1 << 16)
-    with pytest.raises(ValueError, match="distinct lags.*metal=False"):
+    monkeypatch.setattr(metal_mod, "MAX_ADJOINT_BUFFER_BYTES", 1 << 12)
+    with pytest.raises(ValueError, match="slots.*metal=False"):
         with mx.stream(mx.gpu):
             _, g = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
             mx.eval(g)
+
+
+@pytest.mark.slow
+def test_the_slot_buffer_admits_a_cadence_the_per_lag_buffer_refused():
+    """Stage C's point: a problem that used to be refused now runs.
+
+    512 chains over 20,000 points with every timestamp spacing distinct.
+    One slot per (block, lag) *possible* is 3.05 GiB there, past the 2 GiB
+    fence this shipped with before stage C, so the gradient raised; one
+    slot per pair that occurs is the block count smaller and it runs.
+
+    Deliberately not the production shape.  At 1024 chains and N = 1e5 the
+    same comparison is 39.7 GiB against 3.05, inside a 17.5 GiB gradient
+    whose forward alone is 13.2 -- measured, and recorded in
+    docs/lag-slots-plan.md.  Asserting it here needs ~20 GiB free and made
+    this test fail once and pass on retry, which is worse than not having
+    it: a flaky test teaches people to re-run rather than to look.
+    """
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    #: the fence this shipped with before stage C, when the buffer had a
+    #: slot per (block, lag) *possible*
+    was_refused_above = 2 << 30
+
+    n, n_chains, m = 20_000, 512, 2
+    rng = np.random.default_rng(11)
+    t = np.concatenate([[0.0], np.cumsum(rng.uniform(0.2, 0.4, n - 1))])
+    gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.3),
+                   ag.SHOTerm(), ParamMap.log([1.3, 4.0, 3.0]),
+                   GPPolicy(block=1024, hi_block=1024, metal=True))
+    n_blocks = -(-n // gp.metal_block)
+    n_lags = gp.n_distinct_lags + 1
+
+    was = 2 * n_chains * n_blocks * n_lags * m * m * 4
+    now = 2 * n_chains * gp.n_metal_slots * m * m * 4
+    assert was > was_refused_above, (
+        f"fixture no longer reproduces the old refusal: {was / 2**30:.2f} GiB")
+    assert now < was_refused_above
+    assert gp.n_metal_slots < n_blocks * n_lags / 5
+
+    u = mx.zeros((n_chains, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        _, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
+        mx.eval(g)
+    g = np.array(g[0])
+    assert np.all(np.isfinite(g)) and np.any(g != 0.0)
+    # every chain is the same point, so every row is the same gradient
+    assert np.max(np.abs(g - g[0])) / max(np.max(np.abs(g[0])), 1e-30) < 1e-5
 
 
 _CHUNK_TERMS = [("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
@@ -953,3 +1021,78 @@ def test_the_slot_map_follows_the_resolved_block_length():
         assert gp.n_metal_slots == int(want[2].size)
         # and the map covers every observation of every block
         assert np.array(gp._metal_slot_id).size == n
+
+
+@pytest.mark.parametrize("cadence", ["regular", "distinct"])
+def test_the_per_lag_fold_is_reproducible(cadence):
+    """Two identical gradient calls must agree bit for bit.
+
+    Folding slots back into a per-lag table is a scatter, and MLX's
+    scatter-add is **not** reproducible when indices repeat -- the
+    accumulation order across threads is not fixed.  A lag repeats across
+    blocks on every regular cadence, so the naive fold would have cost the
+    gradient its reproducibility on the common case.  The fold goes
+    through a padded `(n_lags, max_rank)` table and one `mx.sum` instead,
+    which is reproducible.  This fails if the naive scatter comes back.
+    """
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    rng = np.random.default_rng(7)
+    n = 6000
+    t = (np.arange(n) * 0.02 if cadence == "regular"
+         else np.concatenate([[0.0], np.cumsum(rng.uniform(0.015, 0.025,
+                                                           n - 1))]))
+    gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.3),
+                   ag.SHOTerm(), ParamMap.log([1.3, 4.0, 3.0]),
+                   GPPolicy(block=1024, hi_block=1024, metal=True,
+                            metal_block=512))
+    kind, plan = gp._metal_fold_plan
+    if cadence == "regular":            # the case with repeated lags
+        assert kind == "dense" and plan.shape[1] > 1, (
+            "fixture must have a lag shared across blocks")
+    u = mx.zeros((32, 3), dtype=mx.float32)
+    one = mx.ones((32,), dtype=mx.float32)
+    outs = []
+    for _ in range(4):
+        with mx.stream(mx.gpu):
+            _, g = mx.vjp(gp, [u], [one])
+            mx.eval(g)
+        outs.append(np.array(g[0]))
+    for i, o in enumerate(outs[1:], 1):
+        assert np.array_equal(outs[0], o), (
+            f"{cadence}: call {i} differs by "
+            f"{np.max(np.abs(o - outs[0])):.3e}")
+
+
+@pytest.mark.parametrize("name,build,_want", _SLOT_CADENCES,
+                         ids=[c[0] for c in _SLOT_CADENCES])
+def test_the_fold_plan_places_every_slot_exactly_once(name, build, _want):
+    """The fold must be a permutation, not a resampling.
+
+    A table that dropped a slot would lose that block's contribution to
+    one lag's adjoint -- a wrong gradient with a correct value, which no
+    value test can see.  One that repeated a slot would double it.
+    """
+    from anvilgp.likelihood import _slot_map, _lag_fold_plan
+
+    n, blk = 100_000, 8192
+    lag = _lag_of(build(n))
+    slot_id, _, slot_lag = _slot_map(lag, blk)
+    n_lags, n_slots = int(lag.max()) + 1, int(slot_lag.size)
+    kind, plan = _lag_fold_plan(slot_lag, n_lags)
+
+    if kind == "dense":
+        assert plan.shape[0] == n_lags
+        flat = plan.ravel()
+        used = flat[flat != n_slots]
+        # every slot exactly once, and each in its own lag's row
+        assert np.array_equal(np.sort(used), np.arange(n_slots)), name
+        rows = np.repeat(np.arange(n_lags), plan.shape[1])[flat != n_slots]
+        assert np.array_equal(rows, slot_lag[used]), f"{name}: wrong row"
+    else:
+        used = np.concatenate([g[0] for g in plan])
+        assert np.array_equal(np.sort(used), np.arange(n_slots)), name
+        for sel, lags_of in plan:
+            assert np.array_equal(slot_lag[sel], lags_of), name
+            assert len(np.unique(lags_of)) == len(lags_of), (
+                f"{name}: a group repeats a lag, so its scatter races")
