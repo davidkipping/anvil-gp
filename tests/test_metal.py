@@ -405,6 +405,23 @@ def _fwd_setup(term, p, k, blk, n_chains=3, cadence="regular", seed=1):
     elif cadence == "dupes":
         t = np.sort(np.concatenate([rng.uniform(0.0, 8.0, (k + 1) // 2)] * 2))
         t = t[:k]
+    elif cadence == "distinct":
+        # Every spacing its own lag, so the lag table degenerates to one
+        # row per observation -- what makes the backward's per-lag buffer
+        # N-sized.  Ground-based photometry looks like this.  The mean
+        # spacing is "regular"'s 0.3, deliberately: jittering the spacings
+        # is then the *only* thing that differs from "regular", and the
+        # comparison isolates the degenerate table.  (Drawing the times
+        # uniformly over a short span instead would also shrink dt/rho to
+        # ~1e-3, which is its own ill-conditioning and degrades the
+        # regular cadence nearly as much -- measured 7.4e-5 on `dh` at
+        # m = 4.  Two effects, one fixture; not what this tests.)
+        t = np.concatenate([[0.0], np.cumsum(rng.uniform(0.2, 0.4, k - 1))])
+    elif cadence == "alternating":
+        # two distinct lags (0 and the cadence) and a run length of one:
+        # the flush-on-change accumulator flushes at every observation, the
+        # most it ever can.  Two instruments observing simultaneously.
+        t = np.sort(np.concatenate([np.arange((k + 1) // 2) * 0.3] * 2))[:k]
     else:
         t = np.arange(k) * 0.3
     dt = np.concatenate([[0.0], np.diff(t)])
@@ -468,7 +485,8 @@ def _e2e_errors(c, seeds):
 
 @pytest.mark.parametrize("name,term,p", _BWD_TERMS,
                          ids=[c[0] for c in _BWD_TERMS])
-@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes",
+                                    "distinct", "alternating"])
 @pytest.mark.parametrize("k,blk", [(64, 32), (300, 100), (1000, 256)])
 def test_checkpointed_backward_matches_the_specification(
         name, term, p, cadence, k, blk):
@@ -507,7 +525,8 @@ def test_checkpointed_backward_matches_the_specification(
 
 @pytest.mark.parametrize("name,term,p", _BWD_TERMS,
                          ids=[c[0] for c in _BWD_TERMS])
-@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes",
+                                    "distinct", "alternating"])
 def test_seed_kernel_matches_the_mlx_scans(name, term, p, cadence):
     """The in-kernel prefix, suffix and seeds against the MLX versions.
 
