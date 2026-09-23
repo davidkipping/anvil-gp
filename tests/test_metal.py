@@ -855,3 +855,101 @@ def test_chunking_the_front_end_lowers_the_gradients_peak_memory():
     chunked = peak(1 << 22)
     assert chunked < 0.75 * whole, (
         f"chunked peak {chunked:.3f} GiB vs unchunked {whole:.3f} GiB")
+
+
+def _lag_of(t):
+    dt = np.concatenate([[0.0], np.diff(t)]).astype(np.float32)
+    uniq, inv = np.unique(dt, return_inverse=True)
+    lag = inv.astype(np.int32) + 1
+    lag[0] = 0
+    return lag
+
+
+_SLOT_CADENCES = [
+    # name, builder, expected slots at N = 1e5, blk = 8192 (13 blocks)
+    ("regular + 1 gap", lambda n: np.concatenate(
+        [np.arange(n // 2) * 0.02, np.arange(n // 2) * 0.02 + 20.0]), 15),
+    ("regular, 20 gaps", lambda n: np.arange(n) * 0.02
+     + np.repeat(np.arange(20) * 5.0, n // 20), 26),
+    ("alternating dupes", lambda n: np.sort(
+        np.concatenate([np.arange(n // 2) * 0.02] * 2)), 27),
+    ("two-cadence mix", lambda n: np.sort(np.concatenate(
+        [np.arange(n // 2) * 0.02, np.arange(n // 2) * 0.05])), 53),
+    ("all distinct", lambda n: np.sort(
+        np.random.default_rng(0).uniform(0.0, 2000.0, n)), 99_992),
+]
+
+
+@pytest.mark.parametrize("name,build,want", _SLOT_CADENCES,
+                         ids=[c[0] for c in _SLOT_CADENCES])
+def test_the_slot_map_is_one_slot_per_block_lag_pair_that_occurs(name, build,
+                                                                 want):
+    """Stage B: the index map the backward's adjoint buffer will use.
+
+    The buffer had one slot per ``(chain, block, lag)``, nearly all of it
+    never written: a block can touch at most ``blk_len`` lags and usually
+    touches one or two.  One slot per pair that *occurs* is 2600x smaller
+    on a regular cadence with a gap and 13x smaller when every timestamp
+    spacing is distinct, where the old shape is 40 GiB at 1024 chains.
+
+    The counts are pinned because they are the whole argument for the
+    change; a map that quietly produced more slots than pairs would still
+    satisfy every invariant below.
+    """
+    from anvilgp.likelihood import _slot_map
+
+    n, blk = 100_000, 8192
+    lag = _lag_of(build(n))
+    slot_id, slot_start, slot_lag = _slot_map(lag, blk)
+    n_blocks = -(-n // blk)
+    n_slots = int(slot_lag.size)
+
+    assert n_slots == want, f"{name}: {n_slots} slots, expected {want}"
+    assert n_slots <= min(n_blocks * (int(lag.max()) + 1), n)
+
+    # every observation lands in exactly one slot, and that slot's lag is
+    # the observation's lag
+    assert slot_id.shape == lag.shape
+    assert int(slot_id.min()) == 0 and int(slot_id.max()) == n_slots - 1
+    assert np.array_equal(slot_lag[slot_id], lag), f"{name}: slot lag mismatch"
+
+    # each block owns a contiguous slot range and writes only inside it --
+    # the kernel thread zeroes exactly this range
+    assert slot_start[0] == 0 and slot_start[-1] == n_slots
+    assert np.all(np.diff(slot_start) >= 0)
+    blk_of = np.arange(n) // blk
+    for b in range(n_blocks):
+        used = np.unique(slot_id[blk_of == b])
+        assert used.min() >= slot_start[b] and used.max() < slot_start[b + 1], (
+            f"{name}: block {b} writes outside its range")
+    # and no slot is shared between blocks
+    owner = np.zeros(n_slots, dtype=np.int64) - 1
+    owner[slot_id] = blk_of
+    for b in range(n_blocks):
+        assert np.all(owner[slot_start[b]:slot_start[b + 1]] == b), (
+            f"{name}: a slot in block {b}'s range belongs to another block")
+
+
+def test_the_slot_map_follows_the_resolved_block_length():
+    """A map built for a different block length misattributes every
+    adjoint -- and the *value* stays correct, because the forward never
+    reads it.  So it is built from `self.metal_block`, after that is
+    resolved, not from the policy field that may be None.
+    """
+    from anvilgp.likelihood import GPLogLike, ParamMap, _slot_map
+
+    rng = np.random.default_rng(4)
+    n = 5000
+    t = np.concatenate([[0.0], np.cumsum(rng.uniform(0.2, 0.4, n - 1))])
+    for blk in (None, 256, 1024):
+        gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.3),
+                       ag.SHOTerm(), ParamMap.log([1.3, 4.0, 3.0]),
+                       GPPolicy(block=1024, hi_block=1024, metal=True,
+                                metal_block=blk))
+        want = _slot_map(np.array(gp._metal_lag), gp.metal_block)
+        for got, exp in zip((gp._metal_slot_id, gp._metal_slot_start,
+                             gp._metal_slot_lag), want):
+            assert np.array_equal(np.array(got), exp), f"blk={blk}"
+        assert gp.n_metal_slots == int(want[2].size)
+        # and the map covers every observation of every block
+        assert np.array(gp._metal_slot_id).size == n

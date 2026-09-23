@@ -68,8 +68,14 @@ numpy:
 * `slot_id[t]`, N entries: the slot observation `t` flushes to.
 * `slot_start[b]`, `n_blocks + 1` entries: block `b` owns slots
   `slot_start[b] .. slot_start[b+1]`.
-* `slot_lag[s]`, `n_slots` entries: the lag each slot belongs to, sorted
-  by `(lag, block)` so the per-lag sum is a contiguous segment.
+* `slot_lag[s]`, `n_slots` entries: the lag each slot belongs to. Slots
+  are ordered by `(block, lag)`, **not** `(lag, block)` as an earlier
+  draft of this document said: the kernel's thread has to zero its own
+  block's slots, which requires that block's range to be contiguous. The
+  per-lag sum is then a scatter rather than a segment sum. If the scatter
+  proves non-deterministic, the fallback is a host-side permutation to
+  lag order and a segment sum over it -- the ordering the earlier draft
+  wanted, recovered without costing the kernel its contiguous range.
 
 Kernel (`_SRC_BWD_CKPT`): zero the block's own slot range instead of all
 `n_lags` slots; flush to `(chain * n_slots + slot_id[gi]) * m^2` instead
@@ -178,14 +184,25 @@ if the second does not pay.
 |---|---|---|---|---|
 | 0 | Pin the baseline | 0.25 | Opus | **DONE** -- above. Two cadences in the suite, 80 cases green, baseline and the front-end split measured. |
 | A | Chunk the front-end backward | 0.75 | Opus | **DONE** -- see below. 2.3x less peak and 5-6x faster at N = 1e5; regular cadences bit-identical; gradient within 1.7e-7. |
-| B | Host slot map | 0.25 | Opus | Every observation's `(block, lag)` pair maps to one slot; counts on the five cadences match the table above. |
+| B | Host slot map | 0.25 | Opus | **DONE** -- `likelihood._slot_map`, built from the resolved `metal_block`. Counts match the table exactly (15/26/27/53/99,992); invariants pinned; 13x fewer slots than `blocks x lags` on an all-distinct cadence, 27.6 ms to build at N = 1e5. |
 | C | Kernel and VJP on slots | 0.5 | Opus | Per-lag adjoint sums equal the pre-change kernel's to 1e-6 at m = 1..4 on all five cadences. The fence, re-based on slots, stops tripping. |
 | D | Measure and document | 0.25 | Opus | All-distinct gradient runs at 1e5 x 1024 within ~2x the forward's peak. `benchmarks/verify_readme.py` green. README, plan and memory corrected. |
+| R2 | Adversarial review of the slot map | 0.5 | **Fable** | Brief: assume the slot map is wrong and prove it. A wrong slot index gives a correct *value* and a silently wrong parameter gradient, because the forward is untouched -- the one failure class this suite has repeatedly missed on its own. Specifically: a slot map stale against `metal_block`; the scatter-add's determinism across runs; blocks whose lag set changes between value and gradient calls; and whether any test would fail if `slot_id` were permuted. |
 
-Opus throughout. The scatter-add's determinism question from the previous
-draft still applies to stage C; the kernel itself is bit-reproducible
-across runs (verified, 4 runs identical), so only the new scatter is in
-question.
+Opus for the work, **Fable for R2**. That split is this project's own
+evidence rather than a guess: stage F of M4, the hardest kernel work in
+the milestone, was written by Fable and still shipped a value-correct,
+gradient-dead bug that a full green suite did not catch. Stage R, also
+Fable, is what found it -- along with five other defects and three tests
+that passed with their subjects deleted. On this codebase the capability
+has paid in review, not in authoring. If stage C turns out to need more
+than the two address changes assumed here -- a deterministic fallback
+designed for the scatter, or a restructure forced by register pressure --
+it stops being mechanical and should move to Fable too.
+
+The scatter-add's determinism question from the previous draft still
+applies to stage C; the kernel itself is bit-reproducible across runs
+(verified, 4 runs identical), so only the new scatter is in question.
 
 ### Expected outcome, revised
 
@@ -260,3 +277,40 @@ bring the same problem to roughly 4 GiB. The gate for stage A said "peak
 down >= 5x at N = 1e5"; the achieved figure is 2.3x, because that gate was
 set from the front end measured *in isolation* (7-15x) and the whole path
 has the slab as its floor. Recorded rather than restated.
+
+## Stage B, measured 2026-09-22
+
+`likelihood._slot_map(lag, blk_len)` returns the three int32 arrays stage
+C's kernel needs, built in `GPLogLike.__init__` from the **resolved**
+`self.metal_block` rather than the policy field, which may be `None`. A
+map built against a different block length would misattribute every
+adjoint while leaving the value correct, since the forward never reads it.
+
+Slot counts at N = 1e5, 13 blocks -- the table this plan rests on,
+reproduced by the shipped code rather than a scratch script:
+
+| cadence | lags | slots | buffer, per-lag | buffer, slots |
+|---|---:|---:|---:|---:|
+| regular + 1 gap | 4 | 15 | 2 MB | 0.5 MB |
+| regular, 20 gaps | 4 | 26 | 2 MB | 0.8 MB |
+| alternating duplicates | 3 | 27 | 1 MB | 0.8 MB |
+| two interleaved cadences | 17 | 53 | 7 MB | 1.7 MB |
+| every spacing distinct | 99,890 | 99,992 | 39.6 GiB | 3.05 GiB |
+
+At 1024 chains, m = 2. The all-distinct row is 13x fewer slots than
+`blocks x lags`, which is the block count: each observation's block-lag
+pair is distinct, so the slot count is N rather than N x blocks.
+
+Ordering is by `(block, lag)`, so each block's slots are one contiguous
+range and a thread can zero exactly its own. An earlier draft said
+`(lag, block)`; that would have made the per-lag fold a segment sum but
+left the kernel's zeroing scattered, which is the wrong trade.
+
+Construction costs 27.6 ms at N = 1e5 on the worst cadence and is a single
+`np.unique`; on a regular cadence it is microseconds. Pinned by two tests:
+one checks the counts and the invariants (every observation in exactly one
+slot, each block's range contiguous and exclusively its own,
+`slot_lag[slot_id] == lag`), the other that the map tracks the resolved
+block length across `metal_block` of `None`, 256 and 1024.
+
+Nothing reads the map yet -- that is stage C. 562 tests pass.

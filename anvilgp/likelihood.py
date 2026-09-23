@@ -445,6 +445,19 @@ class GPLogLike:
                             else _auto_metal_block(self.n_data,
                                                    kernel_spec.n_state))
 
+        # Per-(block, lag) slot map for the backward kernel's adjoint
+        # buffer.  Built here, from the resolved block length, so it can
+        # never disagree with the launch -- see `_slot_map`.
+        sid, sstart, slag = _slot_map(lag, self.metal_block)
+        self._metal_slot_id = mx.array(sid)
+        self._metal_slot_start = mx.array(sstart)
+        self._metal_slot_lag = mx.array(slag)
+        #: slots the backward's per-lag adjoint buffer actually needs, as
+        #: against ``n_blocks x n_distinct_lags`` if every block used every
+        #: lag.  Equal on a regular cadence; ~1/13 of it when every
+        #: timestamp spacing is distinct at 13 blocks.
+        self.n_metal_slots = int(slag.size)
+
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
         self._metal_ok, self._metal_why = self.metal_eligible()
@@ -869,6 +882,48 @@ def _auto_sub_block(m: int) -> int:
 #: sits close enough to the edge that it failed in one run and not another.
 _MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048}
 _MAX_METAL_BLOCK_HI_M = 1024
+
+
+def _slot_map(lag: np.ndarray, blk_len: int):
+    """Index map from observation to per-lag adjoint slot, and back to lag.
+
+    The backward kernel accumulates the propagator adjoints ``dPhi``,
+    ``dQ`` in registers and flushes when the lag changes.  It flushed into
+    a buffer with one slot per ``(chain, block, lag)``, which is fine when
+    the timestamps have one cadence plus a lag per gap and N-sized when
+    every spacing is distinct -- 40 GiB at 1024 chains x N = 1e5, which is
+    why :data:`anvilgp.metal.MAX_LAG_SLAB_BYTES` has to refuse.
+
+    Most of that buffer is never written: a block of 8192 observations can
+    touch at most 8192 lags, and usually touches one or two.  This maps
+    each observation to a slot indexed by the ``(block, lag)`` pair it
+    actually uses, so the buffer is one slot per pair that occurs, at most
+    ``min(n_blocks x n_lags, N)``.
+
+    Returns ``(slot_id, slot_start, slot_lag)``:
+
+    * ``slot_id[t]`` -- the slot observation ``t`` flushes to.
+    * ``slot_start[b] .. slot_start[b+1]`` -- the slots block ``b`` owns.
+      A thread zeroes exactly this range, so it must be contiguous, which
+      is why the slots are ordered by ``(block, lag)``.
+    * ``slot_lag[s]`` -- the lag slot ``s`` belongs to, for folding the
+      slots back into a per-lag table.
+
+    ``blk_len`` must be the block length the kernel is launched with; a
+    map built for a different one silently misattributes every adjoint,
+    with the *value* still correct because the forward never reads it.
+    """
+    n = int(lag.size)
+    n_blocks = -(-n // int(blk_len))
+    blk = np.arange(n, dtype=np.int64) // int(blk_len)
+    stride = int(lag.max()) + 1
+    key = blk * stride + lag.astype(np.int64)
+    uniq, inv = np.unique(key, return_inverse=True)      # sorted: (block, lag)
+    slot_lag = (uniq % stride).astype(np.int32)
+    slot_blk = (uniq // stride).astype(np.int32)
+    slot_start = np.searchsorted(
+        slot_blk, np.arange(n_blocks + 1, dtype=np.int32)).astype(np.int32)
+    return inv.astype(np.int32), slot_start, slot_lag
 
 
 #: Peak bytes MLX's backward through :meth:`Term.matrices` costs per byte of
