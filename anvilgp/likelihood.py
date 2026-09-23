@@ -106,8 +106,12 @@ class GPPolicy:
     blocked: bool | None = None
     #: use the fused Metal scan kernel (:mod:`anvilgp.metal`).
     #: Differentiable since M4: the kernel carries its own VJP, so a
-    #: gradient sampler can use it too.  Measured 25-53x over the MLX path with 2-25x less peak
-    #: memory; see the README.
+    #: gradient sampler can use it too.  Measured 45-74x over the MLX path
+    #: on the forward and ~100x on the gradient, with 20-30x less peak
+    #: memory; see the README.  Limits: m <= 4, one jitter, and the
+    #: gradient's per-lag buffer grows with the number of distinct
+    #: timestamp spacings (``n_distinct_lags``; see
+    #: :data:`anvilgp.metal.MAX_LAG_SLAB_BYTES`).
     metal: bool = False
     #: observations condensed per kernel thread, or None to pick from N.
     #: Larger means fewer, longer sequential walks and less work left for
@@ -117,8 +121,21 @@ class GPPolicy:
     #: floor on the leaf innovation variance, in units of the reference
     #: variance.  Positive-definiteness failure is a *defined* outcome:
     #: with thousands of chains, warmup will visit float32-infeasible
-    #: corners, and the likelihood must come back finite there.
+    #: corners, and the likelihood must come back finite there.  Since
+    #: stage 0 of M4 the non-physical term ``h Q h^T`` is clamped at zero
+    #: on its own, so the innovation variance is at least the reference
+    #: variance and this floor **cannot bind** for any value below 1.
+    #: Values >= 1 are refused: they would change the value, and the
+    #: kernel's backward does not differentiate the floor (stage R).
     s_floor_rel: float = 1e-6
+
+    def __post_init__(self):
+        if not 0.0 <= self.s_floor_rel < 1.0:
+            raise ValueError(
+                f"s_floor_rel = {self.s_floor_rel!r} must be in [0, 1): the "
+                f"innovation variance is already at least r_ref, so a floor "
+                f"below 1 never binds, and one at or above 1 would alter the "
+                f"likelihood without the kernel gradient following it")
 
 
 @dataclass
@@ -536,7 +553,12 @@ class GPLogLike:
         return True, ""
 
     def _evaluate_metal(self, v: mx.array) -> mx.array:
-        """Design C: the kernel condenses blocks, MLX composes the roots."""
+        """Design C: one kernel condenses the blocks, a second folds them.
+
+        The whole thing sits behind :func:`anvilgp.metal.scan_loglike`'s
+        ``custom_function``, whose VJP runs the backward kernels, so this
+        path is differentiable (M4).
+        """
         from .metal import scan_loglike
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
@@ -682,10 +704,17 @@ class GPLogLike:
         is to cut the graph, so the guard is a ``custom_function`` whose VJP
         *selects* zero on failed lanes rather than multiplying by it.
 
-        That costs one extra forward pass on the gradient path, because the
-        VJP has to re-run the graph it is guarding.  Measured at ~20% of a
-        value-and-gradient call.  The forward-only path -- the stretch move,
-        and anything on the Metal kernel -- pays nothing.
+        The guard is an identity on the *input* ``v`` rather than a wrapper
+        on the output, so it re-runs nothing: an earlier version wrapped the
+        whole evaluation and cost an extra forward pass (~20%) on every
+        gradient.  Neither path pays anything measurable now.
+
+        The contract is one-way.  A rejected lane has a zero gradient; a
+        zero gradient does not prove the lane was rejected, since the guard
+        also zeroes a NaN that the backward produced on a healthy value.
+        Stage R found one such point on the kernel path and fixed its cause
+        (the Joseph-form update in the replay); the converse is now pinned
+        by ``tests/test_metal.py::test_a_healthy_value_never_comes_with_a_dead_gradient``.
         """
         self._check_v(v)
         return self._guard(v)

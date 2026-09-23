@@ -305,35 +305,42 @@ def test_the_kernel_holds_high_amplitude_on_model(sig_over_yerr):
 
 
 def test_the_differentiation_boundary_encloses_the_reduction():
-    """An M4 requirement, not tidiness: pin it so a refactor cannot undo it.
+    """M4 requirement: the custom_function's OUTPUT is one scalar per chain.
 
-    If the `custom_function` wrapped the kernel alone, its outputs would be
-    six element fields per block and its VJP would have to accept cotangents
-    on all six. That is a harder problem than the one `adjoint.py` solves.
-    Wrapping the reduction too makes the output one scalar per chain, and a
-    scalar cotangent is what `filter_backward` is derived for.
+    If it returned the six element fields per block instead, its VJP would
+    have to accept cotangents on all six -- not the problem `adjoint.py`
+    solves.  An earlier version of this test spied on `scan_loglike`'s
+    output, which is one scalar per chain whether or not the reduction is
+    inside the boundary; it passed with the reduction moved back outside.
+    This one captures what the decorated function itself returns.
     """
     import anvilgp.metal as metal_mod
 
     seen = {}
-    real = metal_mod.scan_loglike
+    real_cf = mx.custom_function
 
-    def spy(*a, **kw):
-        out = real(*a, **kw)
-        seen["shape"] = out.shape
-        return out
+    def spy_cf(fn):
+        def wrapped(*a, **kw):
+            out = fn(*a, **kw)
+            seen["custom_function_output"] = (
+                out.shape if hasattr(out, "shape") else [o.shape for o in out])
+            return out
+        wrapped.__name__ = fn.__name__
+        return real_cf(wrapped)
 
     n_chains = 6
-    metal_mod.scan_loglike = spy
+    metal_mod.mx.custom_function = spy_cf
     try:
         gp = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], True)
         with mx.stream(mx.gpu):
             mx.eval(gp(mx.zeros((n_chains, 1), dtype=mx.float32)))
     finally:
-        metal_mod.scan_loglike = real
+        metal_mod.mx.custom_function = real_cf
 
-    assert seen["shape"] == (n_chains,), (
-        f"the boundary must return one scalar per chain; got {seen['shape']}")
+    assert seen["custom_function_output"] == (n_chains,), (
+        f"the custom_function must return (n_chains,); it returned "
+        f"{seen['custom_function_output']}")
+
 
 
 @pytest.mark.parametrize("name,term,kp", TERMS, ids=[c[0] for c in TERMS])
@@ -384,118 +391,6 @@ _BWD_TERMS = [
     ("matern52", ag.Matern52Term(), [1.1, 2.5]),
     ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
 ]
-
-
-def _bwd_case(term, p, k, blk, n_chains=3, cadence="regular", seed=0):
-    """Run the kernel sweep and the float64 spec on the same problem."""
-    from anvilgp.adjoint import block_seeds, filter_backward, filter_forward
-    from anvilgp.elements import (Element, leaf_elements, prefix_scan,
-                                  suffix_scan, tree_reduce)
-    from anvilgp.metal import backward_blocks
-
-    rng = np.random.default_rng(seed)
-    if cadence == "gapped":
-        t = np.sort(rng.uniform(0.0, 8.0, k))
-        t[k // 2:] += 20.0
-    elif cadence == "dupes":
-        t = np.repeat(np.sort(rng.uniform(0.0, 8.0, k // 2)), 2)[:k]
-    else:
-        t = np.arange(k) * 0.3
-    dt = np.concatenate([[0.0], np.diff(t)])
-    uniq, inv = np.unique(dt.astype(np.float32), return_inverse=True)
-    lag = mx.concatenate([mx.zeros((1,), dtype=mx.int32),
-                          mx.array(inv.astype(np.int32) + 1)[1:]])
-
-    m = term.n_state
-    P = mx.array(np.tile(np.array(p, np.float32), (n_chains, 1)))
-    phi_u, q_u, h = term.matrices(P, mx.array(uniq.astype(np.float32)))
-    z = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
-    eye = mx.broadcast_to(mx.eye(m, dtype=mx.float32), (n_chains, 1, m, m))
-    pt = mx.concatenate([z, phi_u], axis=1)
-    qt = mx.concatenate([eye, q_u], axis=1)
-    phi, q = mx.take(pt, lag, axis=1), mx.take(qt, lag, axis=1)
-
-    y = mx.array(rng.standard_normal(k).astype(np.float32))
-    rrv = mx.full((k,), 0.09, dtype=mx.float32)
-    yv = mx.broadcast_to(y, (n_chains, k))
-    rv = mx.broadcast_to(rrv, (n_chains, k))
-    cot = mx.array(rng.standard_normal(n_chains).astype(np.float32))
-
-    states, _ = filter_forward(phi, q, h, yv, rv, rrv)
-    want = filter_backward(phi, q, h, yv, rv, rrv, states, cot)
-
-    starts = list(range(0, k, blk))
-    blocks = []
-    for s0 in starts:
-        e0 = min(s0 + blk, k)
-        el, r1 = leaf_elements(phi[:, s0:e0], q[:, s0:e0], h, yv[:, s0:e0],
-                               rv[:, s0:e0], rrv[s0:e0])
-        blocks.append(tree_reduce(el))
-    be = Element(*(mx.stack([getattr(b, f) for b in blocks], axis=1)
-                   for f in Element._fields))
-    pre, suf = prefix_scan(be), suffix_scan(be)
-    nb = len(starts)
-    ent_m = mx.stack([mx.zeros((n_chains, m), dtype=mx.float32)]
-                     + [pre.b[:, i] for i in range(nb - 1)], axis=1)
-    ent_C = mx.stack([mx.zeros((n_chains, m, m), dtype=mx.float32)]
-                     + [pre.C[:, i] for i in range(nb - 1)], axis=1)
-    sm, sc = [], []
-    for i in range(nb):
-        a, b = block_seeds(pre.b[:, i], pre.C[:, i],
-                           Element(*(getattr(suf, f)[:, i + 1]
-                                     for f in Element._fields)), cot)
-        sm.append(a)
-        sc.append(b)
-
-    with mx.stream(mx.gpu):
-        o = backward_blocks(pt, qt, lag, h, mx.swapaxes(yv, 0, 1), rrv,
-                            mx.zeros((n_chains, 0), dtype=mx.float32), cot,
-                            ent_m, ent_C, mx.stack(sm, axis=1),
-                            mx.stack(sc, axis=1), blk)
-        mx.eval(o)
-    got = [o[0], o[1], mx.sum(o[2], axis=1),
-           mx.swapaxes(o[3], 0, 1), mx.swapaxes(o[4], 0, 1)]
-    return [float(mx.max(mx.abs(a - b))) / max(float(mx.max(mx.abs(a))), 1e-20)
-            for a, b in zip(want, got)]
-
-
-@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
-                         ids=[c[0] for c in _BWD_TERMS])
-@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes"])
-def test_backward_kernel_matches_the_specification(name, term, p, cadence):
-    """Stage E: the Metal reverse sweep against `adjoint.filter_backward`.
-
-    The kernel is float32 and the specification float64, so the tolerance
-    is a float32 one. That it is *arithmetic* rather than a transcription
-    error is pinned by the next test: at two observations, where nothing
-    accumulates, the agreement is 1e-7.
-
-    For scale: the MLX float32 gradient's own error on `dh` at the
-    high-amplitude corner is ~2.9e-4, so 1e-4 here is not a weak bound.
-    """
-    for k, blk in ((24, 8), (30, 16)):
-        errs = _bwd_case(term, p, k, blk, cadence=cadence)
-        for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
-            assert e < 1e-4, f"{name}/{cadence} k={k} blk={blk} {nm}: {e:.2e}"
-
-
-@pytest.mark.parametrize("name,term,p", _BWD_TERMS,
-                         ids=[c[0] for c in _BWD_TERMS])
-def test_backward_kernel_arithmetic_is_exact_before_accumulation(
-        name, term, p):
-    """Two observations, one block: nothing accumulates, so any gap is a bug.
-
-    This is what separates "float32 adds up" from "the transcription of
-    `_backward_span` is wrong". At k = 2 every adjoint agrees to float32
-    epsilon; the 1e-4 tolerance above is what accumulation costs over 30
-    observations across a data gap.
-    """
-    errs = _bwd_case(term, p, 2, 2)
-    for nm, e in zip(["phi", "q", "h", "y", "r_var"], errs):
-        assert e < 1e-5, f"{name} {nm}: {e:.2e}"
-
-
-# -- stage F: checkpointed sweep, per-lag adjoints, in-kernel seeds --------
 
 
 def _fwd_setup(term, p, k, blk, n_chains=3, cadence="regular", seed=1):
@@ -730,3 +625,108 @@ def test_kernel_gradient_matches_float64_central_differences():
                      - float(np.array(gp.hi(a64(dn[None])))[0])) / (2 * h)
     rel = np.max(np.abs(got - fd)) / max(np.max(np.abs(fd)), 1e-20)
     assert rel < 1e-5, f"{rel:.2e}\n kernel {got}\n fd     {fd}"
+
+
+def test_the_kernel_clamps_its_variance_term():
+    """Stage 0 in the kernel: fails if `sq = max(sq, 0)` is removed.
+
+    Same fixture as the adjoint test: the leaf variance term is driven to
+    -2e-3 against an r_var of 1e-3, so the unclamped innovation variance is
+    negative and the log of it NaN.  The lag table has one row, `bad_q`,
+    and every observation but the first points at it.
+    """
+    from anvilgp.metal import scan_loglike
+
+    n_chains, k, m = 2, 12, 2
+    bad_q = mx.array(np.tile(-1e-3 * np.eye(m, dtype=np.float32),
+                             (n_chains, 1, 1, 1)))
+    pt = mx.concatenate([mx.zeros((n_chains, 1, m, m), dtype=mx.float32),
+                         mx.zeros((n_chains, 1, m, m), dtype=mx.float32)],
+                        axis=1)
+    qt = mx.concatenate([mx.broadcast_to(mx.eye(m, dtype=mx.float32),
+                                         (n_chains, 1, m, m)), bad_q], axis=1)
+    lag = mx.array(np.array([0] + [1] * (k - 1), dtype=np.int32))
+    h = mx.ones((n_chains, m), dtype=mx.float32)
+    resid = mx.array(np.random.default_rng(0).standard_normal((k, n_chains))
+                     .astype(np.float32))
+    r_ref = mx.full((k,), 1e-3, dtype=mx.float32)
+    j2 = mx.zeros((n_chains, 0), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        out = scan_loglike(pt, qt, lag, h, resid, r_ref, j2, 0.0, 8)
+        mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out))), np.array(out)
+
+
+def test_a_healthy_value_never_comes_with_a_dead_gradient():
+    """Stage R: the converse of the guard's contract, on the kernel path.
+
+    The guard zeroes a lane's gradient when the backward returns NaN.  That
+    is right when the value was rejected and silently wrong when it was
+    not.  At this point -- sigma/yerr = 1e4, rho/dt = 1000, Q = 500, all
+    inside the shipped priors' bounds except the unbounded log sigma -- the
+    kernel value is right to 2e-4 and its gradient came back exactly zero,
+    because the first observation's covariance update ``I - h h^T/(h.h + r)``
+    rounds to a negative ulp along ``h`` when ``h.h/r ~ 1e8`` and an
+    undamped propagator grew that ulp until the replay overflowed.  The
+    Joseph-form update fixed it.  Fails with the plain update restored.
+    """
+    from anvilgp.likelihood import GPLogLike, ParamMap, a64
+    from anvilgp.oracle import sample_ssm
+
+    dt, n, yerr = 0.02, 2048, 1e-3
+    t = np.arange(n) * dt
+    rng = np.random.default_rng(41)
+    y = (sample_ssm(ag.SHOTerm(), [30 * yerr, 100 * dt, 3.0], dt, n, rng)
+         + rng.standard_normal(n) * yerr)
+    pm = ParamMap.log([1e4 * yerr, 1000 * dt, 500.0])
+    gp = GPLogLike(None, t, None, y, np.full(n, yerr), ag.SHOTerm(), pm,
+                   GPPolicy(block=1024, hi_block=1024, metal=True))
+    assert gp.metal_eligible()[0]
+    u = mx.zeros((1, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        val = gp(u)
+        _, grad = mx.vjp(gp, [u], [mx.ones((1,), dtype=mx.float32)])
+        mx.eval(val, grad)
+    v0 = np.zeros((1, 3))
+    with mx.stream(mx.cpu):
+        f64 = float(np.array(gp.hi(a64(v0)))[0])
+        fd = np.zeros(3)
+        for i in range(3):
+            up, dn = v0.copy(), v0.copy()
+            up[0, i] += 1e-4
+            dn[0, i] -= 1e-4
+            fd[i] = (float(np.array(gp.hi(a64(up)))[0])
+                     - float(np.array(gp.hi(a64(dn)))[0])) / 2e-4
+    v = float(np.array(val)[0])
+    assert abs(v - f64) / abs(f64) < 1e-3, "the value is healthy here"
+    g = np.array(grad[0])[0].astype(np.float64)
+    assert np.all(np.isfinite(g)) and np.any(g != 0.0), f"dead gradient {g}"
+    rel = np.max(np.abs(g - fd) / np.maximum(np.abs(fd), 1e-9))
+    assert rel < 1e-2, f"kernel {g} vs float64 {fd}: rel {rel:.2e}"
+
+
+def test_the_kernel_gradient_refuses_an_unaffordable_lag_slab(monkeypatch):
+    """Stage R: the per-lag adjoint buffer is N-sized on an irregular
+    cadence and used to allocate silently -- 2.2 GiB at N = 2e4 and 64
+    chains, linear in chains.  The VJP now refuses over a budget, with the
+    arithmetic and the fix in the message, and the forward is unaffected.
+    """
+    import anvilgp.metal as metal_mod
+
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    rng = np.random.default_rng(3)
+    t = np.sort(rng.uniform(0.0, 50.0, 400))          # every lag distinct
+    gp = GPLogLike(None, t, None, rng.standard_normal(400), np.full(400, 0.3),
+                   ag.SHOTerm(), ParamMap.log([1.3, 4.0, 3.0]),
+                   GPPolicy(block=1024, hi_block=1024, metal=True,
+                            metal_block=64))
+    assert gp.metal_eligible()[0] and gp.n_distinct_lags > 300
+    u = mx.zeros((4, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        mx.eval(gp(u))                                # the forward is fine
+    monkeypatch.setattr(metal_mod, "MAX_LAG_SLAB_BYTES", 1 << 16)
+    with pytest.raises(ValueError, match="distinct lags.*metal=False"):
+        with mx.stream(mx.gpu):
+            _, g = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
+            mx.eval(g)

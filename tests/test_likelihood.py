@@ -469,3 +469,17 @@ def test_the_joint_high_amplitude_long_correlation_corner():
     # Documented, not asserted-good: if this ever drops below 0.3 the MLX
     # path has been fixed and this guard should be tightened.
     assert abs(m32 - hi) < 5.0, f"MLX unexpectedly far off: {m32 - hi:+.3f}"
+
+
+def test_the_variance_floor_is_refused_where_it_could_bind():
+    """Stage R: `s_floor_rel` is applied by the kernel's forward and not by
+    its backward, so at a value where it binds the two disagree (relative
+    gradient error 3.3 at s_floor_rel = 1e3).  Below 1 it provably never
+    binds -- the innovation variance is at least r_ref since stage 0 -- so
+    the policy refuses the range where it would matter.
+    """
+    GPPolicy(s_floor_rel=0.0)
+    GPPolicy(s_floor_rel=0.999)
+    for bad in (1.0, 10.0, -1e-3):
+        with pytest.raises(ValueError, match="s_floor_rel"):
+            GPPolicy(s_floor_rel=bad)

@@ -32,7 +32,7 @@ p.add_argument("--no-compile", action="store_true")
 p.add_argument("--sub-block", type=int, default=None)
 p.add_argument("--cadence", choices=("regular","gapped","random"), default="gapped")
 p.add_argument("--metal", action="store_true",
-               help="use the fused Metal kernel (forward only)")
+               help="use the fused Metal kernel (value and gradient)")
 p.add_argument("--metal-block", type=int, default=None)
 a = p.parse_args()
 

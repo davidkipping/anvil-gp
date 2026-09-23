@@ -17,9 +17,9 @@ from anvilgp.anvil import make_target
 
 from anvilgp import GPPolicy
 
-# metal=True turns on the fused kernel: ~40x, FORWARD ONLY until M4, so it
-# suits the gradient-free stretch move below and not ChEES-HMC.  It is off
-# by default; `gt.loglike.metal_eligible()` says whether it can be honoured
+# metal=True turns on the fused kernel: ~45-75x on the forward and ~100x on
+# the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
+# is off by default; `gt.loglike.metal_eligible()` says whether it can be honoured
 # (m <= 4, one jitter), and a request it cannot honour warns rather than
 # falling back in silence.
 gt = make_target(ag.SHOTerm(), t, y, yerr,      # defaults, not homework
@@ -68,7 +68,7 @@ approximate one.
 | `likelihood.py` | `GPLogLike`: the anvil engine contract |
 | `priors.py` | parametrisation, default priors, periodogram initialiser |
 | `oracle.py` | dense float64 Cholesky oracle, `predict`, celerite2 wrapper |
-| `metal.py` | fused Metal scan kernel — M3's pass 1, forward only |
+| `metal.py` | fused Metal scan kernel and its checkpointed backward — M3 and M4 |
 | `adjoint.py` | hand-derived backward recursion — M4's specification |
 | `anvil.py` | engine integration (lazy import; core stays mlx + numpy only) |
 
@@ -126,7 +126,8 @@ that celerite2's Matérn-3/2 *converges to ours* as its `eps` shrinks
 (6.5e-3 → 6.5e-7 → 1.9e-10), which is what fixes the direction of the
 discrepancy.
 
-Beyond parity, the suite pins (it runs in ~2 minutes):
+Beyond parity, the suite pins (the full suite runs in ~4.5 minutes, ~2.5
+with `-m 'not slow'`):
 
 * the SSM identity `k(tau) = h Phi(tau) h^T` and the Lyapunov consistency
   `Q = I - Phi Phi^T` for all twelve term configurations;
@@ -280,13 +281,15 @@ since a block is up to 4096 sequential adds with no tree to spread the error.
 Limits, stated: m <= 4 (the running element is `3m^2+2m+1` floats in
 registers — 17 at m = 2, 57 at m = 4, 209 at m = 8, which would spill);
 one jitter, not per-instrument; and an all-distinct-lag cadence degenerates
-the table to one row per point, which is correct but gives up the traffic
-saving. Larger m and in-kernel propagators are the obvious follow-ons.
+the table to one row per point, which is correct for the value but gives up
+the traffic saving, and for the gradient makes the per-lag adjoint buffer
+N-sized, which the VJP refuses over 2 GiB (see "What is left"). Larger m
+and in-kernel propagators are the obvious follow-ons.
 
 ### The MLX reference path
 
-Still the differentiable path, the float64 verification path, and the thing
-the kernel is proved against. It is ~40x faster than its first working
+Still the float64 verification path, the thing the kernel is proved against,
+and the only path for m > 4 or per-instrument jitter. It is ~40x faster than its first working
 version and beats a single-core CPU, though not a fully parallelised one.
 M2 Max, float32 GPU, compiled forward, **minimum of 15** sustained
 evaluations, `block=4096`, realistic (regular-cadence-with-gaps) times, all
@@ -463,7 +466,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `False` | you want the ~40x forward kernel and do not need gradients. `m <= 4`, one jitter. Warns if it cannot be honoured. |
+| `metal` | `False` | you want the fused kernel: ~45-75x on the forward, ~100x on the gradient. `m <= 4`, one jitter; the gradient also needs few distinct timestamp spacings (see "What is left"). Warns if it cannot be honoured. |
 | `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
@@ -474,22 +477,35 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 ### What is left, and what it is worth
 
-The forward kernel (M3) landed; what follows is what is still open, with
-what each is worth. Measurements are from the review of 2026-09-19 unless
+Both kernels landed (M3 forward, M4 backward); what follows is what is
+still open, with what each is worth. Measurements are from the review of 2026-09-19 unless
 marked as an estimate.
 
-* **M4's backward kernel** — the critical path. It is what makes ChEES-HMC
-  usable on a GP target: today a gradient costs 0.85 s at 1024 chains x
-  N = 1e4 (m = 2) and 8.8 s at m = 6, and cannot be compiled. See
-  [Milestone status](#milestone-status).
-* **Kernel thread and residual layout (measured 1.5–1.9x).** The launch is
-  `grid=(n_blocks, n_chains, 1)` with a threadgroup of `min(n_blocks, 32)`,
-  so a 10-block problem runs 10-wide threadgroups (31% SIMD occupancy), and
-  adjacent lanes read residuals `blk_len` floats apart. A flat
-  chains-fastest grid with the residual stored `(npts, n_chains)` measured
-  13.3 -> 8.6 ms at N = 1e5 and 20.8 -> 11.1 ms at m = 4, with `ell`
-  bit-identical. Cheap, and the backward kernel inherits it, so it belongs
-  with M4.
+* **The kernel gradient on irregular cadences.** The backward accumulates
+  its propagator adjoints per distinct lag, in a buffer of
+  `2 x chains x blocks x lags x m^2` floats. Photometry has a handful of
+  lags; a cadence where every spacing is distinct has N of them, and the
+  buffer reaches 42 GiB at 1024 chains x N = 1e5 (measured: 2.2 GiB at 64
+  chains x N = 2e4, linear in chains). The VJP refuses above 2 GiB with the
+  arithmetic in the message. The fix is to hand the kernel the term
+  matrices' parameter Jacobians by lag and accumulate the parameter
+  gradient directly, which makes the buffer `chains x blocks x n_params`
+  (estimate: no speed change; it removes the limit). Until then: the MLX
+  gradient path at its memory cost, or binned timestamps.
+* **m > 4 and per-instrument jitter in the kernel.** Both stay on the MLX
+  gradient path, where a gradient costs 8.8 s at m = 6, 256 chains and
+  N = 1e4.
+* **Block count as an accuracy knob for one adjoint.** The backward seed
+  amplifies block-element error through `eta_s - J_s mu`, which reaches
+  only `dh` (the amplitude gradient). At the joint corner (`sigma/yerr =
+  100`, `rho/dt = 1000`) that adjoint is off by 1.4e-4 at one block, 8e-3
+  at 8 and 1.9e-2 at the default's 16, against 0.37 on the MLX path. Every
+  other parameter stays under 1.1e-4. Rounding `metal_block` up rather than
+  to the nearest power of two would halve the blocks and cost forward
+  speed; not done.
+* ~~**Kernel thread and residual layout (measured 1.5–1.9x).**~~ Landed
+  with M4's stage B: flat chains-fastest grid, residual stored
+  `(npts, n_chains)`, `ell` bit-identical.
 * **Bit-reversed leaf permutation (measured, MLX path).** Storing each
   block's leaves in fold-step order makes every fold step a contiguous slab
   and every tree level a contiguous halving. Measured 85 -> 55 ms forward
@@ -504,7 +520,9 @@ marked as an estimate.
   `(phi_table, q_table, h) → ell` end to end. The offending fused group is
   inside `terms._sho_matrices`. Running the front end eager and the rest
   compiled measured 1.15-1.25x on the gradient; worth more in a quiet
-  window. Moot once M4 lands.
+  window. M4 did not moot it: the over-fused group is in the front end
+  both paths share, so this is still what would let ChEES run without
+  `mx.disable_compile()`.
 * **Per-block gradient checkpointing: measured, and not taken.**
   `mx.checkpoint` around each block's `leaf_inputs -> chunked_reduce` trades
   time for the leaf arrays the backward pass would otherwise hold. Measured
@@ -538,6 +556,21 @@ and now agree to three decimals on every one:
 | ρ | 6.950 ± 0.480 | 6.951 ± 0.481 | 7.3 | −0.72 |
 | Q | 6.14 ± 5.49 | 6.11 ± 5.67 | 8.0 | −0.33 |
 | jitter | 0.1133 ± 0.0457 | 0.1133 ± 0.0456 | 0.12 | −0.15 |
+
+**The jitter width in that table is the sampler's, not the likelihood's,
+and it is wrong.** Stage R of M4 checked it. A float64 Laplace
+approximation at the mode gives a half-width of 0.0107; ChEES-HMC on the
+kernel, 1024 chains, converged (R-hat 1.0003, min ESS 386,000), gives
+0.1113 ± 0.0110. The stretch move's ± 0.0457 is two of its 1024 chains:
+they sit in a secondary mode (jitter 1.13, ρ shorter than the cadence, log
+posterior 1,500 units below the bulk) that the stretch move cannot leave,
+because its proposals reach at most halfway to the bulk and halfway is the
+bottom of a 1,000-unit valley. The other 1,022 chains give ± 0.0109, and
+the ρ width is inflated the same way (0.482 against ChEES's 0.376). The two
+columns agree with each other because they are the same likelihood under
+the same sampler with the same seed. Written up for the anvil side in
+[docs/anvil-stretch-width.md](docs/anvil-stretch-width.md); quote the
+ChEES posterior for the widths.
 
 min ESS 20,422 (Metal) and 20,683 (MLX), max R-hat 1.037 on both. The MLX
 column is worth noting: before the float32 work in the reduction it gave
@@ -620,8 +653,10 @@ compiled than eager. Only the *whole* `__call__` fails, so the offending
 group is in the front end (kernel parameters, term matrices, the gather, the
 first-point mask, `_sanitize`) and not in the Cholesky at all. Splitting the
 VJP at the term-matrix boundary should therefore recover most of it; that is
-tracked under "What is left" rather than done, because M4's backward kernel
-removes the graph this would optimise.
+tracked under "What is left" rather than done. (An earlier version of this
+paragraph expected M4 to make it moot. It did not; see above. Note also that
+the failure is a process abort from inside Metal, not a Python exception,
+so nothing can catch it.)
 
 This matters because anvil's ChEES kernel compiles its leapfrog step, so
 **ChEES-HMC cannot run on a GP target as-is**. The workaround is one line and
@@ -675,81 +710,65 @@ Three more are worked around and pinned as regression tests
   bound; and the compiled-gradient limit, a hard structural result rather than
   a tuning number. Still owed: the Design-A probe comparison, the
   `metal::fast` accuracy study, and the ChEES leapfrog cost at scale.
-* **M3 — fused Metal blocked-scan kernel: pass 1 done, forward only.**
+* **M3 — fused Metal blocked-scan kernel: pass 1 done.**
   45-74x over the MLX path and 35-42x ahead of a 12-core celerite2 pool,
   which is the brief's denominator, so the >=100x gate is **not** cleared
   (it is 255-376x against a single-core loop). `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
-  model. Still owed: m > 4, per-instrument jitter in-kernel, the float32
-  feasibility map, and the thread-layout and pass-2 work listed under "What
-  is left" (1.5-1.9x, measured). The feasibility map now has evidence that
+  model. Still owed: m > 4, per-instrument jitter in-kernel, and the float32
+  feasibility map; the thread-layout work landed with M4's stage B. The feasibility map now has evidence that
   it matters: amplitude and correlation length are **not separable**. At
   `sigma/yerr = 100` *and* `rho/dt = 1000` the MLX path is off by 1.5
   log-units where either axis alone stays under 0.2, while the kernel holds
   0.02. See `test_the_joint_high_amplitude_long_correlation_corner`.
-* **M4 — checkpointed backward kernel: foundation done, kernel next.** The
-  mathematics is derived and verified; what remains is the Metal port and one
-  structural problem, described below. Gradients are correct today through
-  autodiff on the MLX path, so ChEES-HMC works — just without the kernel's
-  speed, and only with `mx.disable_compile()`. The VJP hook is in place at
-  `anvilgp/metal.py::_core_vjp`.
+* **M4 — checkpointed backward kernel: done.** The kernel carries its own
+  VJP; see [Gradients](#gradients) for the numbers (99x at N = 1e4, 264x at
+  N = 1e5, matching float64 central differences to ~1e-7) and
+  [docs/m4-plan.md](docs/m4-plan.md) for the stages, what each measured,
+  and the adversarial review that closed it. The design that shipped is
+  not the one first sketched here. The backward blocks are **independent**:
+  a block's backward seed has a closed form in the prefix state and the
+  suffix element (`r = G^T (eta_s - J_s mu)`, `Pbar = (cot/2)(r r^T - Jt)`,
+  where `G` and `Jt` are what `combine` already forms), so there is no
+  chain of `(mbar, Pbar)` through the blocks and no affine-map composition.
+  Three launches, all on the forward's grid: block elements; one thread per
+  chain for prefix, suffix and seeds; one thread per (chain, block) that
+  replays its block from checkpoints and sweeps it back.
 
   Two practical limits to know before relying on it. A gradient at the
-  brief's realistic kernel (rotation + granulation, m = 6) costs seconds
-  per call at 256 chains and N = 1e4. And a ChEES chain started deep in a
-  bounded parameter's prior tail never moves again — not because of
-  anything here (the GP likelihood and its gradient stay finite well past
-  the point where anvil's own transform returns `-inf`) but because the
-  transform's Jacobian gradient reaches ~6e8 there against ~5e2 for a
-  healthy chain, and ChEES adapts one step size for the whole ensemble.
-  Capping `max_leapfrog` does not help; an earlier version of this note
-  claimed it was a Metal buffer limit, which was wrong. Full measurements
-  and suggested fixes: [docs/anvil-chees-boundary.md](docs/anvil-chees-boundary.md).
-  The healthy chains are unaffected, which is the part anvil-gp owes, and
-  the stretch move has neither problem.
+  brief's realistic kernel (rotation + granulation, m = 6) is off the kernel
+  and costs seconds per call at 256 chains and N = 1e4. And a ChEES chain
+  started deep in a bounded parameter's prior tail never moves again — not
+  because of anything here (the GP likelihood and its gradient stay finite
+  well past the point where anvil's own transform returns `-inf`) but
+  because the transform's Jacobian gradient reaches ~6e8 there against ~5e2
+  for a healthy chain, and ChEES adapts one step size for the whole
+  ensemble. Capping `max_leapfrog` does not help; an earlier version of this
+  note claimed it was a Metal buffer limit, which was wrong. Full
+  measurements and suggested fixes:
+  [docs/anvil-chees-boundary.md](docs/anvil-chees-boundary.md). The healthy
+  chains are unaffected, which is the part anvil-gp owes.
 
-  Done: `anvilgp/adjoint.py` holds the hand-derived adjoint of the filter
-  log-likelihood, matching `mx.vjp` to ~1e-16 relative on all five inputs
-  (Phi, Q, h, y, r_var) at m = 1, 2, 3, 4, and matching float64 central
-  differences independently. `blocked_backward` then shows the *kernel's*
-  scheme is exact: each block replays its own forward states from the state
-  it inherits and hands `(mbar, Pbar)` back, storing nothing per observation,
-  and the result is identical at every block length from 1 to beyond N.
-  `elements.prefix_scan` supplies those inherited states.
-
-  **The structural problem, and the way out.** The forward blocks are
-  independent; the backward ones are chained through `(mbar, Pbar)`, and a
-  block's sweep needs its own `L` forward states held locally, so `L` must
-  stay small (~32 at m = 2) — which means hundreds of blocks and no
-  sequential launch schedule that performs. The resolution is the same trick
-  that made the forward parallel: **a block's backward sweep is an affine map
-  on `(mbar, Pbar)`**, so the maps compose. Three passes — compute each
-  block's transfer map in parallel (~6x a sweep at m = 2, where the backward
-  state has 5 components), compose them in a cheap scan over the ~1e2 blocks,
-  then apply in parallel — which costs roughly 8x the forward, i.e. ~24 ms at
-  1024 chains x N = 1e4, against **0.85 s** for the MLX gradient today
-  (min of 7, `block=4096`, gapped cadence), so roughly a **35x** payoff.
-
-  The ~8x holds at m = 2, where the backward state has 5 components. It
-  scales as `m + m(m+1)/2`, so m = 4 has 14 and costs nearer 17x a forward
-  that is itself compute-bound — and 14 basis states x 14 components will
-  spill registers, so plan threadgroup memory or a shorter in-block `L`
-  there. The per-lag parameter adjoints need a per-thread accumulator of
-  `2 L m^2` floats: fine at L = 3, m = 2 (24 floats), not at L = 10, m = 4
-  (320).
-
-  An earlier draft of this section quoted 2.7 s and a ~110x payoff. That
-  number came from `bench_reference.py`'s old `block=256` default, which is
-  not the recommended setting: at the same size and window, block 256 takes
-  2716 ms and block 4096 takes 851 ms. Block 4096 is 3.2x faster and costs
-  7.45 GiB against 3.35 GiB, so the two are a speed/memory trade and the
-  honest gradient baseline is the faster one.
+  What the adversarial review after it (stage R) found, all fixed and
+  pinned by tests: a reachable point where the value was right and the
+  gradient came back exactly zero, because the replay's covariance update
+  was not PSD in float32 (it is now the Joseph form); the `s_floor_rel`
+  knob honoured by the forward and not the backward (values that could
+  bind are refused); the per-lag adjoint buffer unbounded on irregular
+  cadences (refused over 2 GiB; see "What is left"); the kernel's Cholesky
+  pivot floor built from the signed trace where the MLX one clamps it, so a
+  non-PSD block gave NaN on one path and a finite value on the other;
+  three tests that still passed with their subject deleted; and the
+  stretch-move jitter width in the example table, which is two chains
+  trapped in a secondary mode, the sampler's and not the likelihood's (see
+  "End to end").
 
   Also recorded, because it is the tempting shortcut and it is wrong: never
-  reconstruct the forward state by running the filter *backwards* through the
-  propagator. That divides by `Phi`, which underflowed on the way forward at
-  exactly the lags where it would now overflow — every gap in the data.
+  reconstruct the forward state by running the filter *backwards* through
+  the propagator. That divides by `Phi`, which underflowed on the way
+  forward at exactly the lags where it would now overflow — every gap in
+  the data.
 * **M5 — joint validation, SBC calibration, docs: started.** The unbiasedness
   check across realisations is in `tests/test_calibration.py`,
   `examples/gp_injection_recovery.py` is the end-to-end fiducial, and the
@@ -767,7 +786,7 @@ Three more are worked around and pinned as regression tests
 python -m venv .venv
 .venv/bin/pip install -e ".[test]"        # mlx, numpy; celerite2, mpmath, scipy for tests
 .venv/bin/pip install -e ../anvil         # for the engine integration only
-.venv/bin/python -m pytest tests -q       # ~2 min; -m 'not slow' for ~40 s
+.venv/bin/python -m pytest tests -q       # ~4.5 min; -m 'not slow' for ~2.5 min
 .venv/bin/python examples/gp_injection_recovery.py
 ```
 

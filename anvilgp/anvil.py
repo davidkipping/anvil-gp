@@ -20,9 +20,11 @@ Gradient samplers need one extra line today::
 
 anvil's ChEES kernel compiles its leapfrog step, and ``mx.compile`` over the
 *backward* pass of the whole likelihood exceeds MLX's fused-group limit
-(the front end, not the element algebra; see docs/float32.md).  Forward-only compilation is fine, so the
-gradient-free stretch move needs nothing.  M4's backward kernel will
-remove the constraint; M3's forward kernel does not, being forward-only.
+(the front end, ``terms._sho_matrices``, not the element algebra; see
+docs/float32.md).  Forward-only compilation is fine, so the gradient-free
+stretch move needs nothing.  M4's backward kernel did not remove the
+constraint, since both paths share that front end: ChEES needs
+``mx.disable_compile()`` on either.
 """
 
 from __future__ import annotations
@@ -138,9 +140,8 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         ratio bounds -- see :func:`~anvilgp.priors.auto_order_groups`.
     policy
         :class:`~anvilgp.likelihood.GPPolicy`.  ``GPPolicy(metal=True)``
-        turns on the fused kernel, which is forward-only until M4: the
-        returned target then declares ``supports_grad=False`` and a
-        gradient sampler refuses it up front.
+        turns on the fused kernel, value and gradient alike since M4; the
+        returned target declares ``supports_grad=True`` on both paths.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic

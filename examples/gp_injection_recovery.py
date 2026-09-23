@@ -64,7 +64,7 @@ print(f"injected SHO: sigma={SIGMA_TRUE}, rho={RHO_TRUE} d, Q={Q_TRUE}, "
 
 # --------------------------------------------------------- target assembly
 # METAL=1 in the environment runs the fused kernel instead of the MLX graph.
-# It is forward-only until M4, which is fine here: the stretch move needs no
+# Since M4 it is differentiable too, though the stretch move below needs no
 # gradient.  Same answers either way -- that is what the parity tests pin --
 # so this is purely a wall-clock switch.
 USE_METAL = os.environ.get("METAL", "0") not in ("", "0", "false", "no")

@@ -138,9 +138,9 @@ def test_compiled_value_and_grad_exhausts_metal_argument_buffers():
     It matters because anvil's ChEES kernel compiles its leapfrog step, so
     the gradient sampler cannot run on a GP target without either
     ``mx.disable_compile()`` (verified to work, and what
-    ``examples/`` documents) or M4's backward kernel, which will replace
-    this graph with a hand-written one and moot the issue.  M3's forward
-    kernel does not help: a gradient still traverses the MLX graph.
+    ``examples/`` documents).  M4's backward kernel was expected to moot
+    this and did not: the over-fused group is in ``terms._sho_matrices``,
+    which both paths share, so the kernel path aborts identically.
 
     Forward-only compilation is unaffected at every size and every m.
     """

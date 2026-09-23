@@ -117,9 +117,8 @@ def test_chains_started_in_the_infeasible_region_recover():
     bounded prior.  That is a correct statement about the prior, not a
     failure of the likelihood, and a sampler rejects it cleanly.)
 
-    Uses the stretch move, which is what works on a GP target today: the
-    Metal path has no VJP until M4, and the MLX gradient path cannot be
-    compiled.  Half the ensemble starts in the failure region so the rest
+    Uses the stretch move, which needs no gradient and no
+    ``mx.disable_compile()``.  Half the ensemble starts in the failure region so the rest
     has somewhere to pull it back from.
     """
     anvil = pytest.importorskip("anvil")
@@ -220,12 +219,18 @@ def test_a_stuck_chain_does_not_poison_the_ensemble_under_chees():
 
 @pytest.mark.slow
 def test_chees_runs_on_the_fused_kernel():
-    """M4's point: a gradient sampler can use the kernel.
+    """M4's point: a gradient sampler can use the kernel -- and gets the
+    posterior right.
 
-    Before M4 the kernel's VJP raised and `make_target` declared
-    `supports_grad=False`, so ChEES refused the target outright. Now it
-    runs, and much faster -- measured 4.0 s against 126 s on the MLX graph
-    for 300 iterations at 64 chains, with better mixing for it.
+    An earlier version asserted only that the chains were finite and had
+    moved, which a zero gradient also satisfies (HMC degenerates to a
+    random walk).  This one checks two things a wrong gradient fails.  The
+    mean acceptance must be high: with a wrong gradient the leapfrog energy
+    error is large and acceptance collapses.  And the jitter's posterior
+    width must match the float64 Laplace width at the mode, 0.0107 on this
+    problem -- which ChEES reproduces to 3% and which a random walk cannot
+    find in the budget.  (The stretch move gives 0.046 here: two of its
+    1024 chains trapped in a secondary mode; see docs/anvil-stretch-width.md.)
 
     `mx.disable_compile()` is still needed, for both paths: the over-fused
     group is in `terms._sho_matrices`, which the kernel does not replace.
@@ -234,28 +239,31 @@ def test_chees_runs_on_the_fused_kernel():
     from anvilgp import GPPolicy
     from anvilgp.anvil import make_target
 
-    rng = np.random.default_rng(11)
-    n = 600
-    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    rng = np.random.default_rng(20260917)
+    n = 1000
+    t = np.arange(n) * (BASELINE / n)
     yerr = np.full(n, YERR)
     cov = dense_covariance(ag.SHOTerm(), np.array([SIGMA, RHO, QUAL]), t,
                            yerr, jitter=JIT)
     y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
 
-    gt = make_target(ag.SHOTerm(), t, y, yerr, policy=GPPolicy(metal=True))
+    gt = make_target(ag.SHOTerm(), t, y, yerr,
+                     policy=GPPolicy(block=1024, sub_block=16, metal=True))
     assert gt.target.supports_grad, "the kernel target must accept gradients"
 
     mx.disable_compile()
     try:
         with mx.stream(mx.gpu):
-            res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=16),
-                            gt.target, gt.u0(32, seed=1, spread=0.3),
-                            n_warmup=60, n_samples=40, seed=3, progress=False)
-            last = res.final_state["u"]
-            lp = np.array(gt.target.log_prob(last))
+            res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32),
+                            gt.target, gt.u0(256, seed=1, spread=0.3),
+                            n_warmup=300, n_samples=300, seed=3,
+                            progress=False)
     finally:
         mx.enable_compile()
 
-    assert np.all(np.isfinite(lp)), "no chain may go non-finite"
-    moved = np.abs(np.array(last) - np.array(gt.u0(32, seed=1, spread=0.3)))
-    assert np.all(moved.max(axis=1) > 1e-4), "every chain should be sampling"
+    acc = float(np.mean(res.accept_fraction))
+    assert acc > 0.5, f"acceptance {acc:.2f}: the gradient is not right"
+    flat = gt.transform.model_np(res.get_chain(flat=True).astype(np.float64))
+    jit_sd = float(gt.natural(flat)["jitter"].std())
+    assert 0.007 < jit_sd < 0.016, (
+        f"jitter posterior width {jit_sd:.4f}; float64 Laplace gives 0.0107")

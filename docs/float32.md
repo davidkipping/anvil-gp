@@ -187,17 +187,21 @@ Characterised:
   chain inside `_sho_matrices` (`damped_cos_sinc`, `gamma3`, `sincm1` and
   their ~20 intermediates). Splitting the VJP at the term-matrix table
   therefore recovers most of it; that is tracked in the README's "What is
-  left" rather than done, because M4's backward kernel removes the graph it
-  would optimise.
+  left" rather than done. M4's backward kernel did not remove it: the
+  over-fused group is in the front end both paths share.
 
 anvil's ChEES kernel compiles its leapfrog step, so ChEES-HMC cannot run on a
 GP target without `mx.disable_compile()`. With it, 30 ChEES steps over 64
 chains complete in 7.2 s with zero divergences and a finite chain. The
 gradient-free stretch move never hits it.
 
-The proper fix is M4's backward kernel, which replaces this graph with one
-hand-written kernel and a hand VJP — at which point there is nothing left for
-MLX to over-fuse.
+M4's backward kernel was expected to be the proper fix, replacing this
+graph with a hand VJP. It was not: the kernel path aborts identically,
+because the group MLX over-fuses is `terms._sho_matrices`, which the kernel
+consumes rather than replaces (a `RealTerm`, whose front end is trivial,
+compiles its gradient on both paths). Splitting the VJP at the term-matrix
+table is the remaining route. The failure is a process abort from inside
+Metal, not a Python exception, so it cannot be caught.
 
 ## MLX behaviours worked around
 

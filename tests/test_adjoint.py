@@ -255,20 +255,22 @@ def test_blocked_backward_with_floor_equals_the_whole_series_one(blk):
 
 
 def test_both_forms_clamp_their_own_variance_term():
-    """Stage 0: the clamp protects the quantity that can go non-physical.
+    """Stage 0: the clamp protects the quantity that can go non-physical,
+    and this test fails if the clamp is removed from EITHER form.
 
     Each form computes a different total -- the leaf's is
-    ``h Q h^T + r_var``, the filter's is ``h (Phi P Phi^T + Q) h^T +
-    r_var`` -- so clamping the *total* made them clamp different things and
-    disagree by ~0.1 log-units wherever it bound.  Clamping the variance
-    term instead is principled in each form on its own, and gives the
-    stronger guarantee ``s >= r_var > 0``: ``r_var`` beside it is exact and
-    strictly positive, where the old whole-sum floor allowed a negative
-    residue to survive inside the sum.
+    ``h Q h^T + r_var``, the filter's ``h (Phi P Phi^T + Q) h^T + r_var`` --
+    so clamping the *total* made them clamp different things.  Clamping the
+    variance term instead is principled in each form on its own and gives
+    ``s >= r_var > 0``.
 
-    Pinned here: healthy inputs agree, and a variance term driven negative
-    still gives a finite result with the innovation variance never below
-    ``r_var``.
+    The fixture drives the variance term to ``-2e-3`` against an
+    ``r_var`` of ``1e-3``: without the clamp the innovation variance is
+    ``-1e-3``, the log of it is NaN and the division by it is negative, so
+    both forms return non-finite garbage.  With it, both return a finite
+    value.  An earlier version of this test recomputed the clamp inside the
+    test and used an ``r_var`` large enough that the unclamped sum stayed
+    positive -- it passed with the clamp deleted from every site.
     """
     from anvilgp.elements import chunked_reduce, leaf_elements
 
@@ -282,28 +284,22 @@ def test_both_forms_clamp_their_own_variance_term():
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     bad_q = mx.array(np.tile(-1e-3 * np.eye(m), (n, k, 1, 1)), dtype=D)
     hv = mx.array(np.ones((n, m)), dtype=D)
-    rv2 = mx.full((n, k), 0.5, dtype=D)
-    rr2 = mx.full((k,), 0.5, dtype=D)
+    rv2 = mx.full((n, k), 1e-3, dtype=D)        # SMALLER than |h Q h^T|
+    rr2 = mx.full((k,), 1e-3, dtype=D)
 
     qh = mx.sum(bad_q * hv[:, None, None, :], axis=-1)
     hqh = mx.sum(hv[:, None, :] * qh, axis=-1)
-    assert float(mx.max(hqh)) < 0.0, "the fixture must exercise the clamp"
+    assert float(mx.max(hqh + rv2)) < 0.0, (
+        "the fixture must make the UNCLAMPED innovation variance negative")
 
-    out = chunked_reduce(*leaf_elements(phi, bad_q, hv, y, rv2, rr2),
-                         sub_len=1).ell
-    assert bool(mx.all(mx.isfinite(out))), "a clamped lane must stay finite"
-    s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + rv2
-    assert float(mx.min(s_q)) >= float(mx.min(rv2)) - 1e-15
+    leaf = chunked_reduce(*leaf_elements(phi, bad_q, hv, y, rv2, rr2),
+                          sub_len=1).ell
+    assert bool(mx.all(mx.isfinite(leaf))), "leaf form must clamp"
+    # the filter form clamps its own predicted variance; with Phi = 0 that
+    # is the same quantity, so the same fixture exercises it
+    filt = sequential_loglike(mx.zeros_like(phi), bad_q, hv, y, rv2, rr2)
+    assert bool(mx.all(mx.isfinite(filt))), "filter form must clamp"
 
-
-# -- stage D: the backward blocks are independent -------------------------
-#
-# `blocked_backward` chains (m_bar, P_bar) from the last block to the
-# first, so the blocks must run in order.  `independent_backward` seeds
-# each block from the closed form in `block_seeds` instead, so they can run
-# in parallel -- which is what lets the Metal backward kernel have the same
-# launch shape as the forward one.  These tests are the gate: if the seed
-# is wrong, the design is wrong, and it is checkable here with no kernel.
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4])
