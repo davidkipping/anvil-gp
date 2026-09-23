@@ -108,10 +108,12 @@ class GPPolicy:
     #: Differentiable since M4: the kernel carries its own VJP, so a
     #: gradient sampler can use it too.  Measured 45-74x over the MLX path
     #: on the forward and ~100x on the gradient, with 20-30x less peak
-    #: memory; see the README.  Limits: m <= 4, one jitter, and the
-    #: gradient's per-lag buffer grows with the number of distinct
-    #: timestamp spacings (``n_distinct_lags``; see
-    #: :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES`).
+    #: memory; see the README.  Limits: m <= 4 and one jitter.  Any
+    #: cadence is fine, including one where every timestamp spacing is
+    #: distinct: the gradient's adjoint buffer is one slot per
+    #: ``(block, lag)`` pair that *occurs*, so it is bounded by N, and
+    #: :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES` is a sanity check
+    #: rather than a limit to design around.
     metal: bool = False
     #: observations condensed per kernel thread, or None to pick from N.
     #: Larger means fewer, longer sequential walks and less work left for

@@ -281,10 +281,12 @@ since a block is up to 4096 sequential adds with no tree to spread the error.
 Limits, stated: m <= 4 (the running element is `3m^2+2m+1` floats in
 registers — 17 at m = 2, 57 at m = 4, 209 at m = 8, which would spill);
 one jitter, not per-instrument; and an all-distinct-lag cadence degenerates
-the table to one row per point, which is correct for the value but gives up
-the traffic saving, and for the gradient makes the per-lag adjoint buffer
-N-sized, which the VJP refuses over 2 GiB (see "What is left"). Larger m
-and in-kernel propagators are the obvious follow-ons.
+the table to one row per point, which is correct but gives up the traffic
+saving — the value costs 13.2 GiB at 1024 chains x N = 1e5 where a regular
+cadence costs 0.4. The gradient handles it: its adjoint buffer holds one
+slot per `(block, lag)` pair that occurs, so it is bounded by N rather than
+by N x blocks, and that case runs at 1.3x the forward's peak. Larger m and
+in-kernel propagators are the obvious follow-ons.
 
 ### The MLX reference path
 
