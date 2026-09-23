@@ -493,7 +493,12 @@ marked as an estimate.
   *occurs* rather than one per pair possible. That case needed ~115 GiB
   and was refused; it now runs at 17.5 GiB, which is 1.3x the forward's
   own peak. At 256 chains it went 31.3 GiB and 11.4 s to 4.4 GiB and
-  1.5 s. Regular cadences are bit-identical and untouched. See
+  1.5 s. Regular cadences are bit-identical and untouched. Reviewed
+  adversarially afterwards (stage R2): the arithmetic held under ~400
+  configurations, and the five defects found were all in the contracts
+  between components — chiefly that assigning `metal_block` on a built
+  instance left the kernel's slot map stale, giving a correct value with
+  a wrong gradient; it is a property that rebuilds the map now. See
   [docs/lag-slots-plan.md](docs/lag-slots-plan.md); an earlier proposal
   here, per-parameter Jacobian tables, was measured and retracted.
 * **m > 4 and per-instrument jitter in the kernel.** Both stay on the MLX

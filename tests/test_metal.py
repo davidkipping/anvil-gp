@@ -599,7 +599,8 @@ def test_full_kernel_gradient_path_matches_the_specification(name, term, p):
 
 @pytest.mark.parametrize("name,term,p", _BWD_TERMS,
                          ids=[c[0] for c in _BWD_TERMS])
-def test_the_kernel_is_differentiable(name, term, p):
+@pytest.mark.parametrize("cadence", ["gapped", "random"])
+def test_the_kernel_is_differentiable(name, term, p, cadence):
     """M4: the kernel carries its own VJP, and it agrees with the MLX path.
 
     Both are float32 on the same problem, so this is the arithmetic
@@ -608,7 +609,16 @@ def test_the_kernel_is_differentiable(name, term, p):
     """
     n = 1500
     rng = np.random.default_rng(3)
-    t = np.sort(rng.uniform(0.0, 40.0, n))
+    # Both cadences, deliberately.  On a random one every spacing is its
+    # own lag and any one lag carries ~1/1500 of the gradient, so a
+    # per-lag mis-routing worth 6e-2 on the gapped cadence reads as 3e-4
+    # here and passed this test as first written (stage R2).  The gapped
+    # cadence is also every README number and every space light curve.
+    if cadence == "gapped":
+        t = np.arange(n) * (40.0 / n)
+        t[n // 2:] += 20.0
+    else:
+        t = np.sort(rng.uniform(0.0, 40.0, n))
     y = rng.standard_normal(n) * 0.9
     yerr = np.full(n, 0.3)
     pm = ParamMap.log(p)
@@ -630,11 +640,16 @@ def test_the_kernel_is_differentiable(name, term, p):
     assert rel < 1e-4, f"{name}: metal vs MLX gradient {rel:.2e}"
 
 
-def test_kernel_gradient_matches_float64_central_differences():
+@pytest.mark.parametrize("cadence", ["gapped", "random"])
+def test_kernel_gradient_matches_float64_central_differences(cadence):
     """The independent check: no shared code with the MLX path at all."""
     n = 600
     rng = np.random.default_rng(4)
-    t = np.sort(rng.uniform(0.0, 30.0, n))
+    if cadence == "gapped":            # see test_the_kernel_is_differentiable
+        t = np.arange(n) * (30.0 / n)
+        t[n // 2:] += 20.0
+    else:
+        t = np.sort(rng.uniform(0.0, 30.0, n))
     y = rng.standard_normal(n) * 0.9
     yerr = np.full(n, 0.3)
     refs = [1.0, 4.0, 3.0]
@@ -1096,3 +1111,130 @@ def test_the_fold_plan_places_every_slot_exactly_once(name, build, _want):
             assert np.array_equal(slot_lag[sel], lags_of), name
             assert len(np.unique(lags_of)) == len(lags_of), (
                 f"{name}: a group repeats a lag, so its scatter races")
+
+
+def test_assigning_metal_block_rebuilds_the_slot_map():
+    """Stage R2's finding.  The map is indexed by block, so it is only
+    valid for the block length it was built with; assigning the attribute
+    used to leave it stale, and the failure was silent or a hang.
+    """
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    rng = np.random.default_rng(3)
+    n = 3000
+    t = np.arange(n) * 0.3
+    t[n // 2:] += 20.0
+    y, ye = rng.standard_normal(n), np.full(n, 0.3)
+
+    def build(blk):
+        return GPLogLike(None, t, None, y, ye, ag.SHOTerm(),
+                         ParamMap.log([1.3, 4.0, 3.0]),
+                         GPPolicy(block=1024, hi_block=1024, metal=True,
+                                  metal_block=blk))
+
+    def grad(gp):
+        u = mx.array([[0.1, -0.2, 0.05]], dtype=mx.float32)
+        with mx.stream(mx.gpu):
+            _, g = mx.vjp(gp, [u], [mx.ones((1,), dtype=mx.float32)])
+            mx.eval(g)
+        return np.array(g[0])[0].astype(np.float64)
+
+    gp = build(256)
+    for blk in (1024, 128, 4096):
+        gp.metal_block = blk
+        assert gp._metal_slot_start.shape[0] - 1 == -(-n // blk)
+        want = grad(build(blk))
+        got = grad(gp)
+        rel = np.max(np.abs(got - want)) / np.max(np.abs(want))
+        assert rel < 1e-6, f"reassigned to {blk}: {rel:.2e}"
+    with pytest.raises(ValueError, match="metal_block"):
+        gp.metal_block = 0
+    with pytest.raises(ValueError, match="metal_block"):
+        GPPolicy(metal_block=0)
+
+
+def test_the_launch_refuses_a_map_it_did_not_build():
+    """Defence in depth behind the property: bypassing the setter must be
+    loud, because the alternative is a silently wrong gradient."""
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
+                   ParamMap.log([1.3, 4.0, 3.0]),
+                   GPPolicy(metal=True, metal_block=256))
+    gp._metal_block = 512                       # not the property
+    with pytest.raises(RuntimeError, match="slot map"):
+        with mx.stream(mx.gpu):
+            mx.eval(gp(mx.zeros((2, 3), dtype=mx.float32)))
+
+
+def test_the_fold_picks_groups_when_the_dense_table_would_dwarf_the_buffer():
+    """Stage R2: choosing dense on `max_rank` alone sent a mostly-regular
+    cadence with thousands of odd spacings to a gather 10x its buffer."""
+    from anvilgp.likelihood import _slot_map, _lag_fold_plan
+
+    n, blk = 20_000, 2048
+    rng = np.random.default_rng(5)
+    regular = np.arange(n) * 0.02
+    odd = regular.copy()
+    idx = rng.choice(n, 9000, replace=False)
+    odd[idx] += rng.uniform(0.001, 0.009, idx.size)
+    odd = np.sort(odd)
+    for name, t, want in (("regular", regular, "dense"),
+                          ("mostly regular", odd, "groups"),
+                          ("distinct", np.sort(rng.uniform(0, 400.0, n)),
+                           "groups")):
+        lag = _lag_of(t)
+        _, _, slag = _slot_map(lag, blk)
+        kind, plan = _lag_fold_plan(slag, int(lag.max()) + 1)
+        assert kind == want, f"{name}: {kind}"
+        if kind == "dense":
+            assert plan.size <= 4 * slag.size
+
+
+def test_the_front_end_chunk_count_honours_its_budget():
+    """Stage R2: a 64-lags-per-chunk floor returned 1 chunk with the
+    estimate 3x over budget above ~1365 chains at m = 4."""
+    from anvilgp.likelihood import (_front_end_chunks, _FRONT_END_RETENTION,
+                                    _FRONT_END_BUDGET_BYTES)
+    for n_chains, n_lags, m in ((4096, 64, 4), (4096, 100, 2), (4096, 200, 4)):
+        n = _front_end_chunks(n_chains, n_lags, m)
+        est = _FRONT_END_RETENTION * 2 * n_chains * n_lags * m * m * 4
+        assert est / n <= 1.05 * _FRONT_END_BUDGET_BYTES, (
+            f"{n_chains} x {n_lags} x m={m}: {n} chunks, "
+            f"{est / n / 2**20:.0f} MB each")
+        assert n <= n_lags
+
+
+def test_a_single_observation_folds_on_either_branch(monkeypatch):
+    """Stage R2: the fold's row count came from `lag.max() + 1`, which is 1
+    at N = 1 where the table has 2 rows; the dense branch then raised.
+    Unreachable as shipped (N = 1 has one rank), so force the branch."""
+    import anvilgp.likelihood as L
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    monkeypatch.setattr(L, "_MAX_FOLD_RANKS", 0)
+    gp = GPLogLike(None, np.array([0.0]), None, np.array([0.3]),
+                   np.array([0.2]), ag.SHOTerm(), ParamMap.log([1.3, 4.0, 3.0]),
+                   GPPolicy(block=1024, hi_block=1024, metal=True))
+    assert gp._metal_fold_plan[0] == "dense"
+    u = mx.zeros((2, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        v = gp(u)
+        _, g = mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])
+        mx.eval(v, g)
+    assert bool(mx.all(mx.isfinite(v))) and bool(mx.all(mx.isfinite(g[0])))
+
+
+def test_the_kernel_refuses_wide_index_dtypes():
+    """Metal reads the index arrays as 4-byte ints; an int64 array would
+    index garbage with the value still right."""
+    from anvilgp.metal import backward_ckpt
+
+    c = _fwd_setup(ag.SHOTerm(), [1.3, 4.0, 3.0], 64, 32)
+    seeds = (mx.zeros((3, 2, 2)), mx.zeros((3, 2, 2, 2)),
+             mx.zeros((3, 2, 2)), mx.zeros((3, 2, 2, 2)))
+    with pytest.raises(TypeError, match="int32"):
+        backward_ckpt(c["pt"], c["qt"], c["lag"], c["h"], c["resid"], c["rrv"],
+                      c["j2"], c["cot"], *seeds,
+                      c["slot_id"].astype(mx.int64), c["slot_start"],
+                      c["slot_lag"].size, c["blk"])

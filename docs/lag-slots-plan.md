@@ -187,7 +187,7 @@ if the second does not pay.
 | B | Host slot map | 0.25 | Opus | **DONE** -- `likelihood._slot_map`, built from the resolved `metal_block`. Counts match the table exactly (15/26/27/53/99,992); invariants pinned; 13x fewer slots than `blocks x lags` on an all-distinct cadence, 27.6 ms to build at N = 1e5. |
 | C | Kernel and VJP on slots | 0.5 | Opus | **DONE** -- gradients match the pre-change kernel to 1.5e-7 over 32 cases; the headline case runs at 1.3x the forward's peak; reproducibility kept, which took two attempts. |
 | D | Measure and document | 0.25 | Opus | All-distinct gradient runs at 1e5 x 1024 within ~2x the forward's peak. `benchmarks/verify_readme.py` green. README, plan and memory corrected. |
-| R2 | Adversarial review of the slot map | 0.5 | **Fable** | Brief: assume the slot map is wrong and prove it. A wrong slot index gives a correct *value* and a silently wrong parameter gradient, because the forward is untouched -- the one failure class this suite has repeatedly missed on its own. Specifically: a slot map stale against `metal_block`; the scatter-add's determinism across runs; blocks whose lag set changes between value and gradient calls; and whether any test would fail if `slot_id` were permuted. |
+| R2 | Adversarial review of the slot map | 0.5 | **Fable** | **DONE** -- see "Stage R2, measured": five defects fixed, one hardening, one coverage gap closed, and the suite's sensitivity measured under nine mutations. Original brief: assume the slot map is wrong and prove it. A wrong slot index gives a correct *value* and a silently wrong parameter gradient, because the forward is untouched -- the one failure class this suite has repeatedly missed on its own. Specifically: a slot map stale against `metal_block`; the scatter-add's determinism across runs; blocks whose lag set changes between value and gradient calls; and whether any test would fail if `slot_id` were permuted. |
 
 Opus for the work, **Fable for R2**. That split is this project's own
 evidence rather than a guess: stage F of M4, the hardest kernel work in
@@ -397,3 +397,129 @@ fence, with the production figures recorded here instead. A flaky test
 teaches people to re-run rather than to look.
 
 570 tests pass.
+
+## Stage R2, measured 2026-09-23
+
+Three inputs. One independent Opus attacker with the brief above (~400
+configurations over 5 terms, m = 1-4, 4+ cadences, block lengths 1-8192,
+N = 1-20000; 1200 fuzzed slot maps; 56 reproducibility configurations).
+Nine mutations of the shipped code, each run against the kernel suite to
+ask the plan's literal question -- would any test notice? And a direct
+demonstration of the one route to a stale map. Everything below is fixed
+on `main` and pinned by a test that fails with the fix reverted.
+
+**Verdict first.** The code as shipped could not be broken: the kernel
+gradient agreed with the MLX path to <= 8.4e-6 and with float64 central
+differences to <= 1.8e-6 everywhere, every call was bit-reproducible, and
+no fuzzed map violated an invariant. The failure class the brief is about
+-- correct value, silently wrong gradient -- did not occur in the code. It
+occurred the moment `gp.metal_block` was assigned after construction,
+which nothing defended against.
+
+### Defects, all fixed
+
+**1. `metal_block` was a plain attribute; the slot map built from it was
+not rebuilt.** The map is indexed by block, so it is valid only for the
+block length it was built with. Map built at 256 and launched at:
+
+| launch | value | gradient |
+|---:|---|---|
+| 512 | exact | exact -- by scheduling luck (a race that never bit) |
+| 1024 | exact | **wrong by 2.6x**, finite, silent |
+| 128 | -- | read past the end of the block table; **hung the process at 0% CPU for 26 minutes** until killed, holding a GPU queue |
+
+The hang is the worst of the three: it presents identically to the
+pre-existing m = 4 watchdog fragility and would be misdiagnosed as it.
+Fixed: `metal_block` is a property whose setter validates and rebuilds
+the map and fold plan, plus a host-side shape check at launch for anyone
+who bypasses the setter. `GPPolicy` refuses `metal_block < 1`.
+
+**2. The fold chose its dense path on `max_rank` alone.** The padded
+gather is `n_chains x n_lags x max_rank x m^2`; the docstring reasoned
+about the two extremes and the condition read neither. A mostly-regular
+cadence with thousands of odd spacings -- dominant lag in every block,
+every other lag in one -- has both `n_lags` and `max_rank` large and took
+the dense path: measured **1.61x peak** at N = 2e4 (1113 MB against 692),
+a gather 10x the buffer it folds, and 15.9 GiB extrapolated at the plan's
+headline shape. This is the same intermediate stage C removed, back by a
+different door. Fixed: dense only when `n_lags x max_rank <= 4 x n_slots`
+as well.
+
+**3. The fold's row count was `lag.max() + 1`, not the table's.** Equal
+for every N >= 2; at N = 1 the table has two rows and the value one, and
+the dense branch raises. Unreachable as shipped only because N = 1 has one
+rank -- a memory heuristic accidentally guarding a shape bug. Fixed.
+
+**4. The chunk count's 64-lags floor overrode its own budget.** Meant to
+keep a chunk "worth a launch", it returned 1 chunk with the estimate 3x
+over budget above ~1365 chains at m = 4, because a chunk's work is
+`n_chains x lags x m^2` and few lags is plenty at many chains. Removed;
+the count is bounded by one lag per chunk and nothing coarser.
+
+**5. Both dedicated gradient tests used all-distinct cadences.** There,
+any one lag carries ~1/1500 of the gradient, so a per-lag mis-routing
+worth **6.1e-2** on a gapped cadence read as 2.9e-4 and passed. The
+attacker's two-slot swap in the fold survived **563 of 570 tests**. Both
+tests are now parametrised over the gapped cadence too -- the README's
+benchmark cadence and every space light curve -- and the same mutation
+fails all five gapped cases while still passing all five random ones,
+which is the mechanism confirmed rather than assumed.
+
+**Hardening, no defect found:** the backward refuses index arrays that are
+not int32. Metal reads them as 4-byte ints; a wider dtype indexes garbage
+with the value still right.
+
+### What the suite noticed, mutation by mutation
+
+| mutation | what it corrupts | caught by |
+|---|---|---|
+| global permutation of `slot_id` | lag invariant and block ownership | 7 tests: the gradient tests and the structural map test |
+| relabelling within each block's range, fold updated | nothing -- must be harmless | only the structural equality test; every gradient test passes, so the kernel does not depend on slot order |
+| `metal_block` halved after construction | map stale, shrunk direction | **hung**; see defect 1 |
+| `slot_start` shifted by one | each block zeroes its neighbour's first slot | only the structural test -- the cross-thread race it introduces never bit in 155 runs, so a zeroing race is invisible to numerical tests and the structural invariant test is load-bearing |
+| buffer written slot-major, read chain-major | layout | 68 tests |
+| kernel never zeroes | stale data across calls | 73 tests, including both reproducibility tests |
+| fold routes every slot to lag 0 | everything | 6 tests |
+| two slots swapped between lags (the attacker's) | one lag pair | **7 of 570 before the fix**; 5 of 5 gapped cases after |
+
+### Attacked and held
+
+Host/launch consistency by every route but the mutable attribute (`npts`
+pinned to `n_data` on all three paths; `n_blocks` computed identically in
+three places; `_auto_metal_block` called once; a block's lag set is a
+function of the data alone). Every host invariant over 1200 fuzzed maps.
+Degenerate shapes: N = 1, 2, all timestamps equal, `metal_block` > N,
+`metal_block` = 1, gaps and duplicates at and around block boundaries, 96
+ragged-block combinations (worst 7.9e-5 at blk = 1, m = 3). Both fold
+branches forced against each other: 12 of 16 bit-identical, worst 1.9e-7;
+sentinel row cannot alias a slot; an absent lag gets an exact zero. The
+chunked front end at 31 forced chunks with jitter, one and two instrument
+offsets, a mean model, all four terms and three `TermSum`s: <= 7.6e-7
+against unchunked; the `h`-once rule confirmed sensitive (charging it per
+chunk is a 17x error). `mx.compile` of the forward with chunking active:
+0 ulp. Failed lanes: five infeasible points on four cadences, chunked and
+not, every rejected lane exactly zero, every healthy lane bit-identical
+alone and in the mixed batch. Reproducibility: 56 configurations, `max|d|`
+exactly 0. Kernel index arithmetic peaks 4x below uint32 overflow under
+the 8 GiB fence.
+
+### Not settled
+
+Defect 2's 15.9 GiB at production shape is the formula evaluated, not
+measured (the two measured points matched it within 3%). Whether the
+watchdog kill in the shrunk-block case was purely the out-of-bounds read
+-- a two-day PyTorch job and a second reviewer shared the GPU throughout;
+the N = 512 repro shows chain-dependent garbage cleanly and is the
+evidence to rely on. And `MAX_ADJOINT_BUFFER_BYTES` still refuses an
+all-distinct RotationTerm above ~6.7e7 chain-observations, which is where
+the forward's own tables also reach 8 GiB, so the policy docstring's
+"sanity check rather than a limit" is defensible but was not run.
+
+### The lesson for the next review
+
+Both of R2's real findings were **interfaces, not arithmetic**: a public
+attribute that a derived structure silently depended on, and a
+two-variable decision written against one variable. The attacker's ~400
+numerical configurations found nothing because the arithmetic was right.
+The mutations and the attribute assignment found the defects in minutes.
+Review the contracts between components before the numerics inside them.

@@ -132,6 +132,9 @@ class GPPolicy:
     s_floor_rel: float = 1e-6
 
     def __post_init__(self):
+        if self.metal_block is not None and int(self.metal_block) < 1:
+            raise ValueError(
+                f"metal_block = {self.metal_block!r} must be None or >= 1")
         if not 0.0 <= self.s_floor_rel < 1.0:
             raise ValueError(
                 f"s_floor_rel = {self.s_floor_rel!r} must be in [0, 1): the "
@@ -442,29 +445,16 @@ class GPLogLike:
         self.log_norm_const = float(
             -0.5 * np.sum(np.log(2.0 * np.pi * self._yerr64 ** 2)))
 
+        self._lag_np = lag
+        # Assigning `metal_block` (a property) builds the kernel's slot map
+        # from it, so the map can never disagree with the launch.  Stage R2
+        # showed what a stale map does: a correct value with a gradient
+        # wrong by 2.6x, or a read past the end of the block table that
+        # hangs the process at 0% CPU.
         self.metal_block = (self.policy.metal_block
                             if self.policy.metal_block is not None
                             else _auto_metal_block(self.n_data,
                                                    kernel_spec.n_state))
-
-        # Per-(block, lag) slot map for the backward kernel's adjoint
-        # buffer.  Built here, from the resolved block length, so it can
-        # never disagree with the launch -- see `_slot_map`.
-        sid, sstart, slag = _slot_map(lag, self.metal_block)
-        self._metal_slot_id = mx.array(sid)
-        self._metal_slot_start = mx.array(sstart)
-        self._metal_slot_lag = mx.array(slag)
-        # groups of slots with distinct lags, so the fold back to a per-lag
-        # table is a reproducible scatter -- see `_lag_fold_plan`
-        kind, plan = _lag_fold_plan(slag, int(lag.max()) + 1)
-        self._metal_fold_plan = (
-            (kind, mx.array(plan)) if kind == "dense"
-            else (kind, [(mx.array(a), mx.array(b)) for a, b in plan]))
-        #: slots the backward's per-lag adjoint buffer actually needs, as
-        #: against ``n_blocks x n_distinct_lags`` if every block used every
-        #: lag.  Equal on a regular cadence; ~1/13 of it when every
-        #: timestamp spacing is distinct at 13 blocks.
-        self.n_metal_slots = int(slag.size)
 
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
@@ -559,6 +549,49 @@ class GPLogLike:
         s_floor = self.policy.s_floor_rel * r_ref
         return phi, q, h, r, r_var, r_ref, s_floor
 
+    @property
+    def metal_block(self) -> int:
+        """Observations condensed per kernel thread.
+
+        Assigning it rebuilds the backward kernel's slot map, which is
+        indexed by block and so is only valid for the block length it was
+        built with.  Stage R2 of the lag-buffer work found that mutating
+        this attribute on a built instance left the map stale: the value
+        stayed correct (the forward never reads the map) while the gradient
+        came back wrong by 2.6x at one setting, exactly right by scheduling
+        luck at another, and at a third the kernel read past the end of
+        the block table and parked the process at 0% CPU indefinitely.
+        """
+        return self._metal_block
+
+    @metal_block.setter
+    def metal_block(self, blk) -> None:
+        blk = int(blk)
+        if blk < 1:
+            raise ValueError(f"metal_block must be >= 1, got {blk}")
+        self._metal_block = blk
+        self._build_slot_map()
+
+    def _build_slot_map(self) -> None:
+        """Per-(block, lag) slot map and fold plan for ``self.metal_block``."""
+        sid, sstart, slag = _slot_map(self._lag_np, self._metal_block)
+        self._metal_slot_id = mx.array(sid)
+        self._metal_slot_start = mx.array(sstart)
+        self._metal_slot_lag = mx.array(slag)
+        # Row count from the table itself, not `lag.max() + 1`: the two
+        # differ at N = 1, where the table still has its constant row 0
+        # and one lag row but every observation is lag 0 (stage R2).
+        n_lags = int(self._metal_uniq_dt.shape[0]) + 1
+        kind, plan = _lag_fold_plan(slag, n_lags)
+        self._metal_fold_plan = (
+            (kind, mx.array(plan)) if kind == "dense"
+            else (kind, [(mx.array(a), mx.array(b)) for a, b in plan]))
+        #: slots the backward's adjoint buffer actually needs, as against
+        #: ``n_blocks x n_distinct_lags`` if every block used every lag.
+        #: Equal on a regular cadence; ~1/13 of it when every timestamp
+        #: spacing is distinct at 13 blocks.
+        self.n_metal_slots = int(slag.size)
+
     def metal_eligible(self) -> tuple[bool, str]:
         """Whether the fused kernel can serve this problem, and why not."""
         from .metal import MAX_STATE, metal_available
@@ -649,6 +682,14 @@ class GPLogLike:
         from .metal import scan_loglike
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
+        # The property setter makes this unreachable; it stays because the
+        # failure it guards is silent (see `metal_block`) and the check is
+        # a host-side shape comparison.
+        if self._metal_slot_start.shape[0] - 1 != -(-self.n_data // self.metal_block):
+            raise RuntimeError(
+                "the kernel's slot map was built for a different block "
+                "length than the launch; assign `metal_block` rather than "
+                "`_metal_block` so the map is rebuilt")
         phi, q, h = self._metal_matrices(v)
         pt = mx.concatenate(
             [mx.zeros((n, 1, m, m), dtype=dtype), phi], axis=1)
@@ -988,7 +1029,15 @@ def _lag_fold_plan(slot_lag: np.ndarray, n_lags: int):
     rank = np.arange(n_slots) - np.searchsorted(ordered, ordered, side="left")
     max_rank = int(rank.max()) + 1
 
-    if max_rank > _MAX_FOLD_RANKS:
+    # Dense only when the ranks are many *and* the padded table is not
+    # much larger than the slots it holds.  Deciding on `max_rank` alone
+    # (as this first did) sent a mostly-regular cadence with thousands of
+    # odd spacings -- dominant lag in every block, every other lag in one
+    # -- to the dense path, whose gather is `n_lags x max_rank` against
+    # `n_slots` of buffer: measured 1.61x peak at N = 2e4, and the same
+    # 10x-the-buffer intermediate stage C removed, at production shape
+    # (stage R2).  Ten grouped launches are the right trade there.
+    if max_rank > _MAX_FOLD_RANKS and n_lags * max_rank <= 4 * n_slots:
         table = np.full((n_lags, max_rank), n_slots, dtype=np.int32)
         table[ordered, rank] = order            # sentinel stays where absent
         return ("dense", table)
@@ -1017,11 +1066,6 @@ _FRONT_END_RETENTION = 48
 #: the smallest achievable peak.
 _FRONT_END_BUDGET_BYTES = 512 << 20
 
-#: Never split the lag table so finely that a chunk stops being worth a
-#: launch.  Only binds on tables too small to need chunking anyway.
-_MIN_LAGS_PER_CHUNK = 64
-
-
 def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     """How many lag-chunks to split the term front end's backward into.
 
@@ -1039,8 +1083,13 @@ def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     want = _FRONT_END_RETENTION * table
     if want <= _FRONT_END_BUDGET_BYTES:
         return 1
+    # Bounded by one lag per chunk and nothing coarser.  A floor of 64
+    # lags per chunk was here first, "so a chunk stays worth a launch";
+    # it silently overrode the budget above ~1365 chains at m = 4 (a chunk
+    # is n_chains x lags x m^2, so few lags is plenty of work at many
+    # chains), returning 1 with the estimate 3x over budget (stage R2).
     n = -(-want // _FRONT_END_BUDGET_BYTES)
-    return max(1, min(n, max(1, n_lags // _MIN_LAGS_PER_CHUNK)))
+    return max(1, min(n, n_lags))
 
 
 def _auto_metal_block(n_data: int, n_state: int = 2) -> int:

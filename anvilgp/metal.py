@@ -888,6 +888,13 @@ def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
     npts = resid.shape[0]
     if m > MAX_STATE:
         raise ValueError(f"metal backward supports m <= {MAX_STATE}, got {m}")
+    for nm, arr in (("lag", lag), ("slot_id", slot_id),
+                    ("slot_start", slot_start)):
+        # Metal reads these as 4-byte ints; a wider dtype indexes garbage
+        # with no error, and the value would still be right.
+        if arr.dtype != mx.int32:
+            raise TypeError(f"{nm} must be int32 for the kernel, got "
+                            f"{arr.dtype}")
     slen = _SUB_LEN.get(m, 8) if sub_len is None else int(sub_len)
     n_blocks = (npts + blk_len - 1) // blk_len
     n_ckpt = (blk_len + slen - 1) // slen
