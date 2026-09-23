@@ -177,7 +177,7 @@ if the second does not pay.
 | # | Stage | Days | Model | Gate |
 |---|---|---|---|---|
 | 0 | Pin the baseline | 0.25 | Opus | **DONE** -- above. Two cadences in the suite, 80 cases green, baseline and the front-end split measured. |
-| A | Chunk the front-end backward | 0.75 | Opus | Gradient bit-comparable to today (< 1e-6 rel) on every term and cadence; `h`'s cotangent charged once, pinned by a test that fails if it is charged per chunk. Peak on the distinct cadence down >= 5x at N = 1e5. Regular-cadence timing and peak unchanged in an interleaved A/B. |
+| A | Chunk the front-end backward | 0.75 | Opus | **DONE** -- see below. 2.3x less peak and 5-6x faster at N = 1e5; regular cadences bit-identical; gradient within 1.7e-7. |
 | B | Host slot map | 0.25 | Opus | Every observation's `(block, lag)` pair maps to one slot; counts on the five cadences match the table above. |
 | C | Kernel and VJP on slots | 0.5 | Opus | Per-lag adjoint sums equal the pre-change kernel's to 1e-6 at m = 1..4 on all five cadences. The fence, re-based on slots, stops tripping. |
 | D | Measure and document | 0.25 | Opus | All-distinct gradient runs at 1e5 x 1024 within ~2x the forward's peak. `benchmarks/verify_readme.py` green. README, plan and memory corrected. |
@@ -199,3 +199,64 @@ memory difference, both halves of the cost are already negligible there.
 Still out of scope, and still the real answer for very irregular data:
 binning the spacings, which shrinks the table at the cost of changing the
 likelihood, and so stays the user's decision.
+
+## Stage A, measured 2026-09-22
+
+`GPLogLike._metal_matrices` wraps the term front end in a
+`custom_function` whose VJP splits the backward over the lag axis, one
+chunk at a time, when `_front_end_chunks` says the table is large enough
+to need it. Chunk count is budget-driven: an estimate of the backward's
+peak (48x the table, the conservative end of a measured 25-47x) divided by
+a 512 MB target, so a regular cadence always gets exactly one chunk and
+takes the original code path.
+
+### Measured, whole gradient path, one window
+
+| cadence | N | chains | lags | chunks | peak before | peak after | time before | time after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| regular | 1e4 | 1024 | 2 | 1 | 0.167 | 0.166 | 8.7 | 8.5 |
+| regular | 1e5 | 1024 | 2 | 1 | 1.612 | 1.612 | 78.9 | 75.9 |
+| regular (m=4) | 1e5 | 512 | 2 | 1 | 1.301 | 1.301 | 404 | 418 |
+| distinct | 2e4 | 64 | 19,964 | 4 | 2.174 | **0.970** | 74.8 | 76.7 |
+| distinct | 2e4 | 256 | 19,964 | 15 | 6.327 | **2.781** | 298 | 300 |
+| distinct | 1e5 | 256 | 99,083 | 73 | 31.30 | **13.67** | 11,386 | **1,813** |
+| distinct | 1e5 | 512 | 99,083 | 146 | 61.66 | **27.30** | 27,547 | **4,868** |
+
+GiB and ms. The two largest rows needed `MAX_LAG_SLAB_BYTES` lifted to
+measure at all, since the kernel's own buffer refuses there first -- which
+is stages B-C. Regular-cadence gradients are **bit-identical** (relative
+difference exactly 0) and within timing noise; the chunked branch is not
+entered. On the distinct cadence the gradient agrees with the unchunked
+one to 1.7e-7 over four terms.
+
+At N = 1e5 the change is 2.3x smaller *and* 5-6x faster, because the
+unchunked version at 31-62 GiB is thrashing. At N = 2e4 it is 2.2x smaller
+at no time cost.
+
+### Two things that went wrong, both worth keeping
+
+**`mx.eval` inside the chunk loop makes it 3.6x worse.** Forcing each
+chunk to completion looks like the way to free it before building the
+next. It does the opposite: it materialises the upstream graph -- the
+backward kernel and its per-lag slab -- and pins it for the whole loop.
+Measured 7.76 GiB against 2.17 unchunked, where leaving it lazy gives
+0.97. MLX frees each chunk's intermediates as the sum is built.
+`tests/test_metal.py::test_chunking_the_front_end_lowers_the_gradients_peak_memory`
+fails if the eval comes back.
+
+**The first correctness test was vacuous.** At test size the shipped
+budget picks one chunk, so the comparison passed with the whole branch
+unexercised -- and hid a crash: `mx.custom_function` hands a
+single-argument VJP the primal array itself rather than a one-tuple, so
+`primals[0]` silently took its first row. Any irregular cadence large
+enough to chunk would have raised. The test now lowers the budget to force
+the split and asserts the chunk count is above one before comparing.
+
+### What is left after stage A
+
+At 256 chains x N = 1e5 the gradient's peak is 13.67 GiB, of which the
+kernel's per-lag slab is 9.83 -- 72%. Stages B-C address that and would
+bring the same problem to roughly 4 GiB. The gate for stage A said "peak
+down >= 5x at N = 1e5"; the achieved figure is 2.3x, because that gate was
+set from the front end measured *in isolation* (7-15x) and the whole path
+has the slab as its floor. Recorded rather than restated.

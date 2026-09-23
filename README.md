@@ -481,17 +481,22 @@ Both kernels landed (M3 forward, M4 backward); what follows is what is
 still open, with what each is worth. Measurements are from the review of 2026-09-19 unless
 marked as an estimate.
 
-* **The kernel gradient on irregular cadences.** The backward accumulates
-  its propagator adjoints per distinct lag, in a buffer of
-  `2 x chains x blocks x lags x m^2` floats. Photometry has a handful of
-  lags; a cadence where every spacing is distinct has N of them, and the
-  buffer reaches 42 GiB at 1024 chains x N = 1e5 (measured: 2.2 GiB at 64
-  chains x N = 2e4, linear in chains). The VJP refuses above 2 GiB with the
-  arithmetic in the message. The fix is to hand the kernel the term
-  matrices' parameter Jacobians by lag and accumulate the parameter
-  gradient directly, which makes the buffer `chains x blocks x n_params`
-  (estimate: no speed change; it removes the limit). Until then: the MLX
-  gradient path at its memory cost, or binned timestamps.
+* **The kernel gradient on irregular cadences — half done.** Where every
+  timestamp spacing is distinct the lag table degenerates to one row per
+  observation, and two things then scale with N. MLX's backward through
+  the term front end was the larger: 75 GiB at 1024 chains x N = 1e5,
+  against 0.009 GiB on a regular cadence. That one is **fixed** — the
+  front end's backward is split over the lag axis when the table is large,
+  which measured 2.3x less peak and 5-6x *faster* at N = 1e5, and is
+  bit-identical and untouched on every regular cadence. The kernel's own
+  per-lag adjoint buffer, `2 x chains x blocks x lags x m^2` floats,
+  remains: 9.8 GiB at 256 chains x N = 1e5, and the VJP still refuses
+  above 2 GiB. It is now 72% of what is left. The plan for it is one slot
+  per `(block, lag)` pair that occurs rather than per lag, in
+  [docs/lag-slots-plan.md](docs/lag-slots-plan.md); an earlier proposal
+  here, per-parameter Jacobian tables, was measured and retracted. Until
+  then, a cadence of that shape needs the MLX gradient path or binned
+  timestamps.
 * **m > 4 and per-instrument jitter in the kernel.** Both stay on the MLX
   gradient path, where a gradient costs 8.8 s at m = 6, 256 chains and
   N = 1e4.

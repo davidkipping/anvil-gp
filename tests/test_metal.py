@@ -749,3 +749,109 @@ def test_the_kernel_gradient_refuses_an_unaffordable_lag_slab(monkeypatch):
         with mx.stream(mx.gpu):
             _, g = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
             mx.eval(g)
+
+
+_CHUNK_TERMS = [("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+                ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+                ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4])]
+
+
+def _distinct_gp(term, pars, n=3000, n_chains=8):
+    """A cadence whose every spacing is its own lag, so the table is N rows."""
+    from anvilgp.likelihood import GPLogLike, ParamMap
+    rng = np.random.default_rng(7)
+    t = np.concatenate([[0.0], np.cumsum(rng.uniform(0.2, 0.4, n - 1))])
+    gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.3), term,
+                   ParamMap.log(pars),
+                   GPPolicy(block=1024, hi_block=1024, metal=True))
+    return gp, mx.zeros((n_chains, len(pars)), dtype=mx.float32)
+
+
+def _grad_at_budget(gp, u, budget):
+    import anvilgp.likelihood as L
+    old = L._FRONT_END_BUDGET_BYTES
+    L._FRONT_END_BUDGET_BYTES = budget
+    try:
+        with mx.stream(mx.gpu):
+            _, g = mx.vjp(gp, [u], [mx.ones((u.shape[0],), dtype=mx.float32)])
+            mx.eval(g)
+        return np.array(g[0], np.float64)
+    finally:
+        L._FRONT_END_BUDGET_BYTES = old
+
+
+@pytest.mark.parametrize("name,term,pars", _CHUNK_TERMS,
+                         ids=[c[0] for c in _CHUNK_TERMS])
+def test_chunking_the_front_end_does_not_change_the_gradient(name, term, pars):
+    """Stage A: splitting the term front end's backward over the lag axis.
+
+    The budget is lowered so the split actually happens at test size -- at
+    the shipped budget this problem is one chunk, and a test that never
+    enters the branch would pass with the branch deleted.
+
+    This is also what pins **`h`'s cotangent being charged to one chunk**.
+    `h` does not depend on the lag, so charging it to every chunk
+    multiplies that part of the gradient by the chunk count: 9e-2 relative
+    when I first wrote it, against the 1e-7 below.
+    """
+    import anvilgp.likelihood as L
+
+    gp, u = _distinct_gp(term, pars)
+    n_lags = gp._metal_uniq_dt.shape[0]
+    old = L._FRONT_END_BUDGET_BYTES
+    L._FRONT_END_BUDGET_BYTES = 1 << 22
+    try:
+        n_chunk = L._front_end_chunks(u.shape[0], n_lags, term.n_state)
+    finally:
+        L._FRONT_END_BUDGET_BYTES = old
+    assert n_chunk > 1, "the fixture must exercise the chunked branch"
+
+    chunked = _grad_at_budget(gp, u, 1 << 22)
+    whole = _grad_at_budget(gp, u, 1 << 60)
+    rel = np.max(np.abs(chunked - whole)) / max(np.max(np.abs(whole)), 1e-30)
+    assert rel < 1e-6, f"{name}: {n_chunk} chunks change the gradient by {rel:.2e}"
+
+
+def test_a_regular_cadence_never_chunks_the_front_end():
+    """The condition, not just the arithmetic.
+
+    Chunking a two-row lag table costs ~1.8x on the front end's backward to
+    save memory that is already 0.009 GiB at 1024 chains x N = 1e5.  Every
+    cadence with a handful of distinct spacings -- which is all space
+    photometry, however large N is -- must take the unchunked path.
+    """
+    from anvilgp.likelihood import _front_end_chunks
+
+    for n_chains in (64, 256, 1024, 4096):
+        for n_lags in (2, 3, 4, 20):
+            for m in (1, 2, 3, 4):
+                assert _front_end_chunks(n_chains, n_lags, m) == 1, (
+                    f"chunked a {n_lags}-row table at {n_chains} chains, m={m}")
+    # and it does engage where the table is N-sized
+    assert _front_end_chunks(256, 100_001, 2) > 1
+    assert _front_end_chunks(1024, 100_001, 2) > 1
+
+
+@pytest.mark.slow
+def test_chunking_the_front_end_lowers_the_gradients_peak_memory():
+    """Stage A's point, and a guard against the eval that undid it.
+
+    Forcing each chunk to completion with `mx.eval` inside the loop looks
+    like the way to free it and does the opposite -- it materialises the
+    upstream graph, the backward kernel and its per-lag slab, and pins it
+    for the whole loop.  Measured 3.6x *worse* than not chunking (7.76 GiB
+    against 2.17) where leaving it lazy gives 0.97.  This test fails if
+    that eval comes back.
+    """
+    gp, u = _distinct_gp(ag.SHOTerm(), [1.3, 4.0, 3.0], n=20_000, n_chains=64)
+
+    def peak(budget):
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        _grad_at_budget(gp, u, budget)
+        return mx.get_peak_memory() / 2**30
+
+    whole = peak(1 << 60)
+    chunked = peak(1 << 22)
+    assert chunked < 0.75 * whole, (
+        f"chunked peak {chunked:.3f} GiB vs unchunked {whole:.3f} GiB")

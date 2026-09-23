@@ -552,6 +552,72 @@ class GPLogLike:
             return False, "mx.fast.metal_kernel is unavailable here"
         return True, ""
 
+    def _metal_matrices(self, v: mx.array):
+        """``(Phi, Q, h)`` for the lag table, with a chunked backward.
+
+        The value is exactly :meth:`Term.matrices`; only the *backward* is
+        different, and only when the lag table is large.  MLX retains every
+        intermediate of the term algebra at full table size, so its
+        backward costs ~25-47x the table -- 0.009 GiB on a regular cadence
+        and **75 GiB** at 1024 chains x N = 1e5 when every timestamp
+        spacing is distinct, which is what made the kernel gradient
+        unusable there rather than the per-lag adjoint buffer it was first
+        blamed on.  Splitting the backward over the lag axis bounds it:
+        each chunk builds, differentiates and frees its own slice.
+
+        ``mx.checkpoint`` was tried first and does nothing here (identical
+        peak to three decimals at every size).
+
+        **``h`` does not depend on the lag.** Its cotangent is therefore
+        charged to the first chunk only; charging it to every chunk
+        multiplies that part of the gradient by the chunk count, an error
+        large enough to see (9e-2 relative) and small enough to mistake for
+        conditioning.  Pinned by
+        ``tests/test_metal.py::test_the_chunked_front_end_charges_h_once``.
+        """
+        term, uniq = self.term, self._metal_uniq_dt
+        kp = self.param_map.kernel_params
+        n_chunk = _front_end_chunks(v.shape[0], uniq.shape[0], term.n_state)
+        if n_chunk <= 1:
+            return term.matrices(kp(v), uniq)
+
+        n_lags = uniq.shape[0]
+        step = -(-n_lags // n_chunk)
+
+        @mx.custom_function
+        def core(vv):
+            return term.matrices(kp(vv), uniq)
+
+        @core.vjp
+        def _core_vjp(primals, cotangents, outputs):
+            # one input, so MLX hands the array itself rather than a
+            # one-tuple -- `primals[0]` would silently take its first row.
+            vv = primals[0] if isinstance(primals, (list, tuple)) else primals
+            c_phi, c_q, c_h = cotangents
+            z_h = mx.zeros_like(c_h)
+            acc = None
+            for i, lo in enumerate(range(0, n_lags, step)):
+                hi = min(lo + step, n_lags)
+                du = uniq[lo:hi]
+
+                def part(w, du=du):
+                    return term.matrices(kp(w), du)
+
+                g = mx.vjp(part, [vv],
+                           [c_phi[:, lo:hi], c_q[:, lo:hi],
+                            c_h if i == 0 else z_h])[1][0]
+                # Deliberately no `mx.eval(g)` here.  Forcing each chunk to
+                # complete looks like the way to free it and does the
+                # opposite: it materialises the upstream graph -- the
+                # backward kernel and its per-lag slab -- and pins it for
+                # the whole loop, measured 3.6x *worse* than not chunking
+                # at all (7.76 GiB against 2.17).  Left lazy, MLX frees
+                # each chunk's intermediates as the sum is built: 0.97 GiB.
+                acc = g if acc is None else acc + g
+            return acc
+
+        return core(v)
+
     def _evaluate_metal(self, v: mx.array) -> mx.array:
         """Design C: one kernel condenses the blocks, a second folds them.
 
@@ -562,8 +628,7 @@ class GPLogLike:
         from .metal import scan_loglike
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
-        phi, q, h = self.term.matrices(pm.kernel_params(v),
-                                       self._metal_uniq_dt)
+        phi, q, h = self._metal_matrices(v)
         pt = mx.concatenate(
             [mx.zeros((n, 1, m, m), dtype=dtype), phi], axis=1)
         qt = mx.concatenate(
@@ -804,6 +869,51 @@ def _auto_sub_block(m: int) -> int:
 #: sits close enough to the edge that it failed in one run and not another.
 _MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048}
 _MAX_METAL_BLOCK_HI_M = 1024
+
+
+#: Peak bytes MLX's backward through :meth:`Term.matrices` costs per byte of
+#: the ``(n_chains, n_lags, m, m)`` table it produces.  The term algebra's
+#: ~20 intermediates are each of table size and all are retained, and the
+#: measured ratio is 25-47x (higher at small tables, where a fixed overhead
+#: shows).  48 is the conservative end: over-estimating splits the backward
+#: into more chunks than strictly needed, which is cheap, while
+#: under-estimating lets the peak through, which is what this exists to stop.
+_FRONT_END_RETENTION = 48
+
+#: Target peak for one chunk of that backward.  Chosen from a measured
+#: sweep at N = 2e4, 64 chains, an all-distinct cadence: the unchunked
+#: backward is 1.82 GiB and 41 ms; this budget picks 4 chunks, which is
+#: 0.57 GiB and 28 ms -- *both* smaller and faster, because the unchunked
+#: allocation costs more in bandwidth than the extra launches cost in
+#: overhead.  Chunking harder keeps shrinking the peak and starts costing
+#: real time (16 chunks: 0.18 GiB and 127 ms), so this is deliberately not
+#: the smallest achievable peak.
+_FRONT_END_BUDGET_BYTES = 512 << 20
+
+#: Never split the lag table so finely that a chunk stops being worth a
+#: launch.  Only binds on tables too small to need chunking anyway.
+_MIN_LAGS_PER_CHUNK = 64
+
+
+def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
+    """How many lag-chunks to split the term front end's backward into.
+
+    Returns 1 -- meaning "do not chunk" -- for every table small enough to
+    backpropagate in one piece, which is every regular cadence: one cadence
+    plus a lag per gap is a handful of rows whatever N is.  Chunking those
+    would cost 1.8x on the front end to save memory that is already
+    negligible (measured 0.009 GiB at 1024 chains x N = 1e5).
+
+    It only bites on a cadence whose every spacing is distinct, where the
+    lag table degenerates to one row per observation and its backward
+    reaches 75 GiB at production size.
+    """
+    table = 2 * n_chains * n_lags * n_state * n_state * 4
+    want = _FRONT_END_RETENTION * table
+    if want <= _FRONT_END_BUDGET_BYTES:
+        return 1
+    n = -(-want // _FRONT_END_BUDGET_BYTES)
+    return max(1, min(n, max(1, n_lags // _MIN_LAGS_PER_CHUNK)))
 
 
 def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
