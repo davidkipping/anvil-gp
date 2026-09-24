@@ -12,6 +12,28 @@ machine move by 2x under background load, so check
 `benchmarks/verify_readme.py`'s probe before believing any timing you take
 yourself.
 
+## What is being counted
+
+Three numbers vary independently here, and only one of them is the axis
+this library is about:
+
+| | meaning | example |
+|---|---|---|
+| **N** | data points in the light curve | 10,000 |
+| **parameters** | hyperparameters in the kernel — the *length* of one parameter vector | 3 for SHO: `(sigma, rho, Q)` |
+| **parameter vectors** | distinct hyperparameter **settings** scored at once, against the same data | 1024 |
+
+"Parameter vectors" is the last of these: how many different `(sigma, rho,
+Q)` combinations you need a log-likelihood for in one go. In MCMC terms it
+is **your walker count** — an ensemble sampler with 1024 walkers needs
+1024 log-likelihoods per step, all on the same light curve, differing only
+in hyperparameters. It is `n_chains` in the code, the first axis of `v`,
+which has shape `(n_chains, n_params)`.
+
+celerite2 evaluates one parameter vector per call, in a Python loop.
+anvil-gp evaluates all of them in one GPU launch. Everything below follows
+from that.
+
 ## The short version
 
 **anvil-gp is not faster than celerite2 at evaluating one likelihood.** It
@@ -24,23 +46,25 @@ The crossover — where the fused kernel's fixed ~1.5 ms launch cost is
 repaid — depends on N, because celerite2's per-vector cost grows with N
 while the kernel's barely does:
 
-| N | vectors to break even vs 1 core |
+| N | parameter vectors to break even vs 1 core |
 |---|---:|
 | 1,000 | ~26 |
 | 2,000 | ~16 |
 | 10,000 | ~5 |
 | 100,000 | ~1.4 |
 
-Above that anvil-gp pulls away quickly; at 1024 vectors and N = 1e5 it is
+Above that anvil-gp pulls away quickly; at 1024 parameter vectors and
+N = 1e5 it is
 46x a fully parallelised 12-core celerite2 pool and 336x a single core.
 
 ## Speed against celerite2, by ensemble size
 
-SHO kernel, one log-likelihood per parameter vector, milliseconds for the
-whole batch. celerite2 columns are its per-vector cost times the batch,
+SHO kernel (3 hyperparameters), one log-likelihood per parameter vector,
+milliseconds for the whole batch. The "parameter vectors" column is the
+walker count, not the data size and not the hyperparameter count. celerite2 columns are its per-vector cost times the batch,
 single core and a 12-core multiprocess pool.
 
-| N | vectors | anvil-gp kernel | anvil-gp MLX | celerite2 1 core | celerite2 12 cores | kernel vs 1 core | kernel vs pool |
+| N | parameter vectors | anvil-gp kernel | anvil-gp MLX | celerite2 1 core | celerite2 12 cores | kernel vs 1 core | kernel vs pool |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | 1,000 | 1 | **1.53** | 26 | 0.06 | 1.47 | 0.04x | 0.96x |
 | 1,000 | 64 | **1.61** | 25 | 3.93 | 2.86 | 2.4x | 1.8x |
@@ -58,7 +82,8 @@ celerite2 on a single core beats the fused kernel by 25x at N = 1000, by
 of roughly 1.5 ms that a single small problem cannot amortise. It is not a
 defect to be tuned away; it is what a GPU is.
 
-**The batch is nearly free.** Going from 1 to 1024 vectors costs the
+**The batch is nearly free.** Going from 1 to 1024 parameter vectors
+costs the
 kernel 5% at N = 1000 and 46% at N = 1e4. The same step costs celerite2 a
 factor of 1024. That is the entire argument for this library.
 
@@ -68,7 +93,8 @@ is not meant to be.
 
 ## Speed by kernel
 
-N = 10,000, 1024 parameter vectors.
+N = 10,000 data points, 1024 parameter vectors (i.e. 1024 walkers). The
+hyperparameter count varies by kernel and is not the axis here.
 
 | kernel | `m` | anvil-gp kernel | anvil-gp MLX | celerite2 1 core | celerite2 12 cores | kernel vs pool |
 |---|---:|---:|---:|---:|---:|---:|

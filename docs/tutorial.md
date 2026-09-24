@@ -90,8 +90,13 @@ quantise a float32 answer if carried inside. MCMC never sees the
 difference. Use `log_prob_absolute` when comparing against another
 library, as above, and `__call__` everywhere else.
 
-**Everything is batched.** `v` has shape `(n_chains, n_params)`. That is
-the point of the library.
+**Everything is batched.** `v` has shape `(n_chains, n_params)`: one row
+per hyperparameter *setting* you want scored, each row holding that
+setting's values. So `mx.zeros((1024, 3))` is 1024 different `(sigma, rho,
+Q)` triples, all scored against the same light curve in one call. In MCMC
+terms the first axis is your walker count; the second is fixed by the
+kernel (3 for SHO). That is the point of the library, and the axis every
+benchmark in [benchmarks.md](benchmarks.md) varies.
 
 ## The thing celerite2 cannot do
 
@@ -101,8 +106,8 @@ with mx.stream(mx.gpu):
     lls = np.array(gp(u))                     # shape (1024,)
 ```
 
-1024 log-likelihoods in **1.7 ms** at this N — barely more than the
-1.5 ms one costs. The same work through celerite2 is a Python loop:
+1024 log-likelihoods — one per hyperparameter setting, same data — in
+**1.7 ms** at this N, barely more than the 1.5 ms one costs. The same work through celerite2 is a Python loop:
 0.094 ms per vector here, so about 96 ms, and it is 578 ms at N = 1e5 even
 on 12 cores. The break-even is ~16 vectors at this N. Full numbers, and
 the cases where celerite2 wins, in [benchmarks.md](benchmarks.md).

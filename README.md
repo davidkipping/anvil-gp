@@ -49,9 +49,10 @@ parameter is an offset from, proper default priors, and a jitter — see
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
 anvil-gp is 20-46x a 12-core celerite2 pool once you need hundreds of
-parameter vectors at once, carries its own gradient, and is the more
-accurate of the two on Matern-3/2. Break-even is about 26 parameter
-vectors at N = 1000 and about 1.4 at N = 1e5.
+*hyperparameter settings* scored at once — an ensemble sampler's walker
+count, not the data size — carries its own gradient, and is the more
+accurate of the two on Matern-3/2. Break-even is about 26 walkers at
+N = 1000 and about 1.4 at N = 1e5.
 
 ## Why a state-space model rather than celerite's Cholesky
 
