@@ -186,7 +186,7 @@ if the second does not pay.
 | A | Chunk the front-end backward | 0.75 | Opus | **DONE** -- see below. 2.3x less peak and 5-6x faster at N = 1e5; regular cadences bit-identical; gradient within 1.7e-7. |
 | B | Host slot map | 0.25 | Opus | **DONE** -- `likelihood._slot_map`, built from the resolved `metal_block`. Counts match the table exactly (15/26/27/53/99,992); invariants pinned; 13x fewer slots than `blocks x lags` on an all-distinct cadence, 27.6 ms to build at N = 1e5. |
 | C | Kernel and VJP on slots | 0.5 | Opus | **DONE** -- gradients match the pre-change kernel to 1.5e-7 over 32 cases; the headline case runs at 1.3x the forward's peak; reproducibility kept, which took two attempts. |
-| D | Measure and document | 0.25 | Opus | All-distinct gradient runs at 1e5 x 1024 within ~2x the forward's peak. `benchmarks/verify_readme.py` green. README, plan and memory corrected. |
+| D | Measure and document | 0.25 | Opus | **DONE** -- 17.5 GiB against a 13.2 GiB forward (1.33x). `benchmarks/verify_readme.py` green on 2026-09-24 in a 0.4%-spread window, every row within 5% of the README. Docs and memory corrected. |
 | R2 | Adversarial review of the slot map | 0.5 | **Fable** | **DONE** -- see "Stage R2, measured": five defects fixed, one hardening, one coverage gap closed, and the suite's sensitivity measured under nine mutations. Original brief: assume the slot map is wrong and prove it. A wrong slot index gives a correct *value* and a silently wrong parameter gradient, because the forward is untouched -- the one failure class this suite has repeatedly missed on its own. Specifically: a slot map stale against `metal_block`; the scatter-add's determinism across runs; blocks whose lag set changes between value and gradient calls; and whether any test would fail if `slot_id` were permuted. |
 
 Opus for the work, **Fable for R2**. That split is this project's own
@@ -523,3 +523,13 @@ two-variable decision written against one variable. The attacker's ~400
 numerical configurations found nothing because the arithmetic was right.
 The mutations and the attribute assignment found the defects in minutes.
 Review the contracts between components before the numerics inside them.
+
+## Closing measurement, 2026-09-24
+
+The README verifier could not time anything during stages A-D because a
+two-day PyTorch job held the GPU at 75-95%. Run once the machine was
+quiet (stability probe 0.4%), all ten rows pass: MLX forward 74.8 / 696
+ms against the README's 75.1 / 719; Metal forward 1.60 / 11.6 against
+1.67 / 11.5; MLX gradient 880 against 880; Metal gradient 9.37 / 58.8
+against 8.9 / 58.2; accuracy rows unchanged. The interleaved A/B in stage
+D predicted this, and the prediction was checked rather than trusted.
