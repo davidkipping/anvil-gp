@@ -91,6 +91,68 @@ factor of 1024. That is the entire argument for this library.
 parity and kernels with `m > 4`. It is not competitive with celerite2 and
 is not meant to be.
 
+## What this means for an MCMC run
+
+**One MCMC step costs one log-likelihood per walker.** That is the whole
+connection. An ensemble sampler proposes a new position for every walker
+each step and must score every one of them, all against the same light
+curve, differing only in hyperparameters. So a run of `S` steps with `W`
+walkers is `S x W` log-likelihood evaluations, and the "parameter vectors"
+column above is `W`.
+
+The walker count is not a free choice you can shrink to suit celerite2.
+Ensemble samplers need more walkers than twice the parameter count to move
+at all, and in practice you want far more — walkers are where the
+independent samples come from, so halving them roughly halves your
+effective sample size per step. A 4-parameter GP fit with 256 or 1024
+walkers is ordinary.
+
+### A worked example
+
+600 steps, 1024 walkers, the SHO kernel, measured end to end with anvil's
+ensemble sampler on the fused kernel:
+
+| | N = 1,000 | N = 100,000 |
+|---|---:|---:|
+| log-likelihood, per step | 1.86 ms | 12.4 ms |
+| **anvil-gp, 614,400 evaluations** | **1.26 s** | **7.5 s** |
+| of which sampler overhead | 0.15 s (12%) | 0.15 s (2%) |
+| celerite2, 1 core | 38.6 s | 42 min |
+| celerite2, 12-core pool (measured) | 6.6 s | 347 s |
+| **speedup vs the pool** | **~5x** | **~46x** |
+
+The N = 1,000 column is an end-to-end measurement with anvil's sampler;
+the N = 100,000 column is the same 600 x 1024 evaluations timed on the
+likelihood alone, plus the measured sampler overhead, since the sampler's
+cost does not grow with N.
+
+Two things to take from this.
+
+**The end-to-end speedup is smaller than the kernel speedup**, because the
+sampler itself costs something that no likelihood can speed up. At
+N = 1,000 the likelihood is 88% of the wall time and the sampler is the
+rest; drive the likelihood to zero and you still pay that 12%. The
+kernel-only ratios in the tables above are an upper bound on what a real
+fit will see.
+
+**The advantage grows with N**, because celerite2's per-evaluation cost
+grows linearly with the data while the fused kernel's barely moves between
+1,000 and 10,000 points. At a thousand points anvil-gp is about five times
+faster than a fully parallelised pool and you might reasonably not bother.
+At a hundred thousand points the same run is 7.5 seconds against six
+minutes on twelve cores, or 42 minutes on one.
+
+### If you use a gradient sampler
+
+ChEES-HMC and NUTS also run many chains at once, and each leapfrog step
+needs a value *and* a gradient for every chain. anvil-gp's gradient costs
+about 3x its value and comes from a second Metal kernel; celerite2 has no
+gradient at all, so the comparison there is against finite differences
+(`2 x n_params + 1` likelihood calls per gradient, so 7x for SHO) or
+against a different library. On the injection-recovery example, ChEES on
+the fused kernel runs in 4.0 s against 126 s on anvil-gp's own MLX
+reference path.
+
 ## Speed by kernel
 
 N = 10,000 data points, 1024 parameter vectors (i.e. 1024 walkers). The

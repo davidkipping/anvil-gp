@@ -125,6 +125,25 @@ autodiff through the scan. It matches float64 central differences to
 ~1e-7. celerite2 has no gradient; you would pair it with JAX or finite
 differences.
 
+## Why the batch is the whole point
+
+An ensemble sampler proposes a new position for every walker at every
+step, and needs a log-likelihood for each one — same data, different
+hyperparameters. So **one MCMC step is exactly one batched call**, and a
+run of 600 steps with 1024 walkers is 614,400 log-likelihoods.
+
+Through celerite2 that is a Python loop of 614,400 calls: 38.6 s on one
+core at this N, 6.6 s on a 12-core pool. Through anvil-gp it is 600
+batched calls: 1.26 s end to end, of which 0.15 s is anvil's own sampler
+overhead. The gap widens with N — at 100,000 points the same run is
+7.5 s here against 347 s on a twelve-core pool, or 42 minutes on one.
+
+You cannot dodge this by using fewer walkers. Ensemble samplers need more
+walkers than twice the parameter count to move at all, and your effective
+sample size scales with them, so the regime where anvil-gp wins is the
+regime you wanted to be in anyway. Full numbers and the end-to-end caveat
+in [benchmarks.md](benchmarks.md#what-this-means-for-an-mcmc-run).
+
 ## A real fit
 
 ```python
