@@ -108,12 +108,13 @@ class GPPolicy:
     #: Differentiable since M4: the kernel carries its own VJP, so a
     #: gradient sampler can use it too.  Measured 45-74x over the MLX path
     #: on the forward and ~100x on the gradient, with 20-30x less peak
-    #: memory; see the README.  Limits: m <= 4 and one jitter.  Any
-    #: cadence is fine, including one where every timestamp spacing is
-    #: distinct: the gradient's adjoint buffer is one slot per
-    #: ``(block, lag)`` pair that *occurs*, so it is bounded by N, and
-    #: :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES` is a sanity check
-    #: rather than a limit to design around.
+    #: memory; see the README.  Limits: m <= 4 and one jitter.  The
+    #: gradient's adjoint buffer is one slot per ``(block, lag)`` pair
+    #: that *occurs*, so it is bounded by N rather than by N x blocks,
+    #: and an irregular cadence is affordable at m = 2 (3.05 GiB at 1024
+    #: chains x N = 1e5).  It is **not** unconditional: the buffer scales
+    #: with ``m^2``, so the same cadence at m = 4 needs 12.2 GiB and
+    #: :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES` (8 GiB) refuses it.
     metal: bool = False
     #: observations condensed per kernel thread, or None to pick from N.
     #: Larger means fewer, longer sequential walks and less work left for
@@ -135,6 +136,20 @@ class GPPolicy:
         if self.metal_block is not None and int(self.metal_block) < 1:
             raise ValueError(
                 f"metal_block = {self.metal_block!r} must be None or >= 1")
+        if (self.metal_block is not None
+                and int(self.metal_block) > max(_MAX_METAL_BLOCK.values())):
+            # `_auto_metal_block` caps this per state dimension because the
+            # GPU watchdog *kills the command buffer* above the cap at
+            # m = 4 -- a hard failure, not a slow path.  An explicit
+            # `metal_block` used to bypass that cap entirely.  The exact
+            # per-m cap needs the term, which a policy does not have, so
+            # refuse only what no m allows and let the instance check the
+            # rest.
+            raise ValueError(
+                f"metal_block = {self.metal_block} exceeds "
+                f"{max(_MAX_METAL_BLOCK.values())}, which the GPU watchdog "
+                f"cannot survive at any state dimension; see "
+                f"_auto_metal_block for the per-m caps")
         if not 0.0 <= self.s_floor_rel < 1.0:
             raise ValueError(
                 f"s_floor_rel = {self.s_floor_rel!r} must be in [0, 1): the "
@@ -575,6 +590,11 @@ class GPLogLike:
     def _build_slot_map(self) -> None:
         """Per-(block, lag) slot map and fold plan for ``self.metal_block``."""
         sid, sstart, slag = _slot_map(self._lag_np, self._metal_block)
+        #: the block length this map was built for.  Comparing block
+        #: *counts* is not enough: 512 and 600 both give 2 blocks at
+        #: N = 1000, so a bypassed change between them passed the guard
+        #: and misattributed adjoints with the value still exact.
+        self._slot_map_blk = int(self._metal_block)
         self._metal_slot_id = mx.array(sid)
         self._metal_slot_start = mx.array(sstart)
         self._metal_slot_lag = mx.array(slag)
@@ -685,11 +705,12 @@ class GPLogLike:
         # The property setter makes this unreachable; it stays because the
         # failure it guards is silent (see `metal_block`) and the check is
         # a host-side shape comparison.
-        if self._metal_slot_start.shape[0] - 1 != -(-self.n_data // self.metal_block):
+        if self._slot_map_blk != self.metal_block:
             raise RuntimeError(
-                "the kernel's slot map was built for a different block "
-                "length than the launch; assign `metal_block` rather than "
-                "`_metal_block` so the map is rebuilt")
+                f"the kernel's slot map was built for metal_block="
+                f"{self._slot_map_blk} but the launch uses "
+                f"{self.metal_block}; assign `metal_block` rather than "
+                f"`_metal_block` so the map is rebuilt")
         phi, q, h = self._metal_matrices(v)
         pt = mx.concatenate(
             [mx.zeros((n, 1, m, m), dtype=dtype), phi], axis=1)
@@ -1016,10 +1037,13 @@ def _lag_fold_plan(slot_lag: np.ndarray, n_lags: int):
     every block on the same handful of lags, and the padded table is then
     a few kilobytes.
 
-    Returns ``("groups", [(slots, lags), ...])`` when the slots stack no
-    more than :data:`_MAX_FOLD_RANKS` deep -- each group having distinct
-    lags, so each scatter is reproducible on its own -- and
-    ``("dense", table)`` of shape ``(n_lags, max_rank)`` otherwise.
+    Returns ``("dense", table)`` of shape ``(n_lags, max_rank)`` only when
+    the slots stack deeper than :data:`_MAX_FOLD_RANKS` **and** the padded
+    table stays within 4x the slots it holds; ``("groups", [(slots, lags),
+    ...])`` otherwise, each group having distinct lags so each scatter is
+    reproducible on its own.  Both conditions matter: a mostly-regular
+    cadence has a deep stack *and* a huge table, and takes the groups
+    branch.
     """
     n_slots = int(slot_lag.size)
     if n_slots == 0:

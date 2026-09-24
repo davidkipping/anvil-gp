@@ -1379,7 +1379,10 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
                 axis=2)
         else:
             d_phi_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_phi.dtype)
-            d_q_tab = d_phi_tab
+            # a separate zero, not an alias: `.at[].add` is functional so
+            # sharing one would be correct today, but an empty plan would
+            # then return the same array as two independent cotangents.
+            d_q_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_q.dtype)
             for sel, lags_of in plan:
                 d_phi_tab = d_phi_tab.at[:, lags_of].add(
                     mx.take(d_phi, sel, axis=1))

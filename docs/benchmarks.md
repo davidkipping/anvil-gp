@@ -1,16 +1,29 @@
 # Benchmarks against celerite2
 
-Regenerate every table here with one command:
+Regenerate the three measured tables — ensemble size, by kernel, and
+accuracy — with one command:
 
 ```bash
 .venv/bin/python benchmarks/bench_docs_tables.py
 ```
+
+The break-even table and the MCMC worked example below are hand-written
+from separate runs and are **not** covered by that script.
 
 Measured on an M2 Max (12 CPU cores, 64 GB unified memory) on 2026-09-24,
 in a window where a stability probe read 0.4% spread. Wall times on this
 machine move by 2x under background load, so check
 `benchmarks/verify_readme.py`'s probe before believing any timing you take
 yourself.
+
+**Cadence matters and this page uses a gapped one** — a regular grid with
+one 20-day gap, so the lag table has three rows. That is what photometry
+looks like and it is *not* the cadence the README's milestone-3 figures
+use, which is a bare regular grid. Measured side by side in one window,
+the gap costs the fused kernel 1.7x at N = 1e4 and 1.5x at N = 1e5, which
+is why this page's ratios (20x the pool at N = 1e4) are lower than the
+README's 35-42x for what looks like the same comparison. Neither is
+wrong; they are different cadences.
 
 ## What is being counted
 
@@ -97,8 +110,21 @@ is not meant to be.
 connection. An ensemble sampler proposes a new position for every walker
 each step and must score every one of them, all against the same light
 curve, differing only in hyperparameters. So a run of `S` steps with `W`
-walkers is `S x W` log-likelihood evaluations, and the "parameter vectors"
-column above is `W`.
+walkers is `S x W` log-likelihood evaluations.
+
+**They do not arrive as one call of `W`.** anvil's `EnsembleKernel` is a
+red-black scheme, as emcee 3 is: the ensemble splits in half, and each
+half is proposed against the *frozen* other half, which is what keeps the
+vectorised move detailed-balanced. So a step is **two batched calls of
+`W/2`**, and an `S`-step run is `2S` calls — the same `S x W` evaluations,
+delivered in twice as many batches of half the width. Read the table row
+at `W/2`, not `W`.
+
+That split is not free. At N = 1,000 one call of 1024 costs 1.61 ms and
+one of 512 costs about 1.2 ms, so two halves cost ~1.5x what one full
+batch would: the kernel's cost is dominated by fixed overhead at this
+size, and halving the batch does not halve it. The effect shrinks as N
+grows and the work per call starts to dominate.
 
 The walker count is not a free choice you can shrink to suit celerite2.
 Ensemble samplers need more walkers than twice the parameter count to move
@@ -114,33 +140,42 @@ ensemble sampler on the fused kernel:
 
 | | N = 1,000 | N = 100,000 |
 |---|---:|---:|
-| log-likelihood, per step | 1.86 ms | 12.4 ms |
-| **anvil-gp, 614,400 evaluations** | **1.26 s** | **7.5 s** |
-| of which sampler overhead | 0.15 s (12%) | 0.15 s (2%) |
-| celerite2, 1 core | 38.6 s | 42 min |
-| celerite2, 12-core pool (measured) | 6.6 s | 347 s |
-| **speedup vs the pool** | **~5x** | **~46x** |
+| | N = 1,000 |
+|---|---:|
+| batched calls | 1,200 (2 per step, 512 wide) |
+| **anvil-gp, end to end** | **2.7 s** |
+| of which likelihood | 2.2 s (83%) |
+| of which anvil's sampler | 0.4 s (17%) |
+| celerite2, 614,400 evaluations, 1 core | 38.6 s |
+| celerite2, same, 12-core pool | 6.6 s |
+| **end-to-end speedup vs the pool** | **~2.4x** |
 
-The N = 1,000 column is an end-to-end measurement with anvil's sampler;
-the N = 100,000 column is the same 600 x 1024 evaluations timed on the
-likelihood alone, plus the measured sampler overhead, since the sampler's
-cost does not grow with N.
+anvil-gp's row is an end-to-end measurement with anvil's sampler. The
+celerite2 rows are its measured per-vector cost times 614,400; the pool
+row divides by the *measured* pool throughput, not by 12. The N = 100,000
+column that stood here was arithmetic from the table above rather than a
+run, and is withdrawn until it is measured; the ratio there will be far
+larger, because celerite2's per-evaluation cost grows with N and the
+kernel's grows much more slowly.
 
 Two things to take from this.
 
-**The end-to-end speedup is smaller than the kernel speedup**, because the
-sampler itself costs something that no likelihood can speed up. At
-N = 1,000 the likelihood is 88% of the wall time and the sampler is the
-rest; drive the likelihood to zero and you still pay that 12%. The
-kernel-only ratios in the tables above are an upper bound on what a real
-fit will see.
+**The end-to-end speedup is much smaller than the kernel speedup**, for
+two reasons that compound. The sampler costs 17% of wall time here and no
+likelihood improvement touches it. And the red-black split means you pay
+two half-width calls per step rather than one full-width one, which at
+this N costs another ~1.5x. The 6.6x kernel-only ratio in the table above
+becomes ~2.4x end to end. **Treat the kernel-only tables as an upper
+bound**, and a loose one at small N.
 
 **The advantage grows with N**, because celerite2's per-evaluation cost
-grows linearly with the data while the fused kernel's barely moves between
-1,000 and 10,000 points. At a thousand points anvil-gp is about five times
-faster than a fully parallelised pool and you might reasonably not bother.
-At a hundred thousand points the same run is 7.5 seconds against six
-minutes on twelve cores, or 42 minutes on one.
+grows linearly with the data while the fused kernel's grows far more
+slowly — over the range in the table above, 1,000 to 100,000 points,
+celerite2 goes 63 ms to 4249 ms per 1024-vector batch (67x) while the
+kernel goes 1.61 ms to 13 ms (8x). At a thousand points anvil-gp is
+roughly twice a fully parallelised pool end to end and you might
+reasonably not bother. The gap widens by about an order of magnitude over
+that range.
 
 ### If you use a gradient sampler
 
@@ -177,31 +212,55 @@ lower end of the range, and note that `m > 4` leaves the kernel entirely.
 
 Absolute error in log L at N = 2,000, where an exact dense factorisation
 is affordable. anvil-gp's production path is float32; celerite2 is float64
-throughout.
+throughout. **The data is drawn on model** from each kernel: off-model
+residuals are large and the quadratic form dominates, which flatters
+everyone, while on model the log-determinant and the quadratic form very
+nearly cancel and what survives is what a sampler sees.
 
 | kernel | `m` | \|log L\| | anvil-gp kernel | anvil-gp MLX | celerite2 |
 |---|---:|---:|---:|---:|---:|
-| `real` | 1 | 5208 | 3.81e-04 | 1.08e-04 | 3.64e-12 |
-| `sho` | 2 | 9711 | 2.98e-04 | 2.98e-04 | 5.64e-11 |
-| `matern32` | 2 | 9838 | 3.40e-04 | 1.32e-03 | **2.23e-02** |
-| `matern52` | 3 | 10007 | 4.66e-04 | 4.66e-04 | not available |
-| `rotation` | 4 | 9777 | 3.49e-03 | 4.14e-04 | 5.82e-11 |
-| `sho2` | 4 | 8896 | 8.45e-04 | 8.45e-04 | 2.73e-11 |
+| `real` | 1 | 1650 | 2.74e-04 | 5.18e-04 | 2.27e-13 |
+| `sho` | 2 | 620 | 4.22e-05 | 5.30e-04 | 2.61e-12 |
+| `matern32` | 2 | 567 | 1.70e-04 | 9.29e-04 | 1.30e-03 |
+| `matern52` | 3 | 457 | 5.64e-04 | 5.35e-04 | not available |
+| `rotation` | 4 | 660 | 9.67e-04 | 1.56e-02 | 2.61e-11 |
+| `sho2` | 4 | 930 | 5.13e-04 | 3.91e-04 | 1.59e-11 |
 
-**celerite2 is seven orders of magnitude more accurate**, everywhere
-except Matern-3/2. That is float64 against float32 and it is exactly what
-you should expect. The question is whether it matters: a Metropolis
-accept/reject decision turns on differences of order 1, and anvil-gp's
-error is 3e-4 on a log-likelihood of ~1e4. It does not matter for MCMC. It
-would matter if you needed the absolute value of the evidence to better
-than 1e-3, and for that anvil-gp ships a float64 path (`gp.hi(...)`) that
-agrees with the dense oracle to ~1e-11.
+**celerite2 is seven to nine orders of magnitude more accurate** on every
+kernel it implements exactly. That is float64 against float32 and it is
+exactly what you should expect. The question is whether it matters: a
+Metropolis accept/reject decision turns on differences of order 1, and
+anvil-gp's error is 1e-4 to 1e-3 on a log-likelihood of several hundred.
+It does not matter for MCMC. It would matter if you needed the absolute
+evidence to better than 1e-3, and for that anvil-gp ships a float64 path
+(`gp.hi(...)`) that agrees with the dense oracle to ~1e-11.
 
-**The exception is Matern-3/2, where anvil-gp is 65x more accurate.**
-celerite2 represents Matern-3/2 by a rational approximation; anvil-gp uses
-the exact two-state model (it is the SHO at critical damping). Across four
-`(sigma, rho)` settings celerite2's error ran 2.6e-3 to 8.2e-2 while
-anvil-gp held 4.7e-5 to 7.2e-4.
+**Matern-3/2 is the one kernel where that can reverse**, because
+celerite2 approximates it rationally where anvil-gp uses the exact
+two-state model (the SHO at critical damping). The advantage is real but
+not uniform. Over 36 on-model configurations at N = 2,000 — three `sigma`
+by four `rho` by three noise seeds:
+
+| | celerite2 | anvil-gp |
+|---|---:|---:|
+| more accurate in | 9 of 36 | **27 of 36** |
+| median error | 3.9e-04 | **1.7e-04** |
+| worst case | 1.7e-02 | **4.1e-03** |
+| best case | 3.2e-06 | 3.8e-06 |
+
+Median advantage to anvil-gp is 3.6x, but the per-configuration ratio
+ranges from 0.02x to 197x: celerite2's approximation error and anvil-gp's
+float32 error are of comparable size here, and which dominates depends on
+the parameters in a way neither a single number nor a simple rule
+captures. The defensible claim is that anvil-gp wins about three times in
+four and has the better worst case.
+
+Two earlier versions of this page got this wrong, and both errors are
+instructive. The first claimed a flat 65x, measured on *off-model* white
+noise where the quadratic form dominates and flatters the comparison. The
+second claimed the winner was monotone in `rho/dt`, fitted to four points
+that happened to line up; a wider grid shows `sigma` matters too and the
+ordering is not monotone in either.
 
 ### How float32 error grows
 
@@ -237,8 +296,11 @@ float64 accuracy in the likelihood itself, need exposure-time integration
 (`TermConvolution`), need `ComplexTerm`, or are not on Apple Silicon.
 
 Use **anvil-gp** if you run an ensemble sampler with hundreds or thousands
-of walkers, want gradients for HMC without writing them yourself, need
-Matern-5/2, or need Matern-3/2 done exactly.
+of walkers, want gradients for HMC without writing them yourself, or need
+Matern-5/2, which celerite2 does not have. Matern-3/2 is a weaker reason:
+anvil-gp represents it exactly rather than approximately and is more
+accurate in about three quarters of configurations, but not reliably
+enough to choose a library over.
 
 The two agree on the likelihood to float32 precision, so moving between
 them is a change of engine, not of model — the parity tests in

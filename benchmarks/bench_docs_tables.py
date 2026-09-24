@@ -25,7 +25,6 @@ load. `benchmarks/verify_readme.py` has a stability probe; use it first.
 import argparse
 import multiprocessing as mp
 import os
-import statistics
 import time
 
 import numpy as np
@@ -79,11 +78,30 @@ KERNELS = {
 }
 
 
-def make_data(n, seed=7):
+def make_data(n, seed=7, kind=None):
+    """Timestamps, data and errors.  A regular grid with one 20-day gap,
+    which is what photometry looks like -- and *not* the bare regular grid
+    the README's milestone-3 figures use, which is why the ratios here are
+    lower.  Measured in one window, the gap costs the kernel 1.7x at
+    N = 1e4.
+
+    With ``kind``, the data is drawn **on model** from that kernel.  For a
+    precision test that is the honest input: off-model residuals are large
+    and the quadratic form dominates, while on model the log-determinant
+    and the quadratic form very nearly cancel, and what survives the
+    cancellation is what a sampler actually sees (see `anvilgp/oracle.py`).
+    Timing does not care, so it keeps the cheaper white noise."""
     rng = np.random.default_rng(seed)
     t = np.arange(n) * 0.02
-    t[n // 2:] += 20.0                      # one gap, as real photometry
-    return t, rng.standard_normal(n), np.full(n, 0.3)
+    t[n // 2:] += 20.0
+    yerr = np.full(n, 0.3)
+    if kind is None:
+        return t, rng.standard_normal(n), yerr
+    import anvilgp as ag
+    from anvilgp.oracle import sample_ssm
+    factory, pars, _, _ = KERNELS[kind]
+    y = sample_ssm(factory(ag), pars, 0.02, n, rng) + rng.standard_normal(n) * yerr
+    return t, y, yerr
 
 
 def time_anvilgp(kind, n, n_chains, metal, reps=5):
@@ -95,7 +113,7 @@ def time_anvilgp(kind, n, n_chains, metal, reps=5):
     gp = GPLogLike(None, t, None, y, yerr, factory(ag), ParamMap.log(pars),
                    GPPolicy(block=4096, hi_block=4096, metal=metal))
     if metal and not gp.metal_eligible()[0]:
-        return None, None
+        return None
     u = mx.zeros((n_chains, len(pars)), dtype=mx.float32)
     with mx.stream(mx.gpu):
         mx.eval(gp(u))
@@ -104,7 +122,7 @@ def time_anvilgp(kind, n, n_chains, metal, reps=5):
             t0 = time.perf_counter()
             mx.eval(gp(u))
             ts.append(time.perf_counter() - t0)
-    return min(ts) * 1e3, float(np.array(gp(u))[0])
+    return min(ts) * 1e3
 
 
 def time_celerite2(kind, n, n_chains, n_proc, reps=3, probe=8):
@@ -124,8 +142,16 @@ def time_celerite2(kind, n, n_chains, n_proc, reps=3, probe=8):
             _loglike_chunk(params)
             ts.append((time.perf_counter() - t0) / probe)
         return min(ts) * n_chains * 1e3
-    chunks = np.array_split(np.tile(np.array(pars), (n_chains, 1)), n_proc)
-    with mp.Pool(n_proc, initializer=_init, initargs=(t, y, yerr, kind)) as pool:
+    # Only split across as many workers as there is work for: with
+    # n_chains = 1 and n_proc = 12, array_split yields one real chunk and
+    # eleven empty ones, and the number that comes back is pool dispatch
+    # overhead rather than celerite2 (which made the published 1-vector
+    # "12 cores" cells, and their ratios, meaningless).
+    n_use = max(1, min(n_proc, n_chains))
+    chunks = [c for c in np.array_split(np.tile(np.array(pars), (n_chains, 1)),
+                                        n_use) if len(c)]
+    with mp.Pool(n_use, initializer=_init, initargs=(t, y, yerr, kind)) as pool:
+        pool.map(_loglike_chunk, [c[:1] for c in chunks])      # warm up
         ts = []
         for _ in range(reps):
             t0 = time.perf_counter()
@@ -141,7 +167,7 @@ def accuracy(kind, n):
     from anvilgp.likelihood import GPLogLike, GPPolicy, ParamMap
     from anvilgp.oracle import dense_loglike
     factory, pars, m, ok = KERNELS[kind]
-    t, y, yerr = make_data(n)
+    t, y, yerr = make_data(n, kind=kind)          # on model: see make_data
     term = factory(ag)
     ref = dense_loglike(term, np.array(pars), t, y, yerr)
     out = {"|logL|": abs(ref)}
@@ -190,20 +216,24 @@ def main():
 
     # ---- table 1: the ensemble axis --------------------------------------
     print("### Speed against celerite2, by ensemble size\n")
-    print(f"SHO kernel, one log-likelihood per parameter vector, "
-          f"milliseconds for the whole batch. celerite2 columns are "
-          f"per-vector cost x the batch, single core and a {NP}-core pool.\n")
+    print(f"SHO kernel (3 hyperparameters), one log-likelihood per "
+          f"parameter vector, milliseconds for the whole batch. celerite2 "
+          f"columns are per-vector cost x the batch, single core and a "
+          f"{NP}-core pool. anvil-gp runs at `block=4096`, not the shipped "
+          f"default of 1024; `block` affects only the MLX column.\n")
     print("| N | vectors | anvil-gp kernel | anvil-gp MLX | celerite2 1 core |"
           f" celerite2 {NP} cores | kernel vs 1 core | kernel vs pool |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|")
     sizes = [(1_000, [1, 64, 1024]), (10_000, [1, 64, 1024]),
              (100_000, [1, 64, 1024])]
-    if a.quick:
+    kernels = list(KERNELS)
+    if a.quick:                       # smoke test: every code path, once
         sizes = [(10_000, [1, 1024])]
+        kernels = ["sho", "matern52"]
     for n, chains in sizes:
         for c in chains:
-            met, _ = time_anvilgp("sho", n, c, True)
-            mlx_, _ = time_anvilgp("sho", n, c, False)
+            met = time_anvilgp("sho", n, c, True)
+            mlx_ = time_anvilgp("sho", n, c, False)
             one = time_celerite2("sho", n, c, 1)
             pool = time_celerite2("sho", n, c, NP)
             r1 = _ratio(one, met)
@@ -219,10 +249,10 @@ def main():
     print(f"| kernel | m | anvil-gp kernel | anvil-gp MLX | celerite2 1 core "
           f"| celerite2 {NP} cores | kernel vs pool |")
     print("|---|---:|---:|---:|---:|---:|---:|")
-    for kind in KERNELS:
+    for kind in kernels:
         m = KERNELS[kind][2]
-        met, _ = time_anvilgp(kind, 10_000, 1024, True)
-        mlx_, _ = time_anvilgp(kind, 10_000, 1024, False)
+        met = time_anvilgp(kind, 10_000, 1024, True)
+        mlx_ = time_anvilgp(kind, 10_000, 1024, False)
         one = time_celerite2(kind, 10_000, 1024, 1)
         pool = time_celerite2(kind, 10_000, 1024, NP)
         rp = _ratio(pool, met)
@@ -237,7 +267,7 @@ def main():
     print("| kernel | m | \\|log L\\| | anvil-gp kernel | anvil-gp MLX "
           "| celerite2 |")
     print("|---|---:|---:|---:|---:|---:|")
-    for kind in KERNELS:
+    for kind in kernels:
         m = KERNELS[kind][2]
         acc = accuracy(kind, 2_000)
         print(f"| `{kind}` | {m} | {acc['|logL|']:.0f} "

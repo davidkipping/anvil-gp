@@ -48,11 +48,15 @@ parameter is an offset from, proper default priors, and a jitter — see
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
-anvil-gp is 20-46x a 12-core celerite2 pool once you need hundreds of
-*hyperparameter settings* scored at once — an ensemble sampler's walker
-count, not the data size — carries its own gradient, and is the more
-accurate of the two on Matern-3/2. Break-even is about 26 walkers at
-N = 1000 and about 1.4 at N = 1e5.
+anvil-gp is tens of times a 12-core celerite2 pool once you need hundreds
+of *hyperparameter settings* scored at once — an ensemble sampler's walker
+count, not the data size — carries its own gradient, and has Matern-5/2,
+which celerite2 lacks. Break-even is about 26 walkers at
+N = 1000 and about 1.4 at N = 1e5. The exact multiple depends on the
+cadence: 35-42x on a regular grid (the milestone-3 figures below) and
+20-46x on a gapped one (docs/benchmarks.md), because a gap adds a lag-table
+row and costs the kernel ~1.5-1.7x. End to end inside a sampler it is
+lower again; benchmarks.md says by how much and why.
 
 ## Why a state-space model rather than celerite's Cholesky
 

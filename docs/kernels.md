@@ -50,11 +50,16 @@ ag.Matern32Term()                   # params: sigma, rho
 ```
 
 Exactly the SHO at `Q = 1/2` with `omega_0 = sqrt(3)/rho`, which is why it
-costs no new code and is **exact**. celerite2's Matern-3/2 is a rational
-approximation: measured against a float64 dense Cholesky at N = 2000,
-celerite2 is off by 2.6e-3 to 8.2e-2 depending on `(sigma, rho)` where
-anvil-gp holds 4.7e-5 to 7.2e-4. If you fit Matern-3/2 kernels, this is the
-one place anvil-gp is *more* accurate than celerite2, not less.
+costs no new code and is **exact in form** — celerite2 approximates this
+kernel rationally.
+
+That buys a real but uneven accuracy advantage. Over 36 on-model
+configurations at N = 2000, anvil-gp was more accurate in 27, with a
+median error of 1.7e-04 against celerite2's 3.9e-04 and a better worst
+case (4.1e-03 against 1.7e-02). It is not a rule you can rely on
+pointwise: celerite2 wins about a quarter of the time, because its
+approximation error and anvil-gp's float32 error are of similar size here.
+See [benchmarks.md](benchmarks.md#accuracy-against-a-float64-dense-cholesky).
 
 ### `Matern52Term` — `k(tau) = sigma^2 (1 + x + x^2/3) e^{-x}`, `x = sqrt5 tau/rho`
 
@@ -71,13 +76,22 @@ speed one.
 
 ```python
 ag.RotationTerm()                   # params: sigma, period, Q0, dQ, f
-ParamMap.log([1.5, 7.0, 3.0, 1.0, 0.4])
 ```
 
 The primary mode has `Q1 = 1/2 + Q0 + dQ` at damped period `period`; the
-secondary has `Q2 = 1/2 + Q0` at `period/2`; `f` is the secondary's share
-of the variance. Matches the celerite2/exoplanet rotation kernel. Sample
-`(log sigma, log P, log Q0, log dQ, logit f)`.
+secondary has `Q2 = 1/2 + Q0` at `period/2`. Matches the
+celerite2/exoplanet rotation kernel.
+
+`f` is the secondary-to-primary **variance ratio**, not the secondary's
+share: the code sets `amp = sigma^2/(1+f)` for the primary and `f*amp` for
+the secondary, so the secondary carries `f/(1+f)` of the total. At
+`f = 0.4` that is 29%, not 40%, and `f = 1` is an even split.
+
+**`f` takes a logit link, not a log one** — it is a ratio in `(0, 1)` in
+normal use, and `ParamMap.log` would let it exceed 1 during warmup and
+make the "secondary" mode dominate. `make_target` gets this right; if you
+build a `ParamMap` by hand, use `KernelParam(link="logit", index=4)` for
+`f` and `log` for the rest.
 
 At `m = 4` this sits at the kernel's register ceiling and is the slowest
 supported kernel — about 5x a 12-core celerite2 pool, against 17–24x for
@@ -107,6 +121,10 @@ Check before you commit to a design:
 ```python
 gp.metal_eligible()        # (True, '') or (False, 'm = 5 exceeds ...')
 ```
+
+With the default `GPPolicy` the answer is `(False, 'GPPolicy.metal is
+off')`: that reports you did not ask for the kernel, not that your model
+is unsupported.
 
 A request the kernel cannot honour **warns and falls back** to the MLX
 reference path. That path is correct and is what the kernel is verified

@@ -16,6 +16,14 @@ from anvilgp.oracle import dense_loglike, sample_ssm
 
 c2 = pytest.importorskip("celerite2")
 c2t = pytest.importorskip("celerite2.terms")
+metal = pytest.importorskip("anvilgp.metal")
+
+#: Every test here asserts a number the docs attribute to the *fused
+#: kernel*.  Without this, a machine with no Metal gets a RuntimeWarning,
+#: silently runs the MLX path, and validates figures against the wrong
+#: one -- the two differ by 4x on matern32 in the docs' own table.
+pytestmark = pytest.mark.skipif(not metal.metal_available(),
+                                reason="needs mx.fast.metal_kernel")
 
 
 def _tutorial_data():
@@ -67,21 +75,39 @@ def test_the_batched_call_returns_one_value_per_vector():
     assert g.shape == (1024, 3) and np.all(np.isfinite(g))
 
 
-def test_anvilgp_is_the_more_accurate_of_the_two_on_matern32():
-    """docs/kernels.md and docs/benchmarks.md make this the one accuracy
-    claim in anvil-gp's favour, so it carries more weight than the rest and
-    is worth pinning across the parameter range it is claimed over.
+@pytest.mark.slow
+def test_anvilgp_usually_but_not_always_beats_celerite2_on_matern32():
+    """The one accuracy claim the docs make in anvil-gp's favour, pinned as
+    the *aggregate* it actually is.
 
-    celerite2 represents Matern-3/2 by a rational approximation; anvil-gp
-    uses the exact two-state model (the SHO at critical damping).
+    celerite2 approximates Matern-3/2 rationally; anvil-gp uses the exact
+    two-state model (the SHO at critical damping). That wins about three
+    times in four, not always, because the two error sources are of
+    similar size and which dominates depends on the parameters.
+
+    This test has been wrong twice, both times because a story was fitted
+    to too few points.  First it used off-model white noise, where the
+    quadratic form dominates and anvil-gp appeared to win everywhere by
+    65x (on-model data is the honest input; see
+    `anvilgp/oracle.py::sample_ssm`).  Then it asserted a per-point winner
+    monotone in rho/dt, fitted to four points; `sigma` matters too and the
+    ordering is not monotone.  Hence a grid and an aggregate.
     """
-    rng = np.random.default_rng(7)
-    n = 2000
-    t = np.arange(n) * 0.02
-    t[n // 2:] += 20.0
-    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    import itertools
 
-    for sigma, rho in ((1.1, 2.5), (1.0, 1.0), (0.5, 10.0), (2.0, 0.5)):
+    n, dt = 2000, 0.02
+    wins_ag = 0
+    errs_c2, errs_ag = [], []
+    for sigma, rho, seed in itertools.product((0.5, 1.1, 2.0),
+                                              (0.5, 1.0, 2.5, 10.0),
+                                              (7, 11, 13)):
+        rng = np.random.default_rng(seed)
+        t = np.arange(n) * dt
+        t[n // 2:] += 20.0
+        yerr = np.full(n, 0.3)
+        y = sample_ssm(ag.Matern32Term(), [sigma, rho], dt, n, rng) \
+            + rng.standard_normal(n) * yerr
+
         ref = dense_loglike(ag.Matern32Term(), np.array([sigma, rho]),
                             t, y, yerr)
         gp2 = c2.GaussianProcess(c2t.Matern32Term(sigma=sigma, rho=rho),
@@ -95,10 +121,20 @@ def test_anvilgp_is_the_more_accurate_of_the_two_on_matern32():
             err_ag = abs(float(np.array(gp.log_prob_absolute(
                 mx.zeros((1, 2), dtype=mx.float32)))[0]) - ref)
 
-        assert err_ag < err_c2, (
-            f"sigma={sigma} rho={rho}: anvil-gp {err_ag:.2e} vs "
-            f"celerite2 {err_c2:.2e} -- the docs claim anvil-gp is better")
-        assert err_ag < 1e-3, f"sigma={sigma} rho={rho}: {err_ag:.2e}"
+        errs_c2.append(err_c2)
+        errs_ag.append(err_ag)
+        wins_ag += err_ag < err_c2
+
+    n_cfg = len(errs_ag)
+    assert wins_ag >= 0.6 * n_cfg, (
+        f"docs say anvil-gp wins ~27 of 36; got {wins_ag} of {n_cfg}")
+    assert np.median(errs_ag) < np.median(errs_c2), (
+        f"median: anvil-gp {np.median(errs_ag):.2e} vs "
+        f"celerite2 {np.median(errs_c2):.2e}")
+    assert max(errs_ag) < max(errs_c2), (
+        f"worst case: anvil-gp {max(errs_ag):.2e} vs "
+        f"celerite2 {max(errs_c2):.2e}")
+    assert max(errs_ag) < 1e-2, f"anvil-gp worst {max(errs_ag):.2e}"
 
 
 @pytest.mark.parametrize("term,m,eligible", [

@@ -107,9 +107,9 @@ with mx.stream(mx.gpu):
 ```
 
 1024 log-likelihoods — one per hyperparameter setting, same data — in
-**1.7 ms** at this N, barely more than the 1.5 ms one costs. The same work through celerite2 is a Python loop:
-0.094 ms per vector here, so about 96 ms, and it is 578 ms at N = 1e5 even
-on 12 cores. The break-even is ~16 vectors at this N. Full numbers, and
+**1.7 ms** at this tutorial's N = 2,000, barely more than the 1.5 ms one
+costs. The same work through celerite2 is a Python loop at 0.094 ms per
+vector, so about 96 ms. Break-even is ~16 vectors here. Full numbers, and
 the cases where celerite2 wins, in [benchmarks.md](benchmarks.md).
 
 And the gradient with respect to every one of them:
@@ -129,14 +129,18 @@ differences.
 
 An ensemble sampler proposes a new position for every walker at every
 step, and needs a log-likelihood for each one — same data, different
-hyperparameters. So **one MCMC step is exactly one batched call**, and a
-run of 600 steps with 1024 walkers is 614,400 log-likelihoods.
+hyperparameters. So a run of 600 steps with 1024 walkers is **614,400
+log-likelihoods** however they are batched.
 
-Through celerite2 that is a Python loop of 614,400 calls: 38.6 s on one
-core at this N, 6.6 s on a 12-core pool. Through anvil-gp it is 600
-batched calls: 1.26 s end to end, of which 0.15 s is anvil's own sampler
-overhead. The gap widens with N — at 100,000 points the same run is
-7.5 s here against 347 s on a twelve-core pool, or 42 minutes on one.
+Through celerite2 that is a Python loop of 614,400 calls. Through anvil-gp
+it is 1,200 batched calls: anvil's `EnsembleKernel` is a red-black scheme,
+so each step splits the ensemble and issues **two calls of 512**, which is
+what keeps the vectorised move detailed-balanced. Two half-width calls
+cost about 1.5x one full-width call at this size, so the split is not
+free — see
+[benchmarks.md](benchmarks.md#what-this-means-for-an-mcmc-run) for the
+end-to-end figures and the caveat that they are well below the
+kernel-only ratios.
 
 You cannot dodge this by using fewer walkers. Ensemble samplers need more
 walkers than twice the parameter count to move at all, and your effective
@@ -202,7 +206,10 @@ gp.metal_eligible()        # (True, '') or (False, 'reason')
 For example, `SHOTerm() + Matern52Term()` has `m = 5` and reports
 `'m = 5 exceeds the kernel's register budget (max 4)'`.
 
-It returns `False` for `m > 4`, for per-instrument jitter, and when
+It returns `False` first of all when `GPPolicy.metal` is off, which is
+the default — so a fresh `GPLogLike` reports `(False, 'GPPolicy.metal is
+off')` and that means "you did not ask", not "unsupported". It also
+returns `False` for `m > 4`, for per-instrument jitter, and when
 `mx.fast.metal_kernel` is unavailable. A request that cannot be honoured
 **warns and falls back** to the MLX path, which is correct but far
 slower — it does not fail silently. See [kernels.md](kernels.md) for the
