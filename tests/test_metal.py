@@ -1238,3 +1238,79 @@ def test_the_kernel_refuses_wide_index_dtypes():
                       c["j2"], c["cot"], *seeds,
                       c["slot_id"].astype(mx.int64), c["slot_start"],
                       c["slot_lag"].size, c["blk"])
+
+
+def test_the_slot_map_is_deferred_until_the_kernel_is_asked_for():
+    """Building it costs an np.unique over N and three device arrays, and
+    only the Metal backward reads it -- so a float64-only or MLX-path
+    instance should not pay.  Deferred, not skipped: flipping
+    `policy.metal` afterwards must still give the same gradient.
+    """
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    rng = np.random.default_rng(1)
+    n = 2000
+    t = np.arange(n) * 0.02
+    t[n // 2:] += 20.0
+    y, ye = rng.standard_normal(n), np.full(n, 0.3)
+
+    def build(metal):
+        return GPLogLike(None, t, None, y, ye, ag.SHOTerm(),
+                         ParamMap.log([1.3, 4.0, 3.0]), GPPolicy(metal=metal))
+
+    lazy = build(False)
+    assert lazy._metal_slot_id is None and lazy.n_metal_slots == 0
+    lazy.policy.metal = True
+    lazy._metal_ok, lazy._metal_why = lazy.metal_eligible()
+
+    eager = build(True)
+    assert eager._metal_slot_id is not None
+
+    u = mx.zeros((4, 3), dtype=mx.float32)
+    one = mx.ones((4,), dtype=mx.float32)
+
+    def vg(gp):
+        with mx.stream(mx.gpu):
+            v = gp(u)
+            _, g = mx.vjp(gp, [u], [one])
+            mx.eval(v, g)
+        return np.array(v, np.float64), np.array(g[0], np.float64)
+
+    v1, g1 = vg(lazy)
+    v2, g2 = vg(eager)
+    assert lazy.n_metal_slots == eager.n_metal_slots
+    assert np.array_equal(v1, v2), "deferred build changed the value"
+    assert np.array_equal(g1, g2), "deferred build changed the gradient"
+
+
+def test_the_fold_gather_is_charged_to_the_adjoint_budget(monkeypatch):
+    """The dense fold gathers (n_chains, n_lags, max_rank, m, m) on top of
+    the slot buffer, and the fold plan only bounds that at 4x the slots --
+    so a configuration inside the fence could still OOM in the fold.  The
+    fence counts it now.  Fails if only the buffer is charged.
+    """
+    import anvilgp.metal as metal_mod
+    from anvilgp.likelihood import GPLogLike, ParamMap
+
+    n, n_chains, m = 4000, 8, 2
+    t = np.arange(n) * 0.02                      # regular -> dense fold
+    rng = np.random.default_rng(2)
+    gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.3),
+                   ag.SHOTerm(), ParamMap.log([1.3, 4.0, 3.0]),
+                   GPPolicy(block=1024, hi_block=1024, metal=True,
+                            metal_block=64))
+    kind, plan = gp._metal_fold_plan
+    assert kind == "dense", "fixture must exercise the dense branch"
+
+    buf = 2 * n_chains * gp.n_metal_slots * m * m * 4
+    gather = 2 * n_chains * int(plan.shape[0]) * int(plan.shape[1]) * m * m * 4
+    assert gather > buf, "fixture must have a gather larger than the buffer"
+
+    # a budget that admits the buffer but not buffer + gather
+    monkeypatch.setattr(metal_mod, "MAX_ADJOINT_BUFFER_BYTES",
+                        buf + gather // 2)
+    u = mx.zeros((n_chains, 3), dtype=mx.float32)
+    with pytest.raises(ValueError, match="gather"):
+        with mx.stream(mx.gpu):
+            _, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
+            mx.eval(g)

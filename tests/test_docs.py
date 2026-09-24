@@ -5,6 +5,8 @@ it prints is worse than none, because a reader cannot tell which of the
 two is wrong.  Everything pinned here is a figure a reader would act on.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -137,26 +139,53 @@ def test_anvilgp_usually_but_not_always_beats_celerite2_on_matern32():
     assert max(errs_ag) < 1e-2, f"anvil-gp worst {max(errs_ag):.2e}"
 
 
-@pytest.mark.parametrize("term,m,eligible", [
-    (ag.RealTerm(), 1, True),
-    (ag.SHOTerm(), 2, True),
-    (ag.Matern32Term(), 2, True),
-    (ag.Matern52Term(), 3, True),
-    (ag.RotationTerm(), 4, True),
-    (ag.SHOTerm() + ag.SHOTerm(), 4, True),
-    (ag.SHOTerm() + ag.Matern52Term(), 5, False),
-    (ag.RotationTerm() + ag.SHOTerm(), 6, False),
+@pytest.mark.parametrize("term,m,n_par,eligible", [
+    (ag.RealTerm(), 1, 2, True),
+    (ag.SHOTerm(), 2, 3, True),
+    (ag.Matern32Term(), 2, 2, True),
+    (ag.Matern52Term(), 3, 2, True),
+    (ag.RotationTerm(), 4, 5, True),
+    (ag.SHOTerm() + ag.SHOTerm(), 4, 6, True),
+    (ag.SHOTerm() + ag.Matern52Term(), 5, 5, False),
+    (ag.RotationTerm() + ag.SHOTerm(), 6, 8, False),
 ])
-def test_the_kernel_tables_state_dimensions_and_eligibility(term, m, eligible):
+def test_the_kernel_tables_state_dimensions_and_eligibility(term, m, n_par,
+                                                            eligible):
     """docs/kernels.md prints `m` for every kernel and a table of which
     sums stay under the fused kernel's limit.  A reader designs their model
-    around these two columns."""
+    around these two columns.
+
+    The parameter map matches the term, and `GPPolicy(metal=True)` is
+    passed at construction rather than flipped afterwards, so this
+    exercises the real dispatch and the documented "warns and falls back"
+    behaviour -- not just the predicate.  An earlier version gave every
+    term a 2-parameter map and flipped the policy, which left `_metal_ok`
+    stale and made the objects uncallable.
+    """
     assert term.n_state == m, f"docs say m = {m}, got {term.n_state}"
-    t = np.arange(400) * 0.02
-    gp = GPLogLike(None, t, None, np.zeros(400), np.full(400, 0.3), term,
-                   ParamMap.log([1.0] * 2), GPPolicy(metal=False))
-    gp.policy.metal = True
+    n = 400
+    rng = np.random.default_rng(0)
+    t = np.arange(n) * 0.02
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gp = GPLogLike(None, t, None, rng.standard_normal(n),
+                       np.full(n, 0.3), term, ParamMap.log([1.0] * n_par),
+                       GPPolicy(metal=True))
     ok, why = gp.metal_eligible()
     assert ok is eligible, f"docs say {eligible}, got {ok}: {why}"
-    if not eligible:
+    assert gp._metal_ok is eligible
+
+    if eligible:
+        assert not [w for w in caught if "cannot be honoured" in str(w.message)]
+    else:
         assert "register budget" in why, why
+        # docs/kernels.md: "warns and falls back", not fails
+        assert [w for w in caught if "cannot be honoured" in str(w.message)], (
+            "kernels.md promises a warning on fallback")
+
+    # and it is actually callable on whichever path it chose
+    u = mx.zeros((2, n_par), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        v = gp(u)
+        mx.eval(v)
+    assert bool(mx.all(mx.isfinite(v)))

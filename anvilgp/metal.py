@@ -64,7 +64,26 @@ __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
 #: forward is already 13.2 GiB, so the old value refused work that runs
 #: comfortably.  8 GiB keeps this a sanity check: it still stops 4096
 #: chains at m = 4, which would ask for 49 GiB.
-MAX_ADJOINT_BUFFER_BYTES = 8 << 30
+def _default_adjoint_budget() -> int:
+    """8 GiB, or a quarter of the device's memory if that is smaller.
+
+    The fixed 8 GiB was calibrated on a 64 GB M2 Max, where the README
+    records a 3.05 GiB buffer sitting inside a 17.5 GiB gradient -- a
+    ~5.7x multiplier, so 8 GiB of buffer implies a ~45 GiB run.  On a
+    16 GB machine the allocator kills the process long before the fence
+    trips, and the user gets a kill instead of the fence's message naming
+    the cadence and the remedies.  A quarter of device memory keeps the
+    implied total inside what the device has.
+    """
+    try:
+        info = mx.device_info()
+    except Exception:                      # no Metal device, or older MLX
+        return 8 << 30
+    mem = int(info.get("memory_size", 0))
+    return min(8 << 30, mem // 4) if mem else 8 << 30
+
+
+MAX_ADJOINT_BUFFER_BYTES = _default_adjoint_budget()
 
 #: Largest state dimension the kernel accepts.  The running element is
 #: ``3m^2 + 2m + 1`` floats held in registers -- 17 at m = 2, 57 at m = 4,
@@ -1332,12 +1351,22 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
         # a slot per pair that *could* occur (40 GiB at 1024 chains x
         # N = 1e5, where the slots are 3 GiB).
         slab = 2 * n_chains * n_slots * m * m * 4
+        # The dense fold gathers (n_chains, n_lags, max_rank, m, m) on top
+        # of the buffer, and `_lag_fold_plan` only bounds that table at 4x
+        # the slots -- so a configuration comfortably inside the fence
+        # could still OOM in the fold.  Charge the gather to the same
+        # budget.  (The groups branch has no such intermediate.)
+        kind, plan = slots[3]
+        if kind == "dense":
+            slab += 2 * n_chains * int(plan.shape[0]) * int(plan.shape[1]) \
+                * m * m * 4
         if slab > MAX_ADJOINT_BUFFER_BYTES:
             raise ValueError(
                 f"the kernel gradient's adjoint buffer would be "
-                f"{slab / 2**30:.1f} GiB (2 x {n_chains} chains x {n_slots} "
-                f"(block, lag) slots x m^2 = {m * m} x 4 bytes), over "
-                f"MAX_ADJOINT_BUFFER_BYTES = {MAX_ADJOINT_BUFFER_BYTES / 2**30:.0f} GiB. "
+                f"{slab / 2**30:.1f} GiB ({n_chains} chains x {n_slots} "
+                f"(block, lag) slots x m^2 = {m * m}, plus the fold's "
+                f"gather), over MAX_ADJOINT_BUFFER_BYTES = "
+                f"{MAX_ADJOINT_BUFFER_BYTES / 2**30:.1f} GiB. "
                 f"Every distinct float32 spacing in the timestamps is a "
                 f"lag, and this cadence has {n_lags - 1} of them over "
                 f"{npts} points.  Bin the timestamps, use fewer chains, or "

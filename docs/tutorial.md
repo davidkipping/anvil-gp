@@ -2,8 +2,12 @@
 
 This walks through the same fit twice, once in celerite2 and once in
 anvil-gp, so the differences are concrete. The numbers quoted are the ones
-these blocks actually produce; `tests/test_docs.py` re-runs the claims so
-they cannot drift.
+these blocks actually produce. `tests/test_docs.py` re-runs the load-bearing
+ones — the celerite2 agreement, the batched shapes, the kernel/`m` table
+and the Matern-3/2 comparison — with tolerances loose enough to survive
+float32 noise. **The timings and the posterior table below are not
+pinned**: they move with machine load and sampler seed, so treat them as
+illustrative rather than as a contract.
 
 If you have never used celerite2, the short version is: both libraries
 compute the exact marginal likelihood of a Gaussian process whose kernel

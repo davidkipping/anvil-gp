@@ -588,7 +588,26 @@ class GPLogLike:
         self._build_slot_map()
 
     def _build_slot_map(self) -> None:
-        """Per-(block, lag) slot map and fold plan for ``self.metal_block``."""
+        """Per-(block, lag) slot map and fold plan for ``self.metal_block``.
+
+        Only the Metal backward reads this, so it is skipped when the
+        policy does not ask for the kernel: at N = 1e5 it is an
+        ``np.unique`` over 1e5 keys plus an argsort and three device
+        arrays, paid by every float64-only or MLX-path instance, and
+        `error_scaling.py`-style sweeps build many.  The setter still
+        rebuilds on every assignment, so the never-stale property holds.
+        """
+        if not self.policy.metal:
+            # Deferred, not skipped: `_evaluate_metal` rebuilds on first
+            # use, so flipping `policy.metal` after construction still
+            # works.  `_slot_map_blk` stays unset so the launch guard
+            # cannot mistake a deferred map for a stale one.
+            self._metal_slot_id = self._metal_slot_start = None
+            self._metal_slot_lag = self._metal_fold_plan = None
+            self._slot_map_blk = None
+            self.n_metal_slots = 0
+            return
+
         sid, sstart, slag = _slot_map(self._lag_np, self._metal_block)
         #: the block length this map was built for.  Comparing block
         #: *counts* is not enough: 512 and 600 both give 2 blocks at
@@ -655,6 +674,16 @@ class GPLogLike:
         if n_chunk <= 1:
             return term.matrices(kp(v), uniq)
 
+        # The chunk geometry depends only on (n_chains, n_lags, m), all
+        # fixed for an instance after the first call, so build the
+        # custom_function once: it is on the hot path (one or two per MCMC
+        # step) and a fresh primitive each time defeats any graph-level
+        # caching keyed on identity.  Same pattern as
+        # `metal._bwd_ckpt_kernels`.
+        cached = getattr(self, "_metal_matrices_fn", None)
+        if cached is not None and cached[0] == (v.shape[0], n_chunk):
+            return cached[1](v)
+
         n_lags = uniq.shape[0]
         step = -(-n_lags // n_chunk)
 
@@ -690,6 +719,7 @@ class GPLogLike:
                 acc = g if acc is None else acc + g
             return acc
 
+        self._metal_matrices_fn = ((v.shape[0], n_chunk), core)
         return core(v)
 
     def _evaluate_metal(self, v: mx.array) -> mx.array:
@@ -702,9 +732,11 @@ class GPLogLike:
         from .metal import scan_loglike
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
+        if self._metal_slot_id is None:        # deferred at construction
+            self._build_slot_map()
         # The property setter makes this unreachable; it stays because the
         # failure it guards is silent (see `metal_block`) and the check is
-        # a host-side shape comparison.
+        # a host-side comparison of the block length the map was built for.
         if self._slot_map_blk != self.metal_block:
             raise RuntimeError(
                 f"the kernel's slot map was built for metal_block="
@@ -1104,6 +1136,16 @@ def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     reaches 75 GiB at production size.
     """
     table = 2 * n_chains * n_lags * n_state * n_state * 4
+    # Known limitation: `_core_vjp` holds c_phi and c_q -- one full table
+    # each -- live across the whole chunk loop and slices them per chunk,
+    # so ~`table` bytes are a floor on peak that no chunk count reduces.
+    # The budget below covers only the *retained intermediates*, so the
+    # achieved peak is roughly the budget plus that floor: small at
+    # N = 2e4, where this was validated, and ~6 GiB at 1e5 x 1024 chains.
+    # Subtracting the floor here would raise the chunk count, and the
+    # docstring's own measurements show chunking harder costs real time
+    # (16 chunks: 127 ms against 28 ms at 4), so it is documented rather
+    # than "fixed" without a measurement to justify the trade.
     want = _FRONT_END_RETENTION * table
     if want <= _FRONT_END_BUDGET_BYTES:
         return 1

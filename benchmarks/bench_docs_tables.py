@@ -30,6 +30,27 @@ import time
 import numpy as np
 
 _DATA = {}
+_POOL = {}          # (n_proc, kind, n) -> Pool, so it is built once
+
+
+def _get_pool(n_proc, kind, t, y, yerr):
+    """One warmed pool per (workers, kernel, N), reused across cells.
+
+    `bench_vs_celerite2.py` forces the fork start method for the same
+    reason: under spawn (macOS's default since 3.8) every worker re-imports
+    celerite2 and numpy, which shows up as celerite2 being slow rather than
+    as process startup.  Building a fresh pool per table cell put that cost
+    in fifteen separate measurements.
+    """
+    key = (n_proc, kind, len(t))
+    if key not in _POOL:
+        try:
+            mp.set_start_method("fork", force=True)
+        except RuntimeError:
+            pass
+        _POOL[key] = mp.Pool(n_proc, initializer=_init,
+                             initargs=(t, y, yerr, kind))
+    return _POOL[key]
 
 
 def _init(t, y, yerr, kind):
@@ -150,13 +171,17 @@ def time_celerite2(kind, n, n_chains, n_proc, reps=3, probe=8):
     n_use = max(1, min(n_proc, n_chains))
     chunks = [c for c in np.array_split(np.tile(np.array(pars), (n_chains, 1)),
                                         n_use) if len(c)]
-    with mp.Pool(n_use, initializer=_init, initargs=(t, y, yerr, kind)) as pool:
-        pool.map(_loglike_chunk, [c[:1] for c in chunks])      # warm up
-        ts = []
-        for _ in range(reps):
-            t0 = time.perf_counter()
-            pool.map(_loglike_chunk, chunks)
-            ts.append(time.perf_counter() - t0)
+    pool = _get_pool(n_use, kind, t, y, yerr)
+    pool.map(_loglike_chunk, [c[:1] for c in chunks])          # warm up
+    ts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        pool.map(_loglike_chunk, chunks)
+        ts.append(time.perf_counter() - t0)
+    # The minimum, not the median `bench_vs_celerite2.py` reports: on this
+    # machine background load only ever *adds* time, so the minimum is the
+    # least contaminated estimate (see the benchmarking notes). The two
+    # scripts therefore differ slightly even on identical inputs.
     return min(ts) * 1e3
 
 
@@ -276,4 +301,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        for _p in _POOL.values():
+            _p.terminate()
