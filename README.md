@@ -36,6 +36,23 @@ posterior = gt.natural(gt.transform.model_np(res.get_chain(flat=True)))
 parameter is an offset from, proper default priors, and a jitter — see
 [Parametrisation](#parametrisation-and-priors).
 
+## Documentation
+
+| | |
+|---|---|
+| [docs/tutorial.md](docs/tutorial.md) | Getting started, side by side with celerite2 |
+| [docs/kernels.md](docs/kernels.md) | Every supported kernel, how to set it up, and what is not supported |
+| [docs/benchmarks.md](docs/benchmarks.md) | Speed and accuracy against celerite2 across scales and kernels — including where celerite2 wins |
+| [docs/float32.md](docs/float32.md) | The precision discipline and its measured error budget |
+| [docs/statistical-foundation.md](docs/statistical-foundation.md) | Why the state-space form is exact |
+
+**The one-line summary of the comparison:** celerite2 is faster for a
+single likelihood and seven orders more accurate in absolute terms;
+anvil-gp is 20-46x a 12-core celerite2 pool once you need hundreds of
+parameter vectors at once, carries its own gradient, and is the more
+accurate of the two on Matern-3/2. Break-even is about 26 parameter
+vectors at N = 1000 and about 1.4 at N = 1e5.
+
 ## Why a state-space model rather than celerite's Cholesky
 
 Every celerite kernel *is* a linear Gaussian state-space model (the CARMA
