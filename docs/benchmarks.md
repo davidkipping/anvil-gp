@@ -10,8 +10,9 @@ accuracy — with one command:
 The break-even table and the MCMC worked example below are hand-written
 from separate runs and are **not** covered by that script.
 
-Measured on an M2 Max (12 CPU cores, 64 GB unified memory) on 2026-09-24,
-in a window where a stability probe read 0.4% spread. Wall times on this
+Measured on an M2 Max (12 CPU cores, 64 GB unified memory) on 2026-09-27,
+in a window where a stability probe read 0.7% spread and the GPU was
+otherwise idle. Wall times on this
 machine move by 2x under background load, so check
 `benchmarks/verify_readme.py`'s probe before believing any timing you take
 yourself.
@@ -59,12 +60,15 @@ The crossover — where the fused kernel's fixed ~1.5 ms launch cost is
 repaid — depends on N, because celerite2's per-vector cost grows with N
 while the kernel's barely does:
 
-| N | parameter vectors to break even vs 1 core |
-|---|---:|
-| 1,000 | ~26 |
-| 2,000 | ~16 |
-| 10,000 | ~5 |
-| 100,000 | ~1.4 |
+| N | vs 1 core | vs a 12-core pool |
+|---|---:|---:|
+| 1,000 | ~26 | ~158 |
+| 10,000 | ~5 | ~40 |
+| 100,000 | ~1.4 | ~12 |
+
+Against one core the crossover is small; against a *fully parallelised*
+pool — the honest denominator if you are willing to run one — it is 158
+parameter vectors at N = 1000, falling to 12 at N = 1e5.
 
 Above that anvil-gp pulls away quickly; at 1024 parameter vectors and
 N = 1e5 it is
@@ -79,21 +83,22 @@ single core and a 12-core multiprocess pool.
 
 | N | parameter vectors | anvil-gp kernel | anvil-gp MLX | celerite2 1 core | celerite2 12 cores | kernel vs 1 core | kernel vs pool |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 1,000 | 1 | **1.53** | 26 | 0.06 | 1.47 | 0.04x | 0.96x |
-| 1,000 | 64 | **1.61** | 25 | 3.93 | 2.86 | 2.4x | 1.8x |
-| 1,000 | 1024 | **1.61** | 26 | 63 | 11 | **39x** | 6.6x |
-| 10,000 | 1 | **1.96** | 87 | 0.43 | 0.91 | 0.22x | 0.46x |
-| 10,000 | 64 | **2.44** | 94 | 28 | 4.61 | **12x** | 1.9x |
-| 10,000 | 1024 | **2.86** | 136 | 430 | 58 | **151x** | **20x** |
-| 100,000 | 1 | **5.95** | 830 | 4.14 | 5.18 | 0.70x | 0.87x |
-| 100,000 | 64 | **8.62** | 875 | 273 | 41 | **32x** | 4.7x |
-| 100,000 | 1024 | **13** | 1307 | 4249 | 578 | **336x** | **46x** |
+| 1,000 | 1 | **1.54** | 25 | 0.06 | 0.25 | 0.04x | 0.16x |
+| 1,000 | 64 | **1.82** | 25 | 3.97 | 1.07 | 2.2x | 0.58x |
+| 1,000 | 1024 | **1.59** | 27 | 67 | 10 | **42x** | 6.5x |
+| 10,000 | 1 | **1.96** | 89 | 0.41 | 0.57 | 0.21x | 0.29x |
+| 10,000 | 64 | **2.39** | 90 | 27 | 4.27 | **11x** | 1.8x |
+| 10,000 | 1024 | **2.85** | 137 | 421 | 50 | **148x** | **18x** |
+| 100,000 | 1 | **5.92** | 831 | 3.90 | 4.27 | 0.66x | 0.72x |
+| 100,000 | 64 | **8.55** | 854 | 248 | 35 | **29x** | 4.1x |
+| 100,000 | 1024 | **13** | 1300 | 4001 | 490 | **315x** | **39x** |
 
 **Read the first row of each block first.** At one parameter vector,
-celerite2 on a single core beats the fused kernel by 25x at N = 1000, by
-4.5x at N = 1e4, and by 1.4x at N = 1e5. That is a fixed GPU launch cost
-of roughly 1.5 ms that a single small problem cannot amortise. It is not a
-defect to be tuned away; it is what a GPU is.
+celerite2 on a single core beats the fused kernel by 26x at N = 1000, by
+4.8x at N = 1e4, and by 1.5x at N = 1e5 — and its 12-core pool beats it up
+to 64 vectors at N = 1000. That is a fixed GPU launch cost of roughly
+1.5 ms that a small problem cannot amortise. It is not a defect to be
+tuned away; it is what a GPU is.
 
 **The batch is nearly free.** Going from 1 to 1024 parameter vectors
 costs the
@@ -140,42 +145,41 @@ ensemble sampler on the fused kernel:
 
 | | N = 1,000 | N = 100,000 |
 |---|---:|---:|
-| | N = 1,000 |
-|---|---:|
-| batched calls | 1,200 (2 per step, 512 wide) |
-| **anvil-gp, end to end** | **2.7 s** |
-| of which likelihood | 2.2 s (83%) |
-| of which anvil's sampler | 0.4 s (17%) |
-| celerite2, 614,400 evaluations, 1 core | 38.6 s |
-| celerite2, same, 12-core pool | 6.6 s |
-| **end-to-end speedup vs the pool** | **~2.4x** |
+| batched calls | 1,200 (2 per step, 512 wide) | 1,200 |
+| **anvil-gp, end to end** | **0.76 s** | **10.65 s** |
+| celerite2, 614,400 evaluations, 1 core | 36.5 s | 40 min |
+| celerite2, same, 12-core pool | 6.0 s | 294 s |
+| **speedup vs 1 core** | **48x** | **226x** |
+| **speedup vs the pool** | **7.9x** | **28x** |
 
-anvil-gp's row is an end-to-end measurement with anvil's sampler. The
-celerite2 rows are its measured per-vector cost times 614,400; the pool
-row divides by the *measured* pool throughput, not by 12. The N = 100,000
-column that stood here was arithmetic from the table above rather than a
-run, and is withdrawn until it is measured; the ratio there will be far
-larger, because celerite2's per-evaluation cost grows with N and the
-kernel's grows much more slowly.
+anvil-gp's row is the minimum of three end-to-end runs with anvil's
+sampler. The celerite2 rows scale its measured per-vector cost (0.059 ms
+and 3.92 ms) to 614,400 evaluations; the pool row scales its measured
+1024-vector throughput. Nothing here is a 12-core end-to-end run.
+
+**What is not in this table, and why.** Earlier versions split anvil-gp's
+wall time into "likelihood" and "sampler overhead" (12%, then 17%). Both
+were wrong: timing the likelihood in isolation forces an `mx.eval` per
+call that the sampler pipelines away, and the isolated sum comes out
+*larger than the whole measured run* — 2.06 s of "likelihood" inside a
+0.76 s wall. The split is not measurable that way, so it is gone.
 
 Two things to take from this.
 
-**The end-to-end speedup is much smaller than the kernel speedup**, for
-two reasons that compound. The sampler costs 17% of wall time here and no
-likelihood improvement touches it. And the red-black split means you pay
-two half-width calls per step rather than one full-width one, which at
-this N costs another ~1.5x. The 6.6x kernel-only ratio in the table above
-becomes ~2.4x end to end. **Treat the kernel-only tables as an upper
-bound**, and a loose one at small N.
+**The end-to-end numbers track the kernel-only ones closely here**, which
+was not true of the earlier, contended measurements: 7.9x end to end
+against 6.5x kernel-only at N = 1000, and 28x against 39x at N = 1e5. The
+sampler's own cost and the red-black split (two half-width calls per step
+rather than one full-width one) are real but modest at these sizes. Treat
+the kernel-only tables as indicative rather than as a guarantee, and
+measure your own problem.
 
 **The advantage grows with N**, because celerite2's per-evaluation cost
 grows linearly with the data while the fused kernel's grows far more
 slowly — over the range in the table above, 1,000 to 100,000 points,
-celerite2 goes 63 ms to 4249 ms per 1024-vector batch (67x) while the
-kernel goes 1.61 ms to 13 ms (8x). At a thousand points anvil-gp is
-roughly twice a fully parallelised pool end to end and you might
-reasonably not bother. The gap widens by about an order of magnitude over
-that range.
+celerite2 goes 67 ms to 4001 ms per 1024-vector batch (60x) while the
+kernel goes 1.59 ms to 13 ms (8x). End to end that is 7.9x a fully
+parallelised pool at a thousand points and 28x at a hundred thousand.
 
 ### If you use a gradient sampler
 

@@ -524,7 +524,7 @@ numerical configurations found nothing because the arithmetic was right.
 The mutations and the attribute assignment found the defects in minutes.
 Review the contracts between components before the numerics inside them.
 
-## Closing measurement, 2026-09-24
+## Closing measurements
 
 The README verifier could not time anything during stages A-D because a
 two-day PyTorch job held the GPU at 75-95%. Run once the machine was
@@ -533,3 +533,21 @@ ms against the README's 75.1 / 719; Metal forward 1.60 / 11.6 against
 1.67 / 11.5; MLX gradient 880 against 880; Metal gradient 9.37 / 58.8
 against 8.9 / 58.2; accuracy rows unchanged. The interleaved A/B in stage
 D predicted this, and the prediction was checked rather than trusted.
+
+**2026-09-27, the docs' own tables.** Re-run in a quiet window (0.7%
+probe, GPU idle): the README verifier passes all ten rows again, and
+`bench_docs_tables.py`'s three tables are regenerated with the pool
+harness fixed. Two numbers moved enough to matter. celerite2's 12-core
+pool got much faster at small batches once the empty-chunk and
+fork/warm-up bugs were fixed, so its pool now *beats* the fused kernel up
+to 64 parameter vectors at N = 1,000, and break-even against a fully
+parallelised pool is 158 vectors there rather than the 26 that holds
+against one core. And the MCMC worked example, measured end to end rather
+than contended, is 0.76 s at N = 1,000 against 6.0 s for the pool (7.9x)
+and 10.65 s at N = 1e5 against 294 s (28x).
+
+The likelihood/sampler split that stood in that table twice (12%, then
+17%) is withdrawn, not corrected: timing the likelihood in isolation
+forces an `mx.eval` per call that the sampler pipelines away, and the
+isolated sum came out larger than the whole measured run (2.06 s inside a
+0.76 s wall). It is not measurable that way.

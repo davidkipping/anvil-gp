@@ -139,12 +139,13 @@ log-likelihoods** however they are batched.
 Through celerite2 that is a Python loop of 614,400 calls. Through anvil-gp
 it is 1,200 batched calls: anvil's `EnsembleKernel` is a red-black scheme,
 so each step splits the ensemble and issues **two calls of 512**, which is
-what keeps the vectorised move detailed-balanced. Two half-width calls
-cost about 1.5x one full-width call at this size, so the split is not
-free — see
-[benchmarks.md](benchmarks.md#what-this-means-for-an-mcmc-run) for the
-end-to-end figures and the caveat that they are well below the
-kernel-only ratios.
+what keeps the vectorised move detailed-balanced.
+
+Measured end to end at N = 1,000, that run takes **0.76 s**. The same
+614,400 evaluations cost celerite2 36.5 s on one core and 6.0 s on a
+12-core pool — 48x and 7.9x. At N = 100,000 it is 10.65 s against 40
+minutes and 294 s, so 226x and 28x. Full table and method in
+[benchmarks.md](benchmarks.md#what-this-means-for-an-mcmc-run).
 
 You cannot dodge this by using fewer walkers. Ensemble samplers need more
 walkers than twice the parameter count to move at all, and your effective
