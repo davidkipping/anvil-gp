@@ -1,190 +1,321 @@
 # Plan: per-instrument jitter, exposure-time integration, and the compile split
 
-Status: proposed 2026-09-27, not locked. Three items, deliberately in this
-order: one certain, one substantial but contained, one whose obvious
-approach is already measured not to work.
+Status: proposed 2026-09-27; **adversarially reviewed the same day and
+revised** — see "Stage R" at the end. Not locked. The review overturned the
+plan's central design claim and inverted its ordering; the stages below
+are the revised ones, and the original reasoning is kept where it was
+wrong so the correction is legible.
 
-Everything below rests on experiments run before writing, recorded here so
-the estimates are not guesses.
+## What was measured first, and what it did and did not show
 
-## What was measured first
+**Exposure-time integration keeps the rates and rescales the amplitudes.**
+celerite2's `TermConvolution` does exactly two things: it rescales the
+celerite amplitudes and adds a constant to the diagonal. The rates are
+untouched — verified identical to machine precision over eight terms and
+six exposure widths, including a real term, two sums with different
+rates, and overdamped SHOs — and for lags at or beyond the exposure width
+the convolved kernel is exactly a sum of exponentials with the modified
+amplitudes (agreement 3e-16, and by construction: celerite2's own
+`get_value` *is* that sum in that branch).
 
-**Exposure-time integration does not fit the current state-space
-construction.** celerite2's `TermConvolution` does exactly two things: it
-rescales the celerite amplitudes and adds a constant to the diagonal. The
-*rates* are untouched — verified identical to machine precision — and for
-lags at or beyond the exposure width the convolved kernel is exactly a sum
-of exponentials with the modified amplitudes (agreement 4.4e-16). So it is
-celerite-class and therefore a state-space model.
+**The rescaling breaks the SHO's amplitude ratio.** anvil-gp's SHO has
+`b/a = c/d` exactly; at `delta = 1.5` against `rho = 4` the convolution
+moves `b/a` from 0.169 to 0.348. Fitting a free two-vector `h` over the
+existing SHO basis leaves a 6% residual.
 
-But it is not *this* library's state-space model. anvil-gp builds every
-term with `P_inf = I` and the amplitude carried in `h`, which forces the
-ratio `b/a = c/d`. The convolution breaks that ratio: at `delta = 1.5`
-against `rho = 4`, `b/a` goes from 0.169 to 0.348 while `c/d` stays
-0.169. Fitting a free two-vector `h` over the existing SHO basis to the
-convolved kernel leaves a residual of 6.7e-2 against a kernel of
-amplitude 1.04 — **6%, not roundoff**. A general complex amplitude pair
-needs a general `P_inf`.
+**The original inference from that was wrong.** The plan concluded that a
+general stationary covariance `P_inf` was needed. Two facts, both proved
+and measured in the review, say otherwise:
 
-**The obvious term-matrix split does not work.** The stated fix has been
-"split the VJP at the term-matrix table", and `_metal_matrices` already
-wraps `Term.matrices` in a `custom_function` when the front end is
-chunked. Forcing that wrapper on unconditionally and compiling
-`value_and_grad` fails *identically to the baseline*, with the same fused
-kernel name. The over-fused group is a long elementwise chain inside the
-term algebra itself, and a `custom_function` boundary around the whole
-thing does not break it. Whatever the fix is, it is not this.
+1. *No stationary model with positive process noise can realise the
+   convolved kernel, whatever `P_inf` is.* For any such model the
+   kernel's initial slope is `k'(0+) = -½ h Q_c hᵀ ≤ 0` — the other term,
+   `½ h (FP - PFᵀ) hᵀ`, vanishes identically because `FP - PFᵀ` is
+   antisymmetric. That is `b/a ≤ c/d`, celerite's own positive-definiteness
+   condition. The un-convolved SHO sits exactly on that boundary and the
+   convolution pushes it outside for every exposure width (by +1.8e-2 at
+   `delta = 0.5`). A brute search over general `(F, P_inf, h)` with
+   positive noise enforced bottoms out at 2.1% residual; drop the
+   constraint and it reaches 6e-15. So generalising `P_inf` buys nothing.
+2. *Every positive-definite complex term is already reachable with
+   `P_inf = I`*, by a three-parameter generalisation of the SHO basis:
+   `beta = b d / a`, `g = c - beta`, `s = √(beta² + d²)`, `h = (√a, 0)`,
+   `F = [[-g, s], [-s, -(2c - g)]]`, `Q_c = diag(2g, 2(2c - g))`. Verified
+   against `celerite2.terms.ComplexTerm` on 200 random terms to 1.3e-11
+   (via `expm`; 3e-14 with the analytic propagator), including `d → 0`,
+   `b = 0`, and `b` on the boundary. The existing `_sho_matrices` is the
+   special case `beta = c, s = omega_0`, reproduced to 0.0 and 2e-16.
+3. *And the filter does not need positive noise.* It is linear algebra on
+   the observed covariance, which is positive-definite whenever every
+   spacing is at least the exposure width. The same construction on the
+   convolved amplitudes — with `Q_c` formally indefinite — reproduces
+   celerite2's `TermConvolution` log-likelihood to 1e-14 … 4e-13 across
+   SHO, real, and real-plus-SHO terms at three exposure widths.
 
-**One correction to an earlier claim.** `docs/float32.md` and the M4 stage
-R notes say the compile failure is an uncatchable process abort. In this
-probe it surfaced as an ordinary Python `RuntimeError` and the process
-continued. Either MLX changed or the characterisation was wrong; the docs
-should be re-checked when this work starts.
+So the general complex term, `OriginalCeleriteTerm` and exposure time are
+one piece of front-end work, and it is *smaller* than the plan first
+said: a third free rate in `_sho_matrices`, not a new stationary
+covariance threaded through the package. The kernel is untouched. The
+risk moves to one new special function, named under stage 3a.
 
-## Stage 1 — per-instrument jitter in the kernel
+**The compile failure has a one-function cause.** The stated fix had been
+"split the VJP at the term-matrix table". Forcing the existing
+`custom_function` wrapper on unconditionally fails identically to the
+baseline, same fused kernel. Bisecting instead: the offender is
+`special.sincm1`, whose `direct` branch (a three-way nested `where` inside
+`sinc_gen`, each arm sanitised) exhausts the 24-buffer limit on its own.
+At both `_sho_matrices` call sites the argument is bounded by 2, the
+series threshold, so **that branch is provably dead there**: the
+series-only form is bit-identical over 20,005 points in float32 and
+float64, and with it in place `mx.compile(mx.value_and_grad(...))`
+succeeds for every term and both likelihood paths, value bit-identical,
+gradient within 8e-7 relative (float32 reassociation). The full suite
+passes under the patch except the one test that asserts compilation
+fails. This is not an investigation; it is a commit.
 
-Supported on the MLX path today and refused by `metal_eligible()`. The
-host already computes per-datum jitter (`ParamMap.jitter_var(v, idx)`) and
-already carries an instrument index (`_inst32`).
+**The failure is a catchable `RuntimeError`**, not the "uncatchable
+process abort" that `docs/float32.md` and the M4 stage R notes describe.
+Twenty probes, process survived every time. `mx.eval` inside a compiled
+function is rejected outright, so placement cannot be the difference.
 
-What changes:
+## Stage 1 — the compile fix (was stage 3, was "capped and allowed to fail")
 
-* The forward kernel reads `jit2[chain * n_jit]` once per thread, outside
-  the observation loop (`metal.py:114`). It becomes a per-observation read
-  indexed by the instrument, `jit2[chain * n_jit + inst[gi]]`, in the
-  forward and in both replays of the backward.
-* The backward accumulates one `drv` scalar per `(chain, block)`. It needs
-  one per `(chain, block, instrument)`. `n_jit` is a handful, so a
-  per-thread `float drv_acc[MAX_JIT]` with a compile-time cap is enough —
-  no flush-on-change machinery required.
-* `metal_eligible()` drops the one-jitter refusal and gains a
-  `n_jit <= MAX_JIT` one.
+Use the series-only `sincm1` at the two `_sho_matrices` call sites, where
+the other branch cannot be taken. `special.sincm1` itself and its mpmath
+pinning stay as they are.
 
 | gate | |
 |---|---|
-| correctness | kernel gradient matches `GPPolicy(metal=False)` to 1e-5 and float64 central differences to 1e-6, with 1, 2 and 4 instruments, on every cadence in `_fwd_setup` |
-| the jitter gradient specifically | each instrument's jitter adjoint matches; a test that permutes the instrument labels must fail |
-| no regression | single-jitter timings unchanged in an interleaved A/B; the one-jitter path must not pay the per-observation read |
-| cost | one extra indexed global read per observation in three kernels |
+| bit-identity | the term matrices are unchanged to the bit in float32 and float64 (already measured; pin it) |
+| the point | `mx.compile(mx.value_and_grad(gp))` succeeds on both paths, for every term and a `TermSum` |
+| the suite | green, with `test_compiled_value_and_grad_exhausts_metal_argument_buffers` inverted to assert success |
+| the docs | `float32.md` and the README's "Known limitation" rewritten; the "process abort" claim corrected; `mx.disable_compile()` removed from the ChEES examples and `tests/test_calibration.py` |
+| upstream | file the MLX reproducer: `sincm1` alone at 1 chain x 2 lags is a four-line case |
 
-Half a day. The risk is low and the failure mode is visible: a wrong
-instrument index gives a wrong value, not just a wrong gradient, because
-the jitter is inside the innovation variance.
+The measured prize, one size (64 chains x N = 4096, Metal path,
+interleaved): gradient 3.72 ms → 3.04 ms from removing the dead branch,
+→ 1.91 ms compiled — **1.95x overall**, against the "1.15-1.25x" the
+plan expected. One machine, one size, indicative only. Half a day.
 
-## Stage 2 — a general complex term, which is what exposure time needs
+**Not verified:** whether anvil's ChEES leapfrog then compiles end to end.
+The likelihood's `value_and_grad` does; the sampler was not run.
 
-This is the substantial one, and it buys three things at once because all
-three are the same underlying gap:
+## Stage 2 — per-instrument jitter in the kernel (was stage 1)
 
-* `ComplexTerm(a, b, c, d)` — the general celerite term.
-* `OriginalCeleriteTerm` — a reparametrisation of it.
-* `TermConvolution` — exposure-time integration, which is `ComplexTerm`
-  with rescaled amplitudes plus a diagonal constant.
+The shape is right; three premises in the original were wrong and change
+the work.
 
-### 2a. Generalise `P_inf`
+* **There is no per-instrument accessor.** `ParamMap.jitter_var(v, inst)`
+  returns per-*datum* variances, `(n_chains, N)`, via `mx.take`, and with
+  `inst=None` it raises. The kernel needs `(n_chains, n_jit)`. Stage 2
+  writes that accessor.
+* **A wrong instrument index does not necessarily change the value.**
+  `priors.jitter_hyper` gives every instrument the same reference, so at
+  `v = 0` — anvil's starting point — all jitters are numerically equal and
+  permuting the labels leaves the log-likelihood **bit-identical** while
+  the jitter gradients swap (measured: 0.0 on the value, 7.65 on the
+  gradient). The failure is silent exactly where a sampler starts. The
+  permutation gate must use *distinct* jitter values and assert on the
+  gradient.
+* **`param_map.instrument` is validated nowhere.** Label 7 with 3 jitters
+  goes through `mx.take` silently today; in the kernel it would read the
+  next chain's row. Stage 2 adds a host range check.
 
-Today every term returns `(Phi, Q, h)` with `P_inf = I` implied, and the
-first observation's absent predecessor is table row 0 holding
-`Phi = 0, Q = I`. Generalising means a term may declare its own `P_inf`,
-and row 0 holds `Q = P_inf`.
+What changes: the forward kernel's once-per-thread jitter read
+(`metal.py:114`) becomes a per-observation read indexed by instrument,
+at that site and at the two spliced copies of `_FWD_STEP` and the
+backward sweep. The backward accumulates `float drv_acc[MAX_JIT]`;
+`out_drv` becomes `(n_chains, n_blocks, MAX_JIT)`; the VJP slices
+`[:, :n_jit]`. **Zero all `MAX_JIT` slots**, not only the ones a block
+uses: `mx.fast.metal_kernel` outputs are not zero-initialised. Instruments
+absent from a block are fine (slot stays 0); absent from the whole
+dataset give an exactly-zero gradient and should warn.
 
-**The kernel needs no change.** Its only `P_inf = I` assumption is that
-row 0, which is built on the host (`likelihood.py:750`). The kernel reads
-whatever the table contains. That is the single most important finding
-for this estimate: a general `P_inf` is a front-end change and the fused
-kernel and its hand-derived gradient come along unchanged.
+**Design it as an additive per-(chain, instrument) diagonal term, not as
+"the jitter".** Stage 3c needs to add a parameter-dependent constant to
+the diagonal, per chain and (with per-instrument exposure times) per
+instrument. That is this slot. Build it once.
 
-Gate: every existing term, re-expressed through the general path,
-reproduces its current `Phi`, `Q`, `h` bit-identically in float64 and its
-`value_np` to 1e-12. The whole suite passes with no tolerance change.
+| gate | |
+|---|---|
+| correctness | kernel vs `GPPolicy(metal=False)` to 1e-5 and vs float64 central differences to 1e-6, with 1, 2 and 4 instruments, on every cadence in `_fwd_setup` — the MLX reference is trustworthy (its per-instrument jitter adjoints already match float64 to 1.5e-7) |
+| the trap | distinct jitter values, labels permuted: the *gradient* test must fail |
+| no regression | single-jitter timings unchanged interleaved; the one-jitter path keeps the once-per-thread read behind a compile-time switch (doubles the kernel cache keys) |
 
-### 2b. `ComplexTerm`
+Half a day for the code is credible. The gates are a day: 5 cadences x 3
+instrument counts x value, gradient, and central differences.
 
-`k(tau) = e^{-c tau} (a cos d tau + b sin d tau)`, two states, rates `c`
-and `d`, amplitudes `a` and `b` carried in `P_inf`.
+## Stage 3 — the general complex term, and exposure time on top of it (was stage 2)
 
-Gate: float64 parity with `celerite2.terms.ComplexTerm` to ~1e-11 over a
-grid including the degenerate corners (`d -> 0`, which is a real term;
-`b -> 0`; `c -> 0`, undamped). The existing `SHOTerm` at `Q > 1/2` must be
-reproducible as a `ComplexTerm` to 1e-12, which is the cross-check that
-the parametrisation is right.
+### 3a. Generalise `_sho_matrices` from two rates to three
 
-### 2c. `TermConvolution`
+`(omega_0, Q)` becomes `(c, beta, s)` with `P_inf = I` kept. `Phi` and `Q`
+keep their algebraic shape exactly (verified against `expm` and
+`I - Phi Phiᵀ` to 2e-15):
 
-Wraps any term: take its celerite coefficients, apply the closed-form
-amplitude rescaling, and add the diagonal constant to `r_var`.
+```
+Q11 = (1 - E) - 2 b_ E C S - 2 b_² E S²
+Q22 = (1 - E) + 2 b_ E C S - 2 b_² E S²
+Q12 = 2 b_ s_ E S²          with b_ = beta dt, s_ = s dt, E = e^{-2c dt}
+```
 
-Two things to get right, both already visible in celerite2's source:
+**The one new numeric object** is the two-argument
+`1 - e^{-2a}(1 + 2b + 2b²)`, which replaces `gamma3(2a) = 1 - e^{-2a}(1 +
+2a + 2a²)` and reduces to it at `a = b`. Its small-`dt` behaviour is
+`2(a - b) = 2 g dt`, first order rather than third, so the cancellation
+is *milder* everywhere except as `g → 0`, the SHO boundary, where
+`gamma3` is the limit. **That is where stage 3's risk lives**, and it is
+not the risk the original plan named. The `direct`/`series` split in
+`special.py` is the template.
 
-* **The diagonal correction is not optional.** For lags below the exposure
-  width the kernel is *not* the sum of exponentials, and celerite2 handles
-  this by adding a scalar to the diagonal. That scalar goes exactly where
-  anvil-gp already puts `r_ref` and the jitter, so it costs nothing new.
-* **The exposure width must not exceed the smallest non-zero spacing.**
-  Otherwise a real lag falls inside the window where the sum-of-
-  exponentials form is wrong. Physically that is automatic for one
-  instrument, since you cannot sample faster than you expose. Two
-  instruments observing simultaneously with different exposure times is
-  the genuine edge case and should be **refused**, not approximated.
+Gate: the existing SHO reproduced bit-identically in float64 and float32
+through the general path (`beta = c, s = omega_0`); the new function
+pinned against mpmath in float32 across the `(a, b)` plane including
+`g → 0`; the whole suite green with no tolerance change. Because
+`P_inf = I` is kept, `first_point()`, the pivot floor in `linalg.py`, the
+`.hi()` path and `sample_ssm` need **no change** for this stage.
 
-Gate: float64 parity with `celerite2.terms.TermConvolution` to ~1e-11
-across `delta/rho` from 1e-3 to 1 and across the kernels it wraps;
-`delta -> 0` must recover the unconvolved term to 1e-12; a cadence with a
-spacing below `delta` must raise with a message naming the offending
-spacing. Plus the float32 kernel path against the float64 oracle at the
-usual tolerances, and a gradient check, since `delta` is data and not a
-sampled parameter but the rescaled amplitudes are functions of the
-sampled ones.
+### 3b. `ComplexTerm` and `OriginalCeleriteTerm`
 
-Two to three days. The risk is concentrated in 2a: `terms.py` holds the
-cancellation-free special functions that are the most delicate numerics in
-the package and are pinned against mpmath, so the gate for 2a is
-bit-identical reproduction of what exists rather than "close enough".
+The construction above, exposed. Gate: float64 parity with
+`celerite2.terms.ComplexTerm` to ~1e-11 over a grid including `d → 0`,
+`b = 0`, `c → 0` and `b` on the positive-definiteness boundary (where
+`Q_c` has an exact zero eigenvalue); `OriginalCeleriteTerm` by
+reparametrisation. Overdamped `Q < 1/2` goes through the analytic
+continuation to `d² < 0`; `F` and `h` come out exactly real (measured,
+max imaginary part 0.0). **Do not route it through celerite2's two-real-
+term decomposition**, which carries a negative amplitude and is the only
+form that would need a signed `P_inf`.
 
-## Stage 3 — the compile split, as an investigation with a go/no-go
+### 3c. `TermConvolution`
 
-The prize is removing the process-global `mx.disable_compile()` that
-ChEES-HMC currently needs. The measured speed prize is small: the term
-front end's backward is **32% of a gradient call at N = 1e4 and 5% at
-N = 1e5**, and the one time a split was tried it bought 1.15-1.25x.
+The same construction on the rescaled amplitudes, with `Q_c` formally
+indefinite. Four things the original plan got wrong or left out:
 
-Since the `custom_function` boundary is now known not to work, stage 3
-starts as a bounded investigation:
+* **The diagonal correction is a function of the sampled parameters.**
+  Measured: 0.3% of `k(0)` at `delta/rho = 0.125`, 2.3% at 0.25, 8.5% at
+  0.375, and it scales with `sigma²` and varies with `rho` and `Q`. It
+  cannot go into `r_ref`, which is per-observation data with no gradient.
+  It goes through stage 2's additive per-(chain, instrument) diagonal
+  slot, and MLX's chain rule on the host carries its gradient. A user
+  with no jitter parameter still needs the slot.
+* **Refuse any spacing below the exposure width, including zero.** The
+  original rule said "smallest *non-zero* spacing", and zero is the case
+  that fails: at `tau = 0` the off-diagonal is the exponential sum's
+  value, not the convolved kernel's. For a term with a real component the
+  observed matrix goes indefinite (min eigenvalue -3.0e-2 at
+  `delta = 0.1`, needing `yerr` of 14% of `√k(0)` to rescue) and the
+  filter's innovation variance goes negative — a NaN. For SHO-only terms
+  it stays positive but wrong by up to 6e-2 log-units. anvil-gp
+  *supports* duplicate timestamps (`linalg.py:20`, the `dupes` and
+  `alternating` fixtures), so this is reachable. Two instruments observing
+  simultaneously with different exposure times is this case, not a
+  separate one. Near-duplicates decay smoothly (2e-5 of `k(0)` at
+  `0.01 delta`), so the rule needs no tolerance.
+* **Matern-5/2 has no celerite coefficients**, so "take the term's
+  coefficients" cannot cover it — and it is the one kernel anvil-gp has
+  that celerite2 lacks. Its exposure-convolved kernel is a quadratic times
+  the *same* exponential (fitted to 1.6e-15 with the rate fixed; a free
+  rate returns the base rate to six figures), so it is a three-state model
+  with the base propagator. Implement the convolution at the state-space
+  level — same `Phi`, modified amplitude structure — for every term, not
+  via coefficients.
+* **The clamp comments become false.** `metal.py:150` and
+  `elements.leaf_elements` say `h Q hᵀ` is "non-negative in exact
+  arithmetic". For a convolved term it goes negative below `dt ≈ delta/2`
+  (measured sign flip at `0.50-0.72 delta` across `Q` and `delta`). The
+  spacing rule gives ~2x margin, so no failure could be constructed; but
+  the comment must say so, and any spacing under `delta/2` would turn a
+  clamp documented as unable to bind into a silent value change.
 
-1. Bisect the fused group. The failing kernel name is a chain of
-   `Broadcast/Negative/Multiply/Add/Divide/Sign` — elementwise, and
-   `Sign` narrows it. Find which expression in `terms.py` produces it.
-2. Try, in order: restructuring that expression to fewer live inputs;
-   `mx.stop_gradient` on a subexpression that does not need a gradient;
-   splitting the term algebra into two functions with an explicit
-   materialisation between them.
-3. **Go/no-go.** If none of those makes `mx.compile(value_and_grad)`
-   succeed within a day, stop and write it up as an MLX limitation with a
-   minimal reproducer, which is worth more than a partial workaround. The
-   `RuntimeError` observed above makes a clean upstream report easy.
+Gates: float64 parity with `celerite2.terms.TermConvolution` to ~1e-11 on
+cadences with every spacing ≥ `delta`, over SHO (both damping regimes),
+real, Matern-3/2 and sums; `delta → 0` recovers the base term to 1e-12;
+`dupes` and `alternating` must **raise**, naming the offending spacing;
+the float32 kernel path against the float64 oracle at the usual
+tolerances; a gradient check through the diagonal correction.
 
-Half a day to one day, capped. I would not start this before stages 1 and
-2, and I would not be surprised if it ends in a bug report rather than a
-fix.
+Two reference caveats. At `delta/rho = 1e-3` celerite2's own two float64
+routes disagree with an mpmath quadrature of `k_conv(0)` by up to 5.7e-12,
+so a 1e-11 gate there has under 2x margin and is mostly testing celerite2;
+use the quadrature `(2/δ²) ∫₀^δ (δ - u) k(u) du` as the reference at the
+small-`delta` end. And for a convolved Matern-3/2, celerite2 is
+approximate in the base term, so the reference is anvil-gp's own exact
+convolved kernel, not celerite2.
 
-## Order, and why
+**The oracle.** `sample_ssm` draws `x₀ ~ N(0, I)` and clips negative
+eigenvalues of `Q` when it factors it, so it cannot sample a convolved
+process. For 3c the on-model sampler is the dense one: build the exact
+piecewise convolved kernel in `value_np`, Cholesky it. `dense_covariance`
+already does this given a correct `value_np`.
 
-Stage 1 first: certain, contained, and it removes a limitation a real
-multi-instrument radial-velocity user hits immediately. Stage 2 second: it
-is the largest capability gain in the list, closes three documented gaps
-at once, and the kernel comes along for free. Stage 3 last, capped, and
-explicitly allowed to fail.
+Two to three days, as before, but with the risk relocated: from `P_inf`
+plumbing (gone) to one new two-argument special function (3a) and the
+zero-spacing refusal (3c).
 
-Each stage lands as its own commit with its gates met, the docs
-(`kernels.md`'s supported and unsupported tables, `benchmarks.md` if any
-number moves) updated in the same commit, and the README's "What is left"
-entry retired as each item is done.
+## Order, and why it changed
+
+1. **Compile fix.** Half a day, two-line change, bit-identical, 2x on the
+   gradient, removes a process-global workaround. Nothing about it should
+   wait.
+2. **Per-instrument jitter**, designed as the additive diagonal slot
+   stage 3c will reuse.
+3. **Complex term, then exposure time**, on the three-rate SHO basis with
+   the identity stationary covariance kept.
+
+Each stage lands as its own commit with its gates met and the docs
+updated in the same commit.
 
 ## What this plan does not do
 
-* It does not close the >=100x forward gate. Nothing here touches forward
-  speed.
-* It does not add `TermProduct`. Products of celerite terms are not
-  state-space representable at fixed `m`.
-* It does not raise the `m <= 4` kernel ceiling, which is separate work
-  and is what a rotation-plus-granulation model actually needs.
+* It does not close the >=100x forward gate.
+* It does not add `TermProduct`.
+* It does not raise the `m <= 4` kernel ceiling.
+
+## Stage R — the review that revised this plan, 2026-09-27
+
+An independent attacker was given the four claims marked "measured" and
+told to assume each was wrong; in parallel, the reasoned parts of the
+plan were checked by reading. Every finding below was reproduced
+independently before being acted on, except where marked.
+
+**Wrong, and load-bearing:**
+
+* Stage 2a's premise ("a general complex term needs a general `P_inf`").
+  Proved unnecessary for the complex term and insufficient for exposure
+  time — see "What was measured first". The original experiment fitted a
+  two-vector `h` from one starting point with a local optimiser and
+  concluded "unreachable"; the right conclusion was "unreachable *in this
+  basis*", and the basis needed one more free rate, not a new covariance.
+* Stage 3's framing ("a bounded investigation that may end in a bug
+  report"). It is a one-function fix with a measured 2x, and the plan had
+  pointed it at the wrong file (`terms.py`; the offender is `special.py`).
+* Stage 1's premise that a per-instrument accessor exists (it is
+  per-datum) and that a wrong instrument index changes the value (it does
+  not at `v = 0`).
+
+**Incomplete:**
+
+* The diagonal correction's parameter dependence and where it must flow.
+* Zero spacings: the refusal rule said "non-zero" and zero is the case
+  that NaNs.
+* Matern-5/2, excluded by the coefficient-based design.
+* The oracle, which cannot sample a convolved process.
+* The clamp comments, which become false for convolved terms.
+* The "uncatchable process abort" claim, in two documents.
+
+**Confirmed:** the exposure-time algebra (rates untouched, exponential
+sum beyond the width) over a wider grid than the plan used, including
+overdamped and summed terms; the `MAX_JIT` accumulator design; that
+compile failure is structural and size-independent.
+
+**Reported by the attacker and not independently reproduced here:** the
+1.95x gradient timing; the overdamped analytic continuation to 5e-10; the
+duplicate-timestamp indefiniteness table; the 5.7e-12 small-`delta`
+reference caveat. Each is marked where used.
+
+**Two lessons for the next plan.** A negative result from a local search
+is not a proof; the obstruction here had a two-line algebraic proof that
+would have settled it before any code ran. And "capped, allowed to fail"
+was the wrong shape for stage 3: it encoded the assumption that the fix
+was hard, and one afternoon of bisection showed it was not.
