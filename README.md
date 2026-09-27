@@ -20,7 +20,7 @@ from anvilgp import GPPolicy
 # metal=True turns on the fused kernel: ~45-75x on the forward and ~100x on
 # the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
 # is off by default; `gt.loglike.metal_eligible()` says whether it can be honoured
-# (m <= 4, one jitter), and a request it cannot honour warns rather than
+# (m <= 4, up to 8 jitters), and a request it cannot honour warns rather than
 # falling back in silence.
 gt = make_target(ag.SHOTerm(), t, y, yerr,      # defaults, not homework
                  policy=GPPolicy(metal=True))
@@ -303,7 +303,8 @@ since a block is up to 4096 sequential adds with no tree to spread the error.
 
 Limits, stated: m <= 4 (the running element is `3m^2+2m+1` floats in
 registers — 17 at m = 2, 57 at m = 4, 209 at m = 8, which would spill);
-one jitter, not per-instrument; and an all-distinct-lag cadence degenerates
+up to 8 per-instrument jitters (`metal.MAX_JITTER`, a register budget);
+and an all-distinct-lag cadence degenerates
 the table to one row per point, which is correct but gives up the traffic
 saving — the value costs 13.2 GiB at 1024 chains x N = 1e5 where a regular
 cadence costs 0.4. The gradient handles it: its adjoint buffer holds one
@@ -491,7 +492,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `False` | you want the fused kernel: ~45-75x on the forward, ~100x on the gradient. `m <= 4`, one jitter; the gradient also needs few distinct timestamp spacings (see "What is left"). Warns if it cannot be honoured. |
+| `metal` | `False` | you want the fused kernel: ~45-75x on the forward, ~100x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
 | `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |

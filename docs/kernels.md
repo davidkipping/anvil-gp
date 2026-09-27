@@ -162,10 +162,15 @@ tool, at `O(N^3)`.
 
 ## Other limits worth knowing
 
-**One jitter parameter for the fused kernel.** A per-instrument jitter is
-supported on the MLX path but not in the kernel yet; `metal_eligible()`
-reports it, and [m5-plan.md](m5-plan.md) stage 2 is the fix. Per-instrument
-*offsets* are supported on both.
+**Per-instrument jitter, up to eight instruments.** The kernel used to
+accept one jitter only; since 2026-09-27 it indexes the jitter per
+observation from `param_map.instrument`, and the backward gives each
+instrument its own gradient. The cap is `metal.MAX_JITTER = 8`, a register
+budget like `m <= 4` rather than an arbitrary limit; above it
+`metal_eligible()` refuses and the MLX path is correct. Several jitters
+require `param_map.instrument`, whose labels are range-checked at
+construction — an out-of-range label used to pass silently through
+`mx.take`. Per-instrument *offsets* were already supported on both paths.
 
 **Mean models** are supported on both paths: pass `mean_fn` and
 `mean_specs` to `make_target`, or `mean_fn` to `GPLogLike`.

@@ -50,7 +50,8 @@ from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
            "backward_ckpt", "block_seeds_kernel",
-           "metal_available", "MAX_STATE", "MAX_ADJOINT_BUFFER_BYTES"]
+           "metal_available", "MAX_STATE", "MAX_JITTER",
+           "MAX_ADJOINT_BUFFER_BYTES"]
 
 #: Largest adjoint buffer the kernel gradient will allocate.  The backward
 #: accumulates ``dphi``/``dq`` into one slot per ``(block, lag)`` pair that
@@ -92,6 +93,13 @@ MAX_ADJOINT_BUFFER_BYTES = _default_adjoint_budget()
 #: element is moved to threadgroup memory.
 MAX_STATE = 4
 
+#: Largest number of jitter parameters the kernel accepts.  The backward
+#: holds one ``r_var`` adjoint accumulator per jitter in registers, so this
+#: is a register budget like :data:`MAX_STATE`, not an arbitrary limit.
+#: Eight covers every multi-instrument radial-velocity dataset I know of;
+#: above it the MLX path is correct and `metal_eligible` says so.
+MAX_JITTER = 8
+
 _SRC = """
     // Flat grid, chains fastest.  Two reasons.  Adjacent lanes then hold
     // adjacent chains, so the residual read below is coalesced; and the
@@ -111,7 +119,7 @@ _SRC = """
     // per-chain observation vector and jitter variance
     float hv[MDIM];
     for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
-    float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] : 0.0f;
+    JIT_HOIST
 
     // running element, in registers
     float Am[MDIM][MDIM], Cm[MDIM][MDIM], Jm[MDIM][MDIM];
@@ -152,6 +160,7 @@ _SRC = """
         // elements.leaf_elements clamps.  The sfloor line is a secondary
         // guard that cannot bind once this one is in place.
         float rr = r_ref[t];
+        JIT_PER_OBS_T
         sq = max(sq, 0.0f);
         sq += rr + jit2v;
         sq = max(sq, sfloor * rr);              // PSD failure is defined
@@ -288,18 +297,59 @@ _kernels: dict = {}
 _metal_ok: bool | None = None
 
 
-def _kernel(m: int):
-    if m not in _kernels:
-        _kernels[m] = mx.fast.metal_kernel(
-            name=f"anvilgp_scan_m{m}",
-            input_names=["phitab", "qtab", "lag", "hvec", "resid", "r_ref",
+def _jitter_src(src: str, n_jit: int) -> str:
+    """Specialise a kernel source for ``n_jit`` jitter parameters.
+
+    Two variants, on purpose.  With at most one jitter the variance is the
+    same for every observation, so it is read **once per thread** -- which
+    is what the kernel has always done, and the single-jitter path must not
+    start paying a global read per observation for a feature it does not
+    use.  With several, the read moves inside the loop and is indexed by
+    the observation's instrument.
+    """
+    if n_jit <= 1:
+        hoist = ("float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] "
+                 ": 0.0f;")
+        per_obs = ""
+    else:
+        hoist = ""
+        per_obs = "float jit2v = jit2[chain * (uint)n_jit + (uint)inst[GI]];"
+    jit_idx = "0" if n_jit <= 1 else "(uint)inst[gi]"
+    return (src.replace("JIT_HOIST", hoist)
+               .replace("JIT_PER_OBS_T", per_obs.replace("GI", "t"))
+               .replace("JIT_PER_OBS", per_obs.replace("GI", "gi"))
+               .replace("JIT_IDX", jit_idx)
+               .replace("NJIT", str(max(1, n_jit))))
+
+
+def _jit_key(n_jit: int) -> int:
+    """Cache key for the jitter variant.
+
+    0 and 1 share: both use the hoisted read, whose ternary handles the
+    no-jitter case, and both substitute ``NJIT = 1``.  Above that each count
+    needs its **own** kernel, because ``NJIT`` sizes the backward's
+    accumulator and strides its output -- collapsing 2 and 3 into one
+    variant made a 3-jitter problem reuse the 2-jitter kernel, write
+    ``drv_acc[2]`` out of bounds and stride ``out_drv`` wrongly, for a 0.44
+    relative error in the jitter gradients with the *value* still right.
+    """
+    return 0 if n_jit <= 1 else n_jit
+
+
+def _kernel(m: int, n_jit: int = 0):
+    key = (m, _jit_key(n_jit))
+    if key not in _kernels:
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_scan_m{m}_j{key[1]}",
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref",
                          "jit2", "sfloor", "npts", "n_lags", "n_blocks",
                          "n_chains", "blk_len", "n_jit"],
             output_names=["out_A", "out_b", "out_C", "out_eta", "out_J",
                           "out_ell"],
-            source=_SRC.replace("MDIM", str(m)),
+            source=_jitter_src(_SRC, n_jit).replace("MDIM", str(m)),
         )
-    return _kernels[m]
+    return _kernels[key]
 
 
 
@@ -561,6 +611,7 @@ _FWD_STEP = """
                 for (uint j = 0; j < M; ++j) a += cp[i][j] * hv[j];
                 ch[i] = a; hch += hv[i] * a;
             }
+            JIT_PER_OBS
             float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
             float vv = resid[gi * (uint)n_chains + chain];
             for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
@@ -635,7 +686,7 @@ _SRC_BWD_CKPT = """
 
     float hv[MDIM];
     for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
-    float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] : 0.0f;
+    JIT_HOIST
     float cotv = cot[chain];
 
     // This thread's accumulator slots: the contiguous range block blk_i
@@ -680,7 +731,12 @@ _SRC_BWD_CKPT = """
         h_bar[i] = 0.0f;
         for (uint j = 0; j < M; ++j) p_bar[i][j] = seed_C[ei * M * M + i * M + j];
     }
-    float drv_acc = 0.0f;
+    // One r_var adjoint per jitter parameter.  Every slot is zeroed, not
+    // only the ones this block's instruments touch: `mx.fast.metal_kernel`
+    // does not zero its outputs, so an untouched slot would carry whatever
+    // was in the buffer.
+    float drv_acc[NJIT];
+    for (uint j = 0; j < NJIT; ++j) drv_acc[j] = 0.0f;
     uint cur_slot = 0xFFFFFFFFu;
     float acc_p[MDIM][MDIM], acc_q[MDIM][MDIM];
     for (uint i = 0; i < M; ++i)
@@ -741,6 +797,7 @@ _SRC_BWD_CKPT = """
                 ch[i] = a; hch += hv[i] * a;
             }
             bool clamped = hch < 0.0f;
+            JIT_PER_OBS
             float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
             float vv = resid[gi * (uint)n_chains + chain];
             for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
@@ -771,7 +828,7 @@ _SRC_BWD_CKPT = """
                 ch_bar[i] += kg_bar[i] / sv;
                 s_bar -= kg_bar[i] * kg[i] / sv;
             }
-            drv_acc += s_bar;
+            drv_acc[JIT_IDX] += s_bar;
             float hch_bar = clamped ? 0.0f : s_bar;
             for (uint i = 0; i < M; ++i) {
                 h_bar[i] += hch_bar * ch[i];
@@ -851,7 +908,8 @@ _SRC_BWD_CKPT = """
             }
     }
     for (uint i = 0; i < M; ++i) out_dh[ei * M + i] = h_bar[i];
-    out_drv[ei] = drv_acc;
+    for (uint j = 0; j < NJIT; ++j)
+        out_drv[ei * NJIT + j] = drv_acc[j];
 """
 
 
@@ -862,13 +920,14 @@ _bwd_ckpt_kernels: dict = {}
 _SUB_LEN = {1: 32, 2: 32, 3: 16, 4: 8}
 
 
-def _bwd_ckpt_kernel(m: int, slen: int):
-    key = (m, slen)
+def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0):
+    key = (m, slen, _jit_key(n_jit))
     if key not in _bwd_ckpt_kernels:
-        body = _SRC_BWD_CKPT.replace("FWD_STEP", _FWD_STEP)
+        body = _jitter_src(_SRC_BWD_CKPT.replace("FWD_STEP", _FWD_STEP), n_jit)
         _bwd_ckpt_kernels[key] = mx.fast.metal_kernel(
-            name=f"anvilgp_bwd_ckpt_m{m}_s{slen}",
-            input_names=["phitab", "qtab", "lag", "hvec", "resid", "r_ref",
+            name=f"anvilgp_bwd_ckpt_m{m}_s{slen}_j{key[2]}",
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref",
                          "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
                          "slot_id", "slot_start",
                          "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
@@ -880,7 +939,7 @@ def _bwd_ckpt_kernel(m: int, slen: int):
     return _bwd_ckpt_kernels[key]
 
 
-def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
+def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                   ent_m, ent_C, seed_m, seed_C, slot_id, slot_start, n_slots,
                   blk_len, sub_len=None):
     """Checkpointed reverse sweep for every (chain, block), independently.
@@ -894,7 +953,9 @@ def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
     into a per-lag table with ``slot_lag``; the blocks are already summed,
     since distinct blocks own disjoint slots.  ``dh`` and ``drv`` come per
     ``(chain, block)``; ``dy`` per observation, ``(npts, n_chains)``, since
-    it feeds the mean model.
+    it feeds the mean model.  ``drv`` is ``(n_chains, n_blocks, n_jit)`` --
+    one r_var adjoint per jitter parameter, so a per-instrument jitter gets
+    its own gradient; with no jitter the last axis is 1 and unused.
 
     The forward replay uses the Joseph-form covariance update, which is
     PSD by construction; the plain ``cp - K ch^T`` is not, and a rounding
@@ -921,10 +982,11 @@ def backward_ckpt(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
     n_slots = int(n_slots)
     shapes = [(n_chains, n_slots, m, m),
               (n_chains, n_slots, m, m),
-              (n_chains, n_blocks, m), (npts, n_chains), (n_chains, n_blocks),
+              (n_chains, n_blocks, m), (npts, n_chains),
+              (n_chains, n_blocks, max(1, n_jit)),
               (n_chains, n_blocks, n_ckpt, m + m * m)]
-    outs = _bwd_ckpt_kernel(m, slen)(
-        inputs=[phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, cot,
+    outs = _bwd_ckpt_kernel(m, slen, n_jit)(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                 ent_m, ent_C, seed_m, seed_C, slot_id, slot_start,
                 int(npts), int(n_lags), int(n_blocks), int(n_chains),
                 int(blk_len), int(n_jit), int(n_ckpt), int(n_slots)],
@@ -1241,6 +1303,7 @@ def metal_available() -> bool:
             q = mx.broadcast_to(mx.eye(2, dtype=mx.float32), (1, 1, 2, 2))
             out = _kernel(2)(
                 inputs=[phi, q, mx.zeros((1,), dtype=mx.int32),
+                        mx.zeros((1,), dtype=mx.int32),      # inst
                         mx.ones((1, 2), dtype=mx.float32),
                         mx.zeros((1, 1), dtype=mx.float32),
                         mx.ones((1,), dtype=mx.float32),
@@ -1257,8 +1320,8 @@ def metal_available() -> bool:
     return _metal_ok
 
 
-def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
-                blk_len, n_blocks=None) -> Element:
+def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                s_floor_rel, blk_len, n_blocks=None) -> Element:
     """Condense every block of ``blk_len`` observations into one element.
 
     ``phi_tab``/``q_tab``: (n_chains, n_lags, m, m) propagator and process
@@ -1285,8 +1348,8 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
     scalars = [float(s_floor_rel), int(npts), int(n_lags), int(n_blocks),
                int(n_chains), int(blk_len), int(n_jit)]
 
-    outs = _kernel(m)(
-        inputs=[phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, *scalars],
+    outs = _kernel(m, n_jit)(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, *scalars],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -1294,8 +1357,8 @@ def scan_blocks(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
                    ell=outs[5])
 
 
-def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
-                 blk_len, slots=None) -> mx.array:
+def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                 s_floor_rel, blk_len, slots=None) -> mx.array:
     """``(n_chains,)`` log-likelihood: the kernel's blocks, reduced.
 
     **This, not :func:`scan_blocks`, is where the differentiation boundary
@@ -1314,7 +1377,7 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
     """
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
-        el = scan_blocks(phi_t, q_t, lg, hv, rs, rr, j2, s_floor_rel,
+        el = scan_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
                          blk_len)
         return reduce_blocks(el)
 
@@ -1372,22 +1435,26 @@ def scan_loglike(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2, s_floor_rel,
                 f"{npts} points.  Bin the timestamps, use fewer chains, or "
                 f"use GPPolicy(metal=False) for the gradient.")
 
-        el = scan_blocks(p_t, q_t, lg, hv, rs, rr, j2, s_floor_rel, blk_len)
+        el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
+                         blk_len)
         ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
-            p_t, q_t, lg, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m, seed_C,
-            slot_id, slot_start, n_slots, blk_len)
+            p_t, q_t, lg, inst, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m,
+            seed_C, slot_id, slot_start, n_slots, blk_len)
 
         # `lag` is an integer index and `r_ref` is the data's own yerr^2 --
         # neither is ever a function of the sampled parameters, so neither
         # needs a cotangent.  `jit2` does: S = max(h Cp h^T, 0) + r_ref +
         # jit2, so d/d(jit2) is the sum of the r_var cotangents, which is
         # exactly what the kernel accumulates per block.
-        # `metal_eligible` admits at most one jitter, and the kernel reads
-        # column 0, so the whole per-block sum belongs to it.
+        # Since 2026-09-27 the kernel splits this by instrument, so the
+        # per-block sum is already per jitter parameter.
+        # d_rv is (n_chains, n_blocks, n_jit): the kernel split the r_var
+        # adjoint by the observation's instrument, so summing over blocks
+        # gives each jitter parameter its own gradient.
         n_jit = j2.shape[1] if j2.ndim == 2 else 0
         d_j2 = (mx.zeros_like(j2) if n_jit == 0
-                else mx.sum(d_rv, axis=1)[:, None])
+                else mx.sum(d_rv, axis=1)[:, :n_jit])
         # Slots -> the per-lag table the term front end differentiates.
         # Distinct blocks own disjoint slots, so the blocks are already
         # summed and this only regroups.  Applied one fold group at a

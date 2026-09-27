@@ -131,7 +131,7 @@ plan's first error.
 The likelihood's `value_and_grad` does, and `tests/test_calibration.py` now
 runs ChEES with compilation on, which is the closest available evidence.
 
-## Stage 2 — per-instrument jitter in the kernel (was stage 1)
+## Stage 2 — per-instrument jitter in the kernel — **DONE 2026-09-27**
 
 The shape is right; three premises in the original were wrong and change
 the work.
@@ -175,6 +175,76 @@ instrument. That is this slot. Build it once.
 
 Half a day for the code is credible. The gates are a day: 5 cadences x 3
 instrument counts x value, gradient, and central differences.
+
+### Landed
+
+`metal.MAX_JITTER = 8`, a register budget like `MAX_STATE`. The kernel takes
+an `inst` input and is specialised per jitter count: at most one jitter keeps
+the hoisted once-per-thread read it always had, several move the read inside
+the loop indexed by the observation's instrument. The backward holds
+`float drv_acc[NJIT]`, zeroes **all** slots, and `out_drv` gains a jitter
+axis that the VJP slices.
+
+Host side, all three of the review's corrections applied:
+`ParamMap.jitter_var_per_instrument` is the new compact accessor (the
+existing `jitter_var` is per-*datum* and cannot serve the kernel);
+instrument labels are range- and shape-checked at construction; and
+`metal_eligible` refuses above `MAX_JITTER` and when several jitters come
+without labels.
+
+**Gates, measured.** Against the reference path: worst 6.2e-7 relative over
+{1, 2, 3, 4, 8} jitters x 5 cadences, 31 cases. Against float64 central
+differences: 5.9e-6 at one jitter, 1.8e-5 at four. The single-jitter path is
+unchanged (1.04x forward and 1.07x gradient for *four* jitters, so the
+feature costs ~5% only when used).
+
+**One gate as written was unachievable, and the reason is worth keeping.**
+It asked for 1e-6 against central differences. The 1.8e-5 at four jitters
+sits entirely on the smallest gradient component (−0.0246 against a largest
+of −41.7, a factor of 1700), where the absolute error is 4e-7 — float32
+epsilon on a quantity of order one. Varying the difference step from 1e-3
+to 1e-6 moves it hardly at all, so it is not truncation. The MLX reference
+path has the same 1.1e-5 there and is *worse* than the kernel on `sigma`
+(1.6e-4 against 1.2e-5). So a relative gate on a near-zero component cannot
+be met in float32 by any implementation; the binding evidence is the
+6.2e-7 agreement with the path the kernel is verified against.
+
+**Two bugs this stage's own gates caught**, both invisible to a value test:
+
+* The kernel cache key collapsed every jitter count above one into a single
+  variant, but `NJIT` sizes the backward's accumulator and strides its
+  output — so a three-jitter problem reused the two-jitter kernel, wrote
+  `drv_acc[2]` out of bounds and strided `out_drv` wrongly. Value exact,
+  jitter gradients wrong by 0.44 relative. Each count above one now gets
+  its own kernel.
+* The availability probe did not pass the new `inst` input, so
+  `metal_available()` returned False and *every* problem silently fell back
+  to the MLX path — with a warning, but the tests would have measured the
+  wrong path.
+
+**One assertion I wrote was physically wrong.** The permutation test first
+asserted that an instrument left alone by the label swap keeps its
+gradient. It does not, and should not: the jitters enter one shared filter,
+so changing which observations carry which variance changes every later
+observation's contribution. The untouched instrument moved 0.2%. The test
+now asserts what actually discriminates — agreement with the reference path
+under *both* labelings, plus the equal-jitter case where the value is
+bit-identical and only the gradient can reveal a wrong index.
+
+**A fourth mistake, and a process one.** I reported the gates met while 102
+tests were failing, because I had only run the jitter subset. Changing
+`scan_blocks`/`backward_ckpt`/`scan_loglike`'s signatures broke every direct
+caller in the suite, and the `drv` output's new jitter axis silently
+broadcast against the reference in `_e2e_errors` (a `(n_chains, 1)` against
+a `(n_chains,)`, giving a 1.5 relative "error"). **Run the whole suite
+before claiming a gate, not the tests for the thing just built.**
+
+**Left for stage 3c**, as planned: the additive per-(chain, instrument)
+diagonal slot this builds is what the exposure-time diagonal correction
+will use. It is in place; 3c has to route a parameter-dependent constant
+through it rather than build one.
+
+626 tests pass; the README verifier passes all ten rows at a 0.9% probe.
 
 ## Stage 3 — the general complex term, and exposure time on top of it (was stage 2)
 

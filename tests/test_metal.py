@@ -373,7 +373,8 @@ def test_in_kernel_fold_matches_the_mlx_tree(name, term, kp, blk):
     j2 = mx.zeros((n_chains, 0), dtype=v.dtype)
 
     with mx.stream(mx.gpu):
-        el = scan_blocks(pt, qt, gp._metal_lag, h, r, gp._r_ref32, j2,
+        el = scan_blocks(pt, qt, gp._metal_lag, gp._metal_inst, h, r,
+                         gp._r_ref32, j2,
                          gp.policy.s_floor_rel, blk)
         tree = np.array(tree_reduce(el).ell, dtype=np.float64)
         kern = np.array(reduce_blocks(el), dtype=np.float64)
@@ -449,13 +450,15 @@ def _fwd_setup(term, p, k, blk, n_chains=3, cadence="regular", seed=1):
     states, _ = filter_forward(phi, q, h, yv, rv, rrv)
     want = filter_backward(phi, q, h, yv, rv, rrv, states, cot)
     with mx.stream(mx.gpu):
-        el = scan_blocks(pt, qt, lag, h, resid, rrv, j2, 1e-6, blk)
+        el = scan_blocks(pt, qt, lag, mx.zeros((k,), dtype=mx.int32), h,
+                         resid, rrv, j2, 1e-6, blk)
         mx.eval(el)
     from anvilgp.likelihood import _slot_map
     sid, sstart, slag = _slot_map(lag_np, blk)
+    inst = mx.zeros((k,), dtype=mx.int32)
     return dict(pt=pt, qt=qt, lag=lag, lag_np=lag_np, h=h, resid=resid,
                 rrv=rrv, j2=j2, cot=cot, el=el, want=want, blk=blk,
-                n_lags=pt.shape[1], slot_id=mx.array(sid),
+                n_lags=pt.shape[1], inst=inst, slot_id=mx.array(sid),
                 slot_start=mx.array(sstart), slot_lag=slag)
 
 
@@ -488,7 +491,8 @@ def _fold_slots(x_slots, slot_lag, n_lags):
 def _e2e_errors(c, seeds):
     from anvilgp.metal import backward_ckpt
     with mx.stream(mx.gpu):
-        o = backward_ckpt(c["pt"], c["qt"], c["lag"], c["h"], c["resid"],
+        o = backward_ckpt(c["pt"], c["qt"], c["lag"], c["inst"], c["h"],
+                          c["resid"],
                           c["rrv"], c["j2"], c["cot"], *seeds,
                           c["slot_id"], c["slot_start"], c["slot_lag"].size,
                           c["blk"])
@@ -498,7 +502,11 @@ def _e2e_errors(c, seeds):
             _rel(_per_lag(w[1], c["lag_np"], nl), _fold_slots(o[1], sl, nl)),
             _rel(w[2], mx.sum(o[2], axis=1)),
             _rel(w[3], mx.swapaxes(o[3], 0, 1)),
-            _rel(np.sum(np.array(w[4], np.float64), axis=1), mx.sum(o[4], axis=1))]
+            # `drv` is (n_chains, n_blocks, n_jit) since per-instrument
+            # jitter landed; with one jitter (or none) the total r_var
+            # adjoint is the sum over both trailing axes.
+            _rel(np.sum(np.array(w[4], np.float64), axis=1),
+                 mx.sum(o[4], axis=(1, 2)))]
 
 
 @pytest.mark.parametrize("name,term,p", _BWD_TERMS,
@@ -704,7 +712,9 @@ def test_the_kernel_clamps_its_variance_term():
     r_ref = mx.full((k,), 1e-3, dtype=mx.float32)
     j2 = mx.zeros((n_chains, 0), dtype=mx.float32)
     with mx.stream(mx.gpu):
-        out = scan_loglike(pt, qt, lag, h, resid, r_ref, j2, 0.0, 8)
+        out = scan_loglike(pt, qt, lag, mx.zeros((k,), dtype=mx.int32), h,
+                           resid, r_ref, j2, 0.0, 8,
+                           slots=_slots_for(k, 8, lag))
         mx.eval(out)
     assert bool(mx.all(mx.isfinite(out))), np.array(out)
 
@@ -938,6 +948,17 @@ def test_chunking_the_front_end_lowers_the_gradients_peak_memory():
     chunked = peak(1 << 22)
     assert chunked < 0.75 * whole, (
         f"chunked peak {chunked:.3f} GiB vs unchunked {whole:.3f} GiB")
+
+
+def _slots_for(npts, blk, lag):
+    """The slot map + fold plan `scan_loglike` needs, for a direct call."""
+    from anvilgp.likelihood import _slot_map, _lag_fold_plan
+    lag_np = np.array(lag)
+    sid, sstart, slag = _slot_map(lag_np, blk)
+    kind, plan = _lag_fold_plan(slag, int(lag_np.max()) + 1)
+    fold = ((kind, mx.array(plan)) if kind == "dense"
+            else (kind, [(mx.array(a), mx.array(b)) for a, b in plan]))
+    return (mx.array(sid), mx.array(sstart), int(slag.size), fold)
 
 
 def _lag_of(t):
@@ -1234,7 +1255,8 @@ def test_the_kernel_refuses_wide_index_dtypes():
     seeds = (mx.zeros((3, 2, 2)), mx.zeros((3, 2, 2, 2)),
              mx.zeros((3, 2, 2)), mx.zeros((3, 2, 2, 2)))
     with pytest.raises(TypeError, match="int32"):
-        backward_ckpt(c["pt"], c["qt"], c["lag"], c["h"], c["resid"], c["rrv"],
+        backward_ckpt(c["pt"], c["qt"], c["lag"], c["inst"], c["h"],
+                      c["resid"], c["rrv"],
                       c["j2"], c["cot"], *seeds,
                       c["slot_id"].astype(mx.int64), c["slot_start"],
                       c["slot_lag"].size, c["blk"])
@@ -1314,3 +1336,181 @@ def test_the_fold_gather_is_charged_to_the_adjoint_budget(monkeypatch):
         with mx.stream(mx.gpu):
             _, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
             mx.eval(g)
+
+
+def _jitter_gp(n_jit, metal, n=1200, jits=(0.03, 0.09, 0.2, 0.05),
+               inst=None, seed=4):
+    """A GP with `n_jit` per-instrument jitters, labels round-robin by default."""
+    from anvilgp.likelihood import GPLogLike, KernelParam, ParamMap
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) * 0.05
+    if inst is None:
+        inst = None if n_jit == 1 else (np.arange(n) % n_jit).astype(np.int32)
+    pm = ParamMap(
+        kernel=[KernelParam(link="log", index=i, ref=r)
+                for i, r in enumerate((1.3, 4.0, 3.0))],
+        jitter=[KernelParam(link="log", index=3 + j, ref=jits[j % len(jits)])
+                for j in range(n_jit)],
+        n_dim=3 + n_jit, instrument=inst)
+    return GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.3),
+                     ag.SHOTerm(), pm,
+                     GPPolicy(block=1024, hi_block=1024, metal=metal))
+
+
+def _vg(gp, n_par, n_chains=4):
+    u = mx.zeros((n_chains, n_par), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        v = gp(u)
+        _, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
+        mx.eval(v, g)
+    return np.array(v, np.float64), np.array(g[0], np.float64)
+
+
+@pytest.mark.parametrize("n_jit", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("cadence", ["regular", "gapped", "dupes", "distinct",
+                                     "alternating"])
+def test_per_instrument_jitter_matches_the_mlx_path(n_jit, cadence):
+    """M5 stage 2: the kernel used to refuse more than one jitter.
+
+    The jitter sits inside the innovation variance, so it reaches the value
+    *and* every adjoint -- this compares both against the reference path,
+    which the suite already trusts for per-instrument jitter.
+    """
+    from anvilgp.likelihood import GPLogLike, KernelParam, ParamMap
+    n = 1200
+    rng = np.random.default_rng(4)
+    if cadence == "regular":
+        t = np.arange(n) * 0.3
+    elif cadence == "gapped":
+        t = np.arange(n) * 0.3
+        t[n // 2:] += 20.0
+    elif cadence == "dupes":
+        t = np.sort(np.concatenate([np.arange((n + 1) // 2) * 0.3] * 2))[:n]
+    elif cadence == "alternating":
+        t = np.sort(np.concatenate([np.arange((n + 1) // 2) * 0.3] * 2))[:n]
+    else:
+        t = np.concatenate([[0.0], np.cumsum(rng.uniform(0.2, 0.4, n - 1))])
+    inst = None if n_jit == 1 else (np.arange(n) % n_jit).astype(np.int32)
+    jits = (0.03, 0.09, 0.2, 0.05)
+    y = rng.standard_normal(n)          # once: both paths must see one dataset
+
+    def build(metal):
+        pm = ParamMap(
+            kernel=[KernelParam(link="log", index=i, ref=r)
+                    for i, r in enumerate((1.3, 4.0, 3.0))],
+            jitter=[KernelParam(link="log", index=3 + j,
+                                ref=jits[j % len(jits)])
+                    for j in range(n_jit)],
+            n_dim=3 + n_jit, instrument=inst)
+        return GPLogLike(None, t, None, y, np.full(n, 0.3), ag.SHOTerm(), pm,
+                         GPPolicy(block=1024, hi_block=1024, metal=metal))
+
+    kern, ref = build(True), build(False)
+    assert kern.metal_eligible()[0], kern.metal_eligible()[1]
+    vk, gk = _vg(kern, 3 + n_jit)
+    vm, gm = _vg(ref, 3 + n_jit)
+    assert np.max(np.abs(vk - vm)) < 1e-2, f"value: {vk[0]} vs {vm[0]}"
+    rel = np.max(np.abs(gk - gm)) / max(np.max(np.abs(gm)), 1e-30)
+    assert rel < 1e-5, f"gradient rel {rel:.2e}\n kernel {gk[0]}\n mlx {gm[0]}"
+
+
+def test_each_instruments_jitter_gets_its_own_gradient():
+    """The trap the plan named, and it is sharper than a value check.
+
+    With anvil's own priors every instrument shares a jitter reference, so
+    at `v = 0` all jitters are numerically equal, permuting instrument
+    labels leaves the log-likelihood **bit-identical**, and only the
+    gradient moves.  A value-only test therefore passes on a kernel that
+    attributes every observation to instrument 0.
+
+    Three assertions, in increasing sharpness:
+      1. with *distinct* jitters, a permutation changes the kernel's answer
+         at all -- it is reading `inst`;
+      2. the kernel agrees with the reference path under *both* labelings --
+         it is reading `inst` *correctly*, which (1) alone does not show;
+      3. with *equal* jitters the value is bit-identical across the
+         permutation while the gradient still moves, which is the trap.
+
+    Note what is *not* asserted: that an instrument left alone by the
+    permutation keeps its gradient.  It does not, and should not -- the
+    jitters enter one shared filter, so changing which observations carry
+    which variance changes every later observation's contribution.  An
+    instrument untouched by the swap moved 0.2% here.
+    """
+    n, n_jit = 1200, 3
+    lab = (np.arange(n) % n_jit).astype(np.int32)
+    swapped = lab.copy()
+    swapped[lab == 0], swapped[lab == 1] = 1, 0
+
+    # (1) and (2): distinct jitters
+    out = {}
+    for name, L in (("base", lab), ("swap", swapped)):
+        k = _jitter_gp(n_jit, True, inst=L)
+        r = _jitter_gp(n_jit, False, inst=L)
+        assert k.metal_eligible()[0]
+        out[name] = (_vg(k, 3 + n_jit), _vg(r, 3 + n_jit))
+
+    (vk0, gk0), (vm0, gm0) = out["base"]
+    (vk1, gk1), (vm1, gm1) = out["swap"]
+
+    assert np.max(np.abs(gk0[0][3:] - gk1[0][3:])) > 1.0, (
+        f"permuting instrument labels left the kernel's jitter gradients "
+        f"unchanged ({gk0[0][3:]} vs {gk1[0][3:]}): it is not reading `inst`")
+    for nm, (vk, gk, vm, gm) in (("base", (vk0, gk0, vm0, gm0)),
+                                 ("swap", (vk1, gk1, vm1, gm1))):
+        assert np.max(np.abs(vk - vm)) < 1e-2, f"{nm}: {vk[0]} vs {vm[0]}"
+        rel = np.max(np.abs(gk - gm)) / max(np.max(np.abs(gm)), 1e-30)
+        assert rel < 1e-5, f"{nm}: gradient rel {rel:.2e}"
+    assert np.all(np.abs(gk0[0][3:]) > 1e-6), f"a jitter has no gradient"
+
+    # (3) the trap: equal jitter references, as anvil's priors produce
+    eq = (0.07, 0.07, 0.07, 0.07)
+    vke, gke = _vg(_jitter_gp(n_jit, True, inst=lab, jits=eq), 3 + n_jit)
+    vks, gks = _vg(_jitter_gp(n_jit, True, inst=swapped, jits=eq), 3 + n_jit)
+    assert np.array_equal(vke, vks), (
+        "with equal jitters the value must be identical under a permutation "
+        "-- if it is not, this fixture no longer demonstrates the trap")
+    assert np.max(np.abs(gke[0][3:] - gks[0][3:])) > 1.0, (
+        f"with equal jitters only the gradient can reveal a wrong "
+        f"instrument index, and it did not move: {gke[0][3:]}")
+
+
+def test_more_jitters_than_the_kernel_holds_is_refused_not_wrong():
+    """`MAX_JITTER` sizes a per-thread register array, so it is a real
+    budget.  Above it the MLX path is correct and eligibility says so."""
+    import warnings
+    from anvilgp.metal import MAX_JITTER
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gp = _jitter_gp(MAX_JITTER + 1, True)
+    ok, why = gp.metal_eligible()
+    assert not ok and "exceeds the kernel" in why, why
+    # and the user is told, rather than silently getting the slow path
+    assert [w for w in caught if "cannot be honoured" in str(w.message)]
+    # and it still computes, on the reference path
+    v, g = _vg(gp, 3 + MAX_JITTER + 1)
+    assert np.all(np.isfinite(v)) and np.all(np.isfinite(g))
+
+
+def test_per_instrument_jitter_needs_instrument_labels():
+    """Several jitters and no labels is a user error the kernel cannot
+    guess its way out of, and `jitter_var` would raise deep inside the
+    graph.  Eligibility reports it up front instead."""
+    gp = _jitter_gp(3, True)
+    # _jitter_gp supplies labels for n_jit > 1; strip them to make the case
+    gp.param_map.instrument = None
+    ok, why = gp.metal_eligible()
+    assert not ok and "param_map.instrument" in why, why
+
+
+def test_instrument_labels_are_range_checked():
+    """`mx.take` is silent on an out-of-range label and the kernel would
+    read the next chain's jitter row, so the host refuses at construction."""
+    n = 400
+    bad = np.zeros(n, dtype=np.int32)
+    bad[5] = 7                                   # only 3 instruments declared
+    with pytest.raises(ValueError, match="instrument"):
+        _jitter_gp(3, True, n=n, inst=bad)
+    short = np.zeros(n - 1, dtype=np.int32)
+    with pytest.raises(ValueError, match="one label per observation"):
+        _jitter_gp(3, True, n=n, inst=short)

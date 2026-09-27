@@ -108,7 +108,8 @@ class GPPolicy:
     #: Differentiable since M4: the kernel carries its own VJP, so a
     #: gradient sampler can use it too.  Measured 45-74x over the MLX path
     #: on the forward and ~100x on the gradient, with 20-30x less peak
-    #: memory; see the README.  Limits: m <= 4 and one jitter.  The
+    #: memory; see the README.  Limits: m <= 4 and at most
+    #: :data:`anvilgp.metal.MAX_JITTER` per-instrument jitters.  The
     #: gradient's adjoint buffer is one slot per ``(block, lag)`` pair
     #: that *occurs*, so it is bounded by N rather than by N x blocks,
     #: and an irregular cadence is affordable at m = 2 (3.05 GiB at 1024
@@ -320,6 +321,20 @@ class ParamMap:
         j = self._per_datum(v, self.jitter, idx)
         return None if j is None else j * j
 
+    def jitter_var_per_instrument(self, v: mx.array) -> mx.array | None:
+        """``(n_chains, n_jitter)`` variances, **one column per instrument**.
+
+        Not the same thing as :meth:`jitter_var`, which expands to one
+        column per *datum* through ``mx.take`` and needs the instrument
+        index.  The fused kernel wants the compact form and does its own
+        indexing per observation, so it needs this; the MLX path wants the
+        expanded form because it multiplies elementwise.
+        """
+        if not self.jitter:
+            return None
+        j = mx.concatenate([s.apply(v) for s in self.jitter], axis=-1)
+        return j * j
+
     def offsets(self, v: mx.array, idx: mx.array | None) -> mx.array | None:
         return self._per_datum(v, self.offset, idx)
 
@@ -439,6 +454,14 @@ class GPLogLike:
         lag[0] = 0
         self._metal_uniq_dt = mx.array(uniq32, dtype=mx.float32)
         self._metal_lag = mx.array(lag)
+        # Instrument label per observation, for the kernel's per-instrument
+        # jitter.  Always present and always int32: the kernel indexes it
+        # unconditionally in the multi-jitter variant, and a zero vector is
+        # the right answer when there is one instrument or none.
+        self._metal_inst = (mx.zeros((self.n_data,), dtype=mx.int32)
+                            if param_map.instrument is None
+                            else mx.array(np.asarray(param_map.instrument,
+                                                     dtype=np.int32)))
         self.n_distinct_lags = (self.n_data if self._uniq32 is None
                                 else int(self._uniq32[0].size))
         self._y32 = mx.array(self._y64.astype(np.float32))
@@ -446,6 +469,23 @@ class GPLogLike:
         self._x_mean32 = (None if self._x_mean64 is None
                           else mx.array(self._x_mean64.astype(np.float32)))
         inst = param_map.instrument
+        if inst is not None:
+            # `mx.take` is silent on an out-of-range label -- it clamps or
+            # wraps -- so a typo'd instrument would quietly score against
+            # the wrong jitter.  In the kernel it would index the *next
+            # chain's* row, or past the buffer on the last chain.
+            n_lab = max(len(param_map.jitter), len(param_map.offset))
+            lab = np.asarray(inst)
+            if lab.shape != (len(self._y64),):
+                raise ValueError(
+                    f"param_map.instrument has shape {lab.shape}, expected "
+                    f"({len(self._y64)},) -- one label per observation")
+            if n_lab and (lab.min() < 0 or lab.max() >= n_lab):
+                raise ValueError(
+                    f"param_map.instrument labels run {lab.min()}..{lab.max()}"
+                    f" but only {n_lab} instrument(s) are declared "
+                    f"({len(param_map.jitter)} jitter, "
+                    f"{len(param_map.offset)} offset)")
         self._inst32 = (None if inst is None
                         else mx.array(np.asarray(inst, dtype=np.int32)))
 
@@ -633,14 +673,19 @@ class GPLogLike:
 
     def metal_eligible(self) -> tuple[bool, str]:
         """Whether the fused kernel can serve this problem, and why not."""
-        from .metal import MAX_STATE, metal_available
+        from .metal import MAX_JITTER, MAX_STATE, metal_available
         if not self.policy.metal:
             return False, "GPPolicy.metal is off"
         if self.term.n_state > MAX_STATE:
             return False, (f"m = {self.term.n_state} exceeds the kernel's "
                            f"register budget (max {MAX_STATE})")
-        if len(self.param_map.jitter) > 1:
-            return False, "per-instrument jitter is not in the kernel yet"
+        if len(self.param_map.jitter) > MAX_JITTER:
+            return False, (f"{len(self.param_map.jitter)} jitter parameters "
+                           f"exceeds the kernel's per-thread accumulator "
+                           f"(max {MAX_JITTER})")
+        if len(self.param_map.jitter) > 1 and self.param_map.instrument is None:
+            return False, ("per-instrument jitter needs "
+                           "param_map.instrument to say which datum is which")
         if not metal_available():
             return False, "mx.fast.metal_kernel is unavailable here"
         return True, ""
@@ -760,15 +805,20 @@ class GPLogLike:
         off = pm.offsets(v, self._inst32)
         if off is not None:
             r = r - mx.swapaxes(off, 0, 1)
-        jit = pm.jitter_var(v, self._inst32)
+        # The compact per-instrument form: the kernel indexes it per
+        # observation with `_inst32`.  `jitter_var` would expand it to one
+        # column per datum, which is what the MLX path wants and the
+        # kernel does not.
+        jit = pm.jitter_var_per_instrument(v)
         jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
-                else mx.broadcast_to(jit, (n, 1)))
+                else mx.broadcast_to(jit, (n, len(pm.jitter))))
 
         # scan_loglike, not scan_blocks + tree_reduce here: the
         # differentiation boundary has to enclose the reduction so the
         # custom function's output is one scalar per chain.  See its
         # docstring.
-        return scan_loglike(pt, qt, self._metal_lag, h, r, self._r_ref32,
+        return scan_loglike(pt, qt, self._metal_lag, self._metal_inst, h, r,
+                            self._r_ref32,
                             jit2, self.policy.s_floor_rel, self.metal_block,
                             slots=(self._metal_slot_id,
                                    self._metal_slot_start,
