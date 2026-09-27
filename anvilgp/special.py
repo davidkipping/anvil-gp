@@ -42,7 +42,7 @@ import numpy as np
 
 __all__ = [
     "sinc_gen", "cosm1_gen", "cos_gen", "sincm1", "sincm1_series",
-    "damped_cos_sinc",
+    "gamma3_shifted", "damped_cos_sinc",
     "gamma3", "lower_gamma_reg", "exp_acc", "sincos",
 ]
 
@@ -291,6 +291,38 @@ def lower_gamma_reg(n: int, z: mx.array) -> mx.array:
     direct = 1.0 - exp_acc(-zb) * tot
     direct = mx.where(big, mx.ones_like(direct), direct)
     return mx.where(small, ser, direct)
+
+
+def gamma3_shifted(z: mx.array, delta: mx.array) -> mx.array:
+    """``1 - e^{-z}(1 + y + y^2/2)`` with ``y = z - delta``, cancellation-free.
+
+    The two-rate generalisation of :func:`gamma3`, which is the ``delta = 0``
+    case.  It is what a general complex term's ``Q11`` needs: the SHO's
+    process noise asks for ``1 - e^{-2c dt}(1 + 2c dt + 2(c dt)^2)``, and a
+    term whose amplitude ratio is not the SHO's asks for the same thing with
+    the *polynomial* in a different rate, ``beta``, than the exponential's
+    ``c``.  Here ``z = 2c dt`` and ``delta = 2(c - beta) dt``.
+
+    **The identity, because it is the whole reason this is easy.** Writing
+    ``y = z - delta`` and subtracting the two polynomials,
+
+        1 - e^{-z}(1 + y + y^2/2)
+          = [1 - e^{-z}(1 + z + z^2/2)] + e^{-z}(z - y)(1 + (z + y)/2)
+          = gamma3(z) + e^{-z} delta (1 + z - delta/2)
+
+    which is exact, and every piece is already cancellation-free: ``gamma3``
+    handles its own ``z -> 0`` limit, and the correction is a product, not a
+    difference.  Crucially ``delta`` is **passed in, not formed as z - y**:
+    the caller knows ``c - beta`` directly from its parametrisation, so the
+    one subtraction that could cancel never happens.
+
+    That is why there is no series branch here.  Taken naively the
+    expression loses everything -- measured in float32 at ``z = 1e-6,
+    delta = 0``, the naive form is wrong by a factor of 3.6e11 where this is
+    wrong by 7e-8 -- and at ``delta = 0`` this reproduces :func:`gamma3`
+    bit for bit, so the SHO is unaffected.
+    """
+    return gamma3(z) + exp_acc(-z) * delta * (1.0 + z - 0.5 * delta)
 
 
 def gamma3(z: mx.array) -> mx.array:

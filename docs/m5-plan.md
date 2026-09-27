@@ -248,7 +248,7 @@ through it rather than build one.
 
 ## Stage 3 — the general complex term, and exposure time on top of it (was stage 2)
 
-### 3a. Generalise `_sho_matrices` from two rates to three
+### 3a. Generalise `_sho_matrices` from two rates to three — **DONE**
 
 `(omega_0, Q)` becomes `(c, beta, s)` with `P_inf = I` kept. `Phi` and `Q`
 keep their algebraic shape exactly (verified against `expm` and
@@ -260,33 +260,55 @@ Q22 = (1 - E) + 2 b_ E C S - 2 b_² E S²
 Q12 = 2 b_ s_ E S²          with b_ = beta dt, s_ = s dt, E = e^{-2c dt}
 ```
 
-**The one new numeric object** is the two-argument
-`1 - e^{-2a}(1 + 2b + 2b²)`, which replaces `gamma3(2a) = 1 - e^{-2a}(1 +
-2a + 2a²)` and reduces to it at `a = b`. Its small-`dt` behaviour is
-`2(a - b) = 2 g dt`, first order rather than third, so the cancellation
-is *milder* everywhere except as `g → 0`, the SHO boundary, where
-`gamma3` is the limit. **That is where stage 3's risk lives**, and it is
-not the risk the original plan named. The `direct`/`series` split in
-`special.py` is the template.
+**The one new numeric object was expected to be the risk, and is not.**
+It looked like it needed its own series. It does not: there is an exact
+identity,
 
-Gate: the existing SHO reproduced bit-identically in float64 and float32
-through the general path (`beta = c, s = omega_0`); the new function
-pinned against mpmath in float32 across the `(a, b)` plane including
-`g → 0`; the whole suite green with no tolerance change. Because
-`P_inf = I` is kept, `first_point()`, the pivot floor in `linalg.py`, the
-`.hi()` path and `sample_ssm` need **no change** for this stage.
+    1 - e^{-z}(1 + y + y²/2)
+      = gamma3(z) + e^{-z} (z - y) (1 + (z + y)/2)
+      = gamma3(z) + e^{-z} delta (1 + z - delta/2),   delta = z - y
 
-### 3b. `ComplexTerm` and `OriginalCeleriteTerm`
+so it is `gamma3` — already cancellation-free — plus a correction that is a
+*product*, not a difference. And `delta = 2(c - beta) dt = 2 g dt` is
+**supplied by the parametrisation**, so the one subtraction that could
+cancel never happens. `special.gamma3_shifted` is four lines with no
+branch. Measured in float32: worst 1.5e-7 relative over the `(z, delta)`
+corners including `z = 1e-6`, where the naive form is wrong by a factor of
+3.6e11; and at `delta = 0` it is **bit-identical** to `gamma3`, so no
+existing term moves.
 
-The construction above, exposed. Gate: float64 parity with
-`celerite2.terms.ComplexTerm` to ~1e-11 over a grid including `d → 0`,
-`b = 0`, `c → 0` and `b` on the positive-definiteness boundary (where
-`Q_c` has an exact zero eigenvalue); `OriginalCeleriteTerm` by
-reparametrisation. Overdamped `Q < 1/2` goes through the analytic
-continuation to `d² < 0`; `F` and `h` come out exactly real (measured,
-max imaginary part 0.0). **Do not route it through celerite2's two-real-
-term decomposition**, which carries a negative amplitude and is the only
-form that would need a signed `P_inf`.
+**Gate met.** `SHOTerm`, `Matern32Term` and `RotationTerm` reproduced
+**bit-identically** through the general path — 0 differing bits over
+19,584 values, both precisions, `Q` from 0.05 to 300 and `dt` over eight
+decades. `gamma3_shifted` pinned against mpmath and against the naive
+form. Suite green with no tolerance change. As predicted, `first_point()`,
+the pivot floor, the `.hi()` path and `sample_ssm` needed no change,
+because `P_inf = I` is kept.
+
+`_complex_matrices` takes `dsq`, `wsq` and `g` rather than deriving them,
+so each caller keeps the cancellation-free route its own parametrisation
+affords: the SHO still gets `d²` through the factored
+`(2Q-1)(2Q+1)/(4Q²)` that vanishes *exactly* at `Q = 1/2`.
+
+### 3b. `ComplexTerm` — **DONE**; `OriginalCeleriteTerm` folded in
+
+**Gate met, tighter than asked.** `ag.ComplexTerm(a, b, c, d)` matches
+`celerite2.terms.ComplexTerm` to **0.0** on kernel values over 150 random
+terms and to 2.5e-16 through the state-space form, over the corners
+`b = 0`, `d → 0`, `c >> d`, `c << d`, `b < 0` and `b` just inside the
+positive-definiteness boundary. End to end against celerite2 *and* the
+dense float64 oracle: 1.9e-15. On the fused kernel: value within 1e-3 of
+the reference path, gradient 3.3e-7 against it and 1.2e-7 against float64
+central differences.
+
+`SHOTerm` is pinned as the `b/a = c/d` case of it, which is what makes
+3a's refactor safe.
+
+**`OriginalCeleriteTerm` needs no separate class.** In celerite2 it is a
+*wrapper* that just forwards another term's coefficients
+(`get_coefficients` returns `self.term.get_all_coefficients()`), not a
+parametrisation of its own — so `ComplexTerm` already is it. The plan
+listed it as a third gap; it was one gap wearing two names.
 
 ### 3c. `TermConvolution`
 

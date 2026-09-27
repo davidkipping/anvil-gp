@@ -78,6 +78,7 @@ from .special import (
     gamma3,
     lower_gamma_reg,
     sinc_gen,
+    gamma3_shifted,
     sincm1_series,
 )
 
@@ -185,19 +186,45 @@ class RealTerm(Term):
 # ---------------------------------------------------------------------------
 
 
-def _sho_matrices(sigma, omega0, qual, dt):
-    """Propagator and process noise for one SHO block, unit stationary variance.
+def _complex_matrices(sigma, c, beta, s, g, dsq, wsq, dt):
+    """Propagator and process noise for one 2-state block, ``P_inf = I``.
 
-    ``sigma`` only enters ``h``; the returned ``phi``/``q`` are amplitude-free.
-    All of ``a``, ``u``, ``w`` are dimensionless combinations of ``dt`` with
-    the two natural rates, so nothing here has units to lose.
+    The general celerite-class complex term, of which the SHO is the case
+    ``beta = c`` (hence ``g = 0``) and ``s = omega_0``.  ``_sho_matrices``
+    below is exactly that call, and is bit-identical to what it was before
+    this generalisation.
+
+    ``k(tau) = a e^{-c tau} cos(d tau) + b e^{-c tau} sin(d tau)`` is realised
+    by ``h = (sqrt(a), 0)``, ``P_inf = I`` and
+
+        F = [[-g, s], [-s, -(2c - g)]],   beta = b d / a,
+        g = c - beta,                     s = sqrt(beta^2 + d^2),
+
+    whose eigenvalues are ``-c +/- i d`` for every ``beta`` -- the rates are
+    the SHO's, only the amplitude ratio moves.  Then
+
+        Phi = [[ec + b_ es,  s_ es], [-s_ es,  ec - b_ es]]
+        Q   = I - Phi Phi^T,  which reduces to
+              Q11 = (1-E) - 2 b_ ec es - 2 b_^2 es^2
+              Q22 = (1-E) + 2 b_ ec es - 2 b_^2 es^2
+              Q12 = 2 b_ s_ es^2
+
+    with ``b_ = beta dt``, ``s_ = s dt``, ``E = e^{-2a}``.  Verified against
+    ``expm(F dt)`` and ``I - Phi Phi^T`` to 4e-16, and the kernel against
+    ``celerite2.terms.ComplexTerm`` to 8e-15, over 120 random terms x 5 lags.
+
+    **Why so many arguments.** ``dsq`` (``= d^2``) and ``wsq`` (``= c^2+d^2``)
+    are passed rather than derived, because deriving them here would
+    reintroduce exactly the cancellations each caller already avoids in its
+    own parametrisation: the SHO gets ``d^2`` through the factored
+    ``(2Q-1)(2Q+1)/(4Q^2)`` so it vanishes *exactly* at ``Q = 1/2``, and
+    ``wsq`` is ``omega_0^2`` outright.  ``g`` likewise: ``Q11``'s correction
+    needs ``c - beta``, which every caller knows directly, and forming it
+    here would cancel as the term approaches the SHO.
+
+    ``sigma`` only enters ``h``; the returned ``phi``/``q`` are
+    amplitude-free.
     """
-    two_q = 2.0 * qual
-    c = omega0 / two_q                            # damping rate
-    # d^2 = omega0^2 (1 - 1/(4Q^2)); factored as (2Q-1)(2Q+1)/(4Q^2) so the
-    # difference does not cancel as Q -> 1/2.  It vanishes *exactly* there,
-    # which is the point: d never appears alone, only through u = d^2 dt^2.
-    dsq = omega0 * omega0 * ((two_q - 1.0) * (two_q + 1.0)) / (two_q * two_q)
     # |d|, used *only* by the overdamped branch (u < 0) below.  The argument
     # is masked to 1 wherever dsq >= 0 rather than passed as |dsq|, because
     # d(sqrt)/dx is infinite at 0 and MLX propagates that through a zero
@@ -209,11 +236,12 @@ def _sho_matrices(sigma, omega0, qual, dt):
 
     a = c * dt                                    # (n, K), >= 0
     u = dsq * dt * dt                             # (n, K), any sign
-    w = omega0 * dt
+    b_ = beta * dt                                # Phi's diagonal rate
+    s_ = s * dt                                   # Phi's off-diagonal scale
     # Overdamped decay rates a -/+ phi.  c - |d| = omega_0^2/(c + |d|):
     # the literal subtraction loses log10(1/(2Q^2)) digits as Q -> 0.
     cpd = c + absd
-    lo = omega0 * omega0 * dt / cpd
+    lo = wsq * dt / cpd
     hi = cpd * dt
 
     # e^-a cos(d dt) and e^-a sin(d dt)/(d dt), formed as products so the
@@ -221,10 +249,10 @@ def _sho_matrices(sigma, omega0, qual, dt):
     ec, es = damped_cos_sinc(a, u, lo, hi)
 
     # Phi in the non-dimensionalised state x' = diag(1, 1/omega_0) x / sigma:
-    #   Phi' = [[ec + a es,  w es], [-w es,  ec - a es]],  det = e^{-2a}.
+    #   Phi' = [[ec + b_ es,  s_ es], [-s_ es,  ec - b_ es]], det = e^{-2a}.
     phi = mx.stack([
-        mx.stack([ec + a * es, w * es], axis=-1),
-        mx.stack([-w * es, ec - a * es], axis=-1),
+        mx.stack([ec + b_ * es, s_ * es], axis=-1),
+        mx.stack([-s_ * es, ec - b_ * es], axis=-1),
     ], axis=-2)
 
     # E = e^{-2a}.  Taken directly, not recovered from the identity
@@ -243,7 +271,7 @@ def _sho_matrices(sigma, omega0, qual, dt):
     #
     # One extra exponential per lag, on a table of distinct lags, is nothing.
     ee = exp_acc(-2.0 * a)
-    a2 = a * a
+    b2 = b_ * b_
     # Q11 = gamma3(2a) + E 2a (1 - sinc(4u)) + E 2a^2 (1 - sinc(u)^2).
     # Two equivalent forms for each bracket: the series form has no
     # cancellation as u -> 0 but needs bounded sinc arguments; the
@@ -256,14 +284,18 @@ def _sho_matrices(sigma, omega0, qual, dt):
     # branch is what makes any `mx.compile` over this graph exceed MLX's
     # fused-argument limit.  Bit-identical on this domain.
     ta = mx.where(u_small,
-                  ee * 8.0 * a * us * sincm1_series(4.0 * us),
-                  2.0 * a * (ee - es * ec))
+                  ee * 8.0 * b_ * us * sincm1_series(4.0 * us),
+                  2.0 * b_ * (ee - es * ec))
     tb = mx.where(u_small,
-                  ee * 2.0 * a2 * us * sincm1_series(us) * (1.0 + sinc_gen(us)),
-                  2.0 * a2 * (ee - es * es))
-    q11 = gamma3(2.0 * a) + ta + tb
-    q22 = (-mx.expm1(-2.0 * a)) + 2.0 * a * es * ec - 2.0 * a2 * es * es
-    q12 = 2.0 * a * w * es * es
+                  ee * 2.0 * b2 * us * sincm1_series(us) * (1.0 + sinc_gen(us)),
+                  2.0 * b2 * (ee - es * es))
+    # `gamma3_shifted(2a, 2g dt)`, not `gamma3(2a)`: the polynomial belongs
+    # to `beta` while the exponential belongs to `c`.  `g dt` is passed, not
+    # formed as `a - b_`, so the one cancellation is avoided.  At g = 0 this
+    # is `gamma3(2a)` bit for bit.
+    q11 = gamma3_shifted(2.0 * a, 2.0 * g * dt) + ta + tb
+    q22 = (-mx.expm1(-2.0 * a)) + 2.0 * b_ * es * ec - 2.0 * b2 * es * es
+    q12 = 2.0 * b_ * s_ * es * es
     q = mx.stack([
         mx.stack([q11, q12], axis=-1),
         mx.stack([q12, q22], axis=-1),
@@ -272,6 +304,26 @@ def _sho_matrices(sigma, omega0, qual, dt):
     zero = mx.zeros_like(sigma)
     h = mx.concatenate([sigma, zero], axis=-1)
     return phi, q, h
+
+
+def _sho_matrices(sigma, omega0, qual, dt):
+    """Propagator and process noise for one SHO block, unit stationary variance.
+
+    The ``beta = c`` case of :func:`_complex_matrices`, where the amplitude
+    ratio is the SHO's ``b/a = c/d`` and so ``g = c - beta = 0``.  Kept as
+    its own entry point because the two rate combinations it forms --
+    ``d^2`` through the factored ``(2Q-1)(2Q+1)/(4Q^2)``, and
+    ``omega_0^2`` -- are what keep the propagator regular at ``Q = 1/2``,
+    and they are expressed in *this* parametrisation, not the general one.
+    """
+    two_q = 2.0 * qual
+    c = omega0 / two_q                            # damping rate
+    # d^2 = omega0^2 (1 - 1/(4Q^2)); factored as (2Q-1)(2Q+1)/(4Q^2) so the
+    # difference does not cancel as Q -> 1/2.  It vanishes *exactly* there,
+    # which is the point: d never appears alone, only through u = d^2 dt^2.
+    dsq = omega0 * omega0 * ((two_q - 1.0) * (two_q + 1.0)) / (two_q * two_q)
+    return _complex_matrices(sigma, c, c, omega0, mx.zeros_like(c), dsq,
+                             omega0 * omega0, dt)
 
 
 @dataclass
@@ -352,6 +404,55 @@ class Matern32Term(Term):
         sigma, rho = float(p[0]), float(p[1])
         x = math.sqrt(3.0) * np.abs(np.asarray(tau, dtype=np.float64)) / rho
         return sigma ** 2 * (1.0 + x) * np.exp(-x)
+
+
+# ---------------------------------------------------------------------------
+# The general complex celerite term, m = 2
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ComplexTerm(Term):
+    """``k(tau) = e^{-c tau} (a cos(d tau) + b sin(d tau))``.  Two states.
+
+    The general celerite-class term, matching
+    ``celerite2.terms.ComplexTerm(a, b, c, d)``.  :class:`SHOTerm` is the
+    special case ``b/a = c/d`` in a physical parametrisation; this is the raw
+    form, and it is what exposure-time integration needs, because convolving
+    a kernel with a boxcar keeps ``c`` and ``d`` and moves ``b/a``.
+
+    Parameters (natural units): ``a``, ``b``, ``c``, ``d``.  ``a > 0`` is the
+    variance at zero lag, ``c > 0`` the decay rate, ``d`` the angular
+    frequency, ``b`` the sine amplitude.
+
+    **Positive-definiteness is the caller's business, as in celerite2.**
+    ``k`` is a valid covariance only for ``|b/a| <= c/d``; the state-space
+    form's process noise is ``diag(2g, 2(2c-g))`` with ``g = c - b d / a``,
+    whose positivity is that same condition.  Outside it the filter still
+    runs -- it is linear algebra on the *observed* matrix, which can stay
+    positive definite -- and :class:`TermConvolution` relies on that.  A
+    sampler exploring ``|b/a| > c/d`` is asking for a non-GP and will get
+    whatever the filter makes of it, so bound ``b`` if you sample it freely.
+    """
+
+    n_state: int = field(default=2, init=False)
+    param_names: tuple[str, ...] = field(
+        default=("a", "b", "c", "d"), init=False)
+
+    def matrices(self, p: mx.array, dt: mx.array):
+        if dt.ndim == 1:
+            dt = dt[None, :]
+        a, b = p[..., 0:1], p[..., 1:2]
+        c, d = p[..., 2:3], p[..., 3:4]
+        beta = b * d / a
+        return _complex_matrices(mx.sqrt(a), c, beta, mx.sqrt(beta * beta
+                                                              + d * d),
+                                 c - beta, d * d, c * c + d * d, dt)
+
+    def value_np(self, p, tau):
+        a, b, c, d = (float(p[0]), float(p[1]), float(p[2]), float(p[3]))
+        t = np.abs(np.asarray(tau, dtype=np.float64))
+        return np.exp(-c * t) * (a * np.cos(d * t) + b * np.sin(d * t))
 
 
 # ---------------------------------------------------------------------------

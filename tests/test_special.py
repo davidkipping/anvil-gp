@@ -244,3 +244,32 @@ def test_sincm1_series_eventually_diverges_so_the_restriction_is_real():
     assert rel > 1e-3, (
         f"the series still agrees to {rel:.1e} at |u| = 200; if _N_TRIG grew, "
         f"`sincm1`'s branch may no longer be needed at all")
+
+
+def test_gamma3_shifted_beats_the_naive_form_where_it_matters(mpm):
+    """`1 - e^{-z}(1 + y + y^2/2)` taken literally is catastrophic at small
+    `z`; the identity used instead is `gamma3(z) + e^{-z} delta (1 + z -
+    delta/2)`, exact and cancellation-free because `delta` is passed rather
+    than formed as `z - y`."""
+    from anvilgp import special as sp
+    cases = [(1e-6, 0.0), (1e-6, 1e-7), (1e-4, 1e-5), (1e-3, 1e-3),
+             (1e-2, 1e-3), (0.1, 0.05), (1.0, 0.5), (5.0, 2.0)]
+    worst_new = worst_naive = 0.0
+    for z, delta in cases:
+        exact = 1 - mpm.e ** (-mpm.mpf(z)) * (
+            1 + mpm.mpf(z - delta) + mpm.mpf(z - delta) ** 2 / 2)
+        zz = mx.array([z], dtype=mx.float32)
+        dd = mx.array([delta], dtype=mx.float32)
+        with mx.stream(mx.cpu):
+            new = float(np.array(sp.gamma3_shifted(zz, dd))[0])
+            y = zz - dd
+            naive = float(np.array(1.0 - sp.exp_acc(-zz)
+                                   * (1.0 + y + 0.5 * y * y))[0])
+        e = abs(float(exact))
+        worst_new = max(worst_new, abs(new - float(exact)) / max(e, 1e-300))
+        worst_naive = max(worst_naive,
+                          abs(naive - float(exact)) / max(e, 1e-300))
+    assert worst_new < 1e-6, f"the identity form is off by {worst_new:.1e}"
+    assert worst_naive > 1e-3, (
+        f"the naive form is only off by {worst_naive:.1e}; if float32 got "
+        f"better this test has stopped demonstrating anything")

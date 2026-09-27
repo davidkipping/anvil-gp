@@ -236,3 +236,97 @@ def test_overdamped_process_noise_is_accurate_in_float32(qual):
         T32 = mx.array(dt, dtype=mx.float32)
         got = float(np.array(term.matrices(P32, T32)[1])[0, 0, 0, 0])
         assert abs(got - ref) / abs(ref) < 1e-6, (qual, w0dt, got, ref)
+
+
+# ---------------------------------------------------------------------------
+# M5 stage 3: the general complex term
+# ---------------------------------------------------------------------------
+
+def _complex_cases():
+    """(a, b, c, d, name), spanning the corners the parametrisation can hit."""
+    return [
+        (1.69, 0.2857, 0.2618, 1.5488, "SHO-equivalent"),
+        (2.0, 0.0, 0.5, 1.0, "b = 0 (pure cosine)"),
+        (1.0, 0.3, 0.4, 1e-4, "d -> 0 (real limit)"),
+        (1.0, 0.05, 2.0, 0.1, "c >> d (overdamped-ish)"),
+        (1.0, -0.4, 0.5, 1.0, "b < 0"),
+        (1.0, 0.4999, 0.5, 1.0, "just inside |b/a| <= c/d"),
+        (3.0, 0.02, 0.05, 3.0, "c << d (barely damped)"),
+    ]
+
+
+@pytest.mark.parametrize("a,b,c,d,name", _complex_cases(),
+                         ids=[k[4] for k in _complex_cases()])
+def test_complex_term_matches_celerite2(a, b, c, d, name):
+    """The general celerite term, against the library that defines it."""
+    c2t = pytest.importorskip("celerite2.terms")
+    tau = np.concatenate([[0.0], np.logspace(-6, 2, 80)])
+    mine = ag.ComplexTerm().value_np(np.array([a, b, c, d]), tau)
+    ref = np.asarray(c2t.ComplexTerm(a=a, b=b, c=c, d=d).get_value(tau))
+    rel = np.max(np.abs(mine - ref)) / max(np.max(np.abs(ref)), 1e-300)
+    assert rel < 1e-13, f"{name}: {rel:.2e}"
+
+
+@pytest.mark.parametrize("a,b,c,d,name", _complex_cases(),
+                         ids=[k[4] for k in _complex_cases()])
+def test_the_complex_state_space_form_reproduces_its_own_kernel(a, b, c, d,
+                                                                name):
+    """`k(tau) = h Phi(tau) P_inf h^T` with `P_inf = I`.
+
+    This is stage 3a's central claim, and the review proved the alternative
+    wrong: a general complex term does **not** need a general stationary
+    covariance.  One extra free rate in the SHO basis reaches it --
+    `beta = b d / a`, `s = sqrt(beta^2 + d^2)`, `g = c - beta` -- and the
+    identity `P_inf = I` is kept.
+    """
+    tau = np.array([0.0, 1e-5, 0.01, 0.3, 1.0, 5.0, 30.0])
+    p = mx.array([[a, b, c, d]], dtype=mx.float64)
+    with mx.stream(mx.cpu):
+        phi, q, h = ag.ComplexTerm().matrices(p, mx.array(tau, dtype=mx.float64))
+        mx.eval(phi, q, h)
+    hv = np.array(h)[0]
+    k = np.array([hv @ np.array(phi)[0, i] @ hv for i in range(len(tau))])
+    ref = ag.ComplexTerm().value_np(np.array([a, b, c, d]), tau)
+    rel = np.max(np.abs(k - ref)) / max(np.max(np.abs(ref)), 1e-300)
+    assert rel < 1e-13, f"{name}: {rel:.2e}"
+    # and Q = I - Phi Phi^T, the stationarity that P_inf = I asserts
+    for i in range(len(tau)):
+        ph = np.array(phi)[0, i]
+        want = np.eye(2) - ph @ ph.T
+        got = np.array(q)[0, i]
+        assert np.max(np.abs(got - want)) < 1e-12, f"{name} lag {tau[i]}"
+
+
+def test_the_sho_is_the_complex_term_with_the_celerite_amplitude_ratio():
+    """`SHOTerm` has `b/a = c/d` exactly, so it is `ComplexTerm` at `g = 0`.
+
+    Pinned because it is what makes stage 3a's refactor safe: the SHO now
+    *runs through* the general path, and if the two ever disagreed the
+    general form would be wrong.
+    """
+    c2t = pytest.importorskip("celerite2.terms")
+    tau = np.concatenate([[0.0], np.logspace(-5, 2, 60)])
+    for sigma, rho, qual in ((1.3, 4.0, 3.0), (1.1, 2.0, 10.0),
+                             (0.7, 6.0, 0.8), (2.0, 1.0, 100.0)):
+        _, _, aa, bb, cc, dd = c2t.SHOTerm(
+            sigma=sigma, rho=rho, Q=qual).get_coefficients()
+        a, b, c, d = float(aa[0]), float(bb[0]), float(cc[0]), float(dd[0])
+        assert abs(b / a - c / d) < 1e-12, "the SHO's ratio is not c/d"
+        sho = ag.SHOTerm().value_np(np.array([sigma, rho, qual]), tau)
+        cpx = ag.ComplexTerm().value_np(np.array([a, b, c, d]), tau)
+        rel = np.max(np.abs(sho - cpx)) / np.max(np.abs(sho))
+        assert rel < 1e-13, f"sigma={sigma} rho={rho} Q={qual}: {rel:.2e}"
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float64])
+def test_gamma3_shifted_is_gamma3_when_the_rates_agree(dtype):
+    """The SHO is `delta = 0`, and it must be **bit**-identical there --
+    anything else would perturb every existing term."""
+    from anvilgp import special as sp
+    z = mx.array(np.concatenate([[0.0], np.logspace(-7, 1.5, 1000)]),
+                 dtype=dtype)
+    with mx.stream(mx.cpu):
+        a = np.array(sp.gamma3(z))
+        b = np.array(sp.gamma3_shifted(z, mx.zeros_like(z)))
+    view = np.uint32 if dtype == mx.float32 else np.uint64
+    assert int(np.sum(a.view(view) != b.view(view))) == 0
