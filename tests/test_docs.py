@@ -145,6 +145,11 @@ def test_anvilgp_usually_but_not_always_beats_celerite2_on_matern32():
     (ag.Matern32Term(), 2, 2, True),
     (ag.Matern52Term(), 3, 2, True),
     (ag.RotationTerm(), 4, 5, True),
+    (ag.ComplexTerm(), 2, 4, True),
+    # kernels.md: "the state dimension is unchanged, so a convolved
+    # RotationTerm is still m = 4 and still runs on the fused kernel".
+    (ag.TermConvolution(ag.RotationTerm(), 0.01), 4, 5, True),
+    (ag.TermConvolution(ag.SHOTerm(), 0.01), 2, 3, True),
     (ag.SHOTerm() + ag.SHOTerm(), 4, 6, True),
     (ag.SHOTerm() + ag.Matern52Term(), 5, 5, False),
     (ag.RotationTerm() + ag.SHOTerm(), 6, 8, False),
@@ -189,3 +194,63 @@ def test_the_kernel_tables_state_dimensions_and_eligibility(term, m, n_par,
         v = gp(u)
         mx.eval(v)
     assert bool(mx.all(mx.isfinite(v)))
+
+
+def _exposure_data():
+    """docs/tutorial.md, "Long-cadence data: exposure time".
+
+    `sample_ssm` cannot draw from a convolved process -- it assumes
+    `P_inf = I` and clips negative eigenvalues of `Q`, and a convolved `Q`
+    has genuinely negative directions.  So the on-model draw is the dense
+    one, from the exact piecewise covariance.
+    """
+    n, cad = 2000, 0.0204
+    t = np.arange(n) * cad
+    yerr = np.full(n, 0.15)
+    p = [1.2, 0.1, 4.0]
+    cv = ag.TermConvolution(ag.SHOTerm(), cad)
+    tau = np.abs(t[:, None] - t[None, :]).ravel()
+    k = np.asarray(cv.value_np(np.array(p), tau)).reshape(n, n)
+    w, v = np.linalg.eigh(k)
+    rng = np.random.default_rng(42)
+    y = ((v * np.sqrt(np.maximum(w, 0.0))) @ rng.standard_normal(n)
+         + rng.standard_normal(n) * yerr)
+    return t, y, yerr, p, cad, cv
+
+
+def test_the_tutorials_exposure_time_table():
+    """Every figure in the tutorial's exposure-time table, re-run.
+
+    Including the last row, which is the point of the section: the same
+    term *without* the convolution, at the same true parameters, is 44
+    log-units worse.  If that shrinks, the example has stopped
+    demonstrating anything and the prose needs rewriting, not the number.
+    """
+    t, y, yerr, p, cad, cv = _exposure_data()
+    pm = ParamMap.log(p)
+    conv = GPLogLike(None, t, None, y, yerr, cv, pm, GPPolicy(metal=True))
+    plain = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                      GPPolicy(metal=True))
+    with mx.stream(mx.cpu):
+        u = np.zeros((1, 3))
+        ours = float(np.array(conv.hi_absolute(mx.array(u, dtype=mx.float64)))[0])
+        naive = float(np.array(plain.hi_absolute(mx.array(u, dtype=mx.float64)))[0])
+    ref = c2.GaussianProcess(
+        c2t.TermConvolution(c2t.SHOTerm(sigma=p[0], rho=p[1], Q=p[2]), cad),
+        mean=0.0)
+    ref.compute(t, yerr=yerr)
+    c2v = ref.log_likelihood(y)
+    with mx.stream(mx.gpu):
+        f32 = float(np.array(conv.log_prob_absolute(
+            mx.zeros((4, 3), dtype=mx.float32)))[0])
+
+    assert abs(ours - (-1982.2663)) < 5e-4, ours
+    assert abs(ours - c2v) / abs(c2v) < 1e-13, f"{ours} vs {c2v}"
+    assert abs(f32 - c2v) / abs(c2v) < 5e-7, f"{f32} vs {c2v}"
+    assert abs(naive - (-2026.1469)) < 5e-4, naive
+    assert naive - ours < -40.0, f"penalty shrank to {naive - ours:+.1f}"
+    # "suppresses the zero-lag variance by 12%"
+    ratio = (float(np.asarray(cv.value_np(np.array(p), np.array([0.0])))[0])
+             / float(np.asarray(ag.SHOTerm().value_np(np.array(p),
+                                                      np.array([0.0])))[0]))
+    assert abs(ratio - 0.8781) < 1e-4, ratio

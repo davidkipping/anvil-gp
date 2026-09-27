@@ -79,7 +79,9 @@ from .special import (
     lower_gamma_reg,
     sinc_gen,
     gamma3_shifted,
+    sincos,
     sincm1_series,
+    coshm1_sinhm_over_z2, coshm1_sinhm_complex,
 )
 
 __all__ = [
@@ -118,6 +120,34 @@ class Term:
 
     def matrices(self, p: mx.array, dt: mx.array):
         raise NotImplementedError
+
+    def celerite_coefficients(self, p: mx.array):
+        """``(a_real, c_real, a, b, c, d)``, each ``(n_chains, k)``.
+
+        The celerite decomposition ``k(tau) = sum a_r e^{-c_r tau} + sum
+        e^{-c tau}(a cos d tau + b sin d tau)``.  Only
+        :class:`TermConvolution` needs it, because exposure-time integration
+        is defined by a closed form in these coefficients.
+
+        **Not every term has them**, which is not a gap in the
+        implementation: :class:`Matern32Term` is a *repeated* root (``d = 0``
+        exactly, which is what makes it exact here and approximate in
+        celerite2) and :class:`Matern52Term` a triple one, so neither is a
+        sum of distinct exponentials or a complex pair.  Those raise.
+        """
+        raise TypeError(
+            f"{type(self).__name__} has no exact celerite coefficients, so it "
+            f"cannot be wrapped in TermConvolution; see its docstring")
+
+    def diag_correction(self, p: mx.array):
+        """Constant to add to every observation's variance, ``(n_chains, 1)``.
+
+        ``None`` for every term but :class:`TermConvolution`, whose
+        convolution is *not* a sum of exponentials below the exposure width
+        and so needs a correction at zero lag.  It is a function of the
+        sampled parameters, so it carries a gradient.
+        """
+        return None
 
     @property
     def block_sizes(self) -> tuple[int, ...]:
@@ -164,26 +194,36 @@ class RealTerm(Term):
     param_names: tuple[str, ...] = field(default=("sigma", "c"), init=False)
 
     def matrices(self, p: mx.array, dt: mx.array):
-        sigma = p[..., 0:1]
-        c = p[..., 1:2]
-        if dt.ndim == 1:
-            dt = dt[None, :]
-        a = c * dt                                   # (n, K)
-        e = exp_acc(-a)
-        phi = e[..., None, None]
-        # Q = 1 - e^{-2a} in the unit-variance state; -expm1 is exact.
-        q = (-mx.expm1(-2.0 * a))[..., None, None]
-        h = mx.concatenate([sigma], axis=-1)
-        return phi, q, h
+        return _real_matrices(p[..., 0:1], p[..., 1:2], dt)
 
     def value_np(self, p, tau):
         sigma, c = float(p[0]), float(p[1])
         return sigma ** 2 * np.exp(-c * np.abs(tau))
 
+    def celerite_coefficients(self, p: mx.array):
+        sigma, c = p[..., 0:1], p[..., 1:2]
+        empty = sigma[..., :0]
+        return sigma * sigma, c, empty, empty, empty, empty
+
 
 # ---------------------------------------------------------------------------
 # SHO term (and Matern-3/2, which is the same object at Q = 1/2)
 # ---------------------------------------------------------------------------
+
+
+def _real_matrices(sigma, c, dt):
+    """Propagator and process noise for one real block, unit variance, m = 1.
+
+    Factored out of :class:`RealTerm` so :class:`TermConvolution` can build
+    the real components of a convolved term from the same code.
+    """
+    if dt.ndim == 1:
+        dt = dt[None, :]
+    a = c * dt                                   # (n, K)
+    phi = exp_acc(-a)[..., None, None]
+    # Q = 1 - e^{-2a} in the unit-variance state; -expm1 is exact.
+    q = (-mx.expm1(-2.0 * a))[..., None, None]
+    return phi, q, mx.concatenate([sigma], axis=-1)
 
 
 def _complex_matrices(sigma, c, beta, s, g, dsq, wsq, dt):
@@ -354,6 +394,37 @@ class SHOTerm(Term):
         qual = p[..., 2:3]
         return _sho_matrices(sigma, omega0, qual, dt)
 
+    def celerite_coefficients(self, p: mx.array):
+        """One complex pair, **valid only for ``Q > 1/2``**.
+
+        Below critical damping the SHO is two *real* exponentials, one with
+        a **negative** amplitude (celerite2 returns exactly that), and a
+        negative amplitude is the one case the ``P_inf = I`` construction
+        cannot carry.  ``d`` is floored at zero here, so ``b = a c / d``
+        divides by zero and the convolved term becomes non-finite.
+
+        **This cannot be caught at call time.** An earlier version of this
+        docstring claimed it was; it never was, and the consequence is not
+        a NaN the caller sees but the likelihood's own non-finite guard
+        returning ``-1e30`` with an exactly **zero gradient** -- flat in
+        every direction, the failure mode that guard exists to warn about.
+        So the check is at *construction*:
+        :class:`~anvilgp.likelihood.GPLogLike` evaluates a convolved term at
+        the parameter map's reference point and refuses a non-finite one.
+        A sampler can still walk here, so a convolved ``SHOTerm`` needs a
+        prior that keeps ``Q > 1/2``; :class:`RotationTerm` is bounded away
+        from it by construction and has no such requirement.
+        """
+        sigma = p[..., 0:1]
+        omega0 = _TWO_PI / p[..., 1:2]
+        qual = p[..., 2:3]
+        c = omega0 / (2.0 * qual)
+        dsq = omega0 * omega0 - c * c
+        d = mx.sqrt(mx.maximum(dsq, mx.zeros_like(dsq)))
+        a = sigma * sigma
+        empty = a[..., :0]
+        return empty, empty, a, a * c / d, c, d
+
     def value_np(self, p, tau):
         sigma, rho, q = (float(v) for v in p[:3])
         tau = np.abs(np.asarray(tau, dtype=np.float64))
@@ -453,6 +524,199 @@ class ComplexTerm(Term):
         a, b, c, d = (float(p[0]), float(p[1]), float(p[2]), float(p[3]))
         t = np.abs(np.asarray(tau, dtype=np.float64))
         return np.exp(-c * t) * (a * np.cos(d * t) + b * np.sin(d * t))
+
+    def celerite_coefficients(self, p: mx.array):
+        a, b = p[..., 0:1], p[..., 1:2]
+        c, d = p[..., 2:3], p[..., 3:4]
+        empty = a[..., :0]
+        return empty, empty, a, b, c, d
+
+
+# ---------------------------------------------------------------------------
+# Exposure-time integration
+# ---------------------------------------------------------------------------
+
+
+class TermConvolution(Term):
+    """``term`` convolved with a boxcar of width ``delta`` -- exposure time.
+
+    A detector integrating for ``delta`` does not sample the process, it
+    samples its running mean, and for a 30-minute cadence against an hours
+    signal that materially smooths the kernel.  Equivalent to
+    ``celerite2.terms.TermConvolution``.
+
+    **What the convolution does, and why it fits.** It leaves the *rates*
+    untouched and rescales the *amplitudes*, and beyond the exposure width
+    the convolved kernel is exactly a sum of exponentials with the new
+    amplitudes (verified against celerite2 to 3e-16).  So it is a
+    celerite-class term with the same state dimension -- but not the same
+    *parametrisation*: the rescaling breaks the SHO's ``b/a = c/d``, which
+    is why this needs :class:`ComplexTerm` and could not be written before
+    it.
+
+    **Below the exposure width it is not that sum**, and the difference at
+    zero lag is a constant added to the variance -- :meth:`diag_correction`.
+    That is the only piece that is not a kernel, and it is a function of
+    the sampled parameters, so it carries a gradient.  Note it is
+    **sign-indefinite**: positive for oscillatory components, negative for
+    real ones (which *removes* variance).
+
+    **Every spacing must be at least ``delta``** -- including zero, so
+    duplicate timestamps are refused.  At a lag inside the exposure window
+    the exponential sum is simply the wrong function there, and for a term
+    with a real component the observed matrix goes indefinite: measured
+    min eigenvalue -3.0e-2 at ``delta = 0.1``, which makes the filter's
+    innovation variance negative and the likelihood NaN.  Physically the
+    rule is automatic for one instrument, since you cannot sample faster
+    than you expose; two instruments observing simultaneously with
+    different exposure times is the same zero-spacing case and is equally
+    refused.  :class:`~anvilgp.likelihood.GPLogLike` checks it at
+    construction.
+
+    **Limits.** ``term`` must have exact celerite coefficients, so
+    :class:`Matern32Term` (a repeated root) and :class:`Matern52Term` (a
+    triple one) cannot be wrapped -- their convolutions *are* state-space
+    models of the same order, with the same rate and a
+    polynomial-times-exponential form (measured to 1.6e-15), but reaching
+    them needs the ``m = 3`` propagator generalised the way
+    :func:`_complex_matrices` generalised ``m = 2``.  An underdamped
+    ``SHOTerm`` is fine; below ``Q = 1/2`` it decomposes into two real
+    exponentials one of which has a *negative* amplitude, which the
+    ``P_inf = I`` construction cannot carry, and that is refused too.
+    """
+
+    def __init__(self, term: Term, delta: float):
+        self.term = term
+        self.delta = float(delta)
+        if self.delta <= 0.0:
+            raise ValueError(f"delta must be > 0, got {self.delta}")
+        # probe the wrapped term now, so an unsupported one fails here
+        # rather than inside a sampler
+        term.celerite_coefficients(mx.zeros((1, term.n_params)))
+        self.n_state = term.n_state
+        self.param_names = term.param_names
+
+    @property
+    def n_params(self) -> int:
+        return self.term.n_params
+
+    def _convolved(self, p: mx.array):
+        """The rescaled coefficients and the diagonal correction.
+
+        Closed form, transcribed from celerite2 and verified against it to
+        2e-16 on the amplitudes and 1.7e-5 on the correction (where
+        celerite2's own float64 route cancels).
+        """
+        ar, cr, a, b, c, d = self.term.celerite_coefficients(p)
+        dl = self.delta
+        corr = None
+
+        if ar.shape[-1]:
+            # (cosh z - 1)/z^2 and (sinh z - z)/z^2 come back already
+            # divided, from series: written as a subtraction they lose every
+            # digit as z -> 0, and dividing by z^2 afterwards cannot put
+            # them back.  See `coshm1_sinhm_over_z2`.
+            chm1, shm = coshm1_sinhm_over_z2(cr * dl)
+            ar2 = 2.0 * ar * chm1
+            corr = mx.sum(-2.0 * ar * shm, axis=-1, keepdims=True)
+        else:
+            ar2 = ar
+
+        if a.shape[-1]:
+            c2pd2 = c * c + d * d
+            # (c-d)(c+d), not c^2 - d^2: the two are equal in exact
+            # arithmetic and the product keeps its digits when c ~ d.
+            cmd = (c - d) * (c + d)
+            C1 = a * cmd + 2.0 * b * c * d
+            C2 = b * cmd - 2.0 * a * c * d
+            norm = (dl * c2pd2) ** 2
+            # cosh(w) - 1 and sinh(w) - w for w = (c + i d) delta, from
+            # series in w^2.  Both combinations below cancel to nothing as
+            # delta -> 0 if written directly; `coshm1_sinhm_complex` also
+            # uses `exp_acc`/`sincos`, since MLX's float64 exp/sin/cos are
+            # only float32-accurate (a known trap here -- see `exp_acc`).
+            (ct, st), (sr, si) = coshm1_sinhm_complex(c * dl, d * dl)
+            a2 = 2.0 * (C1 * ct - C2 * st) / norm
+            b2 = 2.0 * (C2 * ct + C1 * st) / norm
+            # The correction's numerator is
+            #   2 (C2 Im sinh w - C1 Re sinh w + (ac + bd) delta (c^2+d^2)),
+            # and `C2 d - C1 c = -(c^2+d^2)(ac + bd)` *exactly*, so the
+            # O(delta) part cancels against that last term and the truth is
+            # O(delta^3).  Subtracting w inside `sinhm` does that
+            # cancellation analytically; as written above it was done in
+            # float32 and destroyed the correction -- the value stayed
+            # plausible and the gradient came out 9% wrong.
+            dc = mx.sum(2.0 * (C2 * si - C1 * sr) / norm,
+                        axis=-1, keepdims=True)
+            corr = dc if corr is None else corr + dc
+        else:
+            a2, b2 = a, b
+
+        return ar2, cr, a2, b2, c, d, corr
+
+    def matrices(self, p: mx.array, dt: mx.array):
+        phis, qs, h = self.matrices_blocks(p, dt)
+        return _block_diag(*phis), _block_diag(*qs), h
+
+    def matrices_blocks(self, p: mx.array, dt: mx.array):
+        if dt.ndim == 1:
+            dt = dt[None, :]
+        ar, cr, a, b, c, d, _ = self._convolved(p)
+        phis, qs, hs = [], [], []
+        for i in range(ar.shape[-1]):
+            ph, qq, hh = _real_matrices(mx.sqrt(ar[..., i:i + 1]),
+                                        cr[..., i:i + 1], dt)
+            phis.append(ph)
+            qs.append(qq)
+            hs.append(hh)
+        for i in range(a.shape[-1]):
+            ai, bi = a[..., i:i + 1], b[..., i:i + 1]
+            ci, di = c[..., i:i + 1], d[..., i:i + 1]
+            beta = bi * di / ai
+            ph, qq, hh = _complex_matrices(
+                mx.sqrt(ai), ci, beta, mx.sqrt(beta * beta + di * di),
+                ci - beta, di * di, ci * ci + di * di, dt)
+            phis.append(ph)
+            qs.append(qq)
+            hs.append(hh)
+        return phis, qs, mx.concatenate(hs, axis=-1)
+
+    def celerite_coefficients(self, p: mx.array):
+        ar, cr, a, b, c, d, _ = self._convolved(p)
+        return ar, cr, a, b, c, d
+
+    def diag_correction(self, p: mx.array):
+        return self._convolved(p)[-1]
+
+    @property
+    def block_sizes(self) -> tuple[int, ...]:
+        return self.term.block_sizes
+
+    def value_np(self, p, tau):
+        """The *exact* convolved kernel, piecewise -- not the exponential sum.
+
+        The oracle needs the truth on both sides of the exposure width, so
+        this is the closed form for ``tau < delta`` as well, which is what
+        makes ``dense_covariance`` a valid reference for this term.
+        """
+        pm = mx.array(np.asarray(p, dtype=np.float64)[None, :],
+                      dtype=mx.float64)
+        with mx.stream(mx.cpu):
+            ar, cr, a, b, c, d, _ = self._convolved(pm)
+            corr = float(np.array(self.diag_correction(pm))[0, 0])
+            ar, cr = np.array(ar)[0], np.array(cr)[0]
+            a, b = np.array(a)[0], np.array(b)[0]
+            c, d = np.array(c)[0], np.array(d)[0]
+        t = np.abs(np.asarray(tau, dtype=np.float64))
+        out = np.zeros_like(t)
+        for A, C in zip(ar, cr):
+            out = out + A * np.exp(-C * t)
+        for A, B, C, D in zip(a, b, c, d):
+            out = out + np.exp(-C * t) * (A * np.cos(D * t) + B * np.sin(D * t))
+        # inside the exposure window the sum is wrong; at exactly zero lag
+        # the difference is the diagonal correction, which is all a
+        # covariance matrix with spacings >= delta ever needs.
+        return np.where(t < 1e-300, out + corr, out)
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +905,37 @@ class RotationTerm(Term):
         phi2, qq2, h2 = _sho_matrices(s2, w2, q2, dt)
         return [phi1, phi2], [qq1, qq2], mx.concatenate([h1, h2], axis=-1)
 
+    def celerite_coefficients(self, p: mx.array):
+        """Two complex pairs -- so a rotation kernel *can* be convolved.
+
+        Both modes have ``Q >= 1/2 + Q0 > 1/2`` whenever ``Q0, dQ > 0``, the
+        regime the class documents and the priors sample, so neither pair
+        can reach the critical-damping division a bare :class:`SHOTerm` can.
+        That makes this the *safest* term to wrap in
+        :class:`TermConvolution`, and the one the motivating case needs:
+        long-cadence photometry of a rotating star.
+        """
+        sigma, period = p[..., 0:1], p[..., 1:2]
+        q0, dq, f = p[..., 2:3], p[..., 3:4], p[..., 4:5]
+        amp = sigma * sigma / (1.0 + f)
+        q1 = 0.5 + q0 + dq
+        q2 = 0.5 + q0
+        w1 = 4.0 * math.pi * q1 / (period * mx.sqrt(mx.maximum(
+            (2.0 * q1 - 1.0) * (2.0 * q1 + 1.0), mx.zeros_like(q1) + 1e-30)))
+        w2 = 8.0 * math.pi * q2 / (period * mx.sqrt(mx.maximum(
+            (2.0 * q2 - 1.0) * (2.0 * q2 + 1.0), mx.zeros_like(q2) + 1e-30)))
+        out = []
+        for amp_i, w, qual in ((amp, w1, q1), (f * amp, w2, q2)):
+            c = w / (2.0 * qual)
+            d = mx.sqrt(mx.maximum(w * w - c * c, mx.zeros_like(c)))
+            out.append((amp_i, amp_i * c / d, c, d))
+        empty = sigma[..., :0]
+        return (empty, empty,
+                mx.concatenate([o[0] for o in out], axis=-1),
+                mx.concatenate([o[1] for o in out], axis=-1),
+                mx.concatenate([o[2] for o in out], axis=-1),
+                mx.concatenate([o[3] for o in out], axis=-1))
+
     @property
     def block_sizes(self) -> tuple[int, ...]:
         return (2, 2)
@@ -727,6 +1022,15 @@ class TermSum(Term):
             hs.append(hh)
             off += k
         return phis, qs, mx.concatenate(hs, axis=-1)
+
+    def celerite_coefficients(self, p: mx.array):
+        parts, off = [], 0
+        for t in self.terms:
+            k = t.n_params
+            parts.append(t.celerite_coefficients(p[..., off:off + k]))
+            off += k
+        return tuple(mx.concatenate([q[i] for q in parts], axis=-1)
+                     for i in range(6))
 
     @property
     def block_sizes(self) -> tuple[int, ...]:

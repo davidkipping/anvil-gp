@@ -36,6 +36,7 @@ from .terms import (
     RotationTerm,
     SHOTerm,
     Term,
+    TermConvolution,
     TermSum,
 )
 
@@ -44,6 +45,6 @@ __version__ = "0.1.0.dev0"
 __all__ = [
     "GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64",
     "priors", "oracle",
-    "Term", "TermSum", "RealTerm", "SHOTerm", "ComplexTerm",
+    "Term", "TermSum", "RealTerm", "SHOTerm", "ComplexTerm", "TermConvolution",
     "Matern32Term", "Matern52Term", "RotationTerm",
 ]

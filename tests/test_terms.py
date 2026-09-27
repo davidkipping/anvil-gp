@@ -330,3 +330,240 @@ def test_gamma3_shifted_is_gamma3_when_the_rates_agree(dtype):
         b = np.array(sp.gamma3_shifted(z, mx.zeros_like(z)))
     view = np.uint32 if dtype == mx.float32 else np.uint64
     assert int(np.sum(a.view(view) != b.view(view))) == 0
+
+
+# ---------------------------------------------------------------------------
+# exposure-time integration (M5 stage 3c)
+# ---------------------------------------------------------------------------
+
+#: terms with exact celerite coefficients, so wrappable.  SHO is underdamped
+#: only -- see `test_convolution_needs_an_underdamped_sho`.
+CONVOLVABLE = [
+    ("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+    ("real", ag.RealTerm(), [1.2, 0.7]),
+    ("complex", ag.ComplexTerm(), [1.5, 0.4, 0.6, 1.1]),
+    ("sho+real", ag.SHOTerm() + ag.RealTerm(), [1.3, 4.0, 3.0, 1.2, 0.7]),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+]
+
+
+def _f64p(p):
+    return mx.array(np.asarray(p, dtype=np.float64)[None, :], dtype=mx.float64)
+
+
+@pytest.mark.parametrize("name,term,p", CONVOLVABLE, ids=[c[0] for c in CONVOLVABLE])
+@pytest.mark.parametrize("delta", [1e-4, 1e-2, 0.2])
+def test_convolved_kernel_at_zero_lag_matches_a_quadrature(name, term, p, delta):
+    """``k_conv(0) = (2/d^2) int_0^d (d - u) k(u) du``, by mpmath quadrature.
+
+    The reference the plan reserves for the small-``delta`` end, where
+    celerite2's own two float64 routes disagree by 5.7e-12 and a parity gate
+    would mostly be testing celerite2.  A quadrature of the *base* kernel
+    assumes nothing about the closed form being tested.
+    """
+    mpm = pytest.importorskip("mpmath")
+    mpm.mp.dps = 40
+    cv = ag.TermConvolution(term, delta)
+    got = float(np.asarray(cv.value_np(np.asarray(p, dtype=np.float64),
+                                       np.array([0.0])))[0])
+    d = mpm.mpf(delta)
+    ref = (2 / d ** 2) * mpm.quad(
+        lambda u: (d - u) * mpm.mpf(float(term.value_np(
+            np.asarray(p, dtype=np.float64), np.array([float(u)]))[0])),
+        [0, d])
+    assert abs(got / float(ref) - 1) < 1e-10, f"{name} delta={delta}"
+
+
+@pytest.mark.parametrize("name,term,p", CONVOLVABLE, ids=[c[0] for c in CONVOLVABLE])
+def test_convolution_recovers_the_base_term_as_delta_goes_to_zero(name, term, p):
+    """``delta -> 0`` is the identity, and the limit must be *reached*.
+
+    The cancellation-free forms exist for this: the amplitudes go as
+    ``(cosh z - 1)/z^2 -> 1/2`` and the correction as ``-z/6 -> 0``, both
+    finite limits the literal difference-of-ones form cannot reach -- it
+    returns 0/0 noise, and at ``delta = 1e-8`` it returned NaN.
+
+    Compared at lags ``>= delta`` only, which is not a dodge but the
+    supported domain: :class:`~anvilgp.likelihood.GPLogLike` refuses any
+    cadence with a spacing below the exposure width, so no shorter lag is
+    ever evaluated.  Zero lag is genuinely *not* the base term -- it differs
+    at first order in ``delta`` -- and
+    `test_the_correction_is_delta_over_three_times_the_kernel_slope` pins
+    that separately.
+    """
+    tau = np.logspace(-3, 1.5, 40)
+    base = np.asarray(term.value_np(np.asarray(p, dtype=np.float64), tau))
+    for delta in (1e-8, 1e-6):
+        cv = ag.TermConvolution(term, delta)
+        got = np.asarray(cv.value_np(np.asarray(p, dtype=np.float64), tau))
+        assert np.all(np.isfinite(got)), f"{name} delta={delta}: non-finite"
+        rel = np.max(np.abs(got - base)) / np.max(np.abs(base))
+        assert rel < 1e-12, f"{name} delta={delta}: {rel:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", CONVOLVABLE, ids=[c[0] for c in CONVOLVABLE])
+def test_the_correction_is_delta_over_three_times_the_kernel_slope(name, term, p):
+    """``corr = (delta/3) k'(0+)`` at leading order -- an independent check.
+
+    The zero-lag correction is the one piece of the convolution that is not
+    a kernel, so it gets a reference that does not come from the same closed
+    form: the kink.  Integrating a boxcar over a kernel whose even extension
+    has a corner at the origin misses ``(delta/3) k'(0+)``, and this holds to
+    six digits for every term with a corner.
+
+    It also explains the **sign**, which the class documents as
+    indefinite.  ``k'(0+) = -1/2 h Q_c h^T <= 0`` for any stationary model
+    with PSD process noise, so wherever the corner exists the correction is
+    *negative* -- it removes variance.  A term with ``b/a = c/d`` (the SHO,
+    and so `RotationTerm`) has no corner: ``k'(0+) = 0``, the first-order
+    term vanishes, and what is left is positive and ``O(delta^3)``.  Both
+    signs occur, but at different orders -- not, as the class docstring once
+    implied, as two cases of one leading term.
+    """
+    pp = np.asarray(p, dtype=np.float64)
+    h = 1e-7
+    v = np.asarray(term.value_np(pp, np.array([0.0, h, 2 * h])))
+    slope = float((-3 * v[0] + 4 * v[1] - v[2]) / (2 * h))
+    smooth = abs(slope) < 1e-6 * float(v[0])
+    for delta in (1e-6, 1e-4):
+        with mx.stream(mx.cpu):
+            corr = float(np.array(ag.TermConvolution(term, delta)
+                                  .diag_correction(_f64p(p)))[0, 0])
+        if smooth:
+            # no corner: the O(delta) term is absent, and the remainder is
+            # positive and cubic -- so it is far *below* the corner law.
+            assert corr > 0.0, f"{name} delta={delta}: {corr:.3e}"
+            assert corr < 1e-3 * delta * float(v[0]), f"{name} delta={delta}"
+        else:
+            assert abs(corr / (delta / 3.0 * slope) - 1) < 1e-4, \
+                f"{name} delta={delta}: corr {corr:.6e}"
+            assert corr < 0.0, f"{name}: a corner removes variance"
+
+
+@pytest.mark.parametrize("name,term,p", [
+    ("matern32", ag.Matern32Term(), [1.1, 2.5]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+])
+def test_convolution_refuses_terms_without_exact_celerite_coefficients(name, term, p):
+    """A repeated root is not a sum of distinct exponentials.
+
+    Matern-3/2 (double root) and Matern-5/2 (triple) have *no* celerite
+    coefficients, so the closed form cannot be applied.  Their convolutions
+    are state-space models of the same order, but reaching them needs the
+    ``m = 3`` propagator generalised the way ``_complex_matrices``
+    generalised ``m = 2`` -- out of scope, and it must fail loudly rather
+    than silently pick a wrong decomposition.
+    """
+    with pytest.raises(TypeError, match="no exact celerite coefficients"):
+        ag.TermConvolution(term, 0.01)
+
+
+def test_convolution_needs_an_underdamped_sho():
+    """At ``Q <= 1/2`` the SHO is two real exponentials, one *negative*.
+
+    The ``P_inf = I`` construction cannot carry a negative amplitude, and
+    `SHOTerm.celerite_coefficients` floors ``d`` at zero, so ``b = a c / d``
+    is non-finite.  It is not a NaN the caller sees -- the likelihood's own
+    guard turns it into -1e30 with a zero gradient -- so
+    :class:`GPLogLike` refuses it at the reference point instead (see
+    `test_likelihood.py`).  Here: pin that the coefficients really do go
+    non-finite, which is what that refusal detects.
+    """
+    with mx.stream(mx.cpu):
+        cv = ag.TermConvolution(ag.SHOTerm(), 0.01)
+        ok = cv.celerite_coefficients(_f64p([1.3, 4.0, 3.0]))
+        assert np.all(np.isfinite(np.asarray(ok[3])))
+        for qual in (0.5, 0.4, 0.1):
+            bad = cv.celerite_coefficients(_f64p([1.3, 4.0, qual]))
+            assert not np.all(np.isfinite(np.asarray(bad[3]))), f"Q={qual}"
+    # RotationTerm cannot reach it: both modes have Q >= 1/2 + Q0 > 1/2.
+    with mx.stream(mx.cpu):
+        rot = ag.TermConvolution(ag.RotationTerm(), 0.01)
+        for q0, dq in ((1e-6, 1e-6), (3.0, 1.0), (0.01, 0.01)):
+            co = rot.celerite_coefficients(_f64p([1.5, 7.0, q0, dq, 0.4]))
+            assert all(np.all(np.isfinite(np.asarray(x))) for x in co), \
+                f"Q0={q0} dQ={dq}"
+
+
+@pytest.mark.parametrize("name,term,p", CONVOLVABLE, ids=[c[0] for c in CONVOLVABLE])
+@pytest.mark.parametrize("delta", [1e-2, 0.2])
+def test_convolved_coefficients_match_celerite2(name, term, p, delta):
+    """Rescaled amplitudes and the zero-lag correction, against celerite2.
+
+    celerite2 exposes the convolved coefficients directly, so this pins the
+    closed form independently of the filter.
+
+    **Not below ``delta = 1e-2``**, and that is not a tolerance dodge: down
+    there celerite2 is the inaccurate one.  See
+    `test_we_beat_celerite2_on_the_convolved_amplitudes_at_small_delta`;
+    the small-``delta`` end is gated against an mpmath quadrature instead.
+    """
+    c2t = pytest.importorskip("celerite2.terms")
+    base = _celerite2_equivalent(c2t, name, np.asarray(p, dtype=np.float64))
+    if base is None:
+        pytest.skip(f"no celerite2 equivalent for {name}")
+    conv = c2t.TermConvolution(base, delta)
+    ar_r, cr_r, a_r, b_r, c_r, d_r = [np.asarray(x, dtype=np.float64)
+                                      for x in conv.get_coefficients()]
+    with mx.stream(mx.cpu):
+        ar, cr, a, b, c, d = [np.asarray(x)[0] for x in
+                              ag.TermConvolution(term, delta)
+                              .celerite_coefficients(_f64p(p))]
+    for got, ref, lab in ((ar, ar_r, "ar"), (cr, cr_r, "cr"), (a, a_r, "a"),
+                          (b, b_r, "b"), (c, c_r, "c"), (d, d_r, "d")):
+        assert got.size == ref.size, f"{name} {lab}: {got.size} vs {ref.size}"
+        if got.size:
+            scale = max(float(np.max(np.abs(ref))), 1e-300)
+            err = float(np.max(np.abs(np.sort(got) - np.sort(ref)))) / scale
+            assert err < 1e-11, f"{name} delta={delta} {lab}: {err:.2e}"
+
+
+def _celerite2_equivalent(c2t, name, p):
+    """The same kernel in celerite2's parametrisation, or None."""
+    if name == "sho":
+        return c2t.SHOTerm(sigma=p[0], rho=p[1], Q=p[2])
+    if name == "real":
+        return c2t.RealTerm(a=p[0] ** 2, c=p[1])
+    if name == "complex":
+        return c2t.ComplexTerm(a=p[0], b=p[1], c=p[2], d=p[3])
+    if name == "sho+real":
+        return (c2t.SHOTerm(sigma=p[0], rho=p[1], Q=p[2])
+                + c2t.RealTerm(a=p[3] ** 2, c=p[4]))
+    if name == "rotation":
+        return c2t.RotationTerm(sigma=p[0], period=p[1], Q0=p[2], dQ=p[3],
+                                f=p[4])
+    return None
+
+
+def test_we_beat_celerite2_on_the_convolved_amplitudes_at_small_delta():
+    """At ``delta = 1e-3`` anvil-gp is exact and celerite2 is 2e-10 wrong.
+
+    The convolved amplitude of a real term is ``2 a (cosh z - 1)/z^2`` with
+    ``z = c delta``, and celerite2 evaluates that numerator as written.  In
+    float64 at ``z = 7e-4`` the subtraction costs ~6 digits.  anvil-gp uses
+    the series (`coshm1_sinhm_over_z2`), so it stays at one ulp.
+
+    This is why `test_convolved_coefficients_match_celerite2` stops at
+    ``delta = 1e-2``: below it, a parity gate measures celerite2's error.
+    Recorded as a *directional* assertion -- ours closer to the truth than
+    theirs by a wide margin -- rather than a fixed tolerance.
+    """
+    mpm = pytest.importorskip("mpmath")
+    c2t = pytest.importorskip("celerite2.terms")
+    mpm.mp.dps = 50
+    sigma, c, delta = 1.2, 0.7, 1e-3
+    amp = sigma ** 2
+    z = mpm.mpf(c) * mpm.mpf(delta)
+    exact = float(2 * mpm.mpf(amp) * (mpm.cosh(z) - 1) / z ** 2)
+    with mx.stream(mx.cpu):
+        ours = float(np.asarray(
+            ag.TermConvolution(ag.RealTerm(), delta)
+            .celerite_coefficients(_f64p([sigma, c]))[0])[0, 0])
+    theirs = float(np.asarray(c2t.TermConvolution(
+        c2t.RealTerm(a=amp, c=c), delta).get_coefficients()[0])[0])
+    err_ours = abs(ours / exact - 1)
+    err_theirs = abs(theirs / exact - 1)
+    assert err_ours < 1e-15, f"ours {err_ours:.2e}"
+    assert err_theirs > 100 * err_ours, (
+        f"celerite2 {err_theirs:.2e} vs ours {err_ours:.2e} -- if celerite2 "
+        f"has been fixed upstream, this test has served its purpose")

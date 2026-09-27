@@ -310,7 +310,7 @@ central differences.
 parametrisation of its own — so `ComplexTerm` already is it. The plan
 listed it as a third gap; it was one gap wearing two names.
 
-### 3c. `TermConvolution`
+### 3c. `TermConvolution` — **DONE 2026-09-27**
 
 The same construction on the rescaled amplitudes, with `Q_c` formally
 indefinite. Four things the original plan got wrong or left out:
@@ -375,6 +375,104 @@ already does this given a correct `value_np`.
 Two to three days, as before, but with the risk relocated: from `P_inf`
 plumbing (gone) to one new two-argument special function (3a) and the
 zero-spacing refusal (3c).
+
+#### Landed
+
+Exposure-time integration on the coefficient route, `delta` fixed data and
+the wrapped term's parameters passed through untouched. The state dimension
+is unchanged, so a convolved `RotationTerm` is still `m = 4` and still runs
+on the fused kernel. The zero-lag correction goes through stage 2's additive
+diagonal slot on both paths, exactly as that stage was designed for.
+
+**Gates, measured.** Against `celerite2.terms.TermConvolution` in float64:
+worse than 1e-11 nowhere over five term shapes (SHO, real, complex,
+SHO+real, rotation) x {1e-2, 0.04} x {at, off} the reference point. Fused
+kernel against the reference path: value 1e-5, gradient 1e-3. Gradient
+against float64 central differences: 1e-4 over `delta` in {1e-4, 1e-3,
+1e-2}. `delta -> 0` recovers the base term to 1e-12 at every lag `>= delta`.
+The `dupes` and `alternating` cadences raise, naming the offending pair, and
+the same cadences still construct without the convolution. Full suite 724
+passed, up from 644.
+
+**The stage shipped with a wrong gradient and a right value, and the value
+check was what hid it.** The convolved amplitudes are
+`2a(cosh z - 1)/z^2` and the correction `-2a(sinh z - z)/z^2` at
+`z = c delta`; written that way both cancel to nothing as `delta -> 0`, and
+dividing by `z^2` afterwards cannot restore digits the subtraction already
+destroyed. In float32 at `delta = 1e-2` that left ~2 digits: the *value*
+matched celerite2 to 1e-13 in float64 and the gradient was **9% wrong**, at
+`delta = 1e-3` it was wrong by 247x, and at `1e-4` the analytic gradient was
+exactly **zero** while finite differences were not. Both the autodiff path
+and the hand-written Metal backward were wrong *identically*, which is what
+localised it: a forward whose parameter dependence is destroyed, not a
+backward bug.
+
+Fixed analytically rather than by tolerance. `coshm1_sinhm_over_z2` and
+`coshm1_sinhm_complex` (new, in `special.py`) return the combinations
+already divided, from series in `w^2` with all-positive coefficients. The
+complex correction's `O(delta)` part cancels against its own
+`(ac + bd) delta (c^2 + d^2)` term by the exact identity
+`C2 d - C1 c = -(c^2+d^2)(ac+bd)` (verified in rational arithmetic), so
+subtracting `w` inside `sinh w - w` does that cancellation in algebra
+instead of in float32. Both helpers hold machine precision in both dtypes
+against mpmath across the series/closed-form switch. Gradient error after:
+~1e-5, flat in `delta` from 1e-8 to 1e-2.
+
+**This makes anvil-gp the more accurate of the two at small `delta`**, by
+six orders of magnitude: on a real term at `delta = 1e-3`, against a
+50-digit reference, anvil-gp is 2.2e-16 and celerite2 2.2e-10 — celerite2
+evaluates the same numerator as written. That is why the parity gate stops
+at `delta = 1e-2` and an mpmath quadrature of
+`(2/d^2) int_0^d (d - u) k(u) du` is the reference below it, exactly as the
+plan's reference caveat anticipated — though the plan expected the margin to
+be thin, not to invert.
+
+**Three things the plan did not have.**
+
+* **`RotationTerm` had no `celerite_coefficients`, so the motivating case
+  was refused.** Long-cadence photometry of a rotating star is *the* reason
+  to want this feature, and it raised `TypeError`. Added: two complex pairs,
+  matching celerite2 to 1e-14. Both modes have `Q >= 1/2 + Q0 > 1/2`, so
+  unlike a bare `SHOTerm` it cannot reach the critical-damping division at
+  all.
+* **The overdamped refusal did not exist.** `SHOTerm.celerite_coefficients`
+  documented a call-time check for `Q <= 1/2`; there was none, and `d` is
+  floored at zero, so `b = a c / d` is non-finite. What a sampler got was
+  not a NaN but the likelihood's non-finite guard: `-1e30` with an exactly
+  **zero gradient** — a flat plateau, the failure mode that guard's own
+  comment warns about. Now refused in `GPLogLike.__init__` at the reference
+  point, where the message can name the cause; the docs state that the prior
+  must keep `Q > 1/2`, because a sampler can still walk there.
+* **The correction's sign is two orders, not two cases.** The class
+  documented it as positive for oscillatory and negative for real
+  components. Measured: `corr = (delta/3) k'(0+)` to six digits wherever the
+  even extension has a corner, and `k'(0+) = -1/2 h Q_c h^T <= 0` always, so
+  there it is negative. A term with `b/a = c/d` (SHO, rotation) has no
+  corner, the first-order term vanishes, and the remainder is positive and
+  `O(delta^3)`. Both signs occur, at different orders.
+
+**One gate as written was unachievable, for a reason worth keeping.** It
+asked that `delta -> 0` recover the base term to 1e-12 — at *every* lag.
+At zero lag it cannot: the convolved kernel differs from the base at
+**first order** in `delta` there, by `(delta/3) k'(0+)`, which is physics
+and not error. The gate now runs over lags `>= delta`, which is not a dodge
+but the supported domain, since `GPLogLike` refuses any shorter spacing; the
+zero-lag behaviour has its own test against the corner law.
+
+**Also done:** the clamp comments at `metal.py` and `elements.leaf_elements`
+now say that `h Q h^T >= 0` holds for a convolved term only because
+spacings below `delta` are refused — it genuinely goes negative below
+`delta/2`. `sample_ssm` documents that it cannot draw a convolved process.
+`docs/kernels.md` gains `ComplexTerm` and `TermConvolution` sections and
+loses three stale "planned" rows; `docs/tutorial.md` gains a long-cadence
+worked example with every figure pinned in `test_docs.py`.
+
+**Still not done:** `TermConvolution` around `Matern32Term` or
+`Matern52Term`, which raise. A repeated root has no celerite coefficients,
+so the closed form does not apply; their convolutions are state-space models
+of the same order but need the `m = 3` propagator generalised the way 3a
+generalised `m = 2`. `OriginalCeleriteTerm` is still absent, now only as a
+coefficient conversion away from the implemented `ComplexTerm`.
 
 ## Order, and why it changed
 

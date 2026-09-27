@@ -500,6 +500,59 @@ class GPLogLike:
         self.log_norm_const = float(
             -0.5 * np.sum(np.log(2.0 * np.pi * self._yerr64 ** 2)))
 
+        # A convolved term's kernel is the exponential sum only at lags at
+        # or beyond its exposure width.  Inside it the sum is the wrong
+        # function, and for a term with a real component the observed
+        # matrix goes indefinite (measured min eigenvalue -3.0e-2 at
+        # delta = 0.1), which makes the innovation variance negative and
+        # the likelihood NaN.  Zero spacing is the case that bites, and
+        # this library supports duplicate timestamps -- so the check
+        # includes it.  Two instruments observing simultaneously is this
+        # same case, not a separate one.
+        delta = getattr(kernel_spec, "delta", None)
+        if delta is not None and self.n_data > 1:
+            gaps = np.diff(self._t64)
+            worst = float(gaps.min())
+            if worst < delta * (1.0 - 1e-9):
+                where = int(np.argmin(gaps))
+                raise ValueError(
+                    f"{type(kernel_spec).__name__} has an exposure width of "
+                    f"{delta:g}, but observations {where} and {where + 1} are "
+                    f"{worst:g} apart. Every spacing must be at least the "
+                    f"exposure width: inside it the convolved kernel is not "
+                    f"the sum of exponentials the state-space form "
+                    f"evaluates, and for a real component the covariance "
+                    f"goes indefinite. Duplicate timestamps (spacing 0) are "
+                    f"the common case -- bin them, or drop the convolution.")
+
+        # A convolved term can be non-finite for reachable parameters -- a
+        # bare `SHOTerm` at `Q <= 1/2` is two real exponentials, one with a
+        # negative amplitude, which the `P_inf = I` construction cannot
+        # carry and which divides by `d = 0`.  That does not surface as a
+        # NaN the caller sees: the non-finite guard below returns -1e30
+        # with an exactly zero gradient, so a gradient sampler gets a flat
+        # region rather than a rejection.  Refuse it here, at the reference
+        # point, where the message can still name the cause.  A sampler can
+        # still walk there, so the docs require a prior that excludes it.
+        if delta is not None:
+            ref = np.zeros((1, param_map.n_dim), dtype=np.float64)
+            with mx.stream(mx.cpu):
+                kp = param_map.kernel_params(mx.array(ref, dtype=mx.float64))
+                probe = [np.asarray(x) for x in kernel_spec.celerite_coefficients(kp)]
+                corr = kernel_spec.diag_correction(kp)
+                if corr is not None:
+                    probe.append(np.asarray(corr))
+            if not all(np.all(np.isfinite(x)) for x in probe):
+                raise ValueError(
+                    f"{type(kernel_spec).__name__} is not finite at the "
+                    f"parameter map's reference point "
+                    f"({np.asarray(kp)[0].tolist()}). The usual cause is a "
+                    f"wrapped SHOTerm at Q <= 1/2, which is two real "
+                    f"exponentials -- one with a negative amplitude -- and "
+                    f"not representable here. Keep Q > 1/2 (RotationTerm is "
+                    f"bounded away from it by construction), or drop the "
+                    f"convolution.")
+
         self._lag_np = lag
         # Assigning `metal_block` (a property) builds the kernel's slot map
         # from it, so the map can never disagree with the launch.  Stage R2
@@ -599,6 +652,13 @@ class GPLogLike:
 
         r_ref = r_ref[s:e]
         jit2 = pm.jitter_var(v, sub)
+        # A convolved term is not a sum of exponentials below its exposure
+        # width, and the difference at zero lag is a constant on the
+        # diagonal.  It is a function of the sampled parameters, so it goes
+        # here rather than into `r_ref`, and MLX differentiates it.
+        corr = self.term.diag_correction(pm.kernel_params(v))
+        if corr is not None:
+            jit2 = corr if jit2 is None else jit2 + corr
         r_var = r_ref if jit2 is None else r_ref + jit2
         r_var = mx.broadcast_to(r_var, r.shape)
         s_floor = self.policy.s_floor_rel * r_ref
@@ -810,8 +870,17 @@ class GPLogLike:
         # column per datum, which is what the MLX path wants and the
         # kernel does not.
         jit = pm.jitter_var_per_instrument(v)
+        # Same correction as the reference path.  It is per chain and
+        # applies to every observation, so it is added to *every* jitter
+        # column; with no jitter declared it becomes the one column, which
+        # is why stage 2's slot had to be additive rather than "the
+        # jitter".
+        corr = self.term.diag_correction(pm.kernel_params(v))
+        if corr is not None:
+            jit = corr if jit is None else jit + corr
+        n_col = max(len(pm.jitter), 1) if corr is not None else len(pm.jitter)
         jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
-                else mx.broadcast_to(jit, (n, len(pm.jitter))))
+                else mx.broadcast_to(jit, (n, n_col)))
 
         # scan_loglike, not scan_blocks + tree_reduce here: the
         # differentiation boundary has to enclose the reduction so the

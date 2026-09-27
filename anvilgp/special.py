@@ -44,6 +44,7 @@ __all__ = [
     "sinc_gen", "cosm1_gen", "cos_gen", "sincm1", "sincm1_series",
     "gamma3_shifted", "damped_cos_sinc",
     "gamma3", "lower_gamma_reg", "exp_acc", "sincos",
+    "coshm1_sinhm_over_z2", "coshm1_sinhm_complex",
 ]
 
 # ---------------------------------------------------------------------------
@@ -425,3 +426,100 @@ def sincos(x: mx.array):
     cos = mx.where(q == 0.0, c,
                    mx.where(q == 1.0, -s, mx.where(q == 2.0, -c, s)))
     return sin, cos
+
+
+# ---------------------------------------------------------------------------
+# exposure-time convolution: the two cancelling combinations
+# ---------------------------------------------------------------------------
+
+_N_CONV = 14           # series terms (|w^2| <= 4 converged to 4e-20)
+_W2_SERIES = 4.0       # |w|^2 below which the series is used
+
+# both series are in W = w^2, and both start at W^1, so each is
+# W * horner(W, C) and the two coefficient sets are shared by the real and
+# the complex branch:
+#   cosh(w) - 1 = sum_{k>=1} W^k / (2k)!    = W sum_{j>=0} W^j / (2j+2)!
+#   sinh(w) - w = w sum_{k>=1} W^k / (2k+1)! = w W sum_{j>=0} W^j / (2j+3)!
+_CHM1_C = [1.0 / math.factorial(2 * k + 2) for k in range(_N_CONV)]
+_SHM_C = [1.0 / math.factorial(2 * k + 3) for k in range(_N_CONV)]
+
+
+def coshm1_sinhm_over_z2(z: mx.array):
+    """``((cosh z - 1)/z^2, (sinh z - z)/z^2)``, free of cancellation.
+
+    The exposure-time convolution of a *real* celerite term needs exactly
+    these two, at ``z = c delta``.  Written the obvious way, ``cosh z - 1``
+    and ``z - sinh z`` lose every significant digit as ``z -> 0``, which is
+    the normal regime (a 30-minute exposure against a multi-day
+    timescale).  Dividing by ``z^2`` afterwards does not restore them: at
+    ``delta = 1e-3`` the float32 forward was ~2 digits and its gradient was
+    9% wrong while the *value* still looked right, because the value was
+    only ever checked at the reference point.
+
+    Both limits are finite: ``1/2`` and ``z/6``.
+    """
+    v = z * z
+    small = v <= _W2_SERIES
+    vs = _safe(v, small, 0.0)
+    ser_c = _horner(vs, _CHM1_C)
+    ser_s = z * _horner(vs, _SHM_C)
+
+    vb = _safe(v, ~small, 1.0)
+    zb = _safe(z, ~small, 1.0)
+    e = exp_acc(zb)
+    ei = 1.0 / e
+    ch, sh = 0.5 * (e + ei), 0.5 * (e - ei)
+    return (mx.where(small, ser_c, (ch - 1.0) / vb),
+            mx.where(small, ser_s, (sh - zb) / vb))
+
+
+def _chorner(ur: mx.array, ui: mx.array, coeffs):
+    """Horner in the complex variable ``ur + i ui`` with real coefficients."""
+    ar = coeffs[-1] + 0.0 * ur
+    ai = 0.0 * ui
+    for c in reversed(coeffs[:-1]):
+        ar, ai = ar * ur - ai * ui + c, ar * ui + ai * ur
+    return ar, ai
+
+
+def coshm1_sinhm_complex(x: mx.array, y: mx.array):
+    """``(cosh w - 1, sinh w - w)`` for ``w = x + i y``, as two real pairs.
+
+    Returns ``((ct, st), (sr, si))`` with ``cosh w - 1 = ct + i st`` and
+    ``sinh w - w = sr + i si``.  The complex-exponential branch of the
+    exposure-time convolution needs both, at ``w = (c + i d) delta``:
+
+    * ``ct = cosh x cos y - 1`` and ``st = sinh x sin y`` rescale the
+      amplitudes, and ``ct`` cancels to nothing as ``|w| -> 0``;
+    * the diagonal correction's numerator is ``C2 Im(sinh w - w) -
+      C1 Re(sinh w - w)``, where subtracting ``w`` is an *exact*
+      cancellation of the ``O(delta)` part against the correction's own
+      ``(ac + bd) delta (c^2 + d^2)`` term -- see :meth:`_convolved`.  The
+      truth is ``O(delta^3)``, so computing it as written destroys it.
+
+    The series are in ``W = w^2`` with all-positive coefficients, so
+    nothing cancels inside them; ``W``'s real part is formed as
+    ``(x-y)(x+y)``.
+    """
+    ur, ui = (x - y) * (x + y), 2.0 * x * y          # W = w^2
+    mag = ur * ur + ui * ui
+    small = mag <= _W2_SERIES * _W2_SERIES
+    urs, uis = _safe(ur, small, 0.0), _safe(ui, small, 0.0)
+    # cosh w - 1 = W * horner(W, _CHM1_C)
+    hr, hi = _chorner(urs, uis, _CHM1_C)
+    ct_s, st_s = urs * hr - uis * hi, urs * hi + uis * hr
+    # sinh w - w = w * W * horner(W, _SHM_C)
+    gr, gi = _chorner(urs, uis, _SHM_C)
+    wr, wi = urs * gr - uis * gi, urs * gi + uis * gr
+    xs, ys = _safe(x, small, 0.0), _safe(y, small, 0.0)
+    sr_s, si_s = xs * wr - ys * wi, xs * wi + ys * wr
+
+    xb, yb = _safe(x, ~small, 1.0), _safe(y, ~small, 1.0)
+    e = exp_acc(xb)
+    ei = 1.0 / e
+    ch, sh = 0.5 * (e + ei), 0.5 * (e - ei)
+    sn, cs = sincos(yb)
+    return ((mx.where(small, ct_s, ch * cs - 1.0),
+             mx.where(small, st_s, sh * sn)),
+            (mx.where(small, sr_s, sh * cs - xb),
+             mx.where(small, si_s, ch * sn - yb)))

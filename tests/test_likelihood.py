@@ -483,3 +483,211 @@ def test_the_variance_floor_is_refused_where_it_could_bind():
     for bad in (1.0, 10.0, -1e-3):
         with pytest.raises(ValueError, match="s_floor_rel"):
             GPPolicy(s_floor_rel=bad)
+
+
+# ---------------------------------------------------------------------------
+# exposure-time integration, end to end (M5 stage 3c)
+# ---------------------------------------------------------------------------
+
+CONV_CASES = [
+    ("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+    ("real", ag.RealTerm(), [1.2, 0.7]),
+    ("complex", ag.ComplexTerm(), [1.5, 0.4, 0.6, 1.1]),
+    ("sho+real", ag.SHOTerm() + ag.RealTerm(), [1.3, 4.0, 3.0, 1.2, 0.7]),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+]
+
+
+def _conv_c2(name, p):
+    if name == "sho":
+        return c2t.SHOTerm(sigma=p[0], rho=p[1], Q=p[2])
+    if name == "real":
+        return c2t.RealTerm(a=p[0] ** 2, c=p[1])
+    if name == "complex":
+        return c2t.ComplexTerm(a=p[0], b=p[1], c=p[2], d=p[3])
+    if name == "sho+real":
+        return (c2t.SHOTerm(sigma=p[0], rho=p[1], Q=p[2])
+                + c2t.RealTerm(a=p[3] ** 2, c=p[4]))
+    return c2t.RotationTerm(sigma=p[0], period=p[1], Q0=p[2], dQ=p[3], f=p[4])
+
+
+def _conv_setup(term, p, delta, n=500, spacing=0.05, metal=True, seed=4):
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) * spacing
+    y = rng.standard_normal(n)
+    yerr = np.full(n, 0.3)
+    pm = ParamMap.log(list(p))
+    gp = GPLogLike(None, t, None, y, yerr, ag.TermConvolution(term, delta), pm,
+                   GPPolicy(block=256, hi_block=256, metal=metal))
+    return gp, t, y, yerr, pm
+
+
+@pytest.mark.parametrize("name,term,p", CONV_CASES, ids=[c[0] for c in CONV_CASES])
+@pytest.mark.parametrize("delta", [1e-2, 0.04])
+@pytest.mark.parametrize("at", ["reference", "off-reference"])
+def test_convolved_loglike_matches_celerite2(name, term, p, delta, at):
+    """Absolute float64 parity with ``celerite2.terms.TermConvolution``.
+
+    **Off the reference point as well as on it**, which is the whole point
+    of the second parameter: at ``u = 0`` the parameter map returns exactly
+    its reference values, so a quantity frozen at construction -- or one
+    whose *parameter dependence* is wrong while its value is right -- passes
+    an on-reference value test.  That is not hypothetical: the convolution's
+    amplitudes were once computed in a cancelling form that was accurate at
+    the reference point and 9% wrong in the gradient.
+    """
+    gp, t, y, yerr, pm = _conv_setup(term, p, delta)
+    u = (np.zeros(len(p)) if at == "reference"
+         else np.linspace(0.3, -0.25, len(p)))
+    with mx.stream(mx.cpu):
+        pv = np.array(pm.kernel_params(a64(u[None, :])), np.float64)[0]
+        ours = float(np.array(gp.hi_absolute(a64(u[None, :])))[0])
+    ref = celerite2_loglike(
+        c2t.TermConvolution(_conv_c2(name, pv), delta), t, y, yerr)
+    assert abs(ours - ref) / abs(ref) < 1e-11, f"{name} delta={delta} {at}"
+
+
+@pytest.mark.parametrize("name,term,p", CONV_CASES, ids=[c[0] for c in CONV_CASES])
+def test_the_convolved_gradient_flows_through_the_diagonal_correction(name, term, p):
+    """The gradient, against float64 central differences of ``hi``.
+
+    The gate that matters for this stage, and the one that caught the bug
+    the stage shipped with.  A constant added to the diagonal is easy to get
+    *value*-correct and gradient-wrong two ways: by detaching it, or by
+    computing it in a form whose derivative has lost its digits.  The second
+    is what happened -- and note the sweep over ``delta``: at ``delta =
+    1e-2`` the error was 7%, at ``1e-3`` it was 247x, and at ``1e-4`` the
+    analytic gradient was exactly zero.  A single-``delta`` test at the
+    largest width would have called that 7% float32 noise.
+    """
+    k = len(p)
+    for delta in (1e-4, 1e-3, 1e-2):
+        gp, *_ = _conv_setup(term, p, delta, metal=False)
+        u = mx.array(np.zeros((2, k)), dtype=mx.float32)
+        with mx.stream(mx.gpu):
+            _, grad = mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])
+            mx.eval(grad)
+        got = np.array(grad[0], np.float64)[0]
+        fd = np.zeros(k)
+        step = 1e-5
+        with mx.stream(mx.cpu):
+            for i in range(k):
+                up, dn = np.zeros((1, k)), np.zeros((1, k))
+                up[0, i] += step
+                dn[0, i] -= step
+                fd[i] = (float(np.array(gp.hi(a64(up)))[0])
+                         - float(np.array(gp.hi(a64(dn)))[0])) / (2 * step)
+        rel = float(np.max(np.abs(got - fd)) / np.max(np.abs(fd)))
+        assert rel < 1e-4, f"{name} delta={delta}: {rel:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", CONV_CASES, ids=[c[0] for c in CONV_CASES])
+def test_the_convolved_kernel_path_matches_the_reference_path(name, term, p):
+    """Fused Metal kernel against ``GPPolicy(metal=False)``, value and gradient.
+
+    The correction reaches the kernel through stage 2's additive diagonal
+    slot, on a different route from the reference path's ``r_var``, so it
+    needs its own gate.
+    """
+    k = len(p)
+    gk, *_ = _conv_setup(term, p, 1e-2, metal=True)
+    gm, *_ = _conv_setup(term, p, 1e-2, metal=False)
+    assert gk.metal_eligible()[0], f"{name} fell back: {gk.metal_eligible()[1]}"
+    u = mx.array(np.tile(np.linspace(0.2, -0.15, k), (4, 1)), dtype=mx.float32)
+    out = []
+    for gp in (gk, gm):
+        with mx.stream(mx.gpu):
+            val, grad = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
+            val = gp(u)
+            mx.eval(val, grad)
+        out.append((float(val[0]), np.array(grad[0], np.float64)[0]))
+    (vk, gkv), (vm, gmv) = out
+    assert abs(vk - vm) / abs(vm) < 1e-5, f"{name} value: {vk} vs {vm}"
+    rel = float(np.max(np.abs(gkv - gmv)) / np.max(np.abs(gmv)))
+    assert rel < 1e-3, f"{name} gradient: {rel:.2e}"
+
+
+@pytest.mark.parametrize("cadence", ["dupes", "alternating"])
+def test_convolution_refuses_a_spacing_below_the_exposure_width(cadence):
+    """Duplicate and simultaneous timestamps must raise, naming the spacing.
+
+    Inside the exposure width the convolved kernel is not the exponential
+    sum the state-space form evaluates; at zero lag, for a term with a real
+    component, the observed matrix goes indefinite and the innovation
+    variance negative.  This library *supports* duplicate timestamps, so
+    the case is reachable and has to be refused rather than trusted.
+    """
+    rng = np.random.default_rng(1)
+    n = 200
+    if cadence == "dupes":
+        t = np.sort(np.concatenate([rng.uniform(0.0, 8.0, n // 2)] * 2))
+    else:
+        t = np.sort(np.concatenate([np.arange(n // 2) * 0.3] * 2))
+    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    with pytest.raises(ValueError, match="exposure width"):
+        GPLogLike(None, t, None, y, yerr,
+                  ag.TermConvolution(ag.SHOTerm(), 0.05),
+                  ParamMap.log([1.3, 4.0, 3.0]), GPPolicy())
+    # and the same cadence is fine without the convolution
+    GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
+              ParamMap.log([1.3, 4.0, 3.0]), GPPolicy())
+
+
+@pytest.mark.parametrize("qual", [0.5, 0.4, 0.1])
+def test_convolution_refuses_an_overdamped_sho_at_construction(qual):
+    """``Q <= 1/2`` is outside the construction, and silence there is worse.
+
+    The failure it replaces is not a NaN the caller sees: the likelihood's
+    non-finite guard returns -1e30 with an exactly **zero** gradient, so a
+    gradient sampler entering the region gets a flat plateau rather than a
+    rejection.  Refused at the reference point, where the message can name
+    the cause.  A sampler can still walk there, which is why the docs
+    require a prior that keeps ``Q > 1/2``.
+    """
+    rng = np.random.default_rng(2)
+    n = 200
+    t = np.arange(n) * 0.05
+    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    with pytest.raises(ValueError, match="Q <= 1/2"):
+        GPLogLike(None, t, None, y, yerr,
+                  ag.TermConvolution(ag.SHOTerm(), 0.01),
+                  ParamMap.log([1.3, 4.0, qual]), GPPolicy())
+    # RotationTerm is bounded away from critical damping by construction
+    GPLogLike(None, t, None, y, yerr,
+              ag.TermConvolution(ag.RotationTerm(), 0.01),
+              ParamMap.log([1.5, 7.0, qual, qual, 0.4]), GPPolicy())
+
+
+def test_the_convolved_diagonal_correction_is_not_dead():
+    """Pin that the correction *moves* the likelihood and its gradient.
+
+    Two failure modes a parity test can miss: dropping the correction
+    entirely (it is small), and detaching it from the parameter vector.  So
+    compare against the same model with the correction forced to zero: both
+    the value and the ``sigma`` gradient must differ by more than float32
+    noise.
+    """
+    term = ag.RealTerm()          # a corner, so the correction is O(delta)
+    p = [1.2, 0.7]
+    gp, *_ = _conv_setup(term, p, 0.04, metal=False)
+    u = mx.array(np.zeros((2, 2)), dtype=mx.float32)
+
+    def val_and_grad(g):
+        with mx.stream(mx.gpu):
+            v = g(u)
+            _, gr = mx.vjp(g, [u], [mx.ones((2,), dtype=mx.float32)])
+            mx.eval(v, gr)
+        return float(v[0]), np.array(gr[0], np.float64)[0]
+
+    v_on, g_on = val_and_grad(gp)
+    original = type(gp.term).diag_correction
+    try:
+        type(gp.term).diag_correction = lambda self, pp: None
+        v_off, g_off = val_and_grad(gp)
+    finally:
+        type(gp.term).diag_correction = original
+    assert abs(v_on - v_off) / abs(v_on) > 1e-5, (
+        f"the correction does not move the value: {v_on} vs {v_off}")
+    assert float(np.max(np.abs(g_on - g_off))
+                 / np.max(np.abs(g_on))) > 1e-4, (
+        "the correction does not move the gradient -- it is detached")

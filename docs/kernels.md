@@ -13,6 +13,7 @@ steeply with `m`, and the kernel refuses `m > 4`.
 | `SHOTerm` | 2 | `sigma`, `rho`, `Q` | yes |
 | `Matern32Term` | 2 | `sigma`, `rho` | yes, but **approximate** |
 | `Matern52Term` | 3 | `sigma`, `rho` | **no** |
+| `ComplexTerm` | 2 | `a`, `b`, `c`, `d` | yes |
 | `RotationTerm` | 4 | `sigma`, `period`, `Q0`, `dQ`, `f` | yes |
 | `TermSum` (via `+`) | sum of parts | concatenated | yes |
 
@@ -97,7 +98,117 @@ At `m = 4` this sits at the kernel's register ceiling and is the slowest
 supported kernel — about 5x a 12-core celerite2 pool, against 17–24x for
 `m <= 2`. Still faster, but the margin narrows sharply.
 
-### Sums — `TermSum`
+### `ComplexTerm` — `k(tau) = e^{-c tau}(a cos d tau + b sin d tau)`
+
+```python
+ag.ComplexTerm()                    # params: a, b, c, d
+```
+
+The raw celerite complex-exponential term, matching
+`celerite2.terms.ComplexTerm(a, b, c, d)`. `SHOTerm` is the special case
+`b/a = c/d` with a physical parametrisation, and is what you want for an
+oscillator; `ComplexTerm` is for a decaying oscillation whose amplitude
+ratio is a free parameter.
+
+**`b` takes a linear link, not a log one** — it is the only parameter here
+that is legitimately negative or zero.
+
+Not every `(a, b, c, d)` is a valid covariance. The constraint is
+`k'(0+) = -½ h Q_c hᵀ ≤ 0`, i.e. **`b/a ≤ c/d`**: at `b/a = c/d` the kernel
+is smooth at the origin (the SHO), and above it the implied process noise
+is not PSD. The state-space form is built on a three-rate basis that
+carries the whole valid range with `P_inf = I`.
+
+### `TermConvolution` — exposure-time integration
+
+```python
+ag.TermConvolution(ag.RotationTerm(), delta=0.0204)   # Kepler long cadence
+```
+
+A detector integrating for `delta` does not sample the process, it samples
+its running mean. For a 30-minute cadence against an hours-long signal
+that materially smooths the kernel, and ignoring it biases amplitudes and
+timescales. Equivalent to `celerite2.terms.TermConvolution`, verified
+against it to 1e-11 or better on the log-likelihood over five term shapes,
+three widths, on *and* off the parameter map's reference point.
+
+`delta` is fixed data (the exposure time), not a sampled parameter. The
+wrapped term's parameters pass through unchanged, so a `ParamMap` built for
+the base term needs no edit:
+
+```python
+term = ag.TermConvolution(ag.SHOTerm(), delta=0.0204)
+pm   = ParamMap.log([1.3, 4.0, 3.0])       # still sigma, rho, Q
+```
+
+The state dimension is unchanged, so a convolved `RotationTerm` is still
+`m = 4` and still runs on the fused kernel.
+
+**Three rules, all enforced rather than documented-and-hoped.**
+
+*Every spacing must be at least `delta`.* Inside the exposure width the
+convolved kernel is simply not the sum of exponentials the state-space form
+evaluates, and for a term with a real component the observed matrix goes
+indefinite (measured min eigenvalue -3.0e-2 at `delta = 0.1`), which makes
+the innovation variance negative and the likelihood NaN. `GPLogLike`
+refuses at construction, naming the offending pair. **Duplicate timestamps
+are the common case** — anvil-gp otherwise supports them, and two
+instruments observing simultaneously is this same case. Bin them, or drop
+the convolution. Physically the rule is automatic for one instrument: you
+cannot sample faster than you expose.
+
+*A wrapped `SHOTerm` needs `Q > 1/2`, and your prior must enforce it.*
+Below critical damping the SHO is two real exponentials, one with a
+**negative** amplitude, which the `P_inf = I` construction cannot carry.
+`GPLogLike` refuses a reference point at `Q <= 1/2`, but a sampler can
+still walk there, and what it finds is not a rejection: the non-finite
+guard returns `-1e30` with an exactly **zero gradient**, a flat plateau a
+gradient sampler cannot escape. Bound `Q` away from 1/2 in the prior.
+`RotationTerm` has `Q >= 1/2 + Q0 > 1/2` by construction and needs no such
+care — which, with `m = 4` and long-cadence photometry of a rotating star
+being the motivating case, makes it the term to reach for.
+
+*Only terms with exact celerite coefficients can be wrapped.*
+`Matern32Term` (a repeated root) and `Matern52Term` (a triple one) are not
+sums of distinct exponentials, so the closed form does not apply and
+wrapping them raises `TypeError`. Their convolutions *are* state-space
+models of the same order — measured to 1.6e-15 — but reaching them needs
+the `m = 3` propagator generalised the way `ComplexTerm` generalised
+`m = 2`. Not done; use celerite2's approximation, or an `SHOTerm` at
+`Q = 1/2 + eps` for the Matern-3/2 shape.
+
+**One thing is not a kernel.** Below the exposure width the convolution is
+not an exponential sum, and the difference at zero lag is a constant added
+to every observation's variance. It is a function of the sampled
+parameters, so it carries a gradient, and it is **sign-indefinite**: it
+equals `(delta/3) k'(0+)` to six digits wherever the kernel's even
+extension has a corner, and since `k'(0+) ≤ 0` for any stationary model
+with PSD noise, there it *removes* variance. A term with `b/a = c/d` (the
+SHO, and `RotationTerm`) has no corner, so that term vanishes and what
+remains is positive and `O(delta³)`. You do not need to do anything about
+this — it is applied on both evaluation paths — but it is why a convolved
+term's variance is not just its kernel at zero.
+
+**Accuracy against celerite2.** anvil-gp is the more accurate of the two at
+small `delta`, by a wide margin, and the reason is arithmetic rather than
+algorithm: the convolved amplitudes involve `(cosh z - 1)/z²` and
+`(sinh z - z)/z²` at `z = c·delta`, both of which cancel to nothing as
+`delta → 0`. celerite2 evaluates them as written; anvil-gp uses a series.
+At `delta = 1e-3` on a real term, against a 50-digit reference:
+
+| | relative error on the convolved amplitude |
+|---|---|
+| anvil-gp | 2.2e-16 |
+| celerite2 | 2.2e-10 |
+
+That is six orders of magnitude, and it is why the docs' own parity gate
+against celerite2 stops at `delta = 1e-2` and uses an mpmath quadrature
+below it — a tighter gate there would be measuring celerite2. Written the
+naive way, this bug was *invisible in the value* at the reference point and
+made the gradient 9% wrong at `delta = 1e-2`, 247x wrong at `1e-3`, and
+exactly zero at `1e-4`.
+
+## Sums — `TermSum`
 
 ```python
 term = ag.SHOTerm() + ag.SHOTerm()          # m = 4, granulation + oscillation
@@ -137,10 +248,9 @@ against, but it is 30–70x slower depending on the kernel (see
 
 | kernel | in celerite2 | status here |
 |---|---|---|
-| `ComplexTerm(a, b, c, d)` | yes | **not implemented, planned.** The general complex exponential term. `SHOTerm` covers the oscillatory case with a physical parametrisation; `ComplexTerm` is the raw form. It needs one more free rate in the SHO basis — not a general stationary covariance, as first thought — see [m5-plan.md](m5-plan.md) stage 3. |
-| `OriginalCeleriteTerm` | yes | **not implemented, planned.** A reparametrisation of `ComplexTerm`, so it comes with it. |
-| `TermConvolution` | yes | **not implemented, planned.** Exposure-time integration — convolving the kernel with a finite integration window. Matters for long-cadence photometry where the 30-minute bin smooths short-period signals. It is celerite-class (the convolution keeps the rates and rescales the amplitudes, verified to 4e-16), but the rescaled amplitudes are not reachable in this library's current parametrisation, so it waits on `ComplexTerm` (m5-plan stage 3c). Until then, use celerite2. |
+| `OriginalCeleriteTerm` | yes | **not implemented.** A reparametrisation of `ComplexTerm`, which *is* implemented -- convert the coefficients yourself and use `ComplexTerm`. |
 | `TermProduct` | (varies) | **not implemented.** Products of kernels are not generally state-space representable at fixed `m`. |
+| `TermConvolution` of a Matern | yes | **not implemented.** See `TermConvolution` above: a repeated root has no celerite coefficients, and it raises rather than approximating. |
 
 ### Not celerite-class at all
 

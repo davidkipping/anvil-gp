@@ -251,7 +251,13 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     _m = h.shape[-1]
     hphi = sum(h[:, None, i, None] * phi[:, :, i, :] for i in range(_m))
     qh = sum(q[:, :, :, j] * h[:, None, None, j] for j in range(_m))
-    # `h Q h^T` is a variance, hence non-negative in exact arithmetic, but
+    # `h Q h^T` is a variance, hence non-negative in exact arithmetic --
+    # *except* under a `TermConvolution`, whose `Q` is only formally one: it
+    # goes negative below `dt ~ delta/2`, where this clamp would bind and
+    # change the value rather than repair a rounding error.  `GPLogLike`
+    # refuses any spacing below `delta`, so that `dt` never arrives; the
+    # sentence below holds because of that refusal, not because of
+    # arithmetic.  See `TermConvolution` and docs/kernels.md.
     # float32 can round it slightly negative in the dense-cadence corner.
     # Clamp *it*, not the sum: `r_var` beside it is exact and strictly
     # positive, so clamping the term that can go non-physical leaves

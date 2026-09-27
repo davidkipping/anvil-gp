@@ -273,3 +273,79 @@ def test_gamma3_shifted_beats_the_naive_form_where_it_matters(mpm):
     assert worst_naive > 1e-3, (
         f"the naive form is only off by {worst_naive:.1e}; if float32 got "
         f"better this test has stopped demonstrating anything")
+
+
+# ---------------------------------------------------------------------------
+# the exposure-time convolution's two cancelling combinations (M5 stage 3c)
+# ---------------------------------------------------------------------------
+
+#: spans both sides of the |w|^2 <= 4 series/closed-form switch.
+Z_CONV = np.concatenate([np.logspace(-9, -0.001, 30), [1.0, 1.9, 2.0, 2.1],
+                         np.logspace(0.35, 1.6, 12)])
+
+
+@pytest.mark.parametrize("dtype", [mx.float64, mx.float32])
+def test_coshm1_sinhm_over_z2_matches_mpmath(mpm, dtype):
+    """``(cosh z - 1)/z^2`` and ``(sinh z - z)/z^2`` to working precision.
+
+    These carry :class:`~anvilgp.terms.TermConvolution`'s *real* components.
+    The tolerance is per-dtype eps, not a loose one: the whole point of the
+    pair is that neither loses digits as ``z -> 0``, where both numerators
+    cancel to nothing.
+    """
+    for z in Z_CONV:
+        # Two regimes, two tolerances, because the worst case is *not* where
+        # the danger is: in float32 the largest error over this range is
+        # 1.7e-6 at z = 40, which is `exp`'s own relative error on
+        # cosh(40) ~ 1e17 in the closed-form branch.  The small-z end --
+        # what the helper exists for -- holds 1e-7.
+        if dtype == mx.float64:
+            tol = 4e-15
+        else:
+            tol = 3e-7 if z <= 2.0 else 3e-6
+        got_c, got_s = sp.coshm1_sinhm_over_z2(mx.array([z], dtype=dtype))
+        Z = mpm.mpf(float(z))
+        ref_c = (mpm.cosh(Z) - 1) / Z ** 2
+        ref_s = (mpm.sinh(Z) - Z) / Z ** 2
+        assert abs(float(got_c[0]) / float(ref_c) - 1) < tol, f"cosh form, z={z}"
+        assert abs(float(got_s[0]) / float(ref_s) - 1) < tol, f"sinh form, z={z}"
+
+
+@pytest.mark.parametrize("dtype", [mx.float64, mx.float32])
+def test_coshm1_sinhm_complex_matches_mpmath(mpm, dtype):
+    """``cosh w - 1`` and ``sinh w - w`` for ``w = x + i y``, both parts."""
+    tol = 4e-15 if dtype == mx.float64 else 3e-7
+    for x in (1e-9, 1e-5, 1e-2, 0.4, 1.4, 2.5, 4.0):
+        for y in (0.0, 1e-9, 1e-5, 1e-2, 0.4, 1.4, 2.5, 7.0):
+            (ct, st), (sr, si) = sp.coshm1_sinhm_complex(
+                mx.array([x], dtype=dtype), mx.array([y], dtype=dtype))
+            w = mpm.mpc(float(x), float(y))
+            r1, r2 = mpm.cosh(w) - 1, mpm.sinh(w) - w
+            scale = float(max(abs(r1), abs(r2)))
+            got = np.array([float(ct[0]), float(st[0]), float(sr[0]), float(si[0])])
+            ref = np.array([float(r1.real), float(r1.imag),
+                            float(r2.real), float(r2.imag)])
+            err = float(np.max(np.abs(got - ref)) / scale)
+            assert err < tol, f"x={x} y={y}: {err:.2e}"
+
+
+def test_the_naive_convolution_forms_are_the_ones_that_fail(mpm):
+    """Why these helpers exist, pinned as a *comparison*.
+
+    ``(cosh z - 1)/z^2`` written literally in float32 is worthless below
+    ``z ~ 1e-3`` -- and that is the normal regime, a 30-minute exposure
+    against a multi-day timescale.  Dividing by ``z^2`` afterwards cannot
+    restore digits the subtraction already destroyed.  This is not a
+    hypothetical: written that way, the convolved term's *value* still
+    looked right at the reference point while its gradient was 9% wrong,
+    and at ``delta = 1e-3`` the gradient was wrong by 247x.
+    """
+    z = 1e-4
+    ref = float((mpm.cosh(mpm.mpf(z)) - 1) / mpm.mpf(z) ** 2)
+    zz = mx.array([z], dtype=mx.float32)
+    naive = float(np.array((mx.cosh(zz) - 1.0) / (zz * zz))[0])
+    ours = float(np.array(sp.coshm1_sinhm_over_z2(zz)[0])[0])
+    assert abs(naive / ref - 1) > 0.01, (
+        "the naive form is supposed to be broken here; if it is not, this "
+        "test has lost its point")
+    assert abs(ours / ref - 1) < 3e-7

@@ -129,6 +129,48 @@ autodiff through the scan. It matches float64 central differences to
 ~1e-7. celerite2 has no gradient; you would pair it with JAX or finite
 differences.
 
+## Long-cadence data: exposure time
+
+A detector integrating for 29.4 minutes does not sample the process, it
+samples its running mean. Kepler's long cadence against anything with an
+hours-long timescale smooths the kernel materially, and ignoring it biases
+amplitudes and timescales. Wrap the term:
+
+```python
+cad  = 0.0204                                  # Kepler long cadence, days
+t    = np.arange(2000) * cad
+term = ag.TermConvolution(ag.SHOTerm(), delta=cad)
+pm   = ParamMap.log([1.2, 0.1, 4.0])           # still sigma, rho, Q
+gp   = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(metal=True))
+```
+
+`delta` is the exposure time — fixed data, not a sampled parameter — and
+the wrapped term's parameters pass through unchanged, so an existing
+`ParamMap` needs no edit. The state dimension is unchanged too, so this
+still runs on the fused kernel.
+
+On on-model data at `rho = 0.1` d (a 2.4-hour oscillation at a 29.4-minute
+cadence), at the true parameters:
+
+| | log-likelihood |
+|---|---:|
+| anvil-gp, float64 reference | −1982.2663 |
+| `celerite2.terms.TermConvolution` | −1982.2663 (rel 5e-15) |
+| anvil-gp, fused kernel (float32) | −1982.2662 (rel 5e-08) |
+| **the same `SHOTerm` with no convolution** | **−2026.1469** |
+
+Ignoring the exposure costs 44 log-units at the *true* parameters, and
+suppresses the zero-lag variance by 12% — a fit that ignores it pays for
+the mismatch by distorting `sigma` and `rho`.
+
+**Two rules you will meet immediately.** Every spacing must be at least
+`delta`, duplicate timestamps included, and a wrapped `SHOTerm` needs
+`Q > 1/2`. Both are refused at construction with a message naming the
+cause; `RotationTerm` is bounded away from the second by construction and
+is the usual choice for a rotating star. See
+[kernels.md](kernels.md#termconvolution--exposure-time-integration) for
+why each is a refusal rather than a warning.
+
 ## Why the batch is the whole point
 
 An ensemble sampler proposes a new position for every walker at every
@@ -213,8 +255,8 @@ For example, `SHOTerm() + Matern52Term()` has `m = 5` and reports
 It returns `False` first of all when `GPPolicy.metal` is off, which is
 the default — so a fresh `GPLogLike` reports `(False, 'GPPolicy.metal is
 off')` and that means "you did not ask", not "unsupported". It also
-returns `False` for `m > 4`, for per-instrument jitter, and when
-`mx.fast.metal_kernel` is unavailable. A request that cannot be honoured
+returns `False` for `m > 4`, for more than eight per-instrument jitters
+(`metal.MAX_JITTER`), and when `mx.fast.metal_kernel` is unavailable. A request that cannot be honoured
 **warns and falls back** to the MLX path, which is correct but far
 slower — it does not fail silently. See [kernels.md](kernels.md) for the
 state dimension of each kernel and what combinations stay under the

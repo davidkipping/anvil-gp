@@ -159,6 +159,16 @@ _SRC = """
         // the division below is always safe, and matches what
         // elements.leaf_elements clamps.  The sfloor line is a secondary
         // guard that cannot bind once this one is in place.
+        //
+        // ONE EXCEPTION, and it is why the exposure-width rule is a
+        // refusal rather than a warning: for a TermConvolution, Q is only
+        // formally a covariance, and h Q h^T really does go negative below
+        // dt ~ delta/2 (measured sign flip at 0.50-0.72 delta across Q and
+        // delta).  There the clamp would bind and silently change the
+        // value instead of merely repairing a rounding error.
+        // GPLogLike refuses any spacing below delta, giving ~2x margin, so
+        // no such dt reaches here -- but the claim above is conditional on
+        // that refusal, not on arithmetic.
         float rr = r_ref[t];
         JIT_PER_OBS_T
         sq = max(sq, 0.0f);

@@ -81,6 +81,15 @@ def celerite2_loglike(c2term, t, y, yerr, jitter=0.0) -> float:
 def sample_ssm(term, p, dt, n, rng):
     """Draw ``n`` on-model observations from a term's own state-space model.
 
+    **Not valid for a :class:`~anvilgp.terms.TermConvolution`.** It draws
+    ``x_0 ~ N(0, I)``, which assumes ``P_inf = I``, and it clips negative
+    eigenvalues when it factors ``Q`` -- and a convolved term's ``Q`` is
+    only formally a covariance, with genuinely negative directions.  Both
+    assumptions fail silently, giving on-model-looking data from the wrong
+    process.  For a convolved term the on-model sampler is the dense one:
+    :func:`dense_covariance` on its exact piecewise ``value_np``, then a
+    Cholesky.
+
     O(n) and exact in float64, so it reaches the N where float32 error in
     the reduction becomes visible.  :func:`dense_covariance` plus a Cholesky
     is O(n^3) and stops a couple of thousand points short of that.

@@ -296,8 +296,14 @@ around.
 ## Choosing between them
 
 Use **celerite2** if you evaluate one parameter vector at a time, need
-float64 accuracy in the likelihood itself, need exposure-time integration
-(`TermConvolution`), need `ComplexTerm`, or are not on Apple Silicon.
+float64 accuracy in the likelihood itself, need a kernel anvil-gp does not
+have (`TermProduct`, or `TermConvolution` wrapped around a Matern), or are
+not on Apple Silicon.
+
+Exposure-time integration and `ComplexTerm` are no longer reasons to prefer
+celerite2 — both landed in M5, and on the convolution's small-`delta`
+arithmetic anvil-gp is the more accurate of the two by six orders of
+magnitude (see [kernels.md](kernels.md#termconvolution--exposure-time-integration)).
 
 Use **anvil-gp** if you run an ensemble sampler with hundreds or thousands
 of walkers, want gradients for HMC without writing them yourself, or need

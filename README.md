@@ -43,7 +43,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/tutorial.md](docs/tutorial.md) | Getting started, side by side with celerite2 |
 | [docs/kernels.md](docs/kernels.md) | Every supported kernel, how to set it up, and what is not supported |
 | [docs/benchmarks.md](docs/benchmarks.md) | Speed and accuracy against celerite2 across scales and kernels — including where celerite2 wins |
-| [docs/m5-plan.md](docs/m5-plan.md) | Planned next: per-instrument jitter in the kernel, exposure-time integration, and the compile split |
+| [docs/m5-plan.md](docs/m5-plan.md) | M5, landed: the compile fix, per-instrument jitter in the kernel, `ComplexTerm`, and exposure-time integration |
 | [docs/float32.md](docs/float32.md) | The precision discipline and its measured error budget |
 | [docs/statistical-foundation.md](docs/statistical-foundation.md) | Why the state-space form is exact |
 
@@ -95,9 +95,11 @@ approximate one.
 | `adjoint.py` | hand-derived backward recursion — M4's specification |
 | `anvil.py` | engine integration (lazy import; core stays mlx + numpy only) |
 
-Kernel set: `RealTerm`, `SHOTerm`, `Matern32Term`, `Matern52Term`,
-`RotationTerm` (two SHOs at P and P/2, the celerite2/exoplanet convention),
-sums of terms, per-instrument jitters and mean offsets.
+Kernel set: `RealTerm`, `SHOTerm`, `ComplexTerm`, `Matern32Term`,
+`Matern52Term`, `RotationTerm` (two SHOs at P and P/2, the
+celerite2/exoplanet convention), sums of terms, exposure-time integration
+(`TermConvolution`, around any term with exact celerite coefficients),
+per-instrument jitters and mean offsets.
 
 ## The likelihood is a reduction, not a scan
 
@@ -315,7 +317,7 @@ in-kernel propagators are the obvious follow-ons.
 ### The MLX reference path
 
 Still the float64 verification path, the thing the kernel is proved against,
-and the only path for m > 4 or per-instrument jitter. It is ~40x faster than its first working
+and the only path for m > 4. It is ~40x faster than its first working
 version and beats a single-core CPU, though not a fully parallelised one.
 M2 Max, float32 GPU, compiled forward, **minimum of 15** sustained
 evaluations, `block=4096`, realistic (regular-cadence-with-gaps) times, all
@@ -525,9 +527,9 @@ marked as an estimate.
   a wrong gradient; it is a property that rebuilds the map now. See
   [docs/lag-slots-plan.md](docs/lag-slots-plan.md); an earlier proposal
   here, per-parameter Jacobian tables, was measured and retracted.
-* **m > 4 and per-instrument jitter in the kernel.** Both stay on the MLX
-  gradient path, where a gradient costs 8.8 s at m = 6, 256 chains and
-  N = 1e4.
+* **m > 4.** Stays on the MLX gradient path, where a gradient costs 8.8 s
+  at m = 6, 256 chains and N = 1e4. (Per-instrument jitter was the other
+  half of this entry until M5 stage 2 put it in the kernel, up to 8.)
 * **Block count as an accuracy knob for one adjoint.** The backward seed
   amplifies block-element error through `eta_s - J_s mu`, which reaches
   only `dh` (the amplitude gradient). At the joint corner (`sigma/yerr =
@@ -761,8 +763,8 @@ Three more are worked around and pinned as regression tests
   (it is 255-376x against a single-core loop). `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
-  model. Still owed: m > 4, per-instrument jitter in-kernel, and the float32
-  feasibility map; the thread-layout work landed with M4's stage B. The feasibility map now has evidence that
+  model. Still owed: m > 4 and the float32
+  feasibility map (per-instrument jitter landed in-kernel in M5 stage 2); the thread-layout work landed with M4's stage B. The feasibility map now has evidence that
   it matters: amplitude and correlation length are **not separable**. At
   `sigma/yerr = 100` *and* `rho/dt = 1000` the MLX path is off by 1.5
   log-units where either axis alone stays under 0.2, while the kernel holds
@@ -862,5 +864,7 @@ regression); Foreman-Mackey et al.
 [2406.05188](https://arxiv.org/abs/2406.05188) (parallel square-root filters —
 the pre-registered numerical fallback if float32 covariance-form composition
 ever fails its gates); S+LEAF
-[2201.02440](https://arxiv.org/abs/2201.02440) (integrated kernels, the v2
-path for exposure-time smearing).
+[2201.02440](https://arxiv.org/abs/2201.02440) (integrated kernels; anvil-gp
+does exposure-time smearing by the celerite convolution instead -- see
+`TermConvolution` -- and S+LEAF remains the more general route, including for
+the Matern terms the convolution cannot wrap).
