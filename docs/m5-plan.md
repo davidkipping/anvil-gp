@@ -1,7 +1,8 @@
 # Plan: per-instrument jitter, exposure-time integration, and the compile split
 
-Status: proposed 2026-09-27; **adversarially reviewed the same day and
-revised** — see "Stage R" at the end. Not locked. The review overturned the
+Status: **locked 2026-09-27** after an adversarial review that revised it
+— see "Stage R" at the end. **Stage 1 is done** (commit below); stages 2
+and 3 are as written. The review overturned the
 plan's central design claim and inverted its ordering; the stages below
 are the revised ones, and the original reasoning is kept where it was
 wrong so the correction is legible.
@@ -78,7 +79,7 @@ process abort" that `docs/float32.md` and the M4 stage R notes describe.
 Twenty probes, process survived every time. `mx.eval` inside a compiled
 function is rejected outright, so placement cannot be the difference.
 
-## Stage 1 — the compile fix (was stage 3, was "capped and allowed to fail")
+## Stage 1 — the compile fix — **DONE 2026-09-27**
 
 Use the series-only `sincm1` at the two `_sho_matrices` call sites, where
 the other branch cannot be taken. `special.sincm1` itself and its mpmath
@@ -92,13 +93,43 @@ pinning stay as they are.
 | the docs | `float32.md` and the README's "Known limitation" rewritten; the "process abort" claim corrected; `mx.disable_compile()` removed from the ChEES examples and `tests/test_calibration.py` |
 | upstream | file the MLX reproducer: `sincm1` alone at 1 chain x 2 lags is a four-line case |
 
-The measured prize, one size (64 chains x N = 4096, Metal path,
-interleaved): gradient 3.72 ms → 3.04 ms from removing the dead branch,
-→ 1.91 ms compiled — **1.95x overall**, against the "1.15-1.25x" the
-plan expected. One machine, one size, indicative only. Half a day.
+**Landed**, as `special.sincm1_series` used at the two `_sho_matrices`
+call sites. Every gate met: zero differing bits against `sincm1` across the
+whole threshold interval in both precisions; `mx.compile(value_and_grad)`
+succeeds for all six terms plus a `TermSum` on both paths (14 of 14), value
+bit-identical, gradient within 1.3e-5; the gotchas test inverted; every
+`mx.disable_compile()` removed from the tree; a **verified** self-contained
+MLX reproducer written to `docs/upstream/`.
 
-**Not verified:** whether anvil's ChEES leapfrog then compiles end to end.
-The likelihood's `value_and_grad` does; the sampler was not run.
+**One correction the reproducer forced.** The review said "`sincm1` alone at
+1 chain x 2 lags is a four-line repro". It is not: `sincm1` alone compiles,
+and so does `sinc_gen` alone. Only `sincm1` *inside* `_sho_matrices`'
+surrounding expression fails, so the fused budget is spent collectively and
+no single function is the offender — `sincm1` is merely the contributor that
+can be removed. My first attempt at an upstream report asserted the
+reviewer's version and did not reproduce; the shipped one does, and the
+claim is corrected in `README.md`, `docs/float32.md` and the
+`sincm1_series` docstring.
+
+**The prize is smaller than the review claimed, and size-dependent.** The
+review measured 1.95x at 64 chains x N = 4096 and generalised from it. At
+three sizes, interleaved:
+
+| | gradient eager | compiled | compile gain | dead-branch gain alone |
+|---|---:|---:|---:|---:|
+| N = 4,096, 64 chains | 3.24 ms | 1.93 ms | 1.68x | 1.23x |
+| N = 1e4, 1024 chains | 8.26 ms | 7.06 ms | 1.17x | 1.09x |
+| N = 1e5, 1024 chains | 57.6 ms | 56.3 ms | 1.02x | 1.01x |
+
+So at production sizes it is 1.02-1.17x — which is what the *original*
+plan estimated (1.15-1.25x) and the review talked me out of. The reason to
+do it was always the workaround, not the clock; the review was right about
+the effort and wrong about the payoff, in the opposite direction from the
+plan's first error.
+
+**Still not verified:** whether anvil's ChEES leapfrog compiles end to end.
+The likelihood's `value_and_grad` does, and `tests/test_calibration.py` now
+runs ChEES with compilation on, which is the closest available evidence.
 
 ## Stage 2 — per-instrument jitter in the kernel (was stage 1)
 

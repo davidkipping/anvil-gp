@@ -78,7 +78,7 @@ from .special import (
     gamma3,
     lower_gamma_reg,
     sinc_gen,
-    sincm1,
+    sincm1_series,
 )
 
 __all__ = [
@@ -251,11 +251,15 @@ def _sho_matrices(sigma, omega0, qual, dt):
     # brackets are O(1) and the subtraction is harmless.
     u_small = mx.abs(u) <= 0.5
     us = mx.where(u_small, u, mx.zeros_like(u))
+    # `sincm1_series`, not `sincm1`: `|us| <= 0.5` bounds both arguments by
+    # `_U_SERIES`, so `sincm1`'s other branch is unreachable here, and that
+    # branch is what makes any `mx.compile` over this graph exceed MLX's
+    # fused-argument limit.  Bit-identical on this domain.
     ta = mx.where(u_small,
-                  ee * 8.0 * a * us * sincm1(4.0 * us),
+                  ee * 8.0 * a * us * sincm1_series(4.0 * us),
                   2.0 * a * (ee - es * ec))
     tb = mx.where(u_small,
-                  ee * 2.0 * a2 * us * sincm1(us) * (1.0 + sinc_gen(us)),
+                  ee * 2.0 * a2 * us * sincm1_series(us) * (1.0 + sinc_gen(us)),
                   2.0 * a2 * (ee - es * es))
     q11 = gamma3(2.0 * a) + ta + tb
     q22 = (-mx.expm1(-2.0 * a)) + 2.0 * a * es * ec - 2.0 * a2 * es * es

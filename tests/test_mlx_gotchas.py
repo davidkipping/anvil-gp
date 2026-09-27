@@ -122,27 +122,30 @@ def test_linalg_is_cpu_only_and_has_no_vjp():
             mx.eval(mx.linalg.cholesky(g, stream=mx.gpu))
 
 
-def test_compiled_value_and_grad_exhausts_metal_argument_buffers():
-    """``mx.compile`` over the *backward* pass of the whole likelihood
-    fails with "Too many inputs/outputs fused in the Metal Compiled
-    primitive".
+def test_compiled_value_and_grad_now_succeeds_on_every_term():
+    """**This test asserted the opposite until 2026-09-27**, and the
+    inversion is the point of the commit that changed it.
 
-    Structural, not size-dependent: it fails identically at N = 128 and
-    N = 1000, and disappears at m = 1.  MLX fuses a long dependent
-    elementwise chain into one Metal kernel whose argument count exceeds
-    its limit of 24 arrays per fused group.  Bisected 2026-09-19: the
-    element algebra is NOT the culprit -- chol, combine, combine_leaf and
-    the whole leaf/fold/tree chain each compile under mx.vjp on their own.
-    The offending group is in the front end, inside terms._sho_matrices.
+    ``mx.compile`` over the *backward* pass used to fail with "Too many
+    inputs/outputs fused in the Metal Compiled primitive" for every m >= 2
+    term.  MLX fuses a long dependent elementwise chain into one Metal
+    kernel whose argument count exceeds its limit of 24 arrays, and since
+    anvil's ChEES kernel compiles its leapfrog step, a gradient sampler on
+    a GP target needed a process-global ``mx.disable_compile()``.
 
-    It matters because anvil's ChEES kernel compiles its leapfrog step, so
-    the gradient sampler cannot run on a GP target without either
-    ``mx.disable_compile()`` (verified to work, and what
-    ``examples/`` documents).  M4's backward kernel was expected to moot
-    this and did not: the over-fused group is in ``terms._sho_matrices``,
-    which both paths share, so the kernel path aborts identically.
+    Two earlier diagnoses were wrong and are worth keeping.  The unrolled
+    Cholesky was blamed first; every piece of the element algebra compiles
+    on its own.  ``terms._sho_matrices`` was blamed next, and the proposed
+    fix -- a ``custom_function`` boundary at the term-matrix table -- was
+    measured to change nothing.  The actual offender was a single function,
+    ``special.sincm1``, whose branch selection nests a three-way
+    ``mx.where`` (inside ``sinc_gen``) with each arm separately sanitised.
+    ``_sho_matrices`` calls it only where that branch is unreachable, so
+    ``sincm1_series`` replaces it there and the limit is no longer reached.
 
-    Forward-only compilation is unaffected at every size and every m.
+    If this test starts failing, the fused-argument budget has been spent
+    somewhere else -- look for newly nested both-branch ``mx.where``, not
+    for size.
     """
     import anvilgp as ag
     from anvilgp.likelihood import (GPLogLike, GPPolicy, KernelParam,
@@ -162,21 +165,25 @@ def test_compiled_value_and_grad_exhausts_metal_argument_buffers():
 
     def grad_compiles(gp, k):
         u = mx.zeros((8, k), dtype=mx.float32)
-        try:
-            mx.eval(mx.compile(lambda z: mx.vjp(
-                gp, [z], [mx.ones((8,), dtype=mx.float32)])[1][0])(u))
-            return True
-        except Exception:
-            return False
+        want = mx.vjp(gp, [u], [mx.ones((8,), dtype=mx.float32)])[1][0]
+        got = mx.compile(lambda z: mx.vjp(
+            gp, [z], [mx.ones((8,), dtype=mx.float32)])[1][0])(u)
+        mx.eval(want, got)
+        a, b = np.array(want, np.float64), np.array(got, np.float64)
+        rel = np.max(np.abs(a - b)) / max(np.max(np.abs(a)), 1e-30)
+        assert rel < 1e-4, f"compiled gradient differs by {rel:.2e}"
 
+    cases = [(ag.RealTerm(), [1.0, 0.5]),
+             (ag.SHOTerm(), [1.0, 4.0, 3.0]),
+             (ag.SHOTerm(), [1.0, 4.0, 0.3]),          # overdamped
+             (ag.Matern32Term(), [1.0, 2.5]),
+             (ag.Matern52Term(), [1.0, 2.5]),
+             (ag.RotationTerm(), [1.0, 7.0, 3.0, 1.0, 0.4]),
+             (ag.SHOTerm() + ag.Matern32Term(), [1.0, 4.0, 3.0, 0.6, 1.1])]
     with mx.stream(mx.gpu):
-        # m = 1: the Cholesky is one sqrt, and it compiles
-        assert grad_compiles(build(ag.RealTerm(), [1.0, 0.5]), 2)
-        # m = 2: it does not
-        assert not grad_compiles(build(ag.SHOTerm(), [1.0, 4.0, 3.0]), 3), (
-            "MLX may have raised the fused-argument limit; if so, the "
-            "mx.disable_compile() note in the docs can go")
-        # forward-only is fine either way
+        for term, refs in cases:
+            grad_compiles(build(term, refs), len(refs))
+        # forward-only was always fine and still is
         gp = build(ag.SHOTerm(), [1.0, 4.0, 3.0])
         mx.eval(mx.compile(gp.__call__)(mx.zeros((8, 3), dtype=mx.float32)))
 

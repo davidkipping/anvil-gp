@@ -187,13 +187,40 @@ Characterised:
   chain inside `_sho_matrices` (`damped_cos_sinc`, `gamma3`, `sincm1` and
   their ~20 intermediates). Splitting the VJP at the term-matrix table
   therefore recovers most of it; that is tracked in the README's "What is
-  left" rather than done. M4's backward kernel did not remove it: the
-  over-fused group is in the front end both paths share.
+  left" rather than done. M4's backward kernel did not remove it, and
+  neither did a `custom_function` boundary at the term-matrix table; the
+  actual cause was `special.sincm1` and it is fixed — see below.
 
-anvil's ChEES kernel compiles its leapfrog step, so ChEES-HMC cannot run on a
-GP target without `mx.disable_compile()`. With it, 30 ChEES steps over 64
-chains complete in 7.2 s with zero divergences and a finite chain. The
-gradient-free stretch move never hits it.
+**Resolved 2026-09-27.** anvil's ChEES kernel compiles its leapfrog step,
+so ChEES-HMC could not run on a GP target without `mx.disable_compile()`.
+The cause was a single function: `special.sincm1` selects between a series
+and a `sinc_gen` call, and `sinc_gen` is itself a three-way `mx.where` with
+each arm separately sanitised. That nested both-branch evaluation is what
+exhausts the 24-array limit — **collectively, not alone**: `sinc_gen` by
+itself compiles, `sincm1` by itself compiles, and only `sincm1` inside
+`_sho_matrices`' surrounding expression fails. No single function is the
+culprit; `sincm1` is simply the contributor that can be removed, because
+`_sho_matrices` calls it only under `|u| <= 0.5`, which bounds the argument
+by the series threshold and makes the other branch unreachable there.
+`sincm1_series` drops it. A self-contained reproducer is in
+[upstream/mlx-issue-fused-argument-limit.md](upstream/mlx-issue-fused-argument-limit.md). The
+result is bit-identical over the whole threshold interval in float32 and
+float64, and `mx.compile(mx.value_and_grad(...))` now succeeds for every
+term on both paths. No `mx.disable_compile()` anywhere.
+
+Two earlier diagnoses were wrong and are recorded because each looked
+convincing. The unrolled Cholesky was blamed first; every piece of the
+element algebra compiles under `mx.vjp` on its own. `terms._sho_matrices`
+was blamed next and the prescribed fix was a `custom_function` boundary at
+the term-matrix table — measured, and it changes nothing, because the
+fused group is inside the term algebra and a boundary around the whole of
+it does not break the chain.
+
+**And the failure was never an uncatchable process abort**, as this
+document and the M4 notes claimed. It is an ordinary Python
+`RuntimeError`; the process survives. (`mx.eval` *inside* a compiled
+function is rejected outright with a different error, so eval placement was
+never the difference.)
 
 M4's backward kernel was expected to be the proper fix, replacing this
 graph with a hand VJP. It was not: the kernel path aborts identically,

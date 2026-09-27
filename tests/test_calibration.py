@@ -117,9 +117,9 @@ def test_chains_started_in_the_infeasible_region_recover():
     bounded prior.  That is a correct statement about the prior, not a
     failure of the likelihood, and a sampler rejects it cleanly.)
 
-    Uses the stretch move, which needs no gradient and no
-    ``mx.disable_compile()``.  Half the ensemble starts in the failure region so the rest
-    has somewhere to pull it back from.
+    Uses the stretch move, which needs no gradient.  Half the ensemble
+    starts in the failure region so the rest has somewhere to pull it back
+    from.
     """
     anvil = pytest.importorskip("anvil")
     from anvilgp.anvil import make_target
@@ -200,16 +200,14 @@ def test_a_stuck_chain_does_not_poison_the_ensemble_under_chees():
     u0 = rng.standard_normal((n_chains, dim)).astype(np.float32) * 0.3
     u0[:half] = 15.0
 
-    mx.disable_compile()                 # required for ChEES on a GP target
-    try:
-        with mx.stream(mx.gpu):
-            res = anvil.run(anvil.ChEESHMC(tgt.target, max_leapfrog=16),
-                            tgt.target, mx.array(u0), n_warmup=60,
-                            n_samples=20, seed=3, progress=False)
-            last = np.array(res.final_state["u"])
-            final = np.array(tgt.target.log_prob(mx.array(last)))
-    finally:
-        mx.enable_compile()
+    # No mx.disable_compile() since 2026-09-27: anvil compiles its leapfrog
+    # step and the backward pass now survives it (docs/float32.md).
+    with mx.stream(mx.gpu):
+        res = anvil.run(anvil.ChEESHMC(tgt.target, max_leapfrog=16),
+                        tgt.target, mx.array(u0), n_warmup=60,
+                        n_samples=20, seed=3, progress=False)
+        last = np.array(res.final_state["u"])
+        final = np.array(tgt.target.log_prob(mx.array(last)))
 
     assert np.all(np.isfinite(final)), "no chain may go non-finite"
     moved = np.abs(last - u0).max(axis=1)
@@ -232,8 +230,8 @@ def test_chees_runs_on_the_fused_kernel():
     find in the budget.  (The stretch move gives 0.046 here: two of its
     1024 chains trapped in a secondary mode; see docs/anvil-stretch-width.md.)
 
-    `mx.disable_compile()` is still needed, for both paths: the over-fused
-    group is in `terms._sho_matrices`, which the kernel does not replace.
+    Runs with compilation on: the fused-argument limit that used to force
+    `mx.disable_compile()` was one function in `special.py` and is fixed.
     """
     anvil = pytest.importorskip("anvil")
     from anvilgp import GPPolicy
@@ -251,15 +249,11 @@ def test_chees_runs_on_the_fused_kernel():
                      policy=GPPolicy(block=1024, sub_block=16, metal=True))
     assert gt.target.supports_grad, "the kernel target must accept gradients"
 
-    mx.disable_compile()
-    try:
-        with mx.stream(mx.gpu):
-            res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32),
-                            gt.target, gt.u0(256, seed=1, spread=0.3),
-                            n_warmup=300, n_samples=300, seed=3,
-                            progress=False)
-    finally:
-        mx.enable_compile()
+    with mx.stream(mx.gpu):
+        res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32),
+                        gt.target, gt.u0(256, seed=1, spread=0.3),
+                        n_warmup=300, n_samples=300, seed=3,
+                        progress=False)
 
     acc = float(np.mean(res.accept_fraction))
     assert acc > 0.5, f"acceptance {acc:.2f}: the gradient is not right"

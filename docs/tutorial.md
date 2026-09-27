@@ -188,17 +188,16 @@ chain before quoting them.
 Because the kernel is differentiable, a gradient sampler works:
 
 ```python
-import mlx.core as mx
-mx.disable_compile()                   # see "Known limitation" in the README
 res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32), gt.target,
                 gt.u0(256, seed=1), n_warmup=300, n_samples=300, seed=3)
-mx.enable_compile()
 ```
 
 On the injection-recovery example this runs in 4.0 s against 126 s on the
-MLX graph, and mixes better. `mx.disable_compile()` is still required:
-the group MLX over-fuses is in the term front end that both paths share,
-which M4's kernel did not replace.
+MLX graph, and mixes better. Nothing extra is needed: until 2026-09-27
+this required a process-global `mx.disable_compile()`, because
+`mx.compile` over the backward pass exceeded MLX's fused-argument limit.
+One function was responsible and it is fixed; see
+[float32.md](float32.md).
 
 ## Which path will run?
 

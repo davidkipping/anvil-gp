@@ -13,18 +13,14 @@ that is ``make_quad_transit_flux(period_ref)`` and the ``(2, m)`` stack of
 epoch-centred times and orbit numbers -- a *different* array from the GP's
 ``t``, which carries the physical times that set the lag structure.
 
-Gradient samplers need one extra line today::
-
-    import mlx.core as mx
-    mx.disable_compile()
-
-anvil's ChEES kernel compiles its leapfrog step, and ``mx.compile`` over the
-*backward* pass of the whole likelihood exceeds MLX's fused-group limit
-(the front end, ``terms._sho_matrices``, not the element algebra; see
-docs/float32.md).  Forward-only compilation is fine, so the gradient-free
-stretch move needs nothing.  M4's backward kernel did not remove the
-constraint, since both paths share that front end: ChEES needs
-``mx.disable_compile()`` on either.
+Gradient samplers need nothing extra since 2026-09-27.  ``mx.compile``
+over the *backward* pass used to exceed MLX's fused-group limit, so
+anvil's ChEES kernel -- which compiles its leapfrog step -- required a
+process-global ``mx.disable_compile()``.  The cause was one function,
+``special.sincm1``, whose branch selection nests a three-way ``mx.where``
+with each arm separately sanitised; ``terms._sho_matrices`` calls it only
+where that branch is unreachable and now uses ``sincm1_series`` there.
+See docs/float32.md.
 """
 
 from __future__ import annotations

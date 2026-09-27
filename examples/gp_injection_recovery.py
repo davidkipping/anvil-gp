@@ -12,10 +12,10 @@ count rather than by data, so 1024 chains cost only ~1.6x what 256 do:
   3. the precision harness, run before any sampling;
   4. sampling, and truth recovery in natural units.
 
-The gradient-free stretch move is used deliberately.  ChEES-HMC needs one
-extra line today (`mx.disable_compile()`), because anvil compiles its
-leapfrog step and `mx.compile` over the *backward* pass of the whole
-likelihood exceeds MLX's fused-group limit -- see docs/float32.md.
+The gradient-free stretch move is used deliberately: it is what this
+example is about.  ChEES-HMC needs nothing extra since 2026-09-27 -- it
+used to require a process-global `mx.disable_compile()`, and the one
+function responsible is fixed; see docs/float32.md.
 
 Run:  .venv/bin/python examples/gp_injection_recovery.py
 """

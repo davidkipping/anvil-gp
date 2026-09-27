@@ -545,16 +545,10 @@ marked as an estimate.
   Deferred: it rewrites the reduction's index plumbing, which is where the
   `_pairs` workaround for MLX's strided-slice VJP bug lives, and M4
   replaces the path it optimises.
-* **Compile the gradient by splitting the VJP at the term-matrix table.**
-  `mx.compile` over the whole backward pass fails, but bisection shows the
-  element algebra is not the cause — `chol`, `combine`, `combine_leaf` and
-  the whole leaf → fold → tree chain each compile under `mx.vjp`, as does
-  `(phi_table, q_table, h) → ell` end to end. The offending fused group is
-  inside `terms._sho_matrices`. Running the front end eager and the rest
-  compiled measured 1.15-1.25x on the gradient; worth more in a quiet
-  window. M4 did not moot it: the over-fused group is in the front end
-  both paths share, so this is still what would let ChEES run without
-  `mx.disable_compile()`.
+* ~~**Compile the gradient by splitting the VJP at the term-matrix
+  table.**~~ **Done 2026-09-27, and not that way.** The term-matrix
+  boundary was measured to change nothing; the whole failure was one
+  function, `special.sincm1`. See "Resolved: compiled gradients".
 * **Per-block gradient checkpointing: measured, and not taken.**
   `mx.checkpoint` around each block's `leaf_inputs -> chunked_reduce` trades
   time for the leaf arrays the backward pass would otherwise hold. Measured
@@ -660,49 +654,67 @@ reference-subtracted, an `inf × 0` in the overdamped corner, and a
 positive-definiteness failure mode that must be a *defined, finite* outcome.
 Details and measurements: [docs/float32.md](docs/float32.md).
 
-### Known limitation: compiled gradients
+### Resolved: compiled gradients
 
-**M4 does not remove this, and I checked rather than assumed.** The fused
-kernel's VJP is a `custom_function`, so `mx.compile` never sees the element
-algebra's backward graph — but the failure was never there. It is in the
-*front end*, `terms._sho_matrices`, which both paths share, so
-`mx.disable_compile()` is still required for ChEES-HMC on either. What M4
-changes is the cost of the gradient once it runs, not whether it compiles.
+**Fixed 2026-09-27.** `mx.compile` over the whole likelihood's **backward**
+pass used to fail with *"Too many inputs/outputs fused in the Metal Compiled
+primitive"* for every m ≥ 2 term. MLX fuses a long dependent elementwise
+chain into one Metal kernel whose argument count exceeds its limit of 24
+arrays. Since anvil's ChEES kernel compiles its leapfrog step, a gradient
+sampler on a GP target needed a process-global `mx.disable_compile()`.
 
-`mx.compile` over the **backward** pass of the whole likelihood fails with
-*"Too many inputs/outputs fused in the Metal Compiled primitive"* for m ≥ 2.
-MLX fuses a long dependent elementwise chain into a single Metal kernel whose
-argument count exceeds its limit of 24 arrays per fused group. It is
-structural, not size-dependent: identical at N = 128 and N = 1000, and absent
-at m = 1. Forward-only compilation is fine at every size and every m.
+The cause was **one function**. `special.sincm1` selects between a series
+and a `sinc_gen` call, and `sinc_gen` is itself a three-way `mx.where` with
+each arm separately sanitised. Those nested both-branch evaluations
+exhaust the limit **collectively**: `sinc_gen` alone compiles, `sincm1`
+alone compiles, and only `sincm1` inside `_sho_matrices`' surrounding
+expression fails. So no single function is at fault — `sincm1` is the one
+that can be *removed*, because `terms._sho_matrices` calls it only under
+`|u| <= 0.5`, which bounds the argument by the series threshold and makes
+the other branch **unreachable there**. `sincm1_series` drops it.
 
-**Correction (2026-09-19).** This section used to blame the unrolled
-Cholesky. That is wrong, and it matters because it made the problem look
-unfixable. Every piece of the element algebra compiles under `mx.vjp` when
-taken on its own — `chol`, `combine`, `combine_leaf`, `leaf_elements`, and
-leaf → fold → tree end to end at K = 1024, the last of these 1.5x faster
-compiled than eager. Only the *whole* `__call__` fails, so the offending
-group is in the front end (kernel parameters, term matrices, the gather, the
-first-point mask, `_sanitize`) and not in the Cholesky at all. Splitting the
-VJP at the term-matrix boundary should therefore recover most of it; that is
-tracked under "What is left" rather than done. (An earlier version of this
-paragraph expected M4 to make it moot. It did not; see above. Note also that
-the failure is a process abort from inside Metal, not a Python exception,
-so nothing can catch it.)
+It is bit-identical, not merely close: zero differing bits against `sincm1`
+across the whole threshold interval in float32 and float64
+(`tests/test_special.py`). `mx.compile(mx.value_and_grad(...))` now
+succeeds for `RealTerm`, `SHOTerm` at both damping regimes, `Matern32Term`,
+`Matern52Term`, `RotationTerm` and a `TermSum`, on the MLX path and the
+fused-kernel path, with values bit-identical and gradients within 1.3e-5
+relative (float32 reassociation). No `mx.disable_compile()` anywhere in the
+tree.
 
-This matters because anvil's ChEES kernel compiles its leapfrog step, so
-**ChEES-HMC cannot run on a GP target as-is**. The workaround is one line and
-is verified (30 ChEES steps, 64 chains, zero divergences):
+The speed benefit is real but small and shrinks with size, because the
+front end's cost is fixed in the number of distinct lags while the rest
+grows with N:
 
-```python
-import mlx.core as mx
-mx.disable_compile()          # before anvil.run(ChEESHMC(...), ...)
-```
+| | forward | gradient, eager | compiled | |
+|---|---:|---:|---:|---:|
+| N = 4,096, 64 chains | 1.24 ms | 3.24 ms | **1.93 ms** | 1.68x |
+| N = 1e4, 1024 chains | 2.30 ms | 8.26 ms | **7.06 ms** | 1.17x |
+| N = 1e5, 1024 chains | 12.2 ms | 57.6 ms | **56.3 ms** | 1.02x |
 
-The gradient-free stretch move is unaffected, and so is the forward path.
-The fix is still the one-line workaround: the over-fused group is in
-`terms._sho_matrices`, so splitting the VJP at the term-matrix table is
-what would remove it, and that is tracked under "What is left".
+Dropping the dead branch also speeds the *uncompiled* gradient on its own,
+by 1.23x / 1.09x / 1.01x at those sizes (interleaved A/B). So at production
+sizes this is worth a few percent; the reason to do it was the workaround,
+not the clock.
+
+**Three diagnoses were wrong before this one**, and each looked convincing:
+
+1. *The unrolled Cholesky* (2026-09-19). Every piece of the element algebra
+   compiles under `mx.vjp` on its own — `chol`, `combine`, `combine_leaf`,
+   `leaf_elements`, and leaf → fold → tree end to end.
+2. *M4's backward kernel would moot it.* It did not: the fused group is in
+   the front end both paths share, which the kernel consumes rather than
+   replaces.
+3. *Splitting the VJP at the term-matrix table.* Measured, and it changes
+   nothing — the existing `custom_function` wrapper around `Term.matrices`
+   was forced on unconditionally and the failure was identical, same fused
+   kernel name. A boundary around the whole term algebra does not break a
+   chain inside it.
+
+**And it was never an uncatchable process abort**, as this section claimed.
+It is an ordinary Python `RuntimeError` and the process survives. (`mx.eval`
+*inside* a compiled function is rejected with a different error, so eval
+placement was never the difference.)
 
 ### Silent MLX behaviours
 

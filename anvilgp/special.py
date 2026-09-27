@@ -41,7 +41,8 @@ import mlx.core as mx
 import numpy as np
 
 __all__ = [
-    "sinc_gen", "cosm1_gen", "cos_gen", "sincm1", "damped_cos_sinc",
+    "sinc_gen", "cosm1_gen", "cos_gen", "sincm1", "sincm1_series",
+    "damped_cos_sinc",
     "gamma3", "lower_gamma_reg", "exp_acc", "sincos",
 ]
 
@@ -89,6 +90,38 @@ _SINC_C = [(-1.0) ** k / math.factorial(2 * k + 1) for k in range(_N_TRIG)]
 _COSM1_C = [(-1.0) ** (k + 1) / math.factorial(2 * k + 2) for k in range(_N_TRIG)]
 # sincm1(u) = (1 - sinc_gen(u)) / u = sum_k (-1)^k u^k / (2k+3)!
 _SINCM1_C = [(-1.0) ** k / math.factorial(2 * k + 3) for k in range(_N_TRIG)]
+
+
+def sincm1_series(u: mx.array) -> mx.array:
+    """:func:`sincm1` restricted to ``|u| <= _U_SERIES``, series branch only.
+
+    **Why this exists, and it is not about speed.** ``sincm1`` selects
+    between a series and a ``sinc_gen`` call, and ``sinc_gen`` is itself a
+    three-way ``mx.where`` with each branch separately sanitised.  Nested
+    both-branch evaluation like that exhausts MLX's 24-array limit for a
+    single fused Metal kernel, so ``mx.compile`` over a graph containing
+    ``_sho_matrices`` failed with "Too many inputs/outputs fused in the
+    Metal Compiled primitive".  Since anvil's ChEES kernel compiles its
+    leapfrog step, that is why a gradient sampler needed a process-global
+    ``mx.disable_compile()``.
+
+    The budget is spent **collectively**, which is worth knowing before
+    blaming this function: ``sinc_gen`` alone compiles, and so does
+    ``sincm1`` alone; only ``sincm1`` inside ``_sho_matrices``' surrounding
+    expression crosses the line.  This is not the fault, it is the part
+    that can be *removed*.
+
+    Both of ``_sho_matrices``' calls are guarded by ``|u| <= 0.5`` and pass
+    ``4u`` or ``u``, so ``|argument| <= 2 == _U_SERIES`` and the other
+    branch is *unreachable* there.  This entry point drops it.  The result
+    is bit-identical to :func:`sincm1` on the whole closed interval --
+    pinned in ``tests/test_special.py`` -- so nothing about the numerics
+    changes; only the fused-argument count does.
+
+    :func:`sincm1` itself is unchanged and stays the general-domain
+    function, still pinned against mpmath.
+    """
+    return _horner(u, _SINCM1_C)
 
 
 def sinc_gen(u: mx.array) -> mx.array:

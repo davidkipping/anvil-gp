@@ -191,3 +191,56 @@ def test_lower_gamma_is_finite_at_huge_arguments(n):
     got = np.array(sp.lower_gamma_reg(n, zs), dtype=np.float64)
     assert np.all(np.isfinite(got)), got
     assert np.allclose(got, 1.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float64])
+def test_sincm1_series_is_bit_identical_on_its_stated_domain(dtype):
+    """`sincm1_series` exists only to drop a branch that cannot be taken,
+    so on that branch's domain it must agree to the *bit*, not to a
+    tolerance.  A tolerance here would let a real numerical change hide.
+
+    The domain is the closed interval `|u| <= _U_SERIES`, and the boundary
+    is included on purpose: `_sho_matrices` calls it with `4u` where
+    `|u| <= 0.5`, so `|argument|` reaches exactly `_U_SERIES`, and
+    `sincm1`'s own branch test is `mx.abs(u) <= _U_SERIES`.
+    """
+    lo, hi = -sp._U_SERIES, sp._U_SERIES
+    grid = np.concatenate([
+        np.linspace(lo, hi, 20_001),
+        np.array([lo, hi, 0.0, -0.0, np.nextafter(hi, 0.0),
+                  np.nextafter(lo, 0.0)]),
+    ])
+    u = mx.array(grid.astype(np.float64), dtype=dtype)
+    with mx.stream(mx.cpu):
+        full = np.array(sp.sincm1(u))
+        ser = np.array(sp.sincm1_series(u))
+    view = np.uint32 if dtype == mx.float32 else np.uint64
+    differing = int(np.sum(full.view(view) != ser.view(view)))
+    assert differing == 0, (
+        f"{differing} of {u.size} values differ in {dtype} -- "
+        f"sincm1_series is only sound because it is bit-identical here")
+
+
+def test_sincm1_series_eventually_diverges_so_the_restriction_is_real():
+    """`sincm1` keeps its other branch for a reason, and this pins where.
+
+    Worth knowing how much margin the `|u| <= _U_SERIES` restriction has:
+    with 12 terms the series is bit-identical at u = 2, agrees to 1e-16 at
+    u = 6 and to 6e-12 at u = 20, and only fails past |u| ~ 60 (1.3e-5),
+    becoming useless at 200.  So `_U_SERIES = 2` is conservative by well
+    over an order of magnitude, and `sincm1_series` at the call sites (where
+    |u| <= 2) is not a marginal call.  It is still a restriction: at u = 200
+    the series is wrong by 65x.
+    """
+    with mx.stream(mx.cpu):
+        near = mx.array(np.array([6.0, 20.0, -6.0, -20.0]), dtype=D)
+        assert np.max(np.abs(np.array(sp.sincm1_series(near))
+                             - np.array(sp.sincm1(near)))) < 1e-10, (
+            "the series should still be excellent just outside the threshold")
+        far = mx.array(np.array([200.0, -200.0]), dtype=D)
+        full = np.array(sp.sincm1(far))
+        rel = np.max(np.abs(np.array(sp.sincm1_series(far)) - full)
+                     / np.abs(full))
+    assert rel > 1e-3, (
+        f"the series still agrees to {rel:.1e} at |u| = 200; if _N_TRIG grew, "
+        f"`sincm1`'s branch may no longer be needed at all")
