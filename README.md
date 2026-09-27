@@ -43,6 +43,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/tutorial.md](docs/tutorial.md) | Getting started, side by side with celerite2 |
 | [docs/kernels.md](docs/kernels.md) | Every supported kernel, how to set it up, and what is not supported |
 | [docs/benchmarks.md](docs/benchmarks.md) | Speed and accuracy against celerite2 across scales and kernels — including where celerite2 wins |
+| [docs/m5-plan.md](docs/m5-plan.md) | Planned next: per-instrument jitter in the kernel, exposure-time integration, and the compile split |
 | [docs/float32.md](docs/float32.md) | The precision discipline and its measured error budget |
 | [docs/statistical-foundation.md](docs/statistical-foundation.md) | Why the state-space form is exact |
 

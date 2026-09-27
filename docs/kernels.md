@@ -137,9 +137,9 @@ against, but it is 30–70x slower depending on the kernel (see
 
 | kernel | in celerite2 | status here |
 |---|---|---|
-| `ComplexTerm(a, b, c, d)` | yes | **not implemented.** The general complex exponential term. `SHOTerm` covers the oscillatory case with a physical parametrisation; `ComplexTerm` is the raw form. Nothing about the state-space approach prevents it. |
-| `OriginalCeleriteTerm` | yes | **not implemented.** The original Foreman-Mackey et al. parametrisation. |
-| `TermConvolution` | yes | **not implemented.** Exposure-time integration — convolving the kernel with a finite integration window. Matters for long-cadence photometry where the 30-minute bin smooths short-period signals. If you need this, use celerite2. |
+| `ComplexTerm(a, b, c, d)` | yes | **not implemented, planned.** The general complex exponential term. `SHOTerm` covers the oscillatory case with a physical parametrisation; `ComplexTerm` is the raw form. It needs a general stationary covariance rather than the identity this library assumes — see [m5-plan.md](m5-plan.md) stage 2. |
+| `OriginalCeleriteTerm` | yes | **not implemented, planned.** A reparametrisation of `ComplexTerm`, so it comes with it. |
+| `TermConvolution` | yes | **not implemented, planned.** Exposure-time integration — convolving the kernel with a finite integration window. Matters for long-cadence photometry where the 30-minute bin smooths short-period signals. It is celerite-class (the convolution keeps the rates and rescales the amplitudes, verified to 4e-16), but the rescaled amplitudes are not reachable in this library's current parametrisation, so it waits on `ComplexTerm`. Until then, use celerite2. |
 | `TermProduct` | (varies) | **not implemented.** Products of kernels are not generally state-space representable at fixed `m`. |
 
 ### Not celerite-class at all
@@ -164,7 +164,8 @@ tool, at `O(N^3)`.
 
 **One jitter parameter for the fused kernel.** A per-instrument jitter is
 supported on the MLX path but not in the kernel yet; `metal_eligible()`
-reports it. Per-instrument *offsets* are supported on both.
+reports it, and [m5-plan.md](m5-plan.md) stage 1 is the fix. Per-instrument
+*offsets* are supported on both.
 
 **Mean models** are supported on both paths: pass `mean_fn` and
 `mean_specs` to `make_target`, or `mean_fn` to `GPLogLike`.
