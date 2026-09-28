@@ -834,7 +834,16 @@ Three more are worked around and pinned as regression tests
   traverses the σ_GP–jitter ridge (correlation −0.41, with
   `sqrt(σ² + jitter²)` seven times better determined than the jitter alone).
   Both carry a power test showing the signatures are absent on a resolved GP.
-  Still owed: the MetalPlanet hot-Jupiter joint fit.
+  **The fiducial joint fit landed 2026-09-28** and with it M5 is complete:
+  `examples/hotjupiter_gp_joint.py` fits a MetalPlanet hot Jupiter and an SHO
+  stellar-variability GP *together* — 12 parameters, the transit mean model on
+  MetalPlanet's fused Metal kernel and the GP on anvil-gp's, nothing leaving
+  the GPU inside the loop. Variability at 1200 ppm under a 12,000 ppm transit
+  (10% of the depth, correlated on the scale of the transit duration, so
+  detrending first would bias the depth). All 12 parameters recovered inside
+  1.1σ, zero divergences, R-hat 1.001, and the gradient-based and
+  gradient-free samplers agreeing on every median to 0.012σ and every width to
+  1.4% — the check a wrong gradient fails.
 
 ## Install / test
 

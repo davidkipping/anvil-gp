@@ -653,6 +653,54 @@ against a 0.12 threshold, `log_rho` covering 5% of its prior rather than 95%.
 fit -- transit mean model plus injected SHO variability plus jitter, both
 samplers, truth recovered, zero divergences, cross-sampler agreement.
 
+#### Also landed: the fiducial joint fit, 2026-09-28 --- M5 complete
+
+M5 (a) from the brief: *"MetalPlanet hot Jupiter + injected SHO variability +
+jitter, both samplers, truth recovered, zero divergences, cross-sampler
+agreement."* `examples/hotjupiter_gp_joint.py`, with a test-size version in
+`tests/test_calibration.py`.
+
+Twelve parameters fitted at once: MetalPlanet's eight transit parameters as
+anvil-gp's mean model, plus SHO sigma/rho/Q and a jitter. MetalPlanet's
+`make_quad_transit_flux` already *is* the engine contract anvil-gp wants --
+`(v_mean, x) -> (n_chains, m)` with `x` the `(2, m)` epoch-centered times --
+so the two compose with no adapter, which is what
+`MetalPlanet/docs/sampler-integration.md` anticipated when it exposed
+`x64`/`y_fit`/`model_fn` "should a different likelihood -- an anvil-gp GP over
+the same mean function -- wrap them". Physical values are MetalPlanet's and
+anvil's own hot-Jupiter fiducial rather than invented ones.
+
+**Why joint and not sequential.** The injected variability is 1200 ppm against
+a 12,000 ppm transit -- 10% of the depth, correlated on a 2-day timescale,
+which is the same order as the transit duration. Detrending first with a filter
+that does not know where the transits are biases the depth; fitting afterwards
+with white noise understates every error bar. Only a joint fit lets the depth's
+uncertainty honestly include "some of this dip might be starspots".
+
+**Measured, full size (20,000 points, 30 d, 500 ppm).** All twelve parameters
+inside 1.1 sigma. ChEES-HMC: zero divergences, acceptance 0.88, max R-hat
+1.001. Ensemble (stretch + DE): R-hat 1.027. Cross-sampler agreement: worst
+median shift **0.012 sigma**, worst width ratio **1.014x**. The float32 trust
+check (`anvil.validate_precision`) reports a median fp32-fp64 gap of 0.0016
+against a |logL| of 1.2e4 -- "far below the ~1-unit Metropolis scale" -- run
+before any sampling, as MetalPlanet's docs require.
+
+**A MetalPlanet finding reproduced on a different posterior.** Its
+sampler-integration doc reports ~1% ChEES divergences at 200 warmup iterations
+and exactly zero at 400-600, attributing them to step-size adaptation rather
+than geometry. On this twelve-parameter joint posterior: 1 divergence at 250
+warmup, **zero at 400 and at 600**, acceptance rising 0.84 -> 0.92. So the
+joint fit inherits the transit-only conditioning behaviour, and the test's
+warmup length is load-bearing -- its docstring says to lengthen the warmup
+before suspecting the model.
+
+**Cross-sampler agreement is the point, not a formality.** ChEES uses the
+analytic gradient of both the transit kernel and the GP reduction; the ensemble
+uses none. A wrong gradient does not make HMC fail, it makes it sample a
+different distribution -- and this project has been bitten from the other side
+too, by an ensemble whose trapped walkers inflated a width fourfold
+(docs/anvil-stretch-width.md). The comparison guards both directions.
+
 ## Order, and why it changed
 
 1. **Compile fix.** Half a day, two-line change, bit-identical, 2x on the

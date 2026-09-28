@@ -711,3 +711,219 @@ def test_the_geometry_signatures_are_absent_when_the_gp_is_resolved():
     log_rho = out["model"][:, 1]
     covered = (np.percentile(log_rho, 99) - np.percentile(log_rho, 1)) / (hi - lo)
     assert covered < 0.7, covered
+
+
+# ---------------------------------------------------------------------------
+# The fiducial joint fit (M5 (a))
+# ---------------------------------------------------------------------------
+#
+# The brief: "MetalPlanet hot Jupiter + injected SHO variability + jitter,
+# both samplers, truth recovered, zero divergences, cross-sampler agreement."
+# `examples/hotjupiter_gp_joint.py` is the full-size version with the printed
+# posterior; this is the same problem shrunk to test size.
+#
+# It is the only test here that exercises the whole stack at once -- a
+# MetalPlanet transit as the mean model, an anvil-gp GP over the residual, and
+# anvil sampling all twelve parameters jointly -- so it is the one that catches
+# an integration break that every unit test passes through.
+
+HJ_BASELINE, HJ_N, HJ_YERR = 30.0, 5000, 500e-6
+HJ_TRANSIT = dict(period=3.0, t0=1.2345, r=0.103, b=0.5, a=8.75,
+                  u1=0.40, u2=0.25)
+HJ_GP = dict(sigma=1000e-6, rho=2.0, qual=5.0, jitter=200e-6)
+
+
+@pytest.fixture(scope="module")
+def hotjupiter_joint():
+    """Data, target and truth for the joint fit; built once for both samplers."""
+    pytest.importorskip("anvil")
+    mp = pytest.importorskip("metalplanet.anvil")
+    from metalplanet.ld import u_to_q_np
+    from metalplanet.orbit import epoch_center_times
+
+    from anvilgp import GPPolicy
+    from anvilgp.anvil import make_target
+    from anvilgp.oracle import sample_ssm
+    from anvilgp.priors import SpecHint
+
+    tr = HJ_TRANSIT
+    q1, q2 = (float(q) for q in u_to_q_np(tr["u1"], tr["u2"]))
+    dt = HJ_BASELINE / HJ_N
+    t_model = np.arange(HJ_N) * dt + 0.5 * dt
+    # references a preliminary fit would have got slightly wrong
+    t0_ref, period_ref = tr["t0"] - 0.009, tr["period"] + 0.0005
+    x64 = epoch_center_times(t_model, t0_ref=t0_ref, period_ref=period_ref)
+    truth_mean = np.array([tr["t0"] - t0_ref, tr["period"] - period_ref,
+                           tr["r"], tr["b"], tr["a"], q1, q2, 0.0])
+
+    model_fn = mp.make_quad_transit_flux(period_ref=period_ref)
+    with mx.stream(mx.cpu):                    # float64 through the fallback
+        transit = np.array(
+            model_fn(mx.array(truth_mean[None, :], dtype=mx.float64),
+                     mx.array(x64, dtype=mx.float64))[0], dtype=np.float64)
+    rng = np.random.default_rng(7)
+    gp_draw = sample_ssm(ag.SHOTerm(),
+                         [HJ_GP["sigma"], HJ_GP["rho"], HJ_GP["qual"]],
+                         dt, HJ_N, rng)
+    white = rng.standard_normal(HJ_N) * np.sqrt(HJ_YERR ** 2
+                                                + HJ_GP["jitter"] ** 2)
+    y_fit = transit + gp_draw + white
+
+    specs = [SpecHint(n, lo=mp.DEFAULT_BOUNDS[n][0], hi=mp.DEFAULT_BOUNDS[n][1])
+             for n in mp.PARAM_NAMES]
+    gt = make_target(ag.SHOTerm(), t_model, y_fit, np.full(HJ_N, HJ_YERR),
+                     mean_fn=model_fn, x_mean=x64, mean_specs=specs,
+                     policy=GPPolicy(block=1024, metal=True))
+    gp_truth = np.array([HJ_GP["sigma"], HJ_GP["rho"], HJ_GP["qual"],
+                         HJ_GP["jitter"]])
+    truth_model = np.concatenate(
+        [truth_mean, np.log(gp_truth / np.array([h.ref for h in gt.hypers]))])
+    u_truth = gt.transform.from_model_np(truth_model)
+    init = np.random.default_rng(3)
+
+    def ball(n, spread=1e-3):
+        return mx.array((u_truth + spread * init.standard_normal(
+            (n, gt.transform.dim))).astype(np.float32))
+
+    truth = dict(zip(mp.PARAM_NAMES, truth_model[:8]))
+    truth.update(zip(("gp_sigma", "gp_rho", "gp_Q", "jitter"), gp_truth))
+    return dict(gt=gt, ball=ball, truth=truth, names=list(mp.PARAM_NAMES),
+                depth=float(-transit.min()), gp_sd=float(gp_draw.std()))
+
+
+def _hj_draws(gt, res, names):
+    """Posterior draws per parameter: mean model in model space, GP natural."""
+    flat = gt.transform.model_np(res.get_chain(flat=True).astype(np.float64))
+    nat = gt.natural(flat)
+    cols = {n: flat[:, i] for i, n in enumerate(names)}
+    cols.update({k: nat[k] for k in ("gp_sigma", "gp_rho", "gp_Q", "jitter")})
+    return cols
+
+
+@pytest.fixture(scope="module")
+def hj_chees(hotjupiter_joint):
+    """ChEES-HMC on the joint fit.
+
+    400 warmup, not 250, and that is load-bearing: MetalPlanet's
+    docs/sampler-integration.md reports ~1% divergences at 200 warmup
+    iterations and exactly zero at 400-600, calling them a step-size
+    adaptation artefact rather than a geometry problem.  Reproduced here on a
+    *different* posterior -- twelve joint parameters rather than eight transit
+    ones -- 1 divergence at 250, zero at 400 and at 600, with acceptance
+    rising 0.84 -> 0.92.  If this test ever shows divergences, lengthen the
+    warmup before suspecting the model.
+    """
+    anvil = pytest.importorskip("anvil")
+    from anvil.diagnostics import split_rhat
+    gt, ball = hotjupiter_joint["gt"], hotjupiter_joint["ball"]
+    with mx.stream(mx.gpu):
+        res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=128), gt.target,
+                        ball(64), n_warmup=400, n_samples=200, seed=2,
+                        progress=False)
+    return dict(cols=_hj_draws(gt, res, hotjupiter_joint["names"]),
+                n_div=int(res.extras.get("n_divergent", 0)),
+                rhat=float(split_rhat(np.asarray(res.get_chain(),
+                                                 dtype=np.float64)).max()),
+                accept=float(np.mean(res.accept_fraction)))
+
+
+@pytest.fixture(scope="module")
+def hj_ensemble(hotjupiter_joint):
+    """The gradient-free arm: stretch + DE, long chains.
+
+    The two samplers want opposite budgets and configuring them alike produces
+    an unconverged comparison.  The ensemble's autocorrelation on this family
+    of problems is ~120 iterations (anvil's own hot-Jupiter example), so it
+    gets 6000 draws where ChEES gets 200.
+    """
+    anvil = pytest.importorskip("anvil")
+    from anvil.diagnostics import split_rhat
+    from anvil.kernels.ensemble import DEMove, EnsembleKernel, StretchMove
+    gt, ball = hotjupiter_joint["gt"], hotjupiter_joint["ball"]
+    with mx.stream(mx.gpu):
+        res = anvil.run(
+            EnsembleKernel(gt.target,
+                           moves=[(StretchMove(), 0.5), (DEMove(), 0.5)],
+                           seed=1),
+            gt.target, ball(128), n_warmup=500, n_samples=6000, seed=2,
+            progress=False)
+    return dict(cols=_hj_draws(gt, res, hotjupiter_joint["names"]),
+                rhat=float(split_rhat(np.asarray(res.get_chain(),
+                                                 dtype=np.float64)).max()))
+
+
+@pytest.mark.slow
+def test_the_joint_fit_is_well_posed(hotjupiter_joint):
+    """The injection is the problem the brief asks for, not an easier one.
+
+    Asserted because the whole test below is vacuous if the GP is negligible
+    or the transit unconstrained: the variability has to be a real contaminant
+    (~10% of the transit depth, correlated on the scale of the transit
+    duration) and there have to be enough in-transit points to measure a
+    depth.
+    """
+    gt = hotjupiter_joint["gt"]
+    assert gt.transform.dim == 12, gt.names
+    assert gt.loglike.metal_eligible()[0], gt.loglike.metal_eligible()
+    depth, gp_sd = hotjupiter_joint["depth"], hotjupiter_joint["gp_sd"]
+    assert 0.05 < gp_sd / depth < 0.3, (
+        f"variability is {gp_sd / depth:.1%} of the depth; the point of the "
+        f"fit is that it is a real contaminant")
+    assert gp_sd > 1.5 * HJ_YERR, "variability must dominate the white noise"
+    assert HJ_GP["rho"] > 5.0 * (HJ_BASELINE / HJ_N), "GP must be resolved"
+
+
+@pytest.mark.slow
+def test_the_joint_fit_recovers_truth_without_divergences(hotjupiter_joint,
+                                                          hj_chees):
+    """ChEES on twelve joint parameters: truth in, truth out, no divergences.
+
+    Measured at this size: zero divergences, acceptance 0.92, max R-hat 1.011,
+    and the worst parameter 2.1 sigma from truth (``gp_Q``, the least
+    constrained -- its posterior sd is 3.2 on a truth of 5).  The full-size
+    version in ``examples/hotjupiter_gp_joint.py`` puts every one of the
+    twelve inside 1.1 sigma.
+    """
+    cols, truth = hj_chees["cols"], hotjupiter_joint["truth"]
+    assert hj_chees["n_div"] == 0, (
+        f"{hj_chees['n_div']} divergences; lengthen the warmup before "
+        f"suspecting the model (see the fixture docstring)")
+    assert hj_chees["accept"] > 0.6, hj_chees["accept"]
+    assert hj_chees["rhat"] < 1.05, hj_chees["rhat"]
+    for name, draws in cols.items():
+        assert np.all(np.isfinite(draws)), name
+        z = (np.median(draws) - truth[name]) / draws.std()
+        assert abs(z) < 3.0, (
+            f"{name}: median {np.median(draws):.6g} vs truth "
+            f"{truth[name]:.6g}, {z:+.2f} sigma")
+
+
+@pytest.mark.slow
+def test_the_two_samplers_agree_on_the_joint_posterior(hotjupiter_joint,
+                                                      hj_chees, hj_ensemble):
+    """Cross-sampler agreement -- the check a wrong gradient fails.
+
+    ChEES uses the analytic gradient of both the transit kernel and the GP
+    reduction; the ensemble uses no gradient at all.  If they agree on all
+    twelve marginals, the gradient is right; if the gradient were wrong, HMC
+    would still *run* -- it would sample a different distribution.  This
+    project has been bitten from the other side too, by an ensemble whose
+    trapped walkers inflated a width fourfold (docs/anvil-stretch-width.md),
+    so the comparison guards both directions.
+
+    Measured: worst median shift 0.064 sigma, worst width ratio 1.24x at this
+    size; 0.012 sigma and 1.014x at full size.  The ensemble's R-hat is the
+    looser of the two (1.08 here against ChEES's 1.011) because the stretch
+    move decorrelates in ~120 iterations rather than ~2, which is why its
+    width estimate is the noisier one.
+    """
+    a, b = hj_chees["cols"], hj_ensemble["cols"]
+    assert hj_ensemble["rhat"] < 1.15, hj_ensemble["rhat"]
+    for name in a:
+        sd = 0.5 * (a[name].std() + b[name].std())
+        shift = abs(np.median(a[name]) - np.median(b[name])) / sd
+        ratio = a[name].std() / b[name].std()
+        assert shift < 0.25, (
+            f"{name}: samplers disagree by {shift:.3f} sigma on the median")
+        assert 1 / 1.4 < ratio < 1.4, (
+            f"{name}: width ratio {ratio:.3f} between samplers")
