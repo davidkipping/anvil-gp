@@ -495,3 +495,219 @@ def test_the_sbc_check_detects_a_mis_scaled_posterior():
     # PIT towards the ends, so its spread exceeds the uniform 0.289
     worst = int(np.argmin(pvals))
     assert u[:, worst].std() > 0.30, u[:, worst].std()
+
+
+# ---------------------------------------------------------------------------
+# Adversarial geometry (M5 (b))
+# ---------------------------------------------------------------------------
+#
+# The brief asks for two injections, chosen not for the parameters they
+# recover but for the posterior *shapes* they create -- the two shapes that
+# break gradient samplers:
+#
+#   "zero/weak-amplitude injection (posterior piles against the bound, zero
+#    divergences) and timescale ~= cadence injection (sigma_GP-jitter ridge
+#    sampled correctly)."
+#
+# This is a different question from the SBC checks above.  Those ask whether
+# the likelihood has the right shape on typical data; these ask whether the
+# sampler survives the two atypical shapes.  A plateau (nothing to infer) and
+# a ridge (two parameters trading off) are where HMC diverges, sticks, or
+# reports false precision.
+
+GEOM_WARM, GEOM_SAMP, GEOM_CHAINS = 600, 1200, 128
+
+
+def _geometry_run(y, t, yerr, seed=3):
+    """ChEES on `make_target`'s own priors; returns natural draws + diagnostics.
+
+    ChEES rather than the stretch move because only an HMC kernel reports
+    divergences at all (`anvil.kernels.chees` sets ``diverged`` from the
+    energy error; the ensemble kernel has no such concept), and "zero
+    divergences" is the brief's acceptance criterion.
+    """
+    anvil = pytest.importorskip("anvil")
+    from anvil.diagnostics import split_rhat
+    from anvilgp import GPPolicy
+    from anvilgp.anvil import make_target
+
+    gt = make_target(ag.SHOTerm(), t, y, yerr,
+                     policy=GPPolicy(block=1024, metal=True))
+    with mx.stream(mx.gpu):
+        res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32), gt.target,
+                        gt.u0(GEOM_CHAINS, seed=1, spread=0.3),
+                        n_warmup=GEOM_WARM, n_samples=GEOM_SAMP, seed=seed,
+                        progress=False)
+    rhat = split_rhat(np.asarray(res.get_chain(), dtype=np.float64))
+    flat = gt.transform.model_np(res.get_chain(flat=True).astype(np.float64))
+    return dict(gt=gt, res=res, rhat=rhat, model=flat, nat=gt.natural(flat),
+                n_div=int(res.extras.get("n_divergent", 0)),
+                accept=float(np.mean(res.accept_fraction)))
+
+
+@pytest.mark.slow
+def test_zero_amplitude_injection_is_a_survivable_plateau():
+    """No GP signal and no jitter: nothing to infer, and it must not break.
+
+    The hardest version of the brief's "zero/weak-amplitude" case -- pure
+    white noise at the quoted error bars, so *both* extra scales are
+    unidentified at once.  As ``sigma -> 0`` the kernel stops depending on
+    ``rho`` and ``Q`` at all, and the posterior over them flattens onto the
+    prior.  That plateau is where a gradient sampler wanders off or diverges.
+
+    What correct behaviour looks like, and all of it is asserted: no
+    divergences, nothing non-finite, both amplitudes pinned near zero, and
+    the unidentified directions actually **explored** rather than stuck --
+    ``rho`` covers 95% of its prior support here, which is what a flat
+    posterior should look like and what a stuck chain would not.
+
+    **R-hat on a plateau converges slowly, and that is not a defect.**
+    Measured on this problem: 1.26 at 400 warmup / 400 samples, 1.036 at
+    800/1600, 1.009 at 1500/3000 -- monotone towards 1, with zero divergences
+    at every length.  A flat direction simply needs more samples to mix.  The
+    gate below is 1.1 at 600/1200 (measured 1.032); if it ever fails, check
+    whether it *falls* with a longer run before calling it a bug.
+    """
+    rng = np.random.default_rng(11)
+    n = 600
+    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    yerr = np.full(n, YERR)
+    y = rng.standard_normal(n) * YERR          # no GP, no jitter
+
+    out = _geometry_run(y, t, yerr)
+    nat, gt = out["nat"], out["gt"]
+
+    assert out["n_div"] == 0, f"{out['n_div']} divergences on the plateau"
+    assert out["accept"] > 0.5, out["accept"]
+    for k, v in nat.items():
+        assert np.all(np.isfinite(v)), f"{k} went non-finite"
+    assert out["rhat"].max() < 1.1, (
+        f"R-hat {out['rhat'].max():.3f}; measured 1.032 here. Check it falls "
+        f"with a longer run (1.009 at 1500/3000) before calling it a defect")
+
+    # both amplitudes consistent with zero, against the quoted error bar
+    s99 = float(np.percentile(nat["gp_sigma"], 99))
+    j99 = float(np.percentile(nat["jitter"], 99))
+    assert s99 < 0.6 * YERR, f"GP amplitude 99th pct {s99:.4f} vs yerr {YERR}"
+    assert j99 < 0.8 * YERR, f"jitter 99th pct {j99:.4f} vs yerr {YERR}"
+
+    # and the flat directions are explored, not stuck: rho spans its prior
+    lo, hi = gt.hypers[1].lo, gt.hypers[1].hi
+    log_rho = out["model"][:, 1]
+    covered = (np.percentile(log_rho, 99) - np.percentile(log_rho, 1)) / (hi - lo)
+    assert covered > 0.7, (
+        f"log_rho covers only {covered:.2f} of its prior support; on a "
+        f"plateau it should cover nearly all of it (measured 0.95)")
+
+
+@pytest.mark.slow
+def test_timescale_near_cadence_samples_the_sigma_jitter_ridge():
+    """A GP too fast to resolve looks like white noise, and must say so.
+
+    The brief's second geometry.  Injected at ``rho = 2 x cadence``, which is
+    exactly the floor `priors._log_rho_bounds` puts on the timescale prior --
+    below it the kernel is unresolved and degenerates into the jitter.  So
+    this sits the truth *on* the boundary, which is the adversarial part: the
+    posterior has to pile against that bound and, at the same time, trade GP
+    amplitude against white jitter along a ridge, because a very short
+    timescale and a larger jitter explain the same data.
+
+    Sampling it "correctly" means three things, all asserted: the ridge is
+    traversed rather than collapsed to one end (the two parameters come out
+    anti-correlated); the *combination* is far better determined than either
+    part, which is what makes it a ridge rather than two loose parameters;
+    and the truth is inside the credible region despite neither parameter
+    being individually sharp.  Measured here: correlation -0.41, and the
+    coefficient of variation is 0.046 for ``sqrt(sigma^2 + jitter^2)``
+    against 0.34 for the jitter alone -- a factor of 7.
+    """
+    rng = np.random.default_rng(11)
+    n = 600
+    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    yerr = np.full(n, YERR)
+    cadence = float(np.median(np.diff(t)))
+    rho_true = 2.0 * cadence               # the prior's own floor
+    sigma_true, jit_true = 0.35, 0.05
+    cov = dense_covariance(ag.SHOTerm(),
+                           np.array([sigma_true, rho_true, 3.0]), t, yerr,
+                           jitter=jit_true)
+    y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
+
+    out = _geometry_run(y, t, yerr)
+    nat = out["nat"]
+    s, j = nat["gp_sigma"], nat["jitter"]
+
+    assert out["n_div"] == 0, f"{out['n_div']} divergences on the ridge"
+    for k, v in nat.items():
+        assert np.all(np.isfinite(v)), f"{k} went non-finite"
+    assert out["rhat"].max() < 1.1, out["rhat"]
+
+    # the timescale piles against its lower bound
+    ratio = float(np.median(nat["gp_rho"]) / rho_true)
+    assert ratio < 1.15, (
+        f"rho median is {ratio:.3f}x the prior floor; it should sit on it")
+
+    # the ridge: anti-correlated, and the combination is the sharp direction
+    corr = float(np.corrcoef(np.log(s), np.log(j))[0, 1])
+    assert corr < -0.2, (
+        f"corr(log sigma, log jitter) = {corr:+.3f}; without a ridge these "
+        f"are independent, and a collapsed chain would show neither")
+    cv = lambda x: float(x.std() / x.mean())
+    total = np.sqrt(s ** 2 + j ** 2)
+    assert cv(total) < 0.4 * cv(j), (
+        f"total cv {cv(total):.4f} vs jitter cv {cv(j):.4f}: the combination "
+        f"should be much better determined than the parts")
+    assert cv(total) <= cv(s), (cv(total), cv(s))
+
+    # and the truth survives, despite neither parameter being sharp alone
+    for name, val, draws in (("sigma", sigma_true, s), ("jitter", jit_true, j)):
+        lo, hi = np.percentile(draws, 1), np.percentile(draws, 99)
+        assert lo < val < hi, f"{name} truth {val} outside [{lo:.4f},{hi:.4f}]"
+
+
+@pytest.mark.slow
+def test_the_geometry_signatures_are_absent_when_the_gp_is_resolved():
+    """The power test for the two above: a resolved GP must show neither shape.
+
+    Both geometry tests assert that a *signature* is present -- a timescale
+    piled on its bound, an anti-correlated pair, a plateau covering its prior.
+    Asserting presence is only meaningful if the signature can be absent, so
+    this fits a well-resolved GP (``rho = 5``, fifty times the cadence, with a
+    real amplitude) and checks that every one of those assertions would fail
+    on it.  Measured: rho sits at 48x the floor rather than on it, the
+    sigma-jitter correlation is -0.02 rather than -0.41, the combination is
+    *worse* determined than the jitter rather than seven times better, the
+    amplitude is 0.72 rather than under 0.12, and log_rho covers 5% of its
+    prior rather than 95%.
+
+    If this test ever fails it means a geometry signature has become
+    unconditional -- the two tests above would then be passing on anything,
+    and would be measuring nothing.
+    """
+    rng = np.random.default_rng(11)
+    n = 600
+    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    yerr = np.full(n, YERR)
+    cadence = float(np.median(np.diff(t)))
+    cov = dense_covariance(ag.SHOTerm(), np.array([0.35, 5.0, 3.0]), t, yerr,
+                           jitter=0.05)
+    y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
+
+    out = _geometry_run(y, t, yerr)
+    nat, gt = out["nat"], out["gt"]
+    s, j = nat["gp_sigma"], nat["jitter"]
+    cv = lambda x: float(x.std() / x.mean())
+
+    assert out["n_div"] == 0, out["n_div"]
+    # not piled on the timescale floor
+    assert float(np.median(nat["gp_rho"]) / (2.0 * cadence)) > 1.15
+    # no ridge
+    assert float(np.corrcoef(np.log(s), np.log(j))[0, 1]) > -0.2
+    assert cv(np.sqrt(s ** 2 + j ** 2)) > 0.4 * cv(j)
+    # a real amplitude, not one consistent with zero
+    assert float(np.percentile(s, 99)) > 0.6 * YERR
+    # and the timescale is identified, not a plateau
+    lo, hi = gt.hypers[1].lo, gt.hypers[1].hi
+    log_rho = out["model"][:, 1]
+    covered = (np.percentile(log_rho, 99) - np.percentile(log_rho, 1)) / (hi - lo)
+    assert covered < 0.7, covered

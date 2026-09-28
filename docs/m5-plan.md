@@ -611,6 +611,48 @@ no power test. Caught by inspection, not by running it.
 (zero-amplitude injection, timescale close to the cadence) and the
 MetalPlanet hot-Jupiter joint fit.
 
+#### Also landed: adversarial geometry tests, 2026-09-28
+
+M5 (b) from the brief: *"zero/weak-amplitude injection (posterior piles
+against the bound, zero divergences) and timescale ~= cadence injection
+(sigma_GP-jitter ridge sampled correctly)"*. A different question from the SBC
+checks -- those ask whether the likelihood has the right shape on typical
+data, these ask whether the sampler survives two atypical *posterior* shapes,
+a plateau and a ridge, which is where gradient samplers fail. ChEES, because
+only an HMC kernel reports divergences at all.
+
+**Plateau** (no GP and no jitter -- the hardest form, both extra scales
+unidentified at once): zero divergences, 0.98 acceptance, nothing non-finite,
+GP amplitude 99th percentile at 0.34 of the error bar and jitter at 0.48, and
+`log_rho` covering **95% of its prior support** -- the flat direction is
+explored, not stuck, which is the thing a plateau test has to distinguish.
+
+**Ridge** (`rho = 2 x cadence`, which is exactly the floor
+`priors._log_rho_bounds` puts on the timescale prior, so the truth sits *on*
+the boundary): zero divergences, `rho` median 1.017x the floor -- piled on it
+-- correlation between log sigma and log jitter of **-0.41**, and the
+coefficient of variation of `sqrt(sigma^2 + jitter^2)` is 0.046 against 0.34
+for the jitter alone, a factor of seven. Both truths inside the 1-99%
+interval despite neither parameter being sharp on its own.
+
+**R-hat on a plateau converges slowly, and that is not a defect.** Measured:
+1.26 at 400 warmup / 400 samples, 1.036 at 800/1600, 1.009 at 1500/3000 --
+monotone towards 1, zero divergences at every length. The tests run at
+600/1200 and gate at 1.1 (measured 1.032), with the instruction to check
+whether a failure *falls* with a longer run before calling it a bug. A flat
+direction needs samples, not a fix.
+
+**A power test ships with them**, for the same reason the SBC check has one:
+both tests assert a signature is *present*, which means nothing unless it can
+be absent. On a resolved GP (`rho = 5`, fifty times the cadence) every one of
+the five assertions fails as it should -- rho at 48x the floor, correlation
+-0.02, the combination *worse* determined than its parts, amplitude 0.72
+against a 0.12 threshold, `log_rho` covering 5% of its prior rather than 95%.
+
+**Still owed from the README's M5 list:** the MetalPlanet hot-Jupiter joint
+fit -- transit mean model plus injected SHO variability plus jitter, both
+samplers, truth recovered, zero divergences, cross-sampler agreement.
+
 ## Order, and why it changed
 
 1. **Compile fix.** Half a day, two-line change, bit-identical, 2x on the

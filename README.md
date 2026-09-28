@@ -825,9 +825,16 @@ Three more are worked around and pinned as regression tests
   **SBC rank checks landed 2026-09-28**: conditional SBC by exact quadrature
   rather than MCMC, with a power test showing it detects a 4x tempered
   likelihood at p ~ 1e-8 to 1e-12 while the profile-argmax checks see nothing
-  (tempering does not move the mode). Still owed: the adversarial geometry
-  tests (zero-amplitude injection, timescale ≈ cadence), and the MetalPlanet
-  hot-Jupiter joint fit.
+  (tempering does not move the mode). **Adversarial geometry tests landed
+  2026-09-28**: a zero-amplitude injection (no GP *and* no jitter, so both
+  extra scales are unidentified at once) samples its plateau with zero
+  divergences, both amplitudes pinned near zero, and `rho` covering 95% of its
+  prior — explored, not stuck; and a `rho = 2 x cadence` injection, sitting
+  the truth on the timescale prior's own floor, piles against that bound and
+  traverses the σ_GP–jitter ridge (correlation −0.41, with
+  `sqrt(σ² + jitter²)` seven times better determined than the jitter alone).
+  Both carry a power test showing the signatures are absent on a resolved GP.
+  Still owed: the MetalPlanet hot-Jupiter joint fit.
 
 ## Install / test
 
