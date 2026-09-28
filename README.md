@@ -228,7 +228,8 @@ same problem, same answers:
 (Minimum of 12 sustained evaluations, compiled, gapped cadence with three
 distinct lags, `block=4096`, `metal_block` at its default, all rows in one
 window on 2026-09-20. `benchmarks/verify_readme.py` re-checks every number
-here; it gates on a measured stability probe rather than on the load
+here; it gates on a measured stability probe -- both its spread *and* its
+level, since sustained contention keeps the spread tight -- rather than on the load
 average, which is a poor proxy — a CPU-bound indexer can sit at 14 while
 the GPU is steady to 0.6%.) The speedups are smaller than the
 37-71x first reported here because the MLX path itself got faster in the

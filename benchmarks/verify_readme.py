@@ -13,8 +13,21 @@ still hold.
 average.** Wall times on an M2 Max can swing 2x with background load, but
 the load average is a poor proxy: a CPU-bound indexer can sit at 14 while
 the GPU is perfectly steady. So this runs one cheap workload three times
-first and reports the spread of the three minima. Above 10% it declines to
-judge the timing rows; accuracy rows are load-independent and always run.
+first, and judges the timing rows only if *both* halves of the gate pass.
+Accuracy rows are load-independent and always run.
+
+*Spread* of the three minima, above 10% -> too noisy. This catches a machine
+that stutters.
+
+*Level* against `PROBE_QUIET_MS`, above 1.5x -> contended. This catches the
+one that does not. Sustained contention slows everything by roughly the same
+factor, so the spread stays tight and the spread gate waves it through: on
+2026-09-27 the probe read 205.6 ms at a 9.9% spread, every timing row came
+back 1.6x to 4.7x OVER, and all of it was a competing GPU job. A re-run at
+73 ms put all ten rows inside their claims with nothing changed in between.
+A slow machine is not a slow library, and reporting one as the other is worse
+than reporting nothing -- it invites a hunt for a regression that does not
+exist.
 """
 import argparse
 import os
@@ -138,10 +151,34 @@ def stability():
     return min(mins), (max(mins) - min(mins)) / min(mins)
 
 
+#: The probe's wall time on a quiet M2 Max, measured 2026-09-28 at a 0.2%
+#: spread with nothing else running.  It is a *level*, and the level is the
+#: half of the gate that spread cannot supply.
+PROBE_QUIET_MS = 73.3
+#: How far above that still counts as quiet.  Contention shows up as a
+#: roughly uniform slowdown, so it moves the level while leaving the spread
+#: tight: on 2026-09-27 this probe read 205.6 ms at a 9.9% spread -- 2.8x the
+#: quiet level, and the spread gate passed it.  Every timing row that run was
+#: reported 1.6x to 4.7x OVER, all of it contention, and a re-run at 73 ms put
+#: all ten rows inside their claims.  A slow *machine* is not a slow *library*
+#: and the verifier must not confuse the two.
+PROBE_SLOW_FACTOR = 1.5
+
+
 base, spread = stability()
+level = base / PROBE_QUIET_MS
+noisy = spread > 0.10
+slow = level > PROBE_SLOW_FACTOR
 print(f"load average (1 min): {LOAD:.1f}")
+why = ("" if not noisy else "   <-- too noisy to judge timings")
+if slow and not noisy:
+    why = (f"   <-- {level:.1f}x the quiet level "
+           f"({PROBE_QUIET_MS:.0f} ms): contended, not noisy")
 print(f"stability probe: {base:.1f} ms, spread across 3 rounds {spread:.1%}"
-      + ("" if spread <= 0.10 else "   <-- too noisy to judge timings"))
+      + why)
+if slow and not noisy:
+    print("  A tight spread on a uniformly slow machine is the failure mode "
+          "this level check exists for.")
 print()
 
 # Two interleaved passes, best of both. Conditions drift during a run, and
@@ -151,7 +188,7 @@ print()
 results = {}
 for _ in range(2):
     for label, claimed, fn, kind in CLAIMS:
-        if kind == "time" and spread > 0.10:
+        if kind == "time" and (noisy or slow):
             continue
         got = fn()
         prev = results.get(label)
@@ -160,7 +197,8 @@ for _ in range(2):
 print(f"{'claim':>40s} {'README':>9s} {'measured':>9s}   verdict")
 for label, claimed, fn, kind in CLAIMS:
     if label not in results:
-        print(f"{label:>40s} {claimed:>9.1f} {'--':>9s}   skipped (too noisy)")
+        why = "too noisy" if noisy else "machine contended"
+        print(f"{label:>40s} {claimed:>9.1f} {'--':>9s}   skipped ({why})")
         continue
     got = results[label]
     ratio = got / claimed
@@ -171,6 +209,11 @@ for label, claimed, fn, kind in CLAIMS:
 print()
 print("Accuracy rows are absolute log-unit errors and must not grow; timing")
 print("rows are minima and allowed {:.0%} slack.".format(a.tol))
-if spread > 0.10:
+if noisy:
     print("Timings were skipped: the stability probe varied by "
           f"{spread:.0%}. Re-run when it is under 10%.")
+elif slow:
+    print(f"Timings were skipped: the stability probe ran at {base:.0f} ms, "
+          f"{level:.1f}x the quiet level of {PROBE_QUIET_MS:.0f} ms, so the "
+          f"machine is contended even though the spread is tight. Re-run when "
+          f"the probe is under {PROBE_QUIET_MS * PROBE_SLOW_FACTOR:.0f} ms.")
