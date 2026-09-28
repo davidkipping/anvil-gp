@@ -467,12 +467,22 @@ spacings below `delta` are refused — it genuinely goes negative below
 loses three stale "planned" rows; `docs/tutorial.md` gains a long-cadence
 worked example with every figure pinned in `test_docs.py`.
 
-**Still not done:** `TermConvolution` around `Matern32Term` or
-`Matern52Term`, which raise. A repeated root has no celerite coefficients,
-so the closed form does not apply; their convolutions are state-space models
-of the same order but need the `m = 3` propagator generalised the way 3a
-generalised `m = 2`. `OriginalCeleriteTerm` is still absent, now only as a
-coefficient conversion away from the implemented `ComplexTerm`.
+**Still not done _(both superseded below; kept as the record of what 3c
+shipped)_:** `TermConvolution` around `Matern32Term` or `Matern52Term`, which
+raise. A repeated root has no celerite coefficients, so the closed form does
+not apply; their convolutions are state-space models of the same order but
+need the `m = 3` propagator generalised the way 3a generalised `m = 2`.
+`OriginalCeleriteTerm` is still absent, now only a coefficient conversion
+away from the implemented `ComplexTerm`.
+
+> **Superseded.** Stage 3d lifted the Matern restriction by moving the
+> convolution off the coefficients entirely, and `from_celerite_coefficients`
+> now provides the conversion. Note 3b had *already* established that
+> `OriginalCeleriteTerm` is a wrapper rather than a parametrisation (see
+> above); `docs/kernels.md` kept describing it as "a reparametrisation of
+> `ComplexTerm`" for another day, and that wrong version is the one that got
+> repeated. The plan was right and the user-facing page was not -- when two
+> documents disagree, the one a reader reaches first is the one that matters.
 
 #### Stage 3d --- the convolution moved to the state-space level, 2026-09-27
 
@@ -551,6 +561,55 @@ positive but `F delta` is not, so far enough out the alternating powers cost
 float32 digits, and no algebraic rewrite removes it -- unlike the scalar
 cancellation stage 3c fixed. Beyond the bound the exposure is longer than the
 fastest correlation time and the process is nearly white across a frame.
+
+#### Also landed: `from_celerite_coefficients`, 2026-09-27
+
+The interop route, and the honest version of the "`OriginalCeleriteTerm`"
+item: a celerite coefficient set `(a_r, c_r, a, b, c, d)` in, a
+`RealTerm`/`ComplexTerm` sum plus its parameter vector out. Exact against
+celerite2 (0 ulp on five term shapes -- both sides evaluate the same closed
+form from the same numbers), and it refuses three sets for conditions already
+documented: a non-positive amplitude (an SHO below critical damping, which
+`SHOTerm` carries natively as one 2-state block), `b/a > c/d` (that is
+`k'(0+) > 0`, so the implied noise is not PSD), and `d = 0` (a repeated root,
+i.e. `Matern32Term`).
+
+#### Also landed: SBC rank checks, 2026-09-28
+
+The calibration work the README listed as owed, in `tests/test_calibration.py`.
+The existing tests there profile one parameter and keep the *argmax*, which
+tests unbiasedness of a point estimate and is blind to the posterior's width
+-- a log-likelihood off by a constant factor moves the mode not at all.
+
+Conditional SBC, by exact quadrature rather than MCMC: draw `theta* ~ prior`,
+generate `y ~ p(y | theta*)`, then take `u = P(theta_p <= theta_p* | y,
+theta_{-p})`, which is Uniform(0, 1) under a correct likelihood. Fixing the
+other parameters at their true values makes that posterior one-dimensional and
+exactly computable, so there is no sampler noise in the verdict and the test
+covers the likelihood anvil-gp owns rather than anvil's sampler. It runs on the
+float64 CPU path, so it does not contend for the GPU.
+
+**Measured, 48 simulations at n = 300.** Correct likelihood: p = 0.85 / 0.78 /
+0.28 / 0.23 for sigma / rho / Q / jitter, PIT sd 0.301-0.325 against the
+uniform 0.289. Log-likelihood tempered by 4: p = 7.5e-08 to 1.7e-12, PIT sd
+0.376-0.419, bin counts piled at both ends. The tempered PIT *means* stay at
+0.43-0.50 -- tempering does not move the mode, which is exactly why the
+profile-argmax tests cannot see it.
+
+**Two things this required getting right, either of which would have made it
+vacuous.** `make_target` derives its references and bounds from the data
+(`priors.data_references`), so its prior moves with `y` and the joint
+`p(theta, y)` SBC needs does not exist; the hyperparameters are pinned once
+and reused. And the quadrature is two-stage: `log_sigma`'s prior support is
++/-9 in the log against a posterior ~0.3 wide, so a single grid over the
+support barely resolves the CDF -- and under the tempered likelihood the width
+halves again. A grid too coarse would have made the *power* test pass on
+quadrature error rather than on the miscalibration, which is worse than having
+no power test. Caught by inspection, not by running it.
+
+**Still owed from the README's M5 list:** the adversarial geometry tests
+(zero-amplitude injection, timescale close to the cadence) and the
+MetalPlanet hot-Jupiter joint fit.
 
 ## Order, and why it changed
 

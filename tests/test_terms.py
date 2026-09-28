@@ -694,3 +694,115 @@ def test_we_beat_celerite2_on_the_convolved_amplitudes_at_small_delta():
     assert err_theirs > 100 * err_ours, (
         f"celerite2 {err_theirs:.2e} vs ours {err_ours:.2e} -- if celerite2 "
         f"has been fixed upstream, this test has served its purpose")
+
+
+# ---------------------------------------------------------------------------
+# celerite coefficient interop (what `OriginalCeleriteTerm` actually is)
+# ---------------------------------------------------------------------------
+
+C2_ROUNDTRIP = [
+    ("sho", dict(sigma=1.3, rho=4.0, Q=3.0), "SHOTerm", 2, 4),
+    ("sho-high-q", dict(sigma=0.7, rho=11.0, Q=80.0), "SHOTerm", 2, 4),
+    ("real", dict(a=1.44, c=0.7), "RealTerm", 1, 2),
+    ("complex", dict(a=1.5, b=0.4, c=0.6, d=1.1), "ComplexTerm", 2, 4),
+    ("rotation", dict(sigma=1.5, period=7.0, Q0=3.0, dQ=1.0, f=0.4),
+     "RotationTerm", 4, 8),
+]
+
+
+@pytest.mark.parametrize("name,kw,cls,m,npar", C2_ROUNDTRIP,
+                         ids=[c[0] for c in C2_ROUNDTRIP])
+def test_from_celerite_coefficients_round_trips_celerite2(name, kw, cls, m, npar):
+    """celerite's coefficients in, the same kernel out.
+
+    This is the interop route that replaces the ``OriginalCeleriteTerm`` the
+    docs used to promise.  celerite2's class of that name is **not** a
+    reparametrisation of `ComplexTerm`: reading its source, it wraps a term
+    from the *legacy* ``celerite`` package and passes
+    ``get_all_coefficients()`` through unchanged.  So the coefficients are
+    already in this convention, there is no factor to convert, and anything
+    either celerite version can express goes through this function.
+
+    Exact agreement is expected, not approximate: both sides evaluate the same
+    closed form from the same numbers.
+    """
+    c2t = pytest.importorskip("celerite2.terms")
+    c2term = getattr(c2t, cls)(**kw)
+    term, p = ag.from_celerite_coefficients(*c2term.get_coefficients())
+    assert term.n_state == m, f"{name}: m = {term.n_state}, expected {m}"
+    assert p.size == npar, f"{name}: {p.size} parameters, expected {npar}"
+    tau = np.concatenate([[0.0], np.logspace(-3, 1.5, 60)])
+    ours = np.asarray(term.value_np(p, tau))
+    ref = np.asarray(c2term.get_value(tau))
+    rel = float(np.max(np.abs(ours - ref)) / np.max(np.abs(ref)))
+    assert rel < 1e-14, f"{name}: {rel:.2e}"
+
+
+def test_from_celerite_coefficients_handles_a_sum():
+    """A mixed real+complex set becomes a `TermSum` with the blocks in order."""
+    c2t = pytest.importorskip("celerite2.terms")
+    c2term = (c2t.SHOTerm(sigma=1.3, rho=4.0, Q=3.0)
+              + c2t.RealTerm(a=1.44, c=0.7))
+    term, p = ag.from_celerite_coefficients(*c2term.get_coefficients())
+    assert term.n_state == 3
+    # real blocks first, then the complex pairs -- the order this builds them
+    assert term.block_sizes == (1, 2), term.block_sizes
+    tau = np.concatenate([[0.0], np.logspace(-3, 1.5, 60)])
+    rel = float(np.max(np.abs(np.asarray(term.value_np(p, tau))
+                              - np.asarray(c2term.get_value(tau))))
+                / np.max(np.abs(np.asarray(c2term.get_value(tau)))))
+    assert rel < 1e-14, rel
+
+
+def test_from_celerite_coefficients_refuses_an_overdamped_sho():
+    """The negative real amplitude has no ``P_inf = I`` representation.
+
+    An SHO below critical damping is two real exponentials whose amplitudes
+    have opposite signs.  That is the *coefficient* route's limitation, not
+    the package's -- `SHOTerm` carries the same kernel as one 2-state block at
+    any ``Q``, and the message says so.
+    """
+    c2t = pytest.importorskip("celerite2.terms")
+    co = c2t.SHOTerm(sigma=1.3, rho=4.0, Q=0.4).get_coefficients()
+    with pytest.raises(ValueError, match="use SHOTerm directly"):
+        ag.from_celerite_coefficients(*co)
+    # and the kernel really is available the other way
+    native = ag.SHOTerm().value_np(np.array([1.3, 4.0, 0.4]),
+                                   np.array([0.0, 0.5, 2.0]))
+    ref = c2t.SHOTerm(sigma=1.3, rho=4.0, Q=0.4).get_value(
+        np.array([0.0, 0.5, 2.0]))
+    assert np.max(np.abs(np.asarray(native) - np.asarray(ref))) < 1e-12
+
+
+@pytest.mark.parametrize("kw,match", [
+    (dict(a=[1.0], b=[9.0], c=[0.5], d=[1.0]), "not a valid covariance"),
+    (dict(a=[1.0], b=[0.1], c=[0.5], d=[0.0]), "repeated root"),
+    (dict(a=[-1.0], b=[0.0], c=[0.5], d=[1.0]), r"a\[0\] is -1"),
+    (dict(a_real=[1.0], c_real=[1.0, 2.0]), "differ in length"),
+    (dict(a=[1.0], b=[0.1], c=[0.5]), "differ in length"),
+    (dict(), "no coefficients"),
+])
+def test_from_celerite_coefficients_refuses_invalid_sets(kw, match):
+    """Each refusal names a condition the rest of the package documents.
+
+    ``b/a <= c/d`` is ``k'(0+) <= 0``, the PSD condition on the implied
+    process noise; ``d = 0`` is a repeated root and so a Matern-3/2 rather
+    than a complex pair.
+    """
+    with pytest.raises(ValueError, match=match):
+        ag.from_celerite_coefficients(**kw)
+
+
+def test_from_celerite_coefficients_accepts_the_sho_boundary():
+    """``b/a == c/d`` exactly is the SHO, and must not be refused.
+
+    The check carries a relative tolerance for this: the SHO sits *on* the
+    boundary, and a round trip through celerite2's float64 coefficients lands
+    a few ulp either side of it.
+    """
+    c2t = pytest.importorskip("celerite2.terms")
+    for qual in (0.51, 1.0, 3.0, 300.0):
+        co = c2t.SHOTerm(sigma=1.1, rho=5.0, Q=qual).get_coefficients()
+        _, _, a, b, c, d = [np.atleast_1d(np.asarray(x)) for x in co]
+        assert abs(b[0] / a[0] - c[0] / d[0]) < 1e-9, "not the SHO boundary"
+        ag.from_celerite_coefficients(*co)          # must not raise

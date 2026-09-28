@@ -277,8 +277,36 @@ against, but it is 30–70x slower depending on the kernel (see
 
 | kernel | in celerite2 | status here |
 |---|---|---|
-| `OriginalCeleriteTerm` | yes | **not implemented.** A reparametrisation of `ComplexTerm`, which *is* implemented -- convert the coefficients yourself and use `ComplexTerm`. |
 | `TermProduct` | (varies) | **not implemented.** Products of kernels are not generally state-space representable at fixed `m`. |
+
+### Coming from celerite or celerite2
+
+`from_celerite_coefficients` takes a celerite coefficient set and returns an
+anvil-gp term plus its parameter vector:
+
+```python
+import celerite2.terms as c2t
+co = c2t.SHOTerm(sigma=1.3, rho=4.0, Q=3.0).get_coefficients()
+term, p = ag.from_celerite_coefficients(*co)     # exact, same closed form
+```
+
+**This is what `celerite2.terms.OriginalCeleriteTerm` actually is.** An
+earlier version of this page called it "a reparametrisation of `ComplexTerm`";
+that was wrong. Reading its source, it is a thin wrapper that takes a term
+object from the **legacy `celerite` package** and passes
+`get_all_coefficients()` straight through, unchanged. So there is no separate
+parametrisation to implement and no factor to convert — the coefficients are
+already in this convention, and the function above accepts anything either
+celerite version can express.
+
+Three coefficient sets are refused, each for a condition documented
+elsewhere on this page rather than a new one:
+
+| refused | why |
+|---|---|
+| `a_r <= 0` or `a <= 0` | `P_inf = I` carries the amplitude in `h` as its square root. The usual source is an SHO below critical damping, whose two real amplitudes have opposite signs — use `SHOTerm` directly, which carries it as one 2-state block at any `Q`. |
+| `b/a > c/d` | that is `k'(0+) > 0`, so the implied process noise is not PSD and the set is not a covariance. Equality is the SHO. |
+| `d = 0` | a repeated root, not a complex pair — that is `Matern32Term`, which the coefficient form cannot express. |
 
 ### Not celerite-class at all
 

@@ -6,11 +6,11 @@ off-by-one in the recursion can all leave a single fit looking fine, because
 a single realisation's own scatter is larger than the bias.  These tests
 average over realisations instead.
 
-This is the cheap, fast version of the M5 calibration work (SBC rank checks
-at N = 1e3 through the float64 reference path).  It is not a substitute for
-it: unbiasedness of a point estimate is a weaker claim than correct posterior
-coverage.  It is, however, enough to catch the class of bug that a single
-recovery would miss, and it runs in seconds.
+Two layers, and the difference between them matters.  The tests in the first
+half take the profile *argmax* over realisations: unbiasedness of a point
+estimate, cheap, and blind to the posterior's width -- a log-likelihood off by
+a constant factor moves the mode not at all.  The SBC rank checks at the end
+close that gap, and carry their own power test showing they do.
 """
 
 import math
@@ -261,3 +261,237 @@ def test_chees_runs_on_the_fused_kernel():
     jit_sd = float(gt.natural(flat)["jitter"].std())
     assert 0.007 < jit_sd < 0.016, (
         f"jitter posterior width {jit_sd:.4f}; float64 Laplace gives 0.0107")
+
+
+# ---------------------------------------------------------------------------
+# SBC rank checks (M5's owed calibration work)
+# ---------------------------------------------------------------------------
+#
+# The tests above profile one parameter and keep the *argmax*.  That tests
+# unbiasedness of a point estimate and is blind to the posterior's width: a
+# likelihood off by a constant factor in its log -- a tempered reduction, a
+# double-counted log-determinant, a mis-scaled process noise -- moves the mode
+# not at all and the width a lot.  These tests look at the whole shape.
+#
+# The construction is simulation-based calibration in its conditional form.
+# Draw `theta* ~ prior`, generate `y ~ p(y | theta*)`, then rank `theta_p*`
+# inside the posterior `p(theta_p | y, theta_{-p} = theta*_{-p})`.  The other
+# parameters being *known* makes that a one-dimensional posterior, which can
+# be had exactly by quadrature -- so there is no MCMC in the loop and no
+# sampler noise in the verdict.  Under a correct likelihood the probability
+# integral transform `u = P(theta_p <= theta_p* | y)` is exactly Uniform(0, 1),
+# and that is what is tested.
+#
+# Two things this deliberately does *not* do.  It does not re-derive the
+# priors per simulation: `make_target` sets its references and bounds from the
+# data (`priors.data_references`), so the prior moves with `y` and the joint
+# `p(theta, y)` that SBC needs would not exist.  The hyperparameters are
+# pinned once, from one reference dataset, and reused.  And it does not test
+# anvil's sampler -- that is anvil's to test; this tests the likelihood
+# anvil-gp owns.
+
+
+def _sbc_hypers(t, y, yerr):
+    """The pinned prior: derived once, then frozen across simulations."""
+    from anvilgp.priors import default_hypers, jitter_hyper
+    return default_hypers(ag.SHOTerm(), t, y, yerr), jitter_hyper(yerr)
+
+
+def _support(h, n_sd=6.0):
+    """The interval the 1-D quadrature runs over: the prior's support."""
+    if h.prior is None:
+        assert np.isfinite(h.lo) and np.isfinite(h.hi), h.name
+        return h.lo, h.hi
+    _, mu, sd = h.prior
+    return max(h.lo, mu - n_sd * sd), min(h.hi, mu + n_sd * sd)
+
+
+def _prior_logpdf(h, v):
+    """Model-space log prior, up to a constant, on the support.
+
+    Bounded-with-no-prior is uniform -- anvil's ``Transform`` supplies that
+    density and its Jacobian exactly, so in model space it is flat.  A
+    declared normal prior is a normal *truncated* to the bounds, which the
+    quadrature range already imposes.
+    """
+    if h.prior is None:
+        return np.zeros_like(v)
+    _, mu, sd = h.prior
+    return -0.5 * ((v - mu) / sd) ** 2
+
+
+def _prior_draw(h, rng):
+    if h.prior is None:
+        return float(rng.uniform(h.lo, h.hi))
+    _, mu, sd = h.prior
+    for _ in range(1000):
+        x = float(rng.normal(mu, sd))
+        if h.lo <= x <= h.hi:
+            return x
+    raise RuntimeError(f"cannot draw {h.name} inside its bounds")
+
+
+def _natural(hypers, v):
+    """Model space -> natural units, the ``log`` link's ``ref * exp(v)``."""
+    return np.array([h.ref * math.exp(vi) for h, vi in zip(hypers, v)])
+
+
+def _conditional_cdf(gp, v_star, p, h, temper, n_coarse=97, n_fine=193):
+    """``P(theta_p <= theta_p* | y, theta_{-p})`` by two-stage quadrature.
+
+    **Two stages, because one is not enough and the failure would be silent.**
+    The prior support for ``log_sigma`` is +/-9 in the log, while its posterior
+    is ~0.3 wide, so a single grid over the support resolves the CDF with a
+    handful of points -- and under the *tempered* likelihood of
+    `test_the_sbc_check_detects_a_mis_scaled_posterior` the width halves again.
+    A grid too coarse to resolve the posterior would make that test pass on
+    quadrature error rather than on the miscalibration it is supposed to
+    detect: a vacuous power test, which is worse than none.
+
+    So: a coarse pass over the whole support for the location and scale, then a
+    fine pass over +/-8 of those scales.  Mass outside is ~1e-15 under any
+    calibration; a truth falling outside returns 0 or 1, which is the correct
+    PIT there and exactly what drives detection.
+    """
+    def logpost(grid):
+        vv = np.tile(v_star, (grid.size, 1))
+        vv[:, p] = grid
+        with mx.stream(mx.cpu):
+            ll = np.array(gp.hi(a64(vv)), dtype=np.float64)
+        return temper * ll + _prior_logpdf(h, grid)
+
+    lo, hi = _support(h)
+    coarse = np.linspace(lo, hi, n_coarse)
+    lp = logpost(coarse)
+    w = np.exp(lp - lp.max())
+    mean = float(np.sum(w * coarse) / np.sum(w))
+    var = float(np.sum(w * (coarse - mean) ** 2) / np.sum(w))
+    sd = math.sqrt(max(var, 1e-12))
+
+    f_lo, f_hi = max(lo, mean - 8.0 * sd), min(hi, mean + 8.0 * sd)
+    if not f_hi > f_lo:
+        f_lo, f_hi = lo, hi
+    if v_star[p] <= f_lo:
+        return 0.0
+    if v_star[p] >= f_hi:
+        return 1.0
+
+    fine = np.linspace(f_lo, f_hi, n_fine)
+    lp = logpost(fine)
+    w = np.exp(lp - lp.max())
+    cell = 0.5 * (w[1:] + w[:-1]) * np.diff(fine)
+    cdf = np.concatenate([[0.0], np.cumsum(cell)])
+    total = cdf[-1]
+    assert total > 0.0 and np.isfinite(total), h.name
+    return float(np.interp(v_star[p], fine, cdf / total))
+
+
+def _pit_values(n_sim=48, n_data=300, temper=1.0, seed=4242):
+    """PIT value per parameter per simulation; shape ``(n_sim, 4)``.
+
+    ``temper`` scales the log-likelihood.  ``1.0`` is the real check; anything
+    else is an injected miscalibration, which
+    `test_the_sbc_check_detects_a_mis_scaled_posterior` uses to show the test
+    has power.  Scaling the log is precisely the failure mode a point-estimate
+    check cannot see: the mode does not move at all.
+    """
+    from anvilgp.priors import build_param_map
+
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.uniform(0.0, BASELINE, n_data))
+    yerr = np.full(n_data, YERR)
+    # the prior is pinned here, once, from a throwaway reference realisation
+    ref_cov = dense_covariance(ag.SHOTerm(), np.array([SIGMA, RHO, QUAL]), t,
+                               yerr, jitter=JIT)
+    y_ref = np.linalg.cholesky(ref_cov) @ rng.standard_normal(n_data)
+    kern, jit = _sbc_hypers(t, y_ref, yerr)
+    hypers = kern + [jit]
+    pm, _, _ = build_param_map(kern, jitters=[jit])
+
+    out = np.full((n_sim, len(hypers)), np.nan)
+    for i in range(n_sim):
+        v_star = np.array([_prior_draw(h, rng) for h in hypers])
+        nat = _natural(hypers, v_star)
+        # The generative model must be the one the likelihood evaluates, so
+        # check *both* links rather than trust them.  A mismatch here --
+        # generating with one jitter and inferring with another -- would not
+        # fail loudly; it would quietly make every PIT value meaningless
+        # while the test still reported a verdict.
+        with mx.stream(mx.cpu):
+            v1 = a64(v_star[None, :])
+            kp = np.array(pm.kernel_params(v1), dtype=np.float64)[0]
+            jv = float(np.array(pm.jitter[0].apply(v1), dtype=np.float64)[0, 0])
+        assert np.allclose(kp, nat[:3], rtol=1e-12), (kp, nat[:3])
+        assert abs(jv / nat[3] - 1.0) < 1e-12, (jv, nat[3])
+
+        cov = dense_covariance(ag.SHOTerm(), nat[:3], t, yerr, jitter=nat[3])
+        y = np.linalg.cholesky(cov) @ rng.standard_normal(n_data)
+        gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
+                       GPPolicy(block=1024, hi_block=1024))
+
+        for p, h in enumerate(hypers):
+            out[i, p] = _conditional_cdf(gp, v_star, p, h, temper)
+    return out, [h.name for h in hypers]
+
+
+def _uniformity_p(u, n_bins=8):
+    """Chi-squared p-value for ``u`` against Uniform(0, 1)."""
+    from scipy import stats
+    counts, _ = np.histogram(u, bins=n_bins, range=(0.0, 1.0))
+    expect = len(u) / n_bins
+    chi2 = float(np.sum((counts - expect) ** 2) / expect)
+    return float(stats.chi2.sf(chi2, n_bins - 1)), chi2, counts
+
+
+@pytest.mark.slow
+def test_sbc_pit_values_are_uniform():
+    """The owed SBC check: the PIT is Uniform(0, 1) for every parameter.
+
+    This is the test that can see a mis-scaled posterior *width*, which every
+    other calibration test in this file is blind to.  Run through the float64
+    reference path (`hi`), so what it certifies is the likelihood's shape, not
+    float32 rounding and not the sampler.
+
+    Measured at 48 simulations, n = 300: chi-squared p-values 0.85 / 0.78 /
+    0.28 / 0.23 for sigma / rho / Q / jitter, PIT standard deviations
+    0.301-0.325 against the uniform 0.289, and flat bin counts.
+    """
+    pytest.importorskip("scipy")
+    u, names = _pit_values()
+    for p, name in enumerate(names):
+        col = u[:, p]
+        assert np.all((col >= 0.0) & (col <= 1.0)), name
+        pval, chi2, counts = _uniformity_p(col)
+        assert pval > 0.005, (
+            f"{name}: PIT not uniform, chi2={chi2:.1f} p={pval:.2e} "
+            f"counts={counts.tolist()}; mean={col.mean():.3f} "
+            f"(0.5 expected), sd={col.std():.3f} (0.289 expected)")
+
+
+@pytest.mark.slow
+def test_the_sbc_check_detects_a_mis_scaled_posterior():
+    """The SBC test must *fail* on a known-bad likelihood, or it proves nothing.
+
+    Tempering the log-likelihood by 4 leaves every mode exactly where it was
+    and divides each posterior width by about two -- the precise failure the
+    profile-argmax tests above cannot see.  If this ever stops rejecting, the
+    uniformity gate has lost its power and
+    `test_sbc_pit_values_are_uniform` is decoration.
+
+    Measured: p-values 7.5e-08 to 1.7e-12 across the four parameters, PIT
+    standard deviations 0.376-0.419 against the uniform 0.289, and bin counts
+    piled at both ends (e.g. ``[22, 2, 1, 2, 2, 2, 3, 14]``) -- the signature
+    of an over-narrow posterior.  The PIT *means* stay at 0.43-0.50, which is
+    the whole point: tempering does not move the mode at all, so a
+    point-estimate check sees nothing.
+    """
+    pytest.importorskip("scipy")
+    u, names = _pit_values(n_sim=48, temper=4.0)
+    pvals = [_uniformity_p(u[:, p])[0] for p in range(len(names))]
+    assert min(pvals) < 0.005, (
+        f"a 4x tempered likelihood went undetected: p-values "
+        f"{[f'{p:.3f}' for p in pvals]} against names {names}")
+    # and the direction is the expected one: over-narrow posteriors push the
+    # PIT towards the ends, so its spread exceeds the uniform 0.289
+    worst = int(np.argmin(pvals))
+    assert u[:, worst].std() > 0.30, u[:, worst].std()

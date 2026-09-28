@@ -85,8 +85,9 @@ from .special import (
 )
 
 __all__ = [
-    "Term", "TermSum", "RealTerm", "SHOTerm",
-    "Matern32Term", "Matern52Term", "RotationTerm",
+    "Term", "TermSum", "RealTerm", "SHOTerm", "ComplexTerm",
+    "Matern32Term", "Matern52Term", "RotationTerm", "TermConvolution",
+    "from_celerite_coefficients", "MAX_FDELTA",
 ]
 
 _TWO_PI = 2.0 * math.pi
@@ -606,6 +607,100 @@ class ComplexTerm(Term):
         c, d = p[..., 2:3], p[..., 3:4]
         empty = a[..., :0]
         return empty, empty, a, b, c, d
+
+
+def from_celerite_coefficients(a_real=(), c_real=(), a=(), b=(), c=(), d=()):
+    """Build a term and its parameter vector from celerite coefficients.
+
+    The celerite decomposition is
+    ``k(tau) = sum a_r e^{-c_r tau} + sum e^{-c tau}(a cos d tau + b sin d tau)``,
+    and this turns one into a :class:`RealTerm` / :class:`ComplexTerm` sum.
+    Returns ``(term, params)`` -- two objects, because a term here carries no
+    parameters of its own; they are supplied per evaluation.
+
+    **What this is for.** It is the interop route, and it replaces what the
+    docs used to promise as an ``OriginalCeleriteTerm``.  celerite2's class of
+    that name is *not* a reparametrisation of :class:`ComplexTerm` (an earlier
+    version of `docs/kernels.md` said it was, and that was simply wrong): it
+    is a thin wrapper that takes a term object from the **legacy ``celerite``
+    package** and passes ``get_all_coefficients()`` straight through,
+    unchanged.  So there is no new parametrisation to implement and no factor
+    to convert -- the coefficients are already in this convention.  Anything
+    either celerite version can express, feed here:
+
+    >>> import celerite2.terms as c2t                       # doctest: +SKIP
+    >>> co = c2t.SHOTerm(sigma=1.3, rho=4.0, Q=3.0).get_coefficients()
+    >>> term, p = from_celerite_coefficients(*co)           # doctest: +SKIP
+
+    **Not every coefficient set is representable**, and the refusals are the
+    same ones the rest of the package documents rather than new limitations:
+
+    * ``a_r > 0`` and ``a > 0``.  The ``P_inf = I`` construction carries the
+      amplitude in ``h`` as its square root, so a negative amplitude has no
+      representation -- the obstruction that keeps an overdamped ``SHOTerm``
+      out of the *coefficient* route (its convolution goes through the
+      generator instead, and has no such trouble).
+    * ``b/a <= c/d``, i.e. ``k'(0+) = -1/2 h Q_c h^T <= 0``, which is exactly
+      the condition for the implied process noise to be PSD.  Equality is the
+      SHO.
+    * ``d > 0`` for a complex pair.  ``d = 0`` is a repeated root, not a
+      complex pair; it is a Matern-3/2 (or a doubled real term), and the
+      coefficient form cannot express it -- use :class:`Matern32Term`.
+    """
+    ar = np.atleast_1d(np.asarray(a_real, dtype=np.float64)).ravel()
+    cr = np.atleast_1d(np.asarray(c_real, dtype=np.float64)).ravel()
+    ac = np.atleast_1d(np.asarray(a, dtype=np.float64)).ravel()
+    bc = np.atleast_1d(np.asarray(b, dtype=np.float64)).ravel()
+    cc = np.atleast_1d(np.asarray(c, dtype=np.float64)).ravel()
+    dc = np.atleast_1d(np.asarray(d, dtype=np.float64)).ravel()
+    if ar.size != cr.size:
+        raise ValueError(f"a_real and c_real differ in length: "
+                         f"{ar.size} vs {cr.size}")
+    if not (ac.size == bc.size == cc.size == dc.size):
+        raise ValueError(
+            f"the complex coefficients differ in length: a={ac.size}, "
+            f"b={bc.size}, c={cc.size}, d={dc.size}")
+    if ar.size + ac.size == 0:
+        raise ValueError("no coefficients given")
+
+    terms: list[Term] = []
+    params: list[float] = []
+    for i in range(ar.size):
+        if not ar[i] > 0.0:
+            raise ValueError(
+                f"real amplitude {i} is {ar[i]:g}; the P_inf = I construction "
+                f"carries sqrt(a_r) in h, so a non-positive amplitude has no "
+                f"representation here. The usual source is an SHO below "
+                f"critical damping, whose two real amplitudes have opposite "
+                f"signs -- use SHOTerm directly, which represents it as one "
+                f"2-state block and is regular at every Q")
+        if not cr[i] > 0.0:
+            raise ValueError(f"real rate {i} is {cr[i]:g}, must be > 0")
+        terms.append(RealTerm())
+        params.extend([math.sqrt(float(ar[i])), float(cr[i])])
+    for i in range(ac.size):
+        if not ac[i] > 0.0:
+            raise ValueError(
+                f"complex amplitude a[{i}] is {ac[i]:g}, must be > 0")
+        if not cc[i] > 0.0:
+            raise ValueError(f"complex rate c[{i}] is {cc[i]:g}, must be > 0")
+        if not dc[i] > 0.0:
+            raise ValueError(
+                f"complex frequency d[{i}] is {dc[i]:g}. A zero frequency is a "
+                f"repeated root, not a complex pair -- that is Matern32Term, "
+                f"which the coefficient form cannot express")
+        # b/a <= c/d, with a relative tolerance because the SHO sits exactly
+        # on the boundary and round-trips through float64 land just outside it
+        if bc[i] * dc[i] > ac[i] * cc[i] * (1.0 + 1e-9):
+            raise ValueError(
+                f"pair {i} has b/a = {bc[i] / ac[i]:.6g} > c/d = "
+                f"{cc[i] / dc[i]:.6g}, so k'(0+) > 0 and the implied process "
+                f"noise is not PSD: this is not a valid covariance")
+        terms.append(ComplexTerm())
+        params.extend([float(ac[i]), float(bc[i]), float(cc[i]), float(dc[i])])
+
+    term = terms[0] if len(terms) == 1 else TermSum(*terms)
+    return term, np.array(params, dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------

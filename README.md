@@ -821,11 +821,12 @@ Three more are worked around and pinned as regression tests
   `examples/gp_injection_recovery.py` is the end-to-end fiducial, and the
   brief's failure-region recovery test is in place (half an ensemble started
   in the infeasible corner, every chain out within 500 stretch steps).
-  Still owed: SBC rank checks — the present check profiles one parameter
-  with the others fixed at truth over 12 realisations, which tests
-  unbiasedness of a point estimate and cannot see a mis-scaled posterior
-  width — the adversarial geometry tests (zero-amplitude injection,
-  timescale ≈ cadence), and the MetalPlanet hot-Jupiter joint fit.
+  **SBC rank checks landed 2026-09-28**: conditional SBC by exact quadrature
+  rather than MCMC, with a power test showing it detects a 4x tempered
+  likelihood at p ~ 1e-8 to 1e-12 while the profile-argmax checks see nothing
+  (tempering does not move the mode). Still owed: the adversarial geometry
+  tests (zero-amplitude injection, timescale ≈ cadence), and the MetalPlanet
+  hot-Jupiter joint fit.
 
 ## Install / test
 
@@ -833,7 +834,7 @@ Three more are worked around and pinned as regression tests
 python -m venv .venv
 .venv/bin/pip install -e ".[test]"        # mlx, numpy; celerite2, mpmath, scipy for tests
 .venv/bin/pip install -e ../anvil         # for the engine integration only
-.venv/bin/python -m pytest tests -q       # ~4.5 min; -m 'not slow' for ~2.5 min
+.venv/bin/python -m pytest tests -q       # 779 tests, ~9.5 min; -m 'not slow' is faster
 .venv/bin/python examples/gp_injection_recovery.py
 ```
 

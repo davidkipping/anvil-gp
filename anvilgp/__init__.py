@@ -38,6 +38,7 @@ from .terms import (
     Term,
     TermConvolution,
     TermSum,
+    from_celerite_coefficients,
 )
 
 __version__ = "0.1.0.dev0"
@@ -47,4 +48,5 @@ __all__ = [
     "priors", "oracle",
     "Term", "TermSum", "RealTerm", "SHOTerm", "ComplexTerm", "TermConvolution",
     "Matern32Term", "Matern52Term", "RotationTerm",
+    "from_celerite_coefficients",
 ]
