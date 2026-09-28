@@ -40,6 +40,12 @@ def test_length_one_strided_slice_has_a_wrong_vjp(device):
     """``x[1:2:2]`` scatters its cotangent to *both* elements of a length-2
     axis: the gradient comes back as if the pair were tied together.
 
+    Upstream this is ml-explore/mlx #4444 (``normalize_slice`` collapses the
+    stride of a one-element result without adjusting ``stop``), with a fix
+    pending in PR #4446.  This test asserts the *buggy* behaviour: when it
+    starts failing, MLX has fixed it -- delete this test and nothing else,
+    since `_pairs` keeps its reshape either way.
+
     Values are unaffected.  A binary reduction tree's last level is always
     ``k = 2``, so this silently corrupted every gradient the element algebra
     produced -- see :func:`anvilgp.elements._pairs` for the workaround
@@ -63,7 +69,7 @@ def test_length_one_strided_slice_has_a_wrong_vjp(device):
         assert np.allclose(grad_of(4, slice(0, 4, 2), slice(1, 4, 2)),
                            [1.0, 10.0, 1.0, 10.0])
 
-        # Sharper characterisation, and the form filed upstream (see
+        # Sharper characterisation, matching upstream #4444 (see
         # docs/mlx-issue-strided-slice-vjp.md): the backward pass fills
         # start:stop rather than start:stop:step, so *any* single-element
         # strided slice smears its cotangent over the whole span.

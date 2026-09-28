@@ -439,6 +439,10 @@ def _pairs(e: Element):
 
     Reshaping to ``(n, k//2, 2, ...)`` and taking integer index 0 and 1 avoids
     the strided gather entirely, and is the cheaper op anyway.
+
+    Upstream: ml-explore/mlx issue #4444 (root cause: ``normalize_slice``
+    collapses the stride of a one-element result without adjusting ``stop``),
+    fix pending in PR #4446.  Keep the reshape after the fix; it is faster.
     """
     out_even, out_odd = [], []
     for f in Element._fields:
