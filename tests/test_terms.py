@@ -444,30 +444,157 @@ def test_the_correction_is_delta_over_three_times_the_kernel_slope(name, term, p
     ("matern32", ag.Matern32Term(), [1.1, 2.5]),
     ("matern52", ag.Matern52Term(), [1.1, 2.5]),
 ])
-def test_convolution_refuses_terms_without_exact_celerite_coefficients(name, term, p):
-    """A repeated root is not a sum of distinct exponentials.
+def test_convolution_supports_the_matern_terms(name, term, p):
+    """Matern-3/2 and Matern-5/2 *can* be convolved -- the inverted test.
 
-    Matern-3/2 (double root) and Matern-5/2 (triple) have *no* celerite
-    coefficients, so the closed form cannot be applied.  Their convolutions
-    are state-space models of the same order, but reaching them needs the
-    ``m = 3`` propagator generalised the way ``_complex_matrices``
-    generalised ``m = 2`` -- out of scope, and it must fail loudly rather
-    than silently pick a wrong decomposition.
+    Both were refused while the convolution went through celerite
+    coefficients, which a repeated root (Matern-3/2) and a triple one
+    (Matern-5/2) do not have.  The state-space route is a matrix function of
+    the generator, ``2(cosh(F delta) - I)/(F delta)^2``, which is an entire
+    function and so is indifferent to root multiplicity.  Nothing is
+    decomposed, so there is nothing to decompose badly.
+
+    Checked against a quadrature of the definition, not against celerite2 --
+    celerite2 has no Matern-5/2 at all, and only an *approximation* of
+    Matern-3/2, so this is a capability it does not have.
     """
-    with pytest.raises(TypeError, match="no exact celerite coefficients"):
-        ag.TermConvolution(term, 0.01)
+    mpm = pytest.importorskip("mpmath")
+    mpm.mp.dps = 30
+    for delta in (1e-3, 1e-2, 0.2):
+        cv = ag.TermConvolution(term, delta)
+        assert cv.n_state == term.n_state, "the convolution must not raise m"
+        taus = np.array([0.0, delta, 2.0 * delta, 0.7, 2.0])
+        got = np.asarray(cv.value_np(np.asarray(p, dtype=np.float64), taus))
+        d = mpm.mpf(delta)
+        for tau, g in zip(taus, got):
+            ref = mpm.quad(
+                lambda u: (d - abs(u)) * mpm.mpf(float(np.asarray(
+                    term.value_np(np.asarray(p, dtype=np.float64),
+                                  np.array([abs(float(tau + u))])))[0])),
+                [-d, -min(tau, delta), 0, d]) / d ** 2
+            assert abs(g / float(ref) - 1) < 1e-10, \
+                f"{name} delta={delta} tau={tau}"
 
 
-def test_convolution_needs_an_underdamped_sho():
+@pytest.mark.parametrize("qual", [0.1, 0.5, 0.7])
+def test_convolution_supports_an_overdamped_sho(qual):
+    """``Q <= 1/2`` is convolvable now -- the other inverted test.
+
+    Below critical damping the SHO is two real exponentials, one with a
+    *negative* amplitude, which is why the coefficient route refused it. The
+    generator does not care: ``F = [[0, w0], [-w0, -2c]]`` is regular for
+    every ``Q``, nothing takes a root of ``d^2 < 0``, and no amplitude is
+    ever formed.
+    """
+    mpm = pytest.importorskip("mpmath")
+    mpm.mp.dps = 30
+    p = np.array([1.3, 4.0, qual])
+    term = ag.SHOTerm()
+    for delta in (1e-2, 0.2):
+        cv = ag.TermConvolution(term, delta)
+        taus = np.array([0.0, delta, 3.0 * delta, 1.5])
+        got = np.asarray(cv.value_np(p, taus))
+        assert np.all(np.isfinite(got)), f"Q={qual} delta={delta}"
+        d = mpm.mpf(delta)
+        for tau, g in zip(taus, got):
+            ref = mpm.quad(
+                lambda u: (d - abs(u)) * mpm.mpf(float(np.asarray(
+                    term.value_np(p, np.array([abs(float(tau + u))])))[0])),
+                [-d, -min(tau, delta), 0, d]) / d ** 2
+            assert abs(g / float(ref) - 1) < 1e-10, \
+                f"Q={qual} delta={delta} tau={tau}"
+
+
+TERMS_WITH_GENERATOR = [
+    ("real", ag.RealTerm(), [1.2, 0.7]),
+    ("sho", ag.SHOTerm(), [1.3, 4.0, 3.0]),
+    ("sho-critical", ag.SHOTerm(), [1.3, 4.0, 0.5]),
+    ("sho-overdamped", ag.SHOTerm(), [1.3, 4.0, 0.1]),
+    ("sho-high-q", ag.SHOTerm(), [1.3, 4.0, 100.0]),
+    ("complex", ag.ComplexTerm(), [1.5, 0.4, 0.6, 1.1]),
+    ("matern32", ag.Matern32Term(), [1.1, 2.5]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+    ("sho+real", ag.SHOTerm() + ag.RealTerm(), [1.3, 4.0, 3.0, 1.2, 0.7]),
+    ("m52+m32", ag.Matern52Term() + ag.Matern32Term(), [1.1, 2.5, 1.0, 3.0]),
+]
+
+
+@pytest.mark.parametrize("name,term,p", TERMS_WITH_GENERATOR,
+                         ids=[c[0] for c in TERMS_WITH_GENERATOR])
+def test_the_generator_exponentiates_to_the_propagator(name, term, p):
+    """``expm(F dt) == Phi(dt)``, block by block.
+
+    The invariant the whole state-space convolution rests on: ``F`` has to be
+    in the *same* non-dimensionalised basis the term's own ``Phi`` uses, or
+    the matrix functions built from it describe a different process. Checked
+    against ``scipy.linalg.logm`` of the propagator the term actually
+    returns, which is independent of how ``generator`` computes it.
+    """
+    logm = pytest.importorskip("scipy.linalg").logm
+    pp = _f64p(p)
+    for dt in (0.013, 0.21):
+        with mx.stream(mx.cpu):
+            phis, _, _ = term.matrices_blocks(
+                pp, mx.array([dt], dtype=mx.float64))
+            gens = term.generator(pp)
+        assert len(gens) == len(phis), f"{name}: generator/block count differ"
+        for ph, gen in zip(phis, gens):
+            got = np.asarray(gen, dtype=np.float64)[0]
+            ref = np.real(logm(np.asarray(ph, dtype=np.float64)[0, 0]) / dt)
+            scale = max(float(np.max(np.abs(got))), 1e-300)
+            err = float(np.max(np.abs(got - ref))) / scale
+            assert err < 1e-13, f"{name} dt={dt}: {err:.2e}"
+
+
+@pytest.mark.parametrize("name,term,p", TERMS_WITH_GENERATOR,
+                         ids=[c[0] for c in TERMS_WITH_GENERATOR])
+def test_the_convolved_stationary_covariance_reproduces_the_kernel(name, term, p):
+    """``h Phi(tau) P_conv h^T == k_conv(tau)``, and ``P_conv`` is a covariance.
+
+    The state-space claim in one test: ``P_conv`` is symmetric, PSD, and its
+    only job is to satisfy ``P h^T = M h^T``.  ``M`` itself is *not*
+    symmetric -- asserted here too, because if it ever became symmetric the
+    rank-one construction would be unnecessary and this design would be
+    over-built.
+    """
+    from anvilgp.terms import _block_diag, _conv_matrix_factors
+    delta = 0.02
+    cv = ag.TermConvolution(term, delta)
+    pp = _f64p(p)
+    taus = np.array([delta, 2.5 * delta, 0.4, 1.7])
+    with mx.stream(mx.cpu):
+        phi, _, h = cv.matrices(pp, mx.array(taus, dtype=mx.float64))
+        blocks = cv.p_inf_blocks(pp)
+        pin = _block_diag(*blocks) if len(blocks) > 1 else blocks[0]
+        pin = np.asarray(pin, dtype=np.float64)[0]
+        ph = np.asarray(phi, dtype=np.float64)[0]
+        hv = np.asarray(h, dtype=np.float64)[0]
+        asym = max(
+            float(np.max(np.abs(np.asarray(_conv_matrix_factors(f, delta)[0])[0]
+                                - np.asarray(_conv_matrix_factors(f, delta)[0])[0].T)))
+            for f in term.generator(pp))
+    assert np.max(np.abs(pin - pin.T)) < 1e-13, f"{name}: P_conv not symmetric"
+    assert np.linalg.eigvalsh(pin).min() > -1e-12, f"{name}: P_conv not PSD"
+    if term.n_state > 1:
+        assert asym > 1e-9, (
+            f"{name}: M came out symmetric, so the rank-one construction is "
+            f"unnecessary -- revisit `_conv_p_inf`")
+    ref = np.asarray(cv.value_np(np.asarray(p, dtype=np.float64), taus))
+    got = np.array([float(hv @ ph[i] @ pin @ hv) for i in range(len(taus))])
+    rel = float(np.max(np.abs(got - ref)) / np.max(np.abs(ref)))
+    assert rel < 1e-12, f"{name}: {rel:.2e}"
+
+
+def test_the_sho_coefficients_are_non_finite_below_critical_damping():
     """At ``Q <= 1/2`` the SHO is two real exponentials, one *negative*.
 
-    The ``P_inf = I`` construction cannot carry a negative amplitude, and
-    `SHOTerm.celerite_coefficients` floors ``d`` at zero, so ``b = a c / d``
-    is non-finite.  It is not a NaN the caller sees -- the likelihood's own
-    guard turns it into -1e30 with a zero gradient -- so
-    :class:`GPLogLike` refuses it at the reference point instead (see
-    `test_likelihood.py`).  Here: pin that the coefficients really do go
-    non-finite, which is what that refusal detects.
+    Still true of the *coefficients*, and pinned because it is the reason the
+    convolution does not use them: `SHOTerm.celerite_coefficients` floors
+    ``d`` at zero, so ``b = a c / d`` is non-finite below critical damping.
+    Nothing on the evaluation path calls it any more --
+    `test_convolution_supports_an_overdamped_sho` convolves exactly these
+    parameters successfully -- so this documents a dead end, not a limit.
     """
     with mx.stream(mx.cpu):
         cv = ag.TermConvolution(ag.SHOTerm(), 0.01)

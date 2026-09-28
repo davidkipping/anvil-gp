@@ -175,10 +175,16 @@ def identity_element(batch: tuple[int, ...], m: int, dtype) -> Element:
     )
 
 
-def first_point(phi, q, dtype=None):
+def first_point(phi, q, dtype=None, p_inf=None):
     """Impose "the first observation has no predecessor" on a block.
 
-    Sets ``Phi = 0`` and ``Q = P_inf = I`` at index 0 along the time axis.
+    Sets ``Phi = 0`` and ``Q = P_inf`` at index 0 along the time axis, where
+    ``P_inf`` is the identity unless ``p_inf`` says otherwise.  It says
+    otherwise for exactly one term: a :class:`~anvilgp.terms.TermConvolution`
+    is *not* non-dimensionalised to ``P_inf = I`` -- the convolution changes
+    the stationary covariance and no change of basis restores the identity --
+    so it supplies its own, one array per block (or one dense array when the
+    leaves are not blocked).
     The generic leaf then produces ``A = 0``, ``J = 0``, ``eta = 0`` -- the
     "no incoming state" element -- so nothing downstream needs a special
     case for the start of the series.  Accepts either a dense ``(n, K, m,
@@ -196,14 +202,16 @@ def first_point(phi, q, dtype=None):
         mx.zeros((1, 1, 1, 1), dtype=dtype),
         mx.ones((1, k - 1, 1, 1), dtype=dtype)], axis=1)
 
-    def fix(p_b, q_b):
-        eye = mx.eye(q_b.shape[-1], dtype=dtype)
-        return p_b * keep, q_b * keep + (1.0 - keep) * eye
+    def fix(p_b, q_b, pin):
+        pin = (mx.eye(q_b.shape[-1], dtype=dtype) if pin is None
+               else pin[..., None, :, :].astype(dtype))
+        return p_b * keep, q_b * keep + (1.0 - keep) * pin
 
     if blocked:
-        pairs = [fix(a, b) for a, b in zip(phi, q)]
+        pins = [None] * len(phi) if p_inf is None else list(p_inf)
+        pairs = [fix(a, b, c) for a, b, c in zip(phi, q, pins)]
         return [a for a, _ in pairs], [b for _, b in pairs]
-    return fix(phi, q)
+    return fix(phi, q, p_inf)
 
 
 def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
@@ -252,12 +260,17 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     hphi = sum(h[:, None, i, None] * phi[:, :, i, :] for i in range(_m))
     qh = sum(q[:, :, :, j] * h[:, None, None, j] for j in range(_m))
     # `h Q h^T` is a variance, hence non-negative in exact arithmetic --
-    # *except* under a `TermConvolution`, whose `Q` is only formally one: it
-    # goes negative below `dt ~ delta/2`, where this clamp would bind and
-    # change the value rather than repair a rounding error.  `GPLogLike`
-    # refuses any spacing below `delta`, so that `dt` never arrives; the
-    # sentence below holds because of that refusal, not because of
-    # arithmetic.  See `TermConvolution` and docs/kernels.md.
+    # *except* under a `TermConvolution`, whose `Q` is only formally one.
+    # An earlier version of this comment said it goes negative only below
+    # `dt ~ delta/2` and that the spacing refusal therefore kept it away.
+    # Measured: with the state-space form the sign flip reaches `dt ~ 1.8
+    # delta` for the terms whose convolved exponential sum is not a
+    # positive-definite function (Matern-3/2, Matern-5/2, overdamped SHO),
+    # which provably cannot have a PSD `Q`.  So this clamp *does* bind for
+    # those, and there it changes the value.  The cost is measured and
+    # bounded -- 7e-7 for a convolved Matern-5/2 near `delta/rho ~ 0.01`,
+    # 1e-14 elsewhere; see docs/kernels.md.  For every other term the
+    # sentence below holds on arithmetic alone.
     # float32 can round it slightly negative in the dense-cadence corner.
     # Clamp *it*, not the sum: `r_var` beside it is exact and strictly
     # positive, so clamping the term that can go non-physical leaves

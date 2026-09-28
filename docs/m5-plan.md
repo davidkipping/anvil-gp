@@ -474,6 +474,84 @@ of the same order but need the `m = 3` propagator generalised the way 3a
 generalised `m = 2`. `OriginalCeleriteTerm` is still absent, now only as a
 coefficient conversion away from the implemented `ComplexTerm`.
 
+#### Stage 3d --- the convolution moved to the state-space level, 2026-09-27
+
+The plan's own 3c bullet asked for this and the implementation overruled it:
+"Implement the convolution at the state-space level -- same `Phi`, modified
+amplitude structure -- for every term, not via coefficients." The
+coefficient route shipped first and cost exactly what the bullet predicted:
+`Matern32Term`, `Matern52Term` and an overdamped `SHOTerm` were all refused,
+and those are *one* limitation, not three -- the celerite coefficients
+`(a, b, c, d)` do not exist for a repeated root, a triple root, or a
+decomposition with a negative amplitude.
+
+**The derivation.** For lags `tau >= delta`, with `Phi(tau) = expm(F tau)`,
+
+    k_conv(tau) = (1/d^2) int int h expm(F(tau + s - s')) h^T ds ds'
+                = h A Phi(tau) B h^T = h Phi(tau) M h^T,
+
+since `A`, `B` and `M = A B` are all functions of `F` and commute with
+`Phi`.  `M = f(F)` for the *even* scalar `f(z) = 2(cosh z delta - 1)/(z
+delta)^2` -- exactly the scalar factor the coefficient route applied per
+exponential, now as a matrix function.  The true zero-lag variance is
+`W = 2(e^X - I - X) X^-2`, `X = F delta`, and the diagonal correction is
+`h (W - M) h^T`.  Both reduce to the coefficient route's scalar formulas
+exactly, which is how the sign error in `W - M` was caught: it must be
+`2(sinh X - X)/X^2`, and at `X = -z` that is `2(z - sinh z)/z^2 < 0`.
+
+Being *entire* functions of `F`, both are indifferent to root multiplicity
+and never form an amplitude -- so all three exclusions lift at once.  `Phi`
+is untouched, so `m` is unchanged: a convolved Matern-3/2 stays at `m = 2`,
+correcting this plan's guess that it needed `m = 3` (five lags match a
+two-coefficient form to 1.6e-15; the earlier "quadratic times exponential"
+came from an over-parameterised fit whose quadratic coefficient was ~0).
+
+**`P_inf` is no longer the identity, and the fix is a rank-one one.** `M` is
+*not* symmetric (3e-4 to 1e-2 relative) and no change of basis makes it so,
+since it transforms as `T M T^T`. But only `P h^T` is observable, so any
+symmetric `P` with `P h^T = M h^T` gives the same kernel:
+
+    v = M h^T,  s = h M h^T,  P = v v^T / s + (s / h h^T)(I - h^T h / h h^T).
+
+No linear solve. The projector term is annihilated by `h^T`, so it is free --
+and it is *not* optional: `v v^T / s` alone is **rank one**, the element
+algebra Choleskys exactly this matrix, and a floored singular pivot made the
+likelihood 1e-3 wrong while the sequential filter, which never factors it,
+stayed exact. That asymmetry between the two recursions is what identified
+it. The weight `s / h h^T` makes the construction equivariant -- `M = c I`
+gives `P = c I` -- so `delta -> 0` *recovers* `P_inf = I` rather than
+approaching it.
+
+`Term.generator` is new, one `F` per diagonal block, every implementation
+verified against `logm(Phi(dt))/dt` from the term's own propagator to 9e-15.
+`elements.first_point` and the Metal table's row 0 take an explicit `P_inf`;
+`None` still means the identity, so every other term keeps the constant row
+and no per-chain matrix.
+
+**Gates.** Against a dense float64 Cholesky over ten term shapes x `delta`
+from 1e-3 to 0.3: 1e-14 to 1e-16 nearly everywhere. `value_np` against an
+mpmath quadrature of the definition: 1e-15, including at zero lag and inside
+the exposure width, where it now uses a panelled Gauss-Legendre rule because
+the exponential sum is the wrong function there. Suite 741.
+
+**One structural caveat, stated rather than hidden.** A convolved kernel
+whose exponential-sum continuation is not positive definite *cannot* have a
+PSD process noise -- if it could, that continuation would be a valid
+covariance -- and the reduction factors `Q`. Measured minimum eigenvalue of
+`Q`, relative: exactly 0 for `RealTerm`, `ComplexTerm`, `RotationTerm` and
+`SHOTerm` at `Q > 1/2`; -1e-12 to -3e-2 for the three newly enabled shapes,
+growing with `delta`. End to end it costs nothing almost everywhere, with one
+measured exception: a convolved Matern-5/2 near `delta/rho ~ 0.01` holds
+7e-7 rather than 1e-11. Inside the float32 budget, and documented in
+`kernels.md`; it was *not* fixed by tuning the projector weight, which was
+measured across four values and made things worse in both directions.
+
+**`||F delta|| <= 8` is a new refusal.** The matrix series' coefficients are
+positive but `F delta` is not, so far enough out the alternating powers cost
+float32 digits, and no algebraic rewrite removes it -- unlike the scalar
+cancellation stage 3c fixed. Beyond the bound the exposure is longer than the
+fastest correlation time and the process is nearly white across a frame.
+
 ## Order, and why it changed
 
 1. **Compile fix.** Half a day, two-line change, bit-identical, 2x on the

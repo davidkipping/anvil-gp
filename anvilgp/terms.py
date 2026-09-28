@@ -149,6 +149,39 @@ class Term:
         """
         return None
 
+    def generator(self, p: mx.array):
+        """The continuous-time generators ``F``, one per diagonal block.
+
+        ``Phi(dt) = expm(F dt)`` in the *same* non-dimensionalised basis
+        :meth:`matrices_blocks` uses, each of shape ``(n_chains, m_b, m_b)``.
+
+        Only :class:`TermConvolution` needs this, and it needs it because
+        the exposure-time convolution is a matrix function of ``F`` --
+        ``2(cosh(F delta) - I)/(F delta)^2`` -- which is defined for a
+        *repeated* characteristic root and for a negative-amplitude
+        decomposition alike.  The celerite coefficients are defined for
+        neither, which is why the coefficient route excluded the Matern
+        terms and the overdamped SHO and this route does not.
+
+        Every implementation here is verified against
+        ``logm(Phi(dt))/dt`` from the term's own propagator, to 9e-15 or
+        better.
+        """
+        raise TypeError(
+            f"{type(self).__name__} does not provide a generator, so it "
+            f"cannot be wrapped in TermConvolution")
+
+    def p_inf_blocks(self, p: mx.array, dtype=None):
+        """Stationary state covariance, one per block.  ``None`` means ``I``.
+
+        ``None`` is not the same as returning identities: it tells the
+        callers that this term keeps the package-wide ``P_inf = I``
+        non-dimensionalisation, so row 0 of the lag table stays a constant
+        and no per-chain matrix has to be built.  Only
+        :class:`TermConvolution` overrides it.
+        """
+        return None
+
     @property
     def block_sizes(self) -> tuple[int, ...]:
         """Sizes of Phi's and Q's diagonal blocks.  One block by default."""
@@ -196,6 +229,9 @@ class RealTerm(Term):
     def matrices(self, p: mx.array, dt: mx.array):
         return _real_matrices(p[..., 0:1], p[..., 1:2], dt)
 
+    def generator(self, p: mx.array):
+        return [-p[..., 1:2][..., None]]
+
     def value_np(self, p, tau):
         sigma, c = float(p[0]), float(p[1])
         return sigma ** 2 * np.exp(-c * np.abs(tau))
@@ -224,6 +260,32 @@ def _real_matrices(sigma, c, dt):
     # Q = 1 - e^{-2a} in the unit-variance state; -expm1 is exact.
     q = (-mx.expm1(-2.0 * a))[..., None, None]
     return phi, q, mx.concatenate([sigma], axis=-1)
+
+
+def _pair_generator(g, s, c):
+    """``F = [[-g, s], [-s, -(2c - g)]]`` -- the 2-state block's generator.
+
+    Exactly the matrix :func:`_complex_matrices` documents and realises, so
+    ``expm(F dt)`` is the ``phi`` it returns.  Built here rather than there
+    because the convolution needs ``F`` itself, not its exponential.
+    """
+    row0 = mx.concatenate([-g, s], axis=-1)
+    row1 = mx.concatenate([-s, -(2.0 * c - g)], axis=-1)
+    return mx.stack([row0, row1], axis=-2)
+
+
+def _sho_generator(omega0, qual):
+    """The SHO's generator: :func:`_pair_generator` at ``beta = c``, ``g = 0``.
+
+    ``F = [[0, omega_0], [-omega_0, -2c]]`` with ``c = omega_0/(2Q)``, whose
+    eigenvalues are ``-c +/- i d`` and which is **regular at and below
+    ``Q = 1/2``** -- no ``d`` appears, so nothing divides by zero and
+    nothing takes a root of a negative number.  That regularity is the
+    whole reason the state-space route can convolve an overdamped SHO and
+    the coefficient route cannot.
+    """
+    zero = mx.zeros_like(omega0)
+    return _pair_generator(zero, omega0, omega0 / (2.0 * qual))
 
 
 def _complex_matrices(sigma, c, beta, s, g, dsq, wsq, dt):
@@ -394,6 +456,9 @@ class SHOTerm(Term):
         qual = p[..., 2:3]
         return _sho_matrices(sigma, omega0, qual, dt)
 
+    def generator(self, p: mx.array):
+        return [_sho_generator(_TWO_PI / p[..., 1:2], p[..., 2:3])]
+
     def celerite_coefficients(self, p: mx.array):
         """One complex pair, **valid only for ``Q > 1/2``**.
 
@@ -471,6 +536,11 @@ class Matern32Term(Term):
         qual = mx.full(omega0.shape, 0.5, dtype=omega0.dtype)
         return _sho_matrices(sigma, omega0, qual, dt)
 
+    def generator(self, p: mx.array):
+        omega0 = math.sqrt(3.0) / p[..., 1:2]
+        return [_sho_generator(
+            omega0, mx.full(omega0.shape, 0.5, dtype=omega0.dtype))]
+
     def value_np(self, p, tau):
         sigma, rho = float(p[0]), float(p[1])
         x = math.sqrt(3.0) * np.abs(np.asarray(tau, dtype=np.float64)) / rho
@@ -520,6 +590,12 @@ class ComplexTerm(Term):
                                                               + d * d),
                                  c - beta, d * d, c * c + d * d, dt)
 
+    def generator(self, p: mx.array):
+        a, b = p[..., 0:1], p[..., 1:2]
+        c, d = p[..., 2:3], p[..., 3:4]
+        beta = b * d / a
+        return [_pair_generator(c - beta, mx.sqrt(beta * beta + d * d), c)]
+
     def value_np(self, p, tau):
         a, b, c, d = (float(p[0]), float(p[1]), float(p[2]), float(p[3]))
         t = np.abs(np.asarray(tau, dtype=np.float64))
@@ -535,6 +611,90 @@ class ComplexTerm(Term):
 # ---------------------------------------------------------------------------
 # Exposure-time integration
 # ---------------------------------------------------------------------------
+
+
+#: Series terms in ``Y = (F delta)^2`` for the convolution's matrix
+#: functions.  Both series have *all-positive* coefficients, so nothing
+#: cancels inside them; the switch point is on ``||F delta||``, validated in
+#: `tests/test_terms.py`.
+_N_MATCONV = 20
+_MATCONV_M = [2.0 / math.factorial(2 * j + 2) for j in range(_N_MATCONV)]
+_MATCONV_D = [1.0 / math.factorial(2 * j + 3) for j in range(_N_MATCONV)]
+#: Above this ``||F delta||`` the series loses float32 digits to the
+#: alternating signs of ``X^k`` (the coefficients are positive, ``X`` is
+#: not).  `GPLogLike` refuses beyond it rather than degrade silently.
+MAX_FDELTA = 8.0
+
+
+def _mat_horner(y, coeffs, eye):
+    """``sum_j coeffs[j] Y^j`` for a batch of square matrices ``Y``."""
+    acc = coeffs[-1] * eye
+    for c in reversed(coeffs[:-1]):
+        acc = acc @ y + c * eye
+    return acc
+
+
+def _conv_matrix_factors(f, delta):
+    """``(M, D)`` for one block: the amplitude map and the zero-lag defect.
+
+    With ``X = F delta``,
+
+        M = 2 (cosh X - I) X^-2          rescales the amplitudes
+        D = 2 (sinh X - X) X^-2 = W - M  the zero-lag defect,
+
+    where ``W = 2 (e^X - I - X) X^-2`` is the *true* stationary covariance of
+    the exposure-averaged state.  ``M`` is what the exponential sum sees at
+    lags ``>= delta``; ``W`` is what zero lag sees; their difference is the
+    diagonal correction, and in the scalar case ``D`` reduces to exactly the
+    ``2a(z - sinh z)/z^2`` the coefficient route used.
+
+    Both are **entire** functions of ``X``, evaluated as series in ``X^2``
+    with positive coefficients.  That is the whole point of this route: a
+    repeated or triple characteristic root is no obstacle to a matrix
+    function, while the celerite coefficients it would need do not exist,
+    and a negative-amplitude decomposition never has to be formed.
+    """
+    x = f * delta
+    y = x @ x
+    m = x.shape[-1]
+    eye = mx.eye(m, dtype=x.dtype)
+    amp = _mat_horner(y, _MATCONV_M, eye)
+    defect = 2.0 * (x @ _mat_horner(y, _MATCONV_D, eye))
+    return amp, defect
+
+
+def _conv_p_inf(amp, h):
+    """The convolved block's stationary covariance, ``(n, m, m)``.
+
+    Only ``P h^T`` is observable: ``k_conv(tau) = h Phi(tau) (M h^T)``, so
+    *any* symmetric ``P`` with ``P h^T = M h^T`` gives the same kernel.
+    ``M`` itself is not symmetric (measured 3e-4 to 1e-2 relative asymmetry)
+    and no change of basis can make it so, since it transforms as
+    ``T M T^T``.  So build one:
+
+        v = M h^T,   s = h M h^T,   lambda = s / h h^T,
+        P = v v^T / s + lambda (I - h^T h / h h^T).
+
+    The second term is ``lambda`` times the projector onto ``h``'s orthogonal
+    complement, which ``h^T`` annihilates -- so it is free, and it is *not*
+    optional.  ``v v^T / s`` alone satisfies the constraint and is PSD, but
+    it is **rank one**, and the element algebra takes a Cholesky of exactly
+    this matrix: `anvilgp.linalg.chol` then floors a singular pivot and the
+    likelihood comes out ~1e-3 wrong, while the sequential filter -- which
+    never factors it -- stays exact.  That asymmetry is what identified it.
+
+    ``lambda = s / h h^T`` rather than any positive constant because it makes
+    the construction *equivariant*: ``M = c I`` gives ``P = c I`` exactly, so
+    ``delta -> 0`` recovers the package-wide ``P_inf = I`` rather than
+    merely approaching it.
+    """
+    v = (amp @ h[..., None])[..., 0]                  # (n, m)
+    sc = mx.sum(h * v, axis=-1, keepdims=True)        # (n, 1)
+    hh = mx.sum(h * h, axis=-1, keepdims=True)        # (n, 1)
+    eye = mx.eye(h.shape[-1], dtype=h.dtype)
+    proj = eye - (h[..., :, None] * h[..., None, :]) / hh[..., None]
+    return (v[..., :, None] * v[..., None, :] / sc[..., None]
+            + (sc / hh)[..., None] * proj)
 
 
 class TermConvolution(Term):
@@ -591,8 +751,11 @@ class TermConvolution(Term):
         if self.delta <= 0.0:
             raise ValueError(f"delta must be > 0, got {self.delta}")
         # probe the wrapped term now, so an unsupported one fails here
-        # rather than inside a sampler
-        term.celerite_coefficients(mx.zeros((1, term.n_params)))
+        # rather than inside a sampler.  The generator, *not* the celerite
+        # coefficients: this route is a matrix function of `F`, and needing
+        # coefficients is exactly what excluded the Matern terms.
+        with mx.stream(mx.cpu):
+            term.generator(mx.zeros((1, term.n_params), dtype=mx.float64))
         self.n_state = term.n_state
         self.param_names = term.param_names
 
@@ -659,34 +822,62 @@ class TermConvolution(Term):
         return _block_diag(*phis), _block_diag(*qs), h
 
     def matrices_blocks(self, p: mx.array, dt: mx.array):
+        """The base term's ``Phi`` and ``h``, with ``Q`` rebuilt on ``P_conv``.
+
+        **The propagator does not change.** The convolution leaves the rates
+        alone, so ``Phi`` comes straight from the wrapped term -- already
+        verified, already regular at critical damping, already correct for a
+        repeated root. Only the stationary covariance moves, from ``I`` to
+        :func:`_conv_p_inf`, and ``Q(dt) = P - Phi P Phi^T`` follows.
+
+        Nothing here decomposes the kernel into exponentials, which is why
+        this route covers the Matern terms and the overdamped SHO that the
+        celerite-coefficient route could not.
+        """
         if dt.ndim == 1:
             dt = dt[None, :]
-        ar, cr, a, b, c, d, _ = self._convolved(p)
-        phis, qs, hs = [], [], []
-        for i in range(ar.shape[-1]):
-            ph, qq, hh = _real_matrices(mx.sqrt(ar[..., i:i + 1]),
-                                        cr[..., i:i + 1], dt)
-            phis.append(ph)
-            qs.append(qq)
-            hs.append(hh)
-        for i in range(a.shape[-1]):
-            ai, bi = a[..., i:i + 1], b[..., i:i + 1]
-            ci, di = c[..., i:i + 1], d[..., i:i + 1]
-            beta = bi * di / ai
-            ph, qq, hh = _complex_matrices(
-                mx.sqrt(ai), ci, beta, mx.sqrt(beta * beta + di * di),
-                ci - beta, di * di, ci * ci + di * di, dt)
-            phis.append(ph)
-            qs.append(qq)
-            hs.append(hh)
-        return phis, qs, mx.concatenate(hs, axis=-1)
+        phis, _, h = self.term.matrices_blocks(p, dt)
+        qs = []
+        for ph, pin in zip(phis, self.p_inf_blocks(p)):
+            pin = pin[..., None, :, :]                 # (n, 1, m, m)
+            qs.append(pin - ph @ pin @ mx.swapaxes(ph, -1, -2))
+        return phis, qs, h
+
+    def p_inf_blocks(self, p: mx.array, dtype=None):
+        out = []
+        for f, h in zip(self.term.generator(p), self._h_blocks(p)):
+            amp, _ = _conv_matrix_factors(f, self.delta)
+            out.append(_conv_p_inf(amp, h))
+        return out
+
+    def _h_blocks(self, p: mx.array):
+        """``h`` split per diagonal block, matching :meth:`generator`."""
+        h = self.term.matrices_blocks(
+            p, mx.zeros((1,), dtype=p.dtype))[2]
+        out, off = [], 0
+        for k in self.term.block_sizes:
+            out.append(h[..., off:off + k])
+            off += k
+        return out
 
     def celerite_coefficients(self, p: mx.array):
         ar, cr, a, b, c, d, _ = self._convolved(p)
         return ar, cr, a, b, c, d
 
     def diag_correction(self, p: mx.array):
-        return self._convolved(p)[-1]
+        """``sum_b h_b (W_b - M_b) h_b^T`` -- the zero-lag defect.
+
+        The state-space form of what the coefficient route computed term by
+        term, and identical to it where both apply. Defined for every term
+        with a generator, so it no longer needs celerite coefficients.
+        """
+        tot = None
+        for f, h in zip(self.term.generator(p), self._h_blocks(p)):
+            _, defect = _conv_matrix_factors(f, self.delta)
+            part = mx.sum(h * (defect @ h[..., None])[..., 0],
+                          axis=-1, keepdims=True)
+            tot = part if tot is None else tot + part
+        return tot
 
     @property
     def block_sizes(self) -> tuple[int, ...]:
@@ -695,28 +886,71 @@ class TermConvolution(Term):
     def value_np(self, p, tau):
         """The *exact* convolved kernel, piecewise -- not the exponential sum.
 
-        The oracle needs the truth on both sides of the exposure width, so
-        this is the closed form for ``tau < delta`` as well, which is what
-        makes ``dense_covariance`` a valid reference for this term.
+        Three regimes, because the convolution is only an exponential sum
+        outside the exposure width:
+
+        * ``tau >= delta``: ``h Phi(tau) M h^T``, closed form and exact.
+        * ``tau == 0``: ``h W h^T``, the true variance of the
+          exposure-averaged state, as ``h M h^T`` plus the correction.
+        * ``0 < tau < delta``: Gauss-Legendre quadrature of
+          ``(1/delta^2) int (delta - |u|) k(|tau + u|) du``, panelled at the
+          integrand's two corners (``u = -tau`` and ``u = 0``) so each panel
+          is analytic.  **A likelihood never reaches this band** --
+          :class:`~anvilgp.likelihood.GPLogLike` refuses any spacing below
+          ``delta`` -- but an oracle asked for an arbitrary lag has to
+          answer, and answering by the exponential sum there would be wrong.
         """
         pm = mx.array(np.asarray(p, dtype=np.float64)[None, :],
                       dtype=mx.float64)
-        with mx.stream(mx.cpu):
-            ar, cr, a, b, c, d, _ = self._convolved(pm)
-            corr = float(np.array(self.diag_correction(pm))[0, 0])
-            ar, cr = np.array(ar)[0], np.array(cr)[0]
-            a, b = np.array(a)[0], np.array(b)[0]
-            c, d = np.array(c)[0], np.array(d)[0]
         t = np.abs(np.asarray(tau, dtype=np.float64))
         out = np.zeros_like(t)
-        for A, C in zip(ar, cr):
-            out = out + A * np.exp(-C * t)
-        for A, B, C, D in zip(a, b, c, d):
-            out = out + np.exp(-C * t) * (A * np.cos(D * t) + B * np.sin(D * t))
-        # inside the exposure window the sum is wrong; at exactly zero lag
-        # the difference is the diagonal correction, which is all a
-        # covariance matrix with spacings >= delta ever needs.
-        return np.where(t < 1e-300, out + corr, out)
+        with mx.stream(mx.cpu):
+            amp = [np.asarray(a, dtype=np.float64)[0] for a in
+                   (_conv_matrix_factors(f, self.delta)[0]
+                    for f in self.term.generator(pm))]
+            hb = [np.asarray(x, dtype=np.float64)[0]
+                  for x in self._h_blocks(pm)]
+            corr = float(np.asarray(self.diag_correction(pm))[0, 0])
+            far = t >= self.delta
+            if far.any():
+                phis, _, _ = self.term.matrices_blocks(
+                    pm, mx.array(t[far], dtype=mx.float64))
+                blocks = [np.asarray(x, dtype=np.float64)[0] for x in phis]
+                acc = np.zeros(int(far.sum()))
+                for ph, mm, h in zip(blocks, amp, hb):
+                    acc += np.einsum("i,kij,jl,l->k", h, ph, mm, h)
+                out[far] = acc
+        zero = t < 1e-300
+        if zero.any():
+            s_sum = sum(float(h @ mm @ h) for mm, h in zip(amp, hb))
+            out[zero] = s_sum + corr
+        mid = (~far) & (~zero)
+        if mid.any():
+            out[mid] = self._value_np_quadrature(p, t[mid])
+        return out
+
+    def _value_np_quadrature(self, p, t, n_gl: int = 48):
+        """``(1/delta^2) int_{-d}^{d} (delta - |u|) k(|tau + u|) du``.
+
+        Panelled at ``u = -tau`` and ``u = 0``, the only two points where the
+        integrand is not analytic.  Used for ``0 < tau < delta`` alone.
+        """
+        x, w = np.polynomial.legendre.leggauss(n_gl)
+        dl = self.delta
+        out = np.empty_like(t)
+        for i, tau in enumerate(t):
+            total = 0.0
+            for lo, hi in ((-dl, -tau), (-tau, 0.0), (0.0, dl)):
+                if hi <= lo:
+                    continue
+                mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
+                u = mid + half * x
+                kv = np.asarray(self.term.value_np(
+                    np.asarray(p, dtype=np.float64), np.abs(tau + u)),
+                    dtype=np.float64)
+                total += half * np.sum(w * (dl - np.abs(u)) * kv)
+            out[i] = total / (dl * dl)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +984,18 @@ class Matern52Term(Term):
         lam = math.sqrt(5.0) / p[..., 1:2]
         return _matern52_matrices(sigma, lam, dt)
 
+    def generator(self, p: mx.array):
+        """``lambda`` times a constant matrix -- the triple root, whitened.
+
+        In the scaled frame the companion generator of ``(d/dt + lambda)^3``
+        is ``lambda [[0,1,0],[0,0,1],[-1,-3,-3]]``; conjugating by
+        ``_M52_LW`` puts it in the same ``P_inf = I`` basis
+        :func:`_matern52_matrices` uses.
+        """
+        lam = math.sqrt(5.0) / p[..., 1:2]
+        const = mx.array(_M52_GEN, dtype=lam.dtype)
+        return [lam[..., None] * const]
+
     def value_np(self, p, tau):
         sigma, rho = float(p[0]), float(p[1])
         x = math.sqrt(5.0) * np.abs(np.asarray(tau, dtype=np.float64)) / rho
@@ -767,6 +1013,11 @@ _M52_LW = np.array([[1.0, 0.0, 0.0],
                     [0.0, 1.0 / math.sqrt(3.0), 0.0],
                     [-1.0 / 3.0, 0.0, 2.0 * math.sqrt(2.0) / 3.0]])
 _M52_LW_INV = np.linalg.inv(_M52_LW)
+#: The whitened companion generator, divided by lambda.  `Matern52Term.
+#: generator` scales it; verified against `logm(Phi(dt))/dt` to 9e-15.
+_M52_GEN = _M52_LW_INV @ np.array([[0.0, 1.0, 0.0],
+                                   [0.0, 0.0, 1.0],
+                                   [-1.0, -3.0, -3.0]]) @ _M52_LW
 _m52_const: dict = {}
 
 
@@ -881,29 +1132,46 @@ class RotationTerm(Term):
         phis, qs, h = self.matrices_blocks(p, dt)
         return _block_diag(*phis), _block_diag(*qs), h
 
-    def matrices_blocks(self, p: mx.array, dt: mx.array):
-        if dt.ndim == 1:
-            dt = dt[None, :]
-        sigma = p[..., 0:1]
-        period = p[..., 1:2]
-        q0 = p[..., 2:3]
-        dq = p[..., 3:4]
-        f = p[..., 4:5]
+    def _modes(self, p: mx.array):
+        """``(w1, w2, q1, q2)`` for the two SHO modes.
 
-        amp = sigma * sigma / (1.0 + f)
-        q1 = 0.5 + q0 + dq
-        q2 = 0.5 + q0
+        One definition, three callers (:meth:`matrices_blocks`,
+        :meth:`celerite_coefficients`, :meth:`generator`).  It was written
+        out three times while the last two were added; the omega_0 formula
+        is fiddly enough -- the damped period, not the undamped one, matches
+        ``period`` -- that three copies were going to drift.
+        """
+        period = p[..., 1:2]
+        q1 = 0.5 + p[..., 2:3] + p[..., 3:4]
+        q2 = 0.5 + p[..., 2:3]
         # omega_0 chosen so the *damped* period matches: w0 eta = 2 pi / P.
         w1 = 4.0 * math.pi * q1 / (period * mx.sqrt(mx.maximum(
             (2.0 * q1 - 1.0) * (2.0 * q1 + 1.0), mx.zeros_like(q1) + 1e-30)))
         w2 = 8.0 * math.pi * q2 / (period * mx.sqrt(mx.maximum(
             (2.0 * q2 - 1.0) * (2.0 * q2 + 1.0), mx.zeros_like(q2) + 1e-30)))
-        s1 = mx.sqrt(amp)
-        s2 = mx.sqrt(f * amp)
+        return w1, w2, q1, q2
+
+    def _amps(self, p: mx.array):
+        """``(amp, f * amp)`` -- the two modes' stationary variances."""
+        sigma, f = p[..., 0:1], p[..., 4:5]
+        amp = sigma * sigma / (1.0 + f)
+        return amp, f * amp
+
+    def matrices_blocks(self, p: mx.array, dt: mx.array):
+        if dt.ndim == 1:
+            dt = dt[None, :]
+        w1, w2, q1, q2 = self._modes(p)
+        a1, a2 = self._amps(p)
+        s1 = mx.sqrt(a1)
+        s2 = mx.sqrt(a2)
 
         phi1, qq1, h1 = _sho_matrices(s1, w1, q1, dt)
         phi2, qq2, h2 = _sho_matrices(s2, w2, q2, dt)
         return [phi1, phi2], [qq1, qq2], mx.concatenate([h1, h2], axis=-1)
+
+    def generator(self, p: mx.array):
+        w1, w2, q1, q2 = self._modes(p)
+        return [_sho_generator(w1, q1), _sho_generator(w2, q2)]
 
     def celerite_coefficients(self, p: mx.array):
         """Two complex pairs -- so a rotation kernel *can* be convolved.
@@ -915,21 +1183,13 @@ class RotationTerm(Term):
         :class:`TermConvolution`, and the one the motivating case needs:
         long-cadence photometry of a rotating star.
         """
-        sigma, period = p[..., 0:1], p[..., 1:2]
-        q0, dq, f = p[..., 2:3], p[..., 3:4], p[..., 4:5]
-        amp = sigma * sigma / (1.0 + f)
-        q1 = 0.5 + q0 + dq
-        q2 = 0.5 + q0
-        w1 = 4.0 * math.pi * q1 / (period * mx.sqrt(mx.maximum(
-            (2.0 * q1 - 1.0) * (2.0 * q1 + 1.0), mx.zeros_like(q1) + 1e-30)))
-        w2 = 8.0 * math.pi * q2 / (period * mx.sqrt(mx.maximum(
-            (2.0 * q2 - 1.0) * (2.0 * q2 + 1.0), mx.zeros_like(q2) + 1e-30)))
+        w1, w2, q1, q2 = self._modes(p)
         out = []
-        for amp_i, w, qual in ((amp, w1, q1), (f * amp, w2, q2)):
+        for amp_i, w, qual in zip(self._amps(p), (w1, w2), (q1, q2)):
             c = w / (2.0 * qual)
             d = mx.sqrt(mx.maximum(w * w - c * c, mx.zeros_like(c)))
             out.append((amp_i, amp_i * c / d, c, d))
-        empty = sigma[..., :0]
+        empty = p[..., 0:1][..., :0]
         return (empty, empty,
                 mx.concatenate([o[0] for o in out], axis=-1),
                 mx.concatenate([o[1] for o in out], axis=-1),
@@ -1031,6 +1291,14 @@ class TermSum(Term):
             off += k
         return tuple(mx.concatenate([q[i] for q in parts], axis=-1)
                      for i in range(6))
+
+    def generator(self, p: mx.array):
+        out, off = [], 0
+        for t in self.terms:
+            k = t.n_params
+            out.extend(t.generator(p[..., off:off + k]))
+            off += k
+        return out
 
     @property
     def block_sizes(self) -> tuple[int, ...]:

@@ -163,13 +163,14 @@ Ignoring the exposure costs 44 log-units at the *true* parameters, and
 suppresses the zero-lag variance by 12% — a fit that ignores it pays for
 the mismatch by distorting `sigma` and `rho`.
 
-**Two rules you will meet immediately.** Every spacing must be at least
-`delta`, duplicate timestamps included, and a wrapped `SHOTerm` needs
-`Q > 1/2`. Both are refused at construction with a message naming the
-cause; `RotationTerm` is bounded away from the second by construction and
-is the usual choice for a rotating star. See
-[kernels.md](kernels.md#termconvolution--exposure-time-integration) for
-why each is a refusal rather than a warning.
+**One rule you will meet immediately:** every spacing must be at least
+`delta`, duplicate timestamps included. It is refused at construction with a
+message naming the offending pair. See
+[kernels.md](kernels.md#termconvolution--exposure-time-integration) for why
+it is a refusal rather than a warning.
+
+Any term in this library can be wrapped — including `Matern52Term`, which
+**celerite2 cannot convolve at all**, and an `SHOTerm` at any `Q`.
 
 ## Why the batch is the whole point
 

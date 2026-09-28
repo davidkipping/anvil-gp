@@ -51,7 +51,8 @@ from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
                        first_point,
                        leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
-from .terms import Term
+from . import terms
+from .terms import Term, _block_diag
 
 __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
 
@@ -525,33 +526,51 @@ class GPLogLike:
                     f"goes indefinite. Duplicate timestamps (spacing 0) are "
                     f"the common case -- bin them, or drop the convolution.")
 
-        # A convolved term can be non-finite for reachable parameters -- a
-        # bare `SHOTerm` at `Q <= 1/2` is two real exponentials, one with a
-        # negative amplitude, which the `P_inf = I` construction cannot
-        # carry and which divides by `d = 0`.  That does not surface as a
-        # NaN the caller sees: the non-finite guard below returns -1e30
-        # with an exactly zero gradient, so a gradient sampler gets a flat
-        # region rather than a rejection.  Refuse it here, at the reference
-        # point, where the message can still name the cause.  A sampler can
-        # still walk there, so the docs require a prior that excludes it.
+        # A convolved term's matrix functions are series in `(F delta)^2`.
+        # The coefficients are positive, `F delta` is not, so far enough out
+        # the alternating powers cost float32 digits -- and unlike the
+        # amplitude cancellation this replaced, nothing analytic removes it.
+        # Refuse beyond the validated range rather than degrade quietly.
+        # `||F delta|| > 8` means the exposure is longer than the fastest
+        # correlation time, where the process is nearly white over a frame.
         if delta is not None:
             ref = np.zeros((1, param_map.n_dim), dtype=np.float64)
             with mx.stream(mx.cpu):
                 kp = param_map.kernel_params(mx.array(ref, dtype=mx.float64))
-                probe = [np.asarray(x) for x in kernel_spec.celerite_coefficients(kp)]
+                gens = kernel_spec.term.generator(kp)
+                norms = [float(np.max(np.abs(np.asarray(g)))) * delta
+                         for g in gens]
+                probe = [np.asarray(x) for x in kernel_spec.p_inf_blocks(kp)]
                 corr = kernel_spec.diag_correction(kp)
                 if corr is not None:
                     probe.append(np.asarray(corr))
+            worst_fd = max(norms)
+            if worst_fd > terms.MAX_FDELTA:
+                raise ValueError(
+                    f"{type(kernel_spec).__name__} has ||F delta|| = "
+                    f"{worst_fd:.3g} at the parameter map's reference point, "
+                    f"above the validated {terms.MAX_FDELTA:g}. The "
+                    f"convolution's matrix functions are series in "
+                    f"(F delta)^2 and lose float32 digits beyond it. The "
+                    f"exposure width is then longer than the kernel's "
+                    f"fastest correlation time, so the process is nearly "
+                    f"white across one frame -- model it as white noise, or "
+                    f"bin.")
             if not all(np.all(np.isfinite(x)) for x in probe):
                 raise ValueError(
                     f"{type(kernel_spec).__name__} is not finite at the "
                     f"parameter map's reference point "
-                    f"({np.asarray(kp)[0].tolist()}). The usual cause is a "
-                    f"wrapped SHOTerm at Q <= 1/2, which is two real "
-                    f"exponentials -- one with a negative amplitude -- and "
-                    f"not representable here. Keep Q > 1/2 (RotationTerm is "
-                    f"bounded away from it by construction), or drop the "
-                    f"convolution.")
+                    f"({np.asarray(kp)[0].tolist()}).")
+
+        #: Whether the term wants a stationary covariance other than `I`.
+        #: Structural, so it is settled once here: every term but a
+        #: convolved one returns `None`, and asking per evaluation would
+        #: cost a second `kernel_params` on the hot path for nothing.
+        with mx.stream(mx.cpu):
+            self._has_p_inf = kernel_spec.p_inf_blocks(
+                param_map.kernel_params(
+                    mx.zeros((1, param_map.n_dim), dtype=mx.float64))
+            ) is not None
 
         self._lag_np = lag
         # Assigning `metal_block` (a property) builds the kernel's slot map
@@ -641,7 +660,9 @@ class GPLogLike:
             get_mat = self._matrices_fn(pm.kernel_params(v), dt, None)
         phi, q, h = get_mat(s, e)
         if s == 0:
-            phi, q = first_point(phi, q, dtype)
+            pin = (self._p_inf(pm.kernel_params(v), dtype)
+                   if self._has_p_inf else None)
+            phi, q = first_point(phi, q, dtype, pin)
 
         r = mx.broadcast_to(y[s:e], (n, e - s))
         if self.mean_fn is not None and pm.mean is not None:
@@ -750,6 +771,25 @@ class GPLogLike:
             return False, "mx.fast.metal_kernel is unavailable here"
         return True, ""
 
+    def _p_inf(self, kp: mx.array, dtype, dense: bool = False):
+        """The term's stationary covariance, or ``None`` for the identity.
+
+        ``None`` is the fast path and the common one: every term but
+        :class:`~anvilgp.terms.TermConvolution` keeps ``P_inf = I``, and then
+        row 0 of the lag table is a constant that needs no per-chain array.
+
+        ``dense`` assembles the blocks into one ``m x m`` matrix, which is
+        what the Metal kernel's table row and the unblocked leaves want; the
+        blocked leaves take the list.
+        """
+        blocks = self.term.p_inf_blocks(kp)
+        if blocks is None:
+            return None
+        blocks = [b.astype(dtype) for b in blocks]
+        if dense or not self.blocked:
+            return _block_diag(*blocks) if len(blocks) > 1 else blocks[0]
+        return blocks
+
     def _metal_matrices(self, v: mx.array):
         """``(Phi, Q, h)`` for the lag table, with a chunked backward.
 
@@ -851,8 +891,14 @@ class GPLogLike:
         phi, q, h = self._metal_matrices(v)
         pt = mx.concatenate(
             [mx.zeros((n, 1, m, m), dtype=dtype), phi], axis=1)
-        qt = mx.concatenate(
-            [mx.broadcast_to(mx.eye(m, dtype=dtype), (n, 1, m, m)), q], axis=1)
+        # Row 0 is the first point's absent predecessor, so its `Q` is the
+        # stationary covariance.  Identity for every term but a convolved
+        # one, which supplies its own -- see `Term.p_inf_blocks`.
+        pin = (self._p_inf(pm.kernel_params(v), dtype, dense=True)
+               if self._has_p_inf else None)
+        q0 = (mx.broadcast_to(mx.eye(m, dtype=dtype), (n, 1, m, m))
+              if pin is None else pin[:, None, :, :])
+        qt = mx.concatenate([q0, q], axis=1)
 
         # Built time-major, (npts, n_chains), to match the kernel's flat
         # chains-fastest grid: adjacent threads then read adjacent floats.

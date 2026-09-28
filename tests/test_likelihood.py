@@ -634,28 +634,105 @@ def test_convolution_refuses_a_spacing_below_the_exposure_width(cadence):
 
 
 @pytest.mark.parametrize("qual", [0.5, 0.4, 0.1])
-def test_convolution_refuses_an_overdamped_sho_at_construction(qual):
-    """``Q <= 1/2`` is outside the construction, and silence there is worse.
+def test_an_overdamped_convolved_sho_now_evaluates(qual):
+    """``Q <= 1/2`` used to be refused at construction; now it runs.
 
-    The failure it replaces is not a NaN the caller sees: the likelihood's
-    non-finite guard returns -1e30 with an exactly **zero** gradient, so a
-    gradient sampler entering the region gets a flat plateau rather than a
-    rejection.  Refused at the reference point, where the message can name
-    the cause.  A sampler can still walk there, which is why the docs
-    require a prior that keeps ``Q > 1/2``.
+    The refusal existed because the coefficient route could not represent the
+    negative amplitude in the overdamped decomposition, and the alternative
+    was silent: the non-finite guard returned -1e30 with an exactly zero
+    gradient, a flat plateau. The state-space route needs no decomposition,
+    so the parameters are ordinary ones -- checked against the dense float64
+    oracle, and the gradient checked finite, since a flat plateau is what
+    this replaced.
     """
     rng = np.random.default_rng(2)
     n = 200
+    delta = 0.02
     t = np.arange(n) * 0.05
     y, yerr = rng.standard_normal(n), np.full(n, 0.3)
-    with pytest.raises(ValueError, match="Q <= 1/2"):
+    p = [1.3, 4.0, qual]
+    cv = ag.TermConvolution(ag.SHOTerm(), delta)
+    gp = GPLogLike(None, t, None, y, yerr, cv, ParamMap.log(p),
+                   GPPolicy(block=256, hi_block=256, metal=False))
+    with mx.stream(mx.cpu):
+        hi = float(np.array(gp.hi_absolute(a64(np.zeros((1, 3)))))[0])
+    ref = dense_loglike(cv, np.asarray(p, dtype=np.float64), t, y, yerr)
+    assert abs(hi - ref) / abs(ref) < 1e-10, f"Q={qual}: {hi} vs {ref}"
+
+    u = mx.zeros((2, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        val = gp(u)
+        _, grad = mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])
+        mx.eval(val, grad)
+    g = np.array(grad[0], np.float64)
+    assert np.all(np.isfinite(g)), f"Q={qual}: non-finite gradient"
+    assert float(np.max(np.abs(g))) > 1e-6, (
+        f"Q={qual}: zero gradient -- the flat -1e30 plateau is back")
+    assert float(val[0]) > -1e29, f"Q={qual}: sanitised value"
+
+
+CONV_NEW = [
+    ("matern32", ag.Matern32Term(), [1.1, 2.5]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+    ("sho-overdamped", ag.SHOTerm(), [1.3, 4.0, 0.1]),
+]
+
+
+@pytest.mark.parametrize("name,term,p", CONV_NEW, ids=[c[0] for c in CONV_NEW])
+@pytest.mark.parametrize("delta", [1e-3, 1e-2, 0.1])
+def test_the_newly_convolvable_terms_match_the_dense_oracle(name, term, p, delta):
+    """The three shapes the coefficient route could not reach, end to end.
+
+    Against the dense float64 Cholesky, which is the only oracle available:
+    celerite2 has no Matern-5/2, only approximates Matern-3/2, and cannot
+    convolve an overdamped SHO either.
+
+    The tolerance is 1e-5, not the 1e-11 the other convolved terms hold, and
+    the slack is real rather than defensive. A convolved kernel whose
+    exponential-sum continuation is not positive definite *cannot* have a PSD
+    process noise -- if it could, that continuation would be a valid
+    covariance -- and the element algebra factors ``Q``. Measured min
+    eigenvalue of ``Q`` for these three: -1e-12 to -3e-2 relative, growing
+    with ``delta``. The worst end-to-end error found over this grid is 7e-7
+    (Matern-5/2 near ``delta/rho ~ 0.01``); everything else is at 1e-14.
+    """
+    rng = np.random.default_rng(11)
+    n = 200
+    t = np.arange(n) * delta * 1.8
+    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    cv = ag.TermConvolution(term, delta)
+    gp = GPLogLike(None, t, None, y, yerr, cv, ParamMap.log(list(p)),
+                   GPPolicy(block=256, hi_block=256, metal=False))
+    with mx.stream(mx.cpu):
+        hi = float(np.array(gp.hi_absolute(a64(np.zeros((1, len(p))))))[0])
+    ref = dense_loglike(cv, np.asarray(p, dtype=np.float64), t, y, yerr)
+    assert abs(hi - ref) / abs(ref) < 1e-5, f"{name} delta={delta}"
+
+
+def test_convolution_refuses_too_wide_an_exposure_for_the_series():
+    """``||F delta|| > MAX_FDELTA`` is refused, not silently degraded.
+
+    The matrix functions are series in ``(F delta)^2``; the coefficients are
+    positive but ``F delta`` is not, so far enough out the alternating powers
+    cost float32 digits. Unlike the amplitude cancellation this design
+    replaced, no algebraic rewrite removes it -- so it is a bound, and the
+    bound is enforced.
+    """
+    from anvilgp import terms as _t
+    rng = np.random.default_rng(3)
+    n = 100
+    t = np.arange(n) * 20.0
+    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    # c = 1 per unit time, delta = 20 -> ||F delta|| = 20 > 8
+    with pytest.raises(ValueError, match="F delta"):
         GPLogLike(None, t, None, y, yerr,
-                  ag.TermConvolution(ag.SHOTerm(), 0.01),
-                  ParamMap.log([1.3, 4.0, qual]), GPPolicy())
-    # RotationTerm is bounded away from critical damping by construction
+                  ag.TermConvolution(ag.RealTerm(), 20.0),
+                  ParamMap.log([1.2, 1.0]), GPPolicy())
+    # and just inside the bound is accepted
     GPLogLike(None, t, None, y, yerr,
-              ag.TermConvolution(ag.RotationTerm(), 0.01),
-              ParamMap.log([1.5, 7.0, qual, qual, 0.4]), GPPolicy())
+              ag.TermConvolution(ag.RealTerm(), 20.0),
+              ParamMap.log([1.2, 0.2]), GPPolicy())
+    assert _t.MAX_FDELTA == 8.0
 
 
 def test_the_convolved_diagonal_correction_is_not_dead():

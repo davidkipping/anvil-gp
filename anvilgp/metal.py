@@ -160,15 +160,19 @@ _SRC = """
         // elements.leaf_elements clamps.  The sfloor line is a secondary
         // guard that cannot bind once this one is in place.
         //
-        // ONE EXCEPTION, and it is why the exposure-width rule is a
-        // refusal rather than a warning: for a TermConvolution, Q is only
-        // formally a covariance, and h Q h^T really does go negative below
-        // dt ~ delta/2 (measured sign flip at 0.50-0.72 delta across Q and
-        // delta).  There the clamp would bind and silently change the
-        // value instead of merely repairing a rounding error.
-        // GPLogLike refuses any spacing below delta, giving ~2x margin, so
-        // no such dt reaches here -- but the claim above is conditional on
-        // that refusal, not on arithmetic.
+        // ONE EXCEPTION.  For a TermConvolution, Q is only formally a
+        // covariance and h Q h^T really can go negative -- and *not* only
+        // below dt ~ delta/2, as an earlier version of this comment said.
+        // With the state-space form (P_inf != I) the sign flip reaches
+        // dt ~ 1.8 delta for the terms whose convolved exponential sum is
+        // not a positive-definite function: Matern-3/2, Matern-5/2 and an
+        // overdamped SHO.  Those *cannot* have a PSD Q -- if they could,
+        // that continuation would be a valid covariance -- so the clamp
+        // does bind there, and it changes the value rather than repairing a
+        // rounding error.  Measured cost end to end: nothing at 1e-14
+        // almost everywhere, 7e-7 for a convolved Matern-5/2 near
+        // delta/rho ~ 0.01.  See docs/kernels.md; for every other term
+        // h Q h^T is exactly non-negative and this clamp cannot bind.
         float rr = r_ref[t];
         JIT_PER_OBS_T
         sq = max(sq, 0.0f);

@@ -157,25 +157,54 @@ instruments observing simultaneously is this same case. Bin them, or drop
 the convolution. Physically the rule is automatic for one instrument: you
 cannot sample faster than you expose.
 
-*A wrapped `SHOTerm` needs `Q > 1/2`, and your prior must enforce it.*
-Below critical damping the SHO is two real exponentials, one with a
-**negative** amplitude, which the `P_inf = I` construction cannot carry.
-`GPLogLike` refuses a reference point at `Q <= 1/2`, but a sampler can
-still walk there, and what it finds is not a rejection: the non-finite
-guard returns `-1e30` with an exactly **zero gradient**, a flat plateau a
-gradient sampler cannot escape. Bound `Q` away from 1/2 in the prior.
-`RotationTerm` has `Q >= 1/2 + Q0 > 1/2` by construction and needs no such
-care — which, with `m = 4` and long-cadence photometry of a rotating star
-being the motivating case, makes it the term to reach for.
+*The exposure must not be wider than the kernel's fastest correlation
+time.* Concretely `||F delta|| <= 8`, where `F` is the generator; beyond it
+the matrix series below lose float32 digits and `GPLogLike` refuses. The
+regime is degenerate anyway — the process is nearly white across one frame,
+so model it as white noise, or bin.
 
-*Only terms with exact celerite coefficients can be wrapped.*
-`Matern32Term` (a repeated root) and `Matern52Term` (a triple one) are not
-sums of distinct exponentials, so the closed form does not apply and
-wrapping them raises `TypeError`. Their convolutions *are* state-space
-models of the same order — measured to 1.6e-15 — but reaching them needs
-the `m = 3` propagator generalised the way `ComplexTerm` generalised
-`m = 2`. Not done; use celerite2's approximation, or an `SHOTerm` at
-`Q = 1/2 + eps` for the Matern-3/2 shape.
+**Every term with a generator can be wrapped**, which is every term in this
+library: `RealTerm`, `SHOTerm` at *any* `Q`, `ComplexTerm`, `Matern32Term`,
+`Matern52Term`, `RotationTerm`, and sums. In particular **a convolved
+Matern-5/2 is something celerite2 cannot do at all**, and a convolved
+overdamped SHO (`Q <= 1/2`) works too.
+
+### How it works, and why that matters for what is supported
+
+The convolution leaves the *rates* alone and changes only the stationary
+covariance. With `X = F delta`:
+
+```
+M = 2 (cosh X - I) X^-2      rescales the amplitudes (lags >= delta)
+W = 2 (e^X - I - X) X^-2     the true variance at zero lag
+```
+
+`Phi` is untouched, so the state dimension is unchanged and the propagator
+is the one already verified for the base term. `M` and `W` are **entire**
+functions of `F`, evaluated as series in `X^2` with all-positive
+coefficients — and being matrix functions they are indifferent to root
+multiplicity. That is the whole reason the Matern terms and the overdamped
+SHO work: an earlier version of this feature went through the celerite
+coefficients `(a, b, c, d)`, which a repeated root (Matern-3/2), a triple
+root (Matern-5/2) and a negative-amplitude decomposition (`Q <= 1/2`) simply
+do not have. Nothing is decomposed here, so there is nothing to decompose
+badly.
+
+The diagonal correction is `h (W - M) h^T`, and `P_inf` is no longer the
+identity: it is the symmetric PSD matrix with `P h^T = M h^T`.
+
+**One accuracy caveat, and it is structural.** A convolved kernel whose
+exponential-sum continuation is not a positive-definite function *cannot*
+have a PSD process noise — if it could, that continuation would be a valid
+covariance — and the reduction factors `Q`. Measured minimum eigenvalue of
+`Q`, relative: exactly `0` for `RealTerm`, `ComplexTerm`, `RotationTerm` and
+`SHOTerm` at `Q > 1/2`; `-1e-12` to `-3e-2` for Matern-3/2, Matern-5/2 and
+the overdamped SHO, growing with `delta`. End to end that costs nothing
+almost everywhere (1e-14 to 1e-16 against a dense float64 Cholesky over
+`delta` from 1e-3 to 0.3), with one measured exception: **a convolved
+Matern-5/2 near `delta/rho ~ 0.01` is accurate to 7e-7 rather than 1e-11**.
+That is well inside the float32 path's own error budget and matters only if
+you use `.hi` as an oracle there.
 
 **One thing is not a kernel.** Below the exposure width the convolution is
 not an exponential sum, and the difference at zero lag is a constant added
@@ -250,7 +279,6 @@ against, but it is 30–70x slower depending on the kernel (see
 |---|---|---|
 | `OriginalCeleriteTerm` | yes | **not implemented.** A reparametrisation of `ComplexTerm`, which *is* implemented -- convert the coefficients yourself and use `ComplexTerm`. |
 | `TermProduct` | (varies) | **not implemented.** Products of kernels are not generally state-space representable at fixed `m`. |
-| `TermConvolution` of a Matern | yes | **not implemented.** See `TermConvolution` above: a repeated root has no celerite coefficients, and it raises rather than approximating. |
 
 ### Not celerite-class at all
 

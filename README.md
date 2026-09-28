@@ -98,8 +98,8 @@ approximate one.
 Kernel set: `RealTerm`, `SHOTerm`, `ComplexTerm`, `Matern32Term`,
 `Matern52Term`, `RotationTerm` (two SHOs at P and P/2, the
 celerite2/exoplanet convention), sums of terms, exposure-time integration
-(`TermConvolution`, around any term with exact celerite coefficients),
-per-instrument jitters and mean offsets.
+(`TermConvolution`, around **any** of them -- including Matern-5/2, which
+celerite2 cannot convolve), per-instrument jitters and mean offsets.
 
 ## The likelihood is a reduction, not a scan
 
