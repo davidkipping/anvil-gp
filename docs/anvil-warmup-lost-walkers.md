@@ -225,6 +225,13 @@ default. anvil-gp no longer needs it.
 
 ## Not in this brief
 
+> **Followed up in [`anvil-chees-stuck-chains.md`](anvil-chees-stuck-chains.md).**
+> Re-checked on anvil 0.6.0, the three chains are still stuck, and ChEES
+> *records* their log-probability as about −17,000 while their positions
+> evaluate to the failure value. So the hypothesis below now looks unlikely,
+> and 0.6.0's lost-chain check cannot see these chains. The follow-up brief
+> proposes a triage.
+
 While testing anvil-gp's fix, 3 of 32 ChEES chains started in the failure
 region stayed stuck at `|u| ~ 30.7`. This happened with both the constant and
 the sloped failure value, with identical divergence counts, so anvil-gp's
