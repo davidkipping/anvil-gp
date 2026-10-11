@@ -29,7 +29,7 @@ which needs anvil-gp. 29 of the 32 dead-started chains recover. Three do not:
 |---|---|
 | stuck chains | `0, 4, 25` |
 | their positions, first two coordinates | (23.49, 28.71), (23.66, 29.60), (23.26, 29.06); largest coordinate 30.7 |
-| **recorded log-probability** (`warmup_trace["log_prob"]`, and every sampled draw) | **about −17,000** (−17204, −17357, −16992) |
+| **recorded log-probability** (`warmup_trace["log_prob"]`, and the first and last sampled draws) | **about −17,000** (−17204, −17357, −16992) |
 | **target log-probability evaluated afresh at those final positions** | **about −6.8e30**, the failure value |
 | `warmup_report` | `INCONCLUSIVE` -- not `LOST CHAINS` |
 | `lost_chains(...)` on the recorded values | flags nothing |
@@ -37,8 +37,9 @@ which needs anvil-gp. 29 of the 32 dead-started chains recover. Three do not:
 
 Three things make this worth a look rather than a shrug:
 
-- **The record and the position disagree by 26 orders of magnitude.** Every
-  sampled draw records about −17,000 for these chains, while the target says
+- **The record and the position disagree by 26 orders of magnitude.** The
+  end-of-warmup record and the first and last sampled draws all give about
+  −17,000 for these chains, while the target says
   their position is a failed evaluation.
 - **It is independent of anvil-gp's failure value.** anvil-gp reports a
   failed evaluation two ways: the old constant `−1e30`, and the current
@@ -111,8 +112,8 @@ whose failure boundary is itself rounding-sensitive. If it does reproduce,
 anvil can own the whole investigation with no anvil-gp context.
 
 **Step 4, only if H2 -- why `lost_chains` did not flag about −17,000
-either.** Against a healthy bulk near −460, a chain at −17,000 looks far
-outside ten robust sigmas. The likely reason is that the recovering chains
+either.** Against a healthy bulk of a few hundred, a chain at −17,000 looks
+far outside ten robust sigmas. The likely reason is that the recovering chains
 spread the ensemble's log-probabilities widely at the end of warmup, which
 inflates the median absolute deviation. Worth confirming, since it decides
 whether the relative test can catch a stuck-but-finite chain at all.
