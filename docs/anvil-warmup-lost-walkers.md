@@ -6,6 +6,28 @@ anvil-gp's behalf**: anvil-gp has already fixed its own side (`3975960`), and
 nothing here is needed for anvil-gp to work. They are aimed at every anvil
 user whose target can fail.
 
+> **Status (2026-10-11): items 1 and 2 implemented in anvil `3758996`
+> (0.6.0); item 3 declined.** Verified from anvil-gp against the
+> reproducer, with RuntimeWarnings escalated to errors:
+>
+> - Constant failure value: still 13/64 walkers lost, as expected -- no
+>   sampler change can give a flat region a direction -- but **no coordinate
+>   is non-finite** (they pin near float32's maximum, ~3.4e38, instead of
+>   `inf`). `warmup_report` returns **`LOST CHAINS`**, names them, and says
+>   longer warmup will not help; `diagnose(chain, log_prob=...)` names the
+>   same 13 beside R-hat. No `inf/inf`.
+> - Sloped control: 0 lost, healthy verdict, `diagnose(...).lost` empty.
+> - anvil-gp's own target, the case that got a false `OK`: now
+>   **`LOST CHAINS`, exactly 11**. With anvil-gp's current sloped failure
+>   value: `OK`, 0 lost.
+>
+> The finite-position check went wider than asked: ensemble, RWM *and*
+> ChEES. Item 3 was declined because re-seeding would also hide a target
+> that fails over much of its prior, which a diagnostic should not do --
+> a reasonable call, and the brief had already flagged it as optional for
+> that reason. The ChEES observation under "Not in this brief" remains
+> undiagnosed.
+
 Three items, labelled by how strongly they are argued:
 
 | | item | what it asks |

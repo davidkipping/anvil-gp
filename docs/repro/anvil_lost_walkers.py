@@ -52,13 +52,22 @@ with mx.stream(mx.gpu):
 lost = lp <= 0.5 * FAIL
 print(f"anvil {anvil.__version__} | failure value: "
       f"{'sloped' if SLOPED else 'constant'}")
+# float64: lost walkers can sit near float32's maximum (~3e38), where
+# squaring for the norm overflows in float32
 print(f"lost walkers: {lost.sum()}/64"
-      + (f", at |u| up to {np.linalg.norm(last[lost], axis=1).max():.2g}"
+      + (f", at |u| up to "
+         f"{np.linalg.norm(last[lost].astype(np.float64), axis=1).max():.2g}"
          if lost.any() else ""))
 wr = anvil.warmup_report(res)
 print(f"anvil.warmup_report: {wr.verdict} -- {wr.suggestion}")
-print("anvil.diagnose:\n" + str(anvil.diagnose(
-    np.asarray(res.get_chain(), dtype=np.float64))))
+chain = np.asarray(res.get_chain(), dtype=np.float64)
+try:        # anvil >= 0.6: diagnose names lost chains beside R-hat
+    d = anvil.diagnose(chain, log_prob=np.asarray(res.get_log_prob()))
+except TypeError:
+    d = anvil.diagnose(chain)
+print("anvil.diagnose:\n" + str(d))
+if getattr(d, "lost", None) is not None:
+    print(f"anvil.diagnose lost chains: {list(np.atleast_1d(d.lost))}")
 
 # The proposed lost-chain check: final log-prob far below the ensemble,
 # measured robustly so the lost walkers cannot inflate the scale.
