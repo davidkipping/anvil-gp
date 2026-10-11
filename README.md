@@ -46,6 +46,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/m5-plan.md](docs/m5-plan.md) | M5, landed: the compile fix, per-instrument jitter in the kernel, `ComplexTerm`, and exposure-time integration |
 | [docs/float32.md](docs/float32.md) | The precision discipline and its measured error budget |
 | [docs/statistical-foundation.md](docs/statistical-foundation.md) | Why the state-space form is exact |
+| [docs/anvil-warmup-lost-walkers.md](docs/anvil-warmup-lost-walkers.md) | Brief for anvil: lost ensemble walkers pass its diagnostics (needed / recommended / optional changes), with an anvil-only reproducer |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
