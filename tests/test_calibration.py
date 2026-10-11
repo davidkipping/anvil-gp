@@ -112,14 +112,22 @@ def test_chains_started_in_the_infeasible_region_recover():
     the whole ensemble's adaptation.  And a sampler started there must walk
     back out.
 
-    (The *target's* log-probability may still be -inf at such a point,
-    because anvil's Transform contributes a -inf Jacobian at the edge of a
-    bounded prior.  That is a correct statement about the prior, not a
-    failure of the likelihood, and a sampler rejects it cleanly.)
-
     Uses the stretch move, which needs no gradient.  Half the ensemble
     starts in the failure region so the rest has somewhere to pull it back
     from.
+
+    **This test passed for the wrong reason until 2026-10-11.**  It used to
+    say the *target's* log-probability "may still be -inf at such a point,
+    because anvil's Transform contributes a -inf Jacobian at the edge of a
+    bounded prior" -- and that -inf was what made it pass.  It made every
+    move *within* the failure region ``(-inf) - (-inf) = NaN`` and so
+    rejected, an accidental wall.  anvil f97f583 made the Jacobian finite
+    (correctly), the constant -1e30 sentinel then absorbed it in float32,
+    the region went flat, and 11 of the 32 dead walkers diffused to
+    ``|u| ~ 1e11`` -- proven causal by restoring the old Jacobian
+    in-process (0/32 stuck).  The fix is anvil-gp's: the failure value now
+    slopes back towards the reference point (see `likelihood._sanitize` and
+    the contract tests in `test_contract.py`).
     """
     anvil = pytest.importorskip("anvil")
     from anvilgp.anvil import make_target

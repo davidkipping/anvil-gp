@@ -98,7 +98,19 @@ Requirements, all implemented:
   defined outcome rather than a NaN;
 * a failed evaluation returns a large-negative **finite** log-likelihood
   with both branches of the `mx.where` sanitised, so the VJP contributes
-  zero rather than `0 * inf`.
+  zero rather than `0 * inf`.  The value is **not a constant**:
+  `-1e30 * (1 + pull)`, with `pull` a chain's distance from the reference
+  point over the GP's own columns, so it slopes back towards feasibility.
+  A constant made the failure region perfectly flat -- in float32
+  `-1e30 + (-120) == -1e30`, so even anvil's (finite, correctly inward)
+  Jacobian was absorbed -- and a flat region is not a rejection: stretch
+  walkers started there diffused to `|u| ~ 1e11`. The slope is relative so
+  float32 can resolve it at that magnitude, and `stop_gradient`-ed because
+  its true derivative is of order 1e30; failed lanes keep a zero gradient.
+  Consequence, pinned in `test_contract.py`: wherever the likelihood
+  succeeds, values and gradients are bit-identical to the constant
+  sentinel, so no posterior moves -- only recovery from the infeasible
+  region changes.
 
 Still owed at M3: the *map* of the float32 feasibility boundary over
 `(sigma_GP/yerr, timescale/cadence, Q)`, and the documented ParamSpec bound

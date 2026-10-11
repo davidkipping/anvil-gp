@@ -469,17 +469,15 @@ class SHOTerm(Term):
         cannot carry.  ``d`` is floored at zero here, so ``b = a c / d``
         divides by zero and the convolved term becomes non-finite.
 
-        **This cannot be caught at call time.** An earlier version of this
-        docstring claimed it was; it never was, and the consequence is not
-        a NaN the caller sees but the likelihood's own non-finite guard
-        returning ``-1e30`` with an exactly **zero gradient** -- flat in
-        every direction, the failure mode that guard exists to warn about.
-        So the check is at *construction*:
-        :class:`~anvilgp.likelihood.GPLogLike` evaluates a convolved term at
-        the parameter map's reference point and refuses a non-finite one.
-        A sampler can still walk here, so a convolved ``SHOTerm`` needs a
-        prior that keeps ``Q > 1/2``; :class:`RotationTerm` is bounded away
-        from it by construction and has no such requirement.
+        **Nothing on the evaluation path calls this any more.** The
+        exposure-time convolution used to, which is why a convolved
+        ``SHOTerm`` once needed ``Q > 1/2``; since it moved to the
+        state-space form (a matrix function of :meth:`generator`, regular at
+        every ``Q``) an overdamped convolved SHO evaluates normally.  This
+        remains as the coefficient *view* of the kernel, exact for
+        ``Q > 1/2`` and non-finite below -- see
+        :func:`from_celerite_coefficients` for the interop route, which
+        refuses the negative amplitude with a message naming the cause.
         """
         sigma = p[..., 0:1]
         omega0 = _TWO_PI / p[..., 1:2]

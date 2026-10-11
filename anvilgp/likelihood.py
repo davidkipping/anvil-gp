@@ -59,6 +59,9 @@ __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
 _LARGE_NEGATIVE = -1e30
 #: anything at or below this is a sanitised failure, not a real value.
 _FAILED = 0.5 * _LARGE_NEGATIVE
+#: |v| beyond which the infeasible-region pull stops growing: keeps v**2
+#: (<= 1e30) and so the sentinel (>= -7e31) finite in float32.
+_PULL_CLIP = 1e15
 
 
 def a64(x: np.ndarray) -> mx.array:
@@ -363,6 +366,18 @@ class GPLogLike:
         self.mean_fn = mean_fn
         self.term = kernel_spec
         self.param_map = param_map
+        #: The columns of ``v`` whose reference point is ``v = 0`` by
+        #: construction -- the GP's own kernel, jitter and offset parameters.
+        #: The infeasible-region sentinel slopes towards that point; see
+        #: `_sanitize`.  Mean-model columns are excluded deliberately: their
+        #: model-space ``0`` is not a reference (a transit's ``a/R* = 0`` is
+        #: not even inside its bounds), and pulling them there would be wrong.
+        cols = sorted({k.index for k in (list(param_map.kernel)
+                                         + list(param_map.jitter)
+                                         + list(param_map.offset))
+                       if k.link != "const" and k.index is not None})
+        self._pull_cols = (mx.array(np.array(cols, dtype=np.int32))
+                           if cols else None)
         self.policy = policy or GPPolicy()
         self.sub_block = (self.policy.sub_block
                           if self.policy.sub_block is not None
@@ -1029,15 +1044,30 @@ class GPLogLike:
                 f"v has {v.shape[1]} columns but the parameter map declares "
                 f"n_dim = {want}")
 
+    def _infeasible_pull(self, v: mx.array):
+        """``log1p(mean v_ref**2)`` per chain, gradient-free, or ``None``.
+
+        The distance of each chain from the reference point, over the columns
+        in ``_pull_cols``.  Only ever *used* on lanes whose likelihood failed;
+        see `_sanitize` for why it exists and why it carries no gradient.
+        """
+        if self._pull_cols is None:
+            return None
+        g = mx.take(v, self._pull_cols, axis=1)
+        g = mx.where(mx.isfinite(g), mx.clip(g, -_PULL_CLIP, _PULL_CLIP),
+                     mx.full(g.shape, _PULL_CLIP, dtype=g.dtype))
+        return mx.stop_gradient(mx.log1p(mx.mean(g * g, axis=1)))
+
     def _raw_call(self, v: mx.array) -> mx.array:
         """The float32 likelihood itself, sanitised but not gradient-guarded."""
+        pull = self._infeasible_pull(v)
         if self._metal_ok:
-            return _sanitize(self._evaluate_metal(v))
+            return _sanitize(self._evaluate_metal(v), pull)
         out = self._evaluate(
             v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
             self._inst32, _pow2(self.policy.block), self.policy.eval_blocks,
             uniq=self._uniq32)
-        return _sanitize(out)
+        return _sanitize(out, pull)
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`.
@@ -1366,7 +1396,7 @@ def _pow2(n: int) -> int:
     return p
 
 
-def _sanitize(x: mx.array) -> mx.array:
+def _sanitize(x: mx.array, pull: mx.array | None = None) -> mx.array:
     """Positive-definiteness failure is a defined, finite outcome.
 
     With 4096 chains, warmup *will* visit float32-infeasible corners --
@@ -1382,7 +1412,42 @@ def _sanitize(x: mx.array) -> mx.array:
     an infinite derivative there, and ``0 * inf`` is NaN however the zero
     arrives.  Cutting that is the input-side guard's job; see
     :meth:`GPLogLike.__call__`.
+
+    **The failure value slopes back towards the reference point** when
+    ``pull`` is given: ``-1e30 * (1 + pull)``, with ``pull`` a chain's
+    distance from ``v = 0`` over the GP's own columns.  A constant ``-1e30``
+    made the infeasible region perfectly flat, and a flat region is not a
+    rejection: a sampler accepts moves *within* it and drifts.  That was
+    masked until anvil made its bounded log-Jacobian finite (it had been
+    exactly ``-inf`` past ``|u| ~ 18``, an accidental wall); after that,
+    stretch walkers started in the infeasible region diffused to
+    ``|u| ~ 1e11`` and never came back -- 11 of 32 in
+    `test_chains_started_in_the_infeasible_region_recover`, proven causal by
+    restoring the old Jacobian in-process.
+
+    Three constraints fix the form, and each rules out the obvious
+    alternative:
+
+    * **It must never beat a real likelihood**, so the magnitude stays at
+      ``1e30`` and every ``<= -1e29`` test still means "failed".
+    * **The slope must survive float32 at that magnitude**, which an additive
+      one cannot -- ``-1e30 + (-120) == -1e30`` exactly, which is the bug.
+      Hence relative: a change of ``1e-7`` in ``pull`` is resolvable.
+    * **It must carry no gradient.**  The derivative of ``-1e30 * pull`` is
+      of order ``1e30`` and would wreck an HMC trajectory, so ``pull`` is
+      ``stop_gradient``-ed and a failed lane keeps the exactly-zero gradient
+      it always had.  The slope acts through *values* alone.
+
+    That last choice buys the property the change is verified against: a
+    chain that never enters the infeasible region sees **bit-identical**
+    values and gradients, so no posterior can move.  Only recovery changes --
+    both samplers now ratchet inwards, accepting moves towards the reference
+    (a gain of order ``1e30``) and rejecting moves away.
     """
     bad = mx.logical_not(mx.isfinite(x))
     safe = mx.where(bad, mx.zeros_like(x), x)
-    return mx.where(bad, mx.full(x.shape, _LARGE_NEGATIVE, dtype=x.dtype), safe)
+    if pull is None:
+        sentinel = mx.full(x.shape, _LARGE_NEGATIVE, dtype=x.dtype)
+    else:
+        sentinel = _LARGE_NEGATIVE * (1.0 + pull.astype(x.dtype))
+    return mx.where(bad, sentinel, safe)

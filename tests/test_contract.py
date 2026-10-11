@@ -398,3 +398,103 @@ def test_yerr_that_underflows_in_float32_is_refused():
     with pytest.raises(ValueError, match="rescale|float32 zero"):
         _gp(yerr=np.full(N, 1e-20))
     _gp(yerr=np.full(N, 1e-15))          # fine
+
+
+# -- the failure value ------------------------------------------------------
+#
+# A failed (float32-infeasible) evaluation returns a large-negative finite
+# value.  It used to be the constant -1e30, and a constant is a *flat*
+# region, not a rejection: a sampler accepts moves within it and drifts.
+# That was masked until anvil made its bounded log-Jacobian finite (anvil
+# f97f583; it had been exactly -inf past |u| ~ 18, an accidental wall), after
+# which stretch walkers started there diffused to |u| ~ 1e11 and never came
+# back.  The value now slopes back towards the reference point.  These pin
+# the four properties that make that safe.
+
+def _failing_gp(metal=False):
+    rng = np.random.default_rng(5)
+    n = 300
+    t = np.sort(rng.uniform(0.0, 40.0, n))
+    yerr = np.full(n, 0.2)
+    y = rng.standard_normal(n)
+    return GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
+                     ParamMap.log([1.5, 7.3, 8.0]), GPPolicy(metal=metal))
+
+
+def test_a_failed_likelihood_slopes_back_towards_the_reference():
+    """Finite, never above -1e30, strictly better closer in, zero gradient.
+
+    * **finite** -- a NaN or -inf would poison an ensemble's adaptation;
+    * **at or below -1e30** -- it must never beat a real likelihood, and
+      every ``<= -1e29`` check in the package still has to mean "failed";
+    * **strictly better closer to v = 0** -- the whole point: a slope a
+      sampler can follow home, rather than a plateau it wanders;
+    * **exactly zero gradient** -- the slope is ``-1e30 * pull``, whose true
+      derivative is of order 1e30 and would wreck an HMC trajectory, so it is
+      ``stop_gradient``-ed and acts through values alone.
+    """
+    gp = _failing_gp()
+    ks = np.array([45.0, 60.0, 100.0, 1e3, 1e6], dtype=np.float32)
+    v = mx.array(np.repeat(ks[:, None], 3, axis=1))
+    with mx.stream(mx.gpu):
+        val = gp(v)
+        _, grad = mx.vjp(gp, [v], [mx.ones((len(ks),), dtype=mx.float32)])
+        mx.eval(val, grad)
+    val, grad = np.array(val), np.array(grad[0])
+    assert np.all(val <= -1e29), f"these points are meant to fail: {val}"
+    assert np.all(np.isfinite(val)), val
+    assert np.all(val <= -1e30), val
+    assert np.all(np.diff(val) < 0), (
+        f"not strictly better closer in -- a flat failure region is back: {val}")
+    assert np.all(grad == 0.0), f"failed lanes must carry no gradient: {grad}"
+
+
+@pytest.mark.parametrize("metal", [False, True])
+def test_the_sloped_failure_value_is_invisible_on_feasible_points(metal):
+    """Bit-identical values and gradients wherever the likelihood succeeds.
+
+    The property the change was verified against, pinned: the slope is only
+    ever *selected* on failed lanes, so a chain that never enters the
+    infeasible region cannot see it, and no posterior can move.  Compared
+    against ``pull = None``, which is exactly the previous constant sentinel.
+    """
+    gp = _failing_gp(metal=metal)
+    v = mx.array(np.random.default_rng(1).standard_normal((128, 3))
+                 .astype(np.float32))
+    one = mx.ones((128,), dtype=mx.float32)
+
+    def run():
+        with mx.stream(mx.gpu):
+            val = gp(v)
+            _, g = mx.vjp(gp, [v], [one])
+            mx.eval(val, g)
+        return np.array(val), np.array(g[0])
+
+    new_v, new_g = run()
+    real = GPLogLike._infeasible_pull
+    try:
+        GPLogLike._infeasible_pull = lambda self, vv: None
+        old_v, old_g = run()
+    finally:
+        GPLogLike._infeasible_pull = real
+    ok = old_v > -1e29
+    assert ok.sum() > 100, f"want mostly feasible points, got {ok.sum()}"
+    assert np.array_equal(new_v[ok], old_v[ok])
+    assert np.array_equal(new_g[ok], old_g[ok])
+
+
+def test_the_pull_ignores_mean_model_columns():
+    """Only the GP's own columns are pulled towards zero.
+
+    Their reference point is ``v = 0`` by construction.  A mean model's is
+    not -- a transit's ``a/R* = 0`` is not even inside its bounds -- so its
+    columns must not enter the distance.
+    """
+    gp = GPLogLike(lambda vm, x: mx.zeros((vm.shape[0], x.shape[-1])),
+                   np.arange(50.0), np.arange(50.0), np.zeros(50),
+                   np.full(50, 0.2), ag.SHOTerm(),
+                   ParamMap(kernel=[KernelParam(link="log", index=i + 2)
+                                    for i in range(3)],
+                            n_dim=5, mean=slice(0, 2)),
+                   GPPolicy())
+    assert np.array(gp._pull_cols).tolist() == [2, 3, 4]
