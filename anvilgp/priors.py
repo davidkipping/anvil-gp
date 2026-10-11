@@ -68,7 +68,7 @@ class SpecHint:
 
     Deliberately a plain dataclass rather than ``anvil.ParamSpec``: anvilgp
     depends on mlx and numpy only, and anvil is imported lazily where it is
-    needed (mirroring ``metalplanet/anvil.py``).  :meth:`to_anvil` converts.
+    needed (mirroring ``elome/anvil.py``).  :meth:`to_anvil` converts.
     """
 
     name: str

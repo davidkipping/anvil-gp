@@ -655,6 +655,13 @@ samplers, truth recovered, zero divergences, cross-sampler agreement.
 
 #### Also landed: the fiducial joint fit, 2026-09-28 --- M5 complete
 
+> **Renamed since:** MetalPlanet is now **Elome** (package `elome`,
+> github.com/davidkipping/Elome), renamed 2026-10-11. This record keeps the
+> name in use when it was written, as Elome's own CHANGELOG does for
+> pre-rename entries; the code, tests and example now import `elome`. The
+> `MetalPlanet/docs/sampler-integration.md` cited below is
+> `elome/docs/sampler-integration.md`.
+
 M5 (a) from the brief: *"MetalPlanet hot Jupiter + injected SHO variability +
 jitter, both samplers, truth recovered, zero divergences, cross-sampler
 agreement."* `examples/hotjupiter_gp_joint.py`, with a test-size version in

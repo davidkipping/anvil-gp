@@ -56,7 +56,7 @@ def test_mean_model_is_subtracted_and_differentiable():
 
 def test_x_mean_is_a_separate_abscissa_from_t():
     """t drives the GP's lag structure; x_mean drives the mean model, and for
-    MetalPlanet it is a (2, m) stack of epoch-centred times and orbit numbers.
+    Elome it is a (2, m) stack of epoch-centred times and orbit numbers.
     Conflating them is a silent wrong answer, so the API keeps them apart."""
     x_mean = np.stack([T * 2.0, np.floor(T)])          # (2, N), unlike t
 

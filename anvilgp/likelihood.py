@@ -25,7 +25,7 @@ The gradient split
 ------------------
 ``d logL / d(mean model) = alpha = (K + Sigma)^-1 r`` -- the mean model's
 gradient is the GP-whitened residual, chain-ruled into whatever VJP the
-mean model already has (MetalPlanet's is analytic).  So the hard gradient
+mean model already has (Elome's is analytic).  So the hard gradient
 engineering is confined to the hyperparameters; the transit path is
 already solved and rides ordinary autodiff through ``mean_fn``.
 
@@ -348,7 +348,7 @@ class GPLogLike:
     ``(n_chains, m)`` -- or ``None`` for a pure-GP fit.
 
     ``t`` is the physical time vector (float64, host).  ``x_mean`` is the
-    mean model's *own* abscissa: for MetalPlanet that is the ``(2, m)`` stack
+    mean model's *own* abscissa: for Elome that is the ``(2, m)`` stack
     of epoch-centred residual times and orbit numbers, which is a different
     array from ``t`` and must not be conflated with it -- ``t`` drives the
     GP's lag structure, ``x_mean`` drives the transit.

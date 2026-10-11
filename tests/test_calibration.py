@@ -717,13 +717,14 @@ def test_the_geometry_signatures_are_absent_when_the_gp_is_resolved():
 # The fiducial joint fit (M5 (a))
 # ---------------------------------------------------------------------------
 #
-# The brief: "MetalPlanet hot Jupiter + injected SHO variability + jitter,
+# The brief (written before MetalPlanet was renamed Elome):
+# "MetalPlanet hot Jupiter + injected SHO variability + jitter,
 # both samplers, truth recovered, zero divergences, cross-sampler agreement."
 # `examples/hotjupiter_gp_joint.py` is the full-size version with the printed
 # posterior; this is the same problem shrunk to test size.
 #
 # It is the only test here that exercises the whole stack at once -- a
-# MetalPlanet transit as the mean model, an anvil-gp GP over the residual, and
+# Elome transit as the mean model, an anvil-gp GP over the residual, and
 # anvil sampling all twelve parameters jointly -- so it is the one that catches
 # an integration break that every unit test passes through.
 
@@ -737,9 +738,9 @@ HJ_GP = dict(sigma=1000e-6, rho=2.0, qual=5.0, jitter=200e-6)
 def hotjupiter_joint():
     """Data, target and truth for the joint fit; built once for both samplers."""
     pytest.importorskip("anvil")
-    mp = pytest.importorskip("metalplanet.anvil")
-    from metalplanet.ld import u_to_q_np
-    from metalplanet.orbit import epoch_center_times
+    el = pytest.importorskip("elome.anvil")
+    from elome.ld import u_to_q_np
+    from elome.orbit import epoch_center_times
 
     from anvilgp import GPPolicy
     from anvilgp.anvil import make_target
@@ -756,7 +757,7 @@ def hotjupiter_joint():
     truth_mean = np.array([tr["t0"] - t0_ref, tr["period"] - period_ref,
                            tr["r"], tr["b"], tr["a"], q1, q2, 0.0])
 
-    model_fn = mp.make_quad_transit_flux(period_ref=period_ref)
+    model_fn = el.make_quad_transit_flux(period_ref=period_ref)
     with mx.stream(mx.cpu):                    # float64 through the fallback
         transit = np.array(
             model_fn(mx.array(truth_mean[None, :], dtype=mx.float64),
@@ -769,8 +770,8 @@ def hotjupiter_joint():
                                                 + HJ_GP["jitter"] ** 2)
     y_fit = transit + gp_draw + white
 
-    specs = [SpecHint(n, lo=mp.DEFAULT_BOUNDS[n][0], hi=mp.DEFAULT_BOUNDS[n][1])
-             for n in mp.PARAM_NAMES]
+    specs = [SpecHint(n, lo=el.DEFAULT_BOUNDS[n][0], hi=el.DEFAULT_BOUNDS[n][1])
+             for n in el.PARAM_NAMES]
     gt = make_target(ag.SHOTerm(), t_model, y_fit, np.full(HJ_N, HJ_YERR),
                      mean_fn=model_fn, x_mean=x64, mean_specs=specs,
                      policy=GPPolicy(block=1024, metal=True))
@@ -785,9 +786,9 @@ def hotjupiter_joint():
         return mx.array((u_truth + spread * init.standard_normal(
             (n, gt.transform.dim))).astype(np.float32))
 
-    truth = dict(zip(mp.PARAM_NAMES, truth_model[:8]))
+    truth = dict(zip(el.PARAM_NAMES, truth_model[:8]))
     truth.update(zip(("gp_sigma", "gp_rho", "gp_Q", "jitter"), gp_truth))
-    return dict(gt=gt, ball=ball, truth=truth, names=list(mp.PARAM_NAMES),
+    return dict(gt=gt, ball=ball, truth=truth, names=list(el.PARAM_NAMES),
                 depth=float(-transit.min()), gp_sd=float(gp_draw.std()))
 
 
@@ -804,7 +805,7 @@ def _hj_draws(gt, res, names):
 def hj_chees(hotjupiter_joint):
     """ChEES-HMC on the joint fit.
 
-    400 warmup, not 250, and that is load-bearing: MetalPlanet's
+    400 warmup, not 250, and that is load-bearing: Elome's
     docs/sampler-integration.md reports ~1% divergences at 200 warmup
     iterations and exactly zero at 400-600, calling them a step-size
     adaptation artefact rather than a geometry problem.  Reproduced here on a
@@ -878,11 +879,11 @@ def test_the_joint_fit_recovers_truth_without_divergences(hotjupiter_joint,
                                                           hj_chees):
     """ChEES on twelve joint parameters: truth in, truth out, no divergences.
 
-    Measured at this size: zero divergences, acceptance 0.92, max R-hat 1.011,
-    and the worst parameter 2.1 sigma from truth (``gp_Q``, the least
-    constrained -- its posterior sd is 3.2 on a truth of 5).  The full-size
-    version in ``examples/hotjupiter_gp_joint.py`` puts every one of the
-    twelve inside 1.1 sigma.
+    Measured at this size (anvil 0.5.0): zero divergences, acceptance 0.92,
+    max R-hat 1.015, and the worst parameter 2.24 sigma from truth (``gp_Q``,
+    the least constrained -- posterior sd 1.0 here on a truth of 5).  The
+    full-size version in ``examples/hotjupiter_gp_joint.py`` puts every one of
+    the twelve within 1.1 sigma (worst 1.10).
     """
     cols, truth = hj_chees["cols"], hotjupiter_joint["truth"]
     assert hj_chees["n_div"] == 0, (
@@ -911,9 +912,11 @@ def test_the_two_samplers_agree_on_the_joint_posterior(hotjupiter_joint,
     trapped walkers inflated a width fourfold (docs/anvil-stretch-width.md),
     so the comparison guards both directions.
 
-    Measured: worst median shift 0.064 sigma, worst width ratio 1.24x at this
-    size; 0.012 sigma and 1.014x at full size.  The ensemble's R-hat is the
-    looser of the two (1.08 here against ChEES's 1.011) because the stretch
+    Measured on anvil 0.5.0: worst median shift 0.070 sigma, worst width ratio
+    1.26x at this size; 0.019 sigma and 1.013x at full size.  The width gate
+    (1.4x) has the least margin of the assertions here, ~11%, and it is the
+    ensemble's estimate that is noisy.  The ensemble's R-hat is the looser of
+    the two (1.088 here against ChEES's 1.015) because the stretch
     move decorrelates in ~120 iterations rather than ~2, which is why its
     width estimate is the noisier one.
     """

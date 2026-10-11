@@ -1,9 +1,10 @@
 """M5's fiducial: a hot Jupiter and its star's variability, fitted jointly.
 
-The brief's joint-validation case -- *"MetalPlanet hot Jupiter + injected SHO
+The brief's joint-validation case (written when Elome was still called
+MetalPlanet) -- *"MetalPlanet hot Jupiter + injected SHO
 variability + jitter, both samplers, truth recovered, zero divergences,
 cross-sampler agreement"* -- and the end-to-end demonstration of what this
-package is for. The transit mean model is MetalPlanet's fused Metal kernel;
+package is for. The transit mean model is Elome's fused Metal kernel;
 the GP over the residual is anvil-gp's; anvil samples the 12 parameters of
 both at once. Nothing leaves the GPU inside the loop.
 
@@ -17,17 +18,19 @@ uncertainty can honestly include "some of this dip might be starspots".
 
 What the numbers below demonstrate:
 
-* the 8 transit parameters and the 4 GP/noise parameters all recovered inside
-  1.1 sigma, with the GP amplitude 10x smaller than the transit it sits under;
-* zero divergences, R-hat 1.001 from ChEES-HMC;
+* the 8 transit parameters and the 4 GP/noise parameters all recovered within
+  1.1 sigma of truth (worst 1.10, the impact parameter), with the GP
+  amplitude 10x smaller than the transit it sits under;
+* zero divergences, R-hat 1.000 from ChEES-HMC;
 * the two samplers -- gradient-free ensemble and gradient-based ChEES --
-  agreeing on every median to 0.04 sigma and every width to 2%, which is the
+  agreeing on every median to 0.019 sigma and every width to 1.3%, which is the
   check that catches a wrong gradient or a trapped ensemble (both of which
   have happened in this project: docs/anvil-stretch-width.md,
   docs/anvil-chees-boundary.md).
 
 Run: .venv/bin/python examples/hotjupiter_gp_joint.py
-Requires MetalPlanet (pip install -e ../MetalPlanet) and anvil.
+Requires Elome (github.com/davidkipping/Elome; pip install -e ../elome)
+and anvil.
 """
 
 import time
@@ -38,9 +41,9 @@ import numpy as np
 import anvil
 from anvil.diagnostics import split_rhat
 from anvil.kernels.ensemble import DEMove, EnsembleKernel, StretchMove
-from metalplanet.anvil import DEFAULT_BOUNDS, PARAM_NAMES, make_quad_transit_flux
-from metalplanet.ld import u_to_q_np
-from metalplanet.orbit import epoch_center_times
+from elome.anvil import DEFAULT_BOUNDS, PARAM_NAMES, make_quad_transit_flux
+from elome.ld import u_to_q_np
+from elome.orbit import epoch_center_times
 
 import anvilgp as ag
 from anvilgp import GPPolicy
@@ -80,7 +83,7 @@ rng = np.random.default_rng(7)
 variability = sample_ssm(ag.SHOTerm(), [SIGMA_TRUE, RHO_TRUE, Q_TRUE],
                          dt, N_DATA, rng)
 noise = rng.standard_normal(N_DATA) * np.sqrt(YERR ** 2 + JITTER_TRUE ** 2)
-y_fit = transit + variability + noise          # flux - 1, as MetalPlanet fits
+y_fit = transit + variability + noise          # flux - 1, as Elome fits
 
 print(f"{N_DATA} points, {BASELINE:g} d, cadence {dt * 24 * 60:.2f} min")
 print(f"transit depth {-transit.min() * 1e6:.0f} ppm over "
@@ -90,7 +93,7 @@ print(f"variability {variability.std() * 1e6:.0f} ppm = "
       f"white noise {noise.std() * 1e6:.0f} ppm")
 
 # ------------------------------------------------ the joint 12-parameter fit
-# MetalPlanet's model_fn is already the engine contract anvil-gp wants for a
+# Elome's model_fn is already the engine contract anvil-gp wants for a
 # mean model: (v_mean, x) -> (n_chains, m) with x the (2, m) epoch-centered
 # times.  Its parameters take the leading columns; the GP's follow.
 specs = [SpecHint(n, lo=DEFAULT_BOUNDS[n][0], hi=DEFAULT_BOUNDS[n][1])
@@ -115,7 +118,7 @@ def ball(n, spread=1e-3):
         (n, gt.transform.dim))).astype(np.float32))
 
 
-# The float32 trust check, before any sampling (MetalPlanet's discipline).
+# The float32 trust check, before any sampling (Elome's discipline).
 print("\n", anvil.validate_precision(gt.target, ball(32)), sep="")
 
 

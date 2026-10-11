@@ -150,7 +150,7 @@ integral as a function of `(x_out, x_in)`, which pins every component at once.
 The mean model's gradient is the GP-whitened residual, chain-ruled into
 whatever VJP the mean model already has. This decouples the hard
 (hyperparameter) gradient engineering from the solved (transit) path:
-MetalPlanet's analytic VJP is unchanged and simply receives a different
+Elome's analytic VJP is unchanged and simply receives a different
 cotangent.
 
 ## What is deliberately excluded

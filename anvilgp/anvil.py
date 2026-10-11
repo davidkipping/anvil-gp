@@ -3,12 +3,12 @@
 ``make_target`` assembles the whole sampling problem -- transform, priors,
 GP likelihood, float64 verification path -- from data and a kernel, so the
 common case is one call rather than a page of bookkeeping.  anvil is imported
-inside the functions that need it, mirroring ``metalplanet/anvil.py``, so
+inside the functions that need it, mirroring ``elome/anvil.py``, so
 ``import anvilgp`` still works with only mlx and numpy installed.
 
 The mean model, if any, follows anvil's usual model contract:
 ``mean_fn(v_mean, x) -> (n_chains, m)`` with ``v_mean`` the leading block of
-the parameter vector and ``x`` the mean model's own abscissa.  For MetalPlanet
+the parameter vector and ``x`` the mean model's own abscissa.  For Elome
 that is ``make_quad_transit_flux(period_ref)`` and the ``(2, m)`` stack of
 epoch-centred times and orbit numbers -- a *different* array from the GP's
 ``t``, which carries the physical times that set the lag structure.

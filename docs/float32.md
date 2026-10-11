@@ -263,5 +263,5 @@ workaround code.
   with the LAPACK route reserved for the value-only float64 path.
 * Numpy-scalar poison, `.item()` forcing evaluation inside `mx.compile`,
   both-branch `mx.where` sanitisation including masked denominators, and
-  `mx.compile` retracing on shape change — inherited from MetalPlanet's
+  `mx.compile` retracing on shape change — inherited from Elome's
   hard-won list and respected throughout.

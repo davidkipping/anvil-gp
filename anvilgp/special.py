@@ -75,7 +75,7 @@ def _safe(x: mx.array, mask: mx.array, fill: float = 1.0) -> mx.array:
 
     Both-branch sanitisation: a clamped-tiny denominator gives a finite
     forward value but an overflowing -x/y^2 in the VJP, and 0 * inf = NaN
-    in the backward pass (MetalPlanet learned this the hard way).
+    in the backward pass (Elome, then MetalPlanet, learned this the hard way).
     """
     return mx.where(mask, x, mx.array(fill, dtype=x.dtype))
 
@@ -410,7 +410,7 @@ def sincos(x: mx.array):
     """``(sin x, cos x)`` at full working precision in both dtypes.
 
     Same Cody--Waite treatment as :func:`exp_acc`; MLX's fp64 sin/cos are
-    float32-accurate (independently rediscovered by MetalPlanet's trig.py,
+    float32-accurate (independently rediscovered by Elome's trig.py,
     whose reduction constants this shares).
     """
     if x.dtype != mx.float64:
