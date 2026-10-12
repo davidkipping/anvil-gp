@@ -62,7 +62,19 @@ class GPTarget:
     def u0(self, n_chains: int, seed: int = 0, spread: float = 0.05):
         """Initial states: near the reference point, which the parametrisation
         has arranged to be a sensible guess (``v = 0`` means every scale
-        parameter sits at its data-derived host reference)."""
+        parameter sits at its data-derived host reference).
+
+        **Keep ``spread`` small for ChEES-HMC.**  ChEES adapts one step size
+        for all chains from the harmonic mean of their acceptance, so a few
+        chains started in a rough region drag it down for every chain.
+        Measured on the tutorial problem at 1024 chains (3 seeds, final step
+        size): 0.29 at the default 0.05, 0.03 at 0.3, 0.015 at 0.5, 0.001 at
+        0.7, and down to 3e-7 at 1.0.  4096 chains behave the same.  It cannot
+        bias a posterior -- adaptation only sets the step size -- but it makes
+        a run slow, and ``warmup_report`` will name the stranded chains.  See
+        ``docs/anvil-chees-stuck-chains-measurement.md``.  The stretch move is
+        not affected this way.
+        """
         rng = np.random.default_rng(seed)
         return mx.array((spread * rng.standard_normal(
             (n_chains, self.transform.dim))).astype(np.float32))

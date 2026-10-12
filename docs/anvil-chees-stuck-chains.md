@@ -6,6 +6,16 @@ was seen, two competing explanations, and a short triage that would tell
 them apart. **anvil-gp needs nothing here**: its likelihood stayed finite
 and the healthy chains kept sampling, which is all anvil-gp promises.
 
+> **Correction (2026-10-11), after anvil's reply.** An earlier version of
+> this brief said 29 of 32 chains "recover". That counted a chain as
+> recovered once its likelihood was finite, which is not convergence. Measured
+> at the end of the run, **all 32** dead-started chains sit near −17,500 in
+> recorded log-probability against about −900 for the healthy half, a gap of
+> ~16,600; none is anywhere near the bulk. The three discussed here are only
+> the ones where compiled and uncompiled evaluation disagree enough to flip
+> the value to the failure value. See
+> [`anvil-chees-stuck-chains-reply.md`](anvil-chees-stuck-chains-reply.md).
+
 ## Why it matters
 
 Three ChEES chains are stuck, and **anvil's new lost-chain check cannot see
@@ -23,7 +33,9 @@ The setup: anvil-gp's SHO target, 600 points, 64 ChEES chains
 start at `u = 30` in every coordinate, inside the region where the GP
 likelihood cannot be evaluated in float32. The run is
 [`repro/anvilgp_chees_stuck_chains.py`](repro/anvilgp_chees_stuck_chains.py),
-which needs anvil-gp. 29 of the 32 dead-started chains recover. Three do not:
+which needs anvil-gp. 29 of the 32 dead-started chains reach a *finite*
+likelihood; **none converge** (see the correction below). Three are still at
+the failure value:
 
 | | value |
 |---|---|

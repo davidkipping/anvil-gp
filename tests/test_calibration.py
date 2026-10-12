@@ -178,6 +178,17 @@ def test_a_stuck_chain_does_not_poison_the_ensemble_under_chees():
     Half the ensemble starts at u = 15, which is ~15 sigma into the prior:
     log-probability around -9000 against -800 for a healthy chain, and a
     transform Jacobian gradient of ~6e8 against ~5e2.
+
+    **What this test does and does not establish.**  It establishes the
+    finiteness contract, which is all anvil-gp owes.  Its last assertion --
+    that the healthy half "moved" -- compares against ``u0`` and so is
+    satisfied in the first few warmup steps; it cannot see a sampler that
+    has stopped.  It was passing while the stuck half collapsed ChEES's
+    shared step size to 3e-10 and the healthy half moved EXACTLY zero across
+    the whole sampling phase (anvil's reply,
+    docs/anvil-chees-stuck-chains-reply.md; measured here 2026-10-11).
+    Whether the healthy half really keeps sampling is tested separately, in
+    `test_healthy_chains_keep_sampling_*` below.
     """
     anvil = pytest.importorskip("anvil")
     from anvilgp.anvil import make_target
@@ -218,9 +229,84 @@ def test_a_stuck_chain_does_not_poison_the_ensemble_under_chees():
         final = np.array(tgt.target.log_prob(mx.array(last)))
 
     assert np.all(np.isfinite(final)), "no chain may go non-finite"
+    # Weak on purpose, and labelled so: distance from the START, which warmup
+    # alone covers.  See the docstring and the tests below for the real check.
     moved = np.abs(last - u0).max(axis=1)
-    assert np.all(moved[half:] > 1e-3), (
-        "the healthy half must keep sampling regardless of the stuck half")
+    assert np.all(moved[half:] > 1e-3), "healthy chains never left u0"
+
+
+def _chees_sampling_health(n_stuck):
+    """ChEES with ``n_stuck`` of 16 chains started at u = 15 (finite, deep).
+
+    Returns ``(step_size, healthy_motion)``: the step size adaptation ended
+    on, and the median distance a *healthy* chain travels across the 20
+    **sampling** steps -- measured between draws, not from ``u0``, which is
+    what makes it able to see a stalled sampler.
+    """
+    anvil = pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+
+    rng = np.random.default_rng(5)
+    n = 400
+    t = np.sort(rng.uniform(0.0, BASELINE, n))
+    yerr = np.full(n, YERR)
+    cov = dense_covariance(ag.SHOTerm(), np.array([SIGMA, RHO, QUAL]), t,
+                           yerr, jitter=JIT)
+    y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
+    tgt = make_target(ag.SHOTerm(), t, y, yerr)
+    u0 = rng.standard_normal((16, tgt.transform.dim)).astype(np.float32) * 0.3
+    if n_stuck:
+        u0[:n_stuck] = 15.0
+    with mx.stream(mx.gpu):
+        res = anvil.run(anvil.ChEESHMC(tgt.target, max_leapfrog=16),
+                        tgt.target, mx.array(u0), n_warmup=60, n_samples=20,
+                        seed=3, progress=False)
+    chain = np.asarray(res.get_chain(), dtype=np.float64)   # sampling phase
+    healthy = slice(n_stuck, None)
+    motion = np.abs(chain[-1, healthy] - chain[0, healthy]).max(axis=1)
+    return float(np.array(res.final_params["step_size"])), float(np.median(motion))
+
+
+@pytest.mark.slow
+def test_healthy_chains_keep_sampling_when_no_chain_is_stuck():
+    """The control: the assertions below must PASS when nothing is stuck.
+
+    Measured: step size 2.4e-2, healthy chains travel 0.35 across the 20
+    sampling steps.  Without this, the xfail beside it could be failing for
+    any reason; with it, the failure is attributable to the stuck chains.
+    """
+    step, motion = _chees_sampling_health(n_stuck=0)
+    assert step > 1e-3, f"step size {step:.2e} with no chain stuck"
+    assert motion > 1e-2, f"chains travelled {motion:.2e} across sampling"
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(strict=True, reason=(
+    "ChEES adapts ONE step size from the harmonic mean of every chain's "
+    "acceptance, so a single finite chain stranded near anvil-gp's float32 "
+    "feasibility edge drags it down for all: measured 3.1e-10 with 8 of 16 "
+    "stranded, healthy chains moving exactly 0 across sampling (control: "
+    "2.4e-2 and 0.35).  anvil 0.7.0 excludes chains at the failure value "
+    "from the statistic but cannot exclude a finite straggler.  See "
+    "docs/anvil-chees-stuck-chains-reply.md.  strict: when this starts "
+    "passing, the edge has been fixed -- delete the xfail."))
+def test_healthy_chains_keep_sampling_when_some_chains_are_stuck():
+    """What a user of anvil-gp actually wants, which does not hold today.
+
+    The finiteness contract above is met.  This is the stronger property --
+    that stranded chains do not stop the rest of the run -- and anvil's reply
+    shows it fails for a reason that sits in anvil-gp's likelihood, not in
+    ChEES: a band near the float32 feasibility edge where only steps of
+    order 1e-7 are accepted, and where compiled and eager evaluation
+    disagree.  It cannot bias a posterior (adaptation only sets the step
+    size) but it can make a whole run slow.  The default initialisation is
+    NOT exposed; the exposure is graded by initial spread and is measured in
+    `docs/anvil-chees-stuck-chains-measurement.md`.  This test starts half
+    the chains at ``u = 15``, deep in the exposed range.
+    """
+    step, motion = _chees_sampling_health(n_stuck=8)
+    assert step > 1e-3, f"step size collapsed to {step:.2e}"
+    assert motion > 1e-2, f"healthy chains travelled {motion:.2e} across sampling"
 
 
 @pytest.mark.slow

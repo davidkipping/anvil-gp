@@ -48,6 +48,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/statistical-foundation.md](docs/statistical-foundation.md) | Why the state-space form is exact |
 | [docs/anvil-warmup-lost-walkers.md](docs/anvil-warmup-lost-walkers.md) | Brief for anvil: lost ensemble walkers pass its diagnostics (needed / recommended / optional changes), with an anvil-only reproducer |
 | [docs/anvil-chees-stuck-chains.md](docs/anvil-chees-stuck-chains.md) | Proposed investigation for anvil: three ChEES chains whose recorded log-probability disagrees with their position, invisible to the 0.6.0 lost-chain check |
+| [docs/anvil-chees-stuck-chains-measurement.md](docs/anvil-chees-stuck-chains-measurement.md) | The production measurement anvil asked for: ChEES step size against initial spread at 1024 and 4096 chains. The default is not exposed |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;

@@ -235,8 +235,10 @@ default. anvil-gp no longer needs it.
 While testing anvil-gp's fix, 3 of 32 ChEES chains started in the failure
 region stayed stuck at `|u| ~ 30.7`. This happened with both the constant and
 the sloped failure value, with identical divergence counts, so anvil-gp's
-change neither caused nor fixed it. The other 29 recovered, which is anvil's
-own boundary work in `f97f583`. The cause of the remaining three has not been
+change neither caused nor fixed it. The other 29 reached a finite likelihood -- **not** convergence: all 32 end
+about 16,600 log-units below the healthy half (corrected 2026-10-11 after
+anvil's reply; the earlier wording said "recovered" and credited anvil's
+boundary work in `f97f583`, which was never established). The cause of the remaining three has not been
 diagnosed. One possibility is that ChEES's rule "a divergence vetoes a
 proposal only from a finite state" treats a finite failure value as an
 ordinary state, but that is a hypothesis, so it is left out until it is
