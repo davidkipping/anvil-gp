@@ -59,25 +59,76 @@ class GPTarget:
     hypers: list
     param_map: object
 
-    def u0(self, n_chains: int, seed: int = 0, spread: float = 0.05):
-        """Initial states: near the reference point, which the parametrisation
-        has arranged to be a sensible guess (``v = 0`` means every scale
-        parameter sits at its data-derived host reference).
+    def u0(self, n_chains: int, seed: int = 0, spread: float = 0.05,
+           units: str = "u"):
+        """Initial states: a Gaussian ball around ``u = 0``, which the
+        parametrisation has arranged to be a sensible guess (every scale
+        parameter near its data-derived host reference).
 
-        **Keep ``spread`` small for ChEES-HMC.**  ChEES adapts one step size
-        for all chains from the harmonic mean of their acceptance, so a few
-        chains started in a rough region drag it down for every chain.
-        Measured on the tutorial problem at 1024 chains (3 seeds, final step
-        size): 0.29 at the default 0.05, 0.03 at 0.3, 0.015 at 0.5, 0.001 at
-        0.7, and down to 3e-7 at 1.0.  4096 chains behave the same.  It cannot
-        bias a posterior -- adaptation only sets the step size -- but it makes
-        a run slow, and ``warmup_report`` will name the stranded chains.  See
-        ``docs/anvil-chees-stuck-chains-measurement.md``.  The stretch move is
-        not affected this way.
+        ``units`` says what ``spread`` is measured in:
+
+        * ``"u"`` (default): the sampler's unconstrained coordinates.  One
+          unit means very different things for different parameters: for a
+          bounded parameter it is ``(hi - lo) / 4`` in model space at the
+          centre, which for the default jitter (bounds 1e-3 to 1e3 times the
+          error bar, prior sd 1) is **3.4 prior standard deviations**, about
+          a factor of 30 in jitter.
+        * ``"prior"``: prior standard deviations, per parameter, so a spread
+          of 1 is one prior sigma for every column.  The width comes from the
+          parameter's Gaussian prior, or for a bounded parameter without one
+          from its uniform prior, ``(hi - lo) / sqrt(12)``, and is converted
+          to ``u`` with the transform's slope at ``u = 0``.  Columns with
+          neither (the mean model's, an unbounded flat parameter) keep
+          ``spread`` in ``u``.  This is the one to use for an overdispersed
+          start, e.g. for R-hat.
+
+        The same ``seed`` draws the same standard normals in both units.
+
+        **For ChEES-HMC, a wide start needs a long warmup, and a start far
+        outside the prior can trap the run.**  ChEES adapts one step size for
+        all chains from the harmonic mean of their acceptance, so the
+        slowest chain sets it for everyone.  Measured on the tutorial problem
+        at 1024 chains, 300 warmup: the final step size is 0.29 at the
+        default ``spread=0.05``; 0.03 at ``spread=0.3``; 3e-3 at
+        ``spread=1, units="prior"``, with R-hat 2 to 5.  That run is slow,
+        not stuck: with 3000 warmup it reaches step 0.09 to 0.26 and R-hat
+        1.003.  ``spread=1`` in ``u`` can be stuck: in one of two seeds a
+        single chain wandered to an amplitude 1e13 times the error bar,
+        where float32 is off by 2 log-units and only steps of ~1e-7 are
+        accepted, and the step size stayed at 3e-7 through 3000 warmup with
+        78 other chains frozen behind it.  None of this can bias a posterior
+        -- adaptation only sets the step size -- and ``warmup_report`` names
+        the stranded chains.  See
+        ``docs/anvil-chees-stuck-chains-measurement.md``.  The stretch move
+        is not affected this way.
         """
+        if units not in ("u", "prior"):
+            raise ValueError(f"units must be 'u' or 'prior', got {units!r}")
         rng = np.random.default_rng(seed)
-        return mx.array((spread * rng.standard_normal(
-            (n_chains, self.transform.dim))).astype(np.float32))
+        z = rng.standard_normal((n_chains, self.transform.dim))
+        scale = spread if units == "u" else spread * self._prior_sd_in_u()
+        return mx.array((scale * z).astype(np.float32))
+
+    def _prior_sd_in_u(self) -> np.ndarray:
+        """Each column's prior standard deviation, mapped to ``u`` at
+        ``u = 0``; 1.0 where there is no prior width to use."""
+        specs = self.transform.specs
+        n_mean = len(specs) - len(self.hypers)
+        out = np.ones(len(specs))
+        for j, h in enumerate(self.hypers):
+            s = specs[n_mean + j]
+            bounded = np.isfinite(s.lo) and np.isfinite(s.hi)
+            if h.prior is not None:
+                sd_v = float(h.prior[2])
+            elif bounded:
+                sd_v = (s.hi - s.lo) / np.sqrt(12.0)
+            else:
+                continue
+            # dv/du at u = 0: (hi - lo)/4 for the sigmoid map, scale for the
+            # affine and the half-bounded exp maps.
+            out[n_mean + j] = sd_v / ((s.hi - s.lo) / 4.0 if bounded
+                                      else s.scale)
+        return out
 
     def natural(self, v_model: np.ndarray) -> dict:
         """Model-space draws -> natural units, for reporting.

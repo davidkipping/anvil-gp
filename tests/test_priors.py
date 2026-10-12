@@ -236,3 +236,51 @@ def test_zero_baseline_is_refused():
     yerr = np.full(5, 0.1)
     with pytest.raises(ValueError, match="zero time"):
         priors.default_hypers(ag.SHOTerm(), t, y, yerr)
+
+
+def test_u0_spread_in_u_is_unchanged():
+    """The default draws exactly what it always drew: spread * N(0, 1)."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    gt = make_target(ag.SHOTerm(), T, Y, YERR)
+    z = np.random.default_rng(7).standard_normal((64, gt.transform.dim))
+    np.testing.assert_array_equal(np.array(gt.u0(64, seed=7, spread=0.3)),
+                                  (0.3 * z).astype(np.float32))
+
+
+def test_u0_prior_units_put_one_prior_sigma_in_every_column():
+    """With units='prior', spread 1 maps to one prior standard deviation in
+    model space for every column, whatever its transform.  Checked through
+    the transform itself: a small step along each column, scaled back up,
+    must land at the prior width."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    gt = make_target(ag.SHOTerm(), T, Y, YERR)
+    eps = 1e-4
+    u = np.array(gt.u0(1, seed=0, spread=eps, units="prior"), dtype=np.float64)
+    z = np.random.default_rng(0).standard_normal(gt.transform.dim)
+    v = gt.transform.model_np(u[0]) - gt.transform.model_np(np.zeros_like(u[0]))
+    sd_v = v / (eps * z)
+    expected = []
+    for h, s in zip(gt.hypers, gt.transform.specs):
+        expected.append(h.prior[2] if h.prior is not None
+                        else (s.hi - s.lo) / math.sqrt(12.0))
+    np.testing.assert_allclose(sd_v, expected, rtol=1e-3)
+    # The default jitter is the column the option exists for: one unit of u
+    # is 3.4 prior sigmas there, so spread 1 in u is far outside the prior.
+    j = gt.names.index("log_jitter")
+    assert 0.28 < gt._prior_sd_in_u()[j] < 0.30
+
+
+def test_u0_prior_units_leave_mean_columns_in_u():
+    """The mean model's priors are its own business, so its columns keep
+    spread in u."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    gt = make_target(ag.SHOTerm(), T, Y, YERR,
+                     mean_fn=lambda v, x: mx.broadcast_to(v[:, :1], (v.shape[0], x.shape[-1])),
+                     x_mean=T, mean_specs=[priors.SpecHint("m0", scale=1.0)])
+    sd = gt._prior_sd_in_u()
+    assert sd[0] == 1.0 and len(sd) == gt.transform.dim
+    with pytest.raises(ValueError, match="units"):
+        gt.u0(4, units="sigma")

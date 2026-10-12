@@ -13,6 +13,12 @@ gradually rather than suddenly.** The step size is a smooth function of how
 widely the chains start, from 0.29 at the default down to a collapse of
 2.9e-7 at the wide end. Chain count (1024 or 4096) makes little difference.
 
+**Later the same day:** the collapse at the wide end is one chain reaching
+the float32 edge through the unbounded GP amplitude, and it is a trap: 3000
+warmup steps do not clear it. The milder cells are slow warmup from a wide
+start, which a longer warmup clears. See
+[What strands the chains](#what-strands-the-chains-added-later-the-same-day).
+
 ## Setup
 
 The tutorial problem: SHO kernel (truth 1.2, 5.0, 4.0), 2000 points at 0.02
@@ -91,22 +97,78 @@ and a fair reading is that a one-in-4096 straggler at a robust sigma of 1.3
 is flagged correctly as unusual but described too confidently. This is an
 observation for anvil to weigh, not a request.
 
+## What strands the chains (added later the same day)
+
+A first version of this section said there was nothing to fix. Taking the
+collapsed run apart (1024 chains, `spread=1.0`, seed 1, final step 2.9e-7,
+79 lost) found two separate things. Scripts were not kept; the numbers are
+from the session.
+
+**Most of the lost chains are slow, not broken.** 78 of the 79 sit at
+ordinary positions (every `|u|` under 3), mostly with the jitter 7 to 71 in
+natural units, 45 to 470 times the error bar: they mostly *started* there
+(median starting jitter coordinate 1.62 against −0.06 for the rest). There
+the likelihood is correct (float32 matches float64 to 1.3e-7 relative;
+compiled and eager agree; point-to-point noise as in the bulk) but about
+nine times steeper than the bulk in the run's own preconditioning. Over 8
+leapfrog steps with the run's mass matrix, these 78 accept at steps of 1e-4
+to 1e-2. They would come in on their own; at 3e-7 they cannot move.
+
+**One chain causes the collapse, and it is at the float32 edge.** Chain 288
+drifted during warmup to `u = (19.3, 53.7, 19.8, −1.0)`: the GP amplitude
+2.5e13 times the error bar, `rho` and `Q` pinned at their upper bounds
+(their sigmoids saturated). There the float32 log-likelihood is off from
+float64 by **2.2 log-units**, and the chain accepts only steps of about
+1e-7. The harmonic mean follows it, which freezes the other 78. A second
+chain (170: amplitude 8.8e3 times the error bar, jitter at its floor, `rho`
+and `Q` at their bounds, float32 off by 1.2) produced 75 of the run's 100
+divergences without being counted as lost.
+
+**It is a trap, not just slow.** The same seed with 3000 warmup ends at step
+3.3e-7 with the same 79 chains lost and 116 divergences. A second seed with
+3000 warmup was slowly recovering (step 1.5e-3, 26 lost, R-hat 1.51).
+
+**A start inside the prior is only slow.** `GPTarget.u0` now takes
+`units="prior"`, which counts `spread` in prior standard deviations per
+column. In `u`, one unit is 3.4 prior sigmas for the default jitter, so
+`spread=1.0` in `u` was a start far outside the prior. At 1024 chains:
+
+| start | warmup | final step | lost | max R-hat | min bulk ESS |
+|---|---:|---|---:|---|---:|
+| `spread=1, units="prior"` (3 seeds) | 300 | 3.0e-3 to 4.0e-3 | 15 to 38 | 2.0 to 4.8 | 1076 to 1402 |
+| `spread=2, units="prior"` (3 seeds) | 300 | 4.6e-5 to 9.8e-5 | 27 to 46 | 78 to 106 | 1028 |
+| `spread=0.3` (3 seeds) | 300 | 3.0e-2 to 4.0e-2 | 0 to 1 | 1.07 to 1.13 | 5602 to 9582 |
+| `spread=1, units="prior"` (2 seeds) | 1500 | 6.5e-3, 2.2e-2 | 7, 0 | 1.50, 1.03 | 1905, 29552 |
+| `spread=1, units="prior"` (2 seeds) | 3000 | 8.9e-2, 2.6e-1 | 0, 0 | 1.003, 1.002 | 165589, 207189 |
+| `spread=0.3` (2 seeds) | 1500 | 3.2e-1, 3.2e-1 | 0, 0 | 1.003, 1.003 | 184347, 185999 |
+| `spread=1` (2 seeds) | 3000 | 3.3e-7, 1.5e-3 | 79, 26 | 111, 1.51 | 1028, 1888 |
+
+At `spread=1, units="prior"` and 300 warmup, all 31 lost chains of seed 1
+climb by gradient ascent to the same maximum as the healthy chains: there is
+no secondary mode. They sit out along the long-timescale direction (`rho`
+up to the T/2 bound, the amplitude 0.03 to 97) and are still travelling.
+
 ## What this means on our side
 
-1. **No engineering change now.** The default is not exposed, and the exposure
-   elsewhere is graded, visible (tiny steps, near-1.00 acceptance, lost
-   chains, a `warmup_report` that names them) and cannot bias a posterior.
-   anvil's suggested root fix, a sharper failure boundary at the feasibility
-   edge, remains the option if wide initialisation ever matters.
-2. **Say so where users will see it.** `GPTarget.u0`'s docstring now states
-   that the default spread is the tested one, and gives this table's
-   headline: a spread of 0.3 or more costs step size, 0.7 or more can make
-   the run unproductive.
-3. **Our own tests that use `spread=0.3`** (the ChEES kernel test and the
-   geometry tests) operate, on this problem, with a step size about ten
-   times below the default; their own problems were not measured. They still pass their assertions, but they are not exercising
-   the default regime, and a reader should know that.
-4. **The strict expected-failure test stays.** It fails today because the
-   stuck chains in it start at `u = 15`, deep in the exposure range
-   (equivalent to the wide end of this table), and will pass if the edge is
-   ever fixed.
+1. **The likelihood is right wherever float32 is in range.** Nothing to fix
+   for the slow chains: they are a warmup-length matter, and the table above
+   shows a 3000-step warmup clears a one-prior-sigma start.
+2. **The trap is ours to fix, at the source.** It needs one chain to reach a
+   region where float32 is off by order one log-unit, here through an
+   amplitude 1e13 times the error bar, about 20 prior sigmas out on an
+   *unbounded* `log_gp_sigma`. anvil's suggested fix still stands: make the
+   failure boundary sharp, so such a chain gets the failure value, which
+   anvil 0.7.0 already leaves out of the step-size statistic and our sloped
+   sentinel pulls back. Not done yet: it wants the float32 feasibility map
+   (owed since M3) to place the boundary, and a check that it clears the
+   trapped seed.
+3. **`GPTarget.u0` documents all this,** and `units="prior"` makes an
+   overdispersed start mean what it says.
+4. **Our own tests that use `spread=0.3`** (the ChEES kernel test and the
+   geometry tests) run 300 or fewer warmup steps from a start where, on this
+   problem, a 300-step warmup ends with R-hat 1.07 to 1.13. They still pass
+   their assertions, but they are not exercising converged sampling, and a
+   reader should know that.
+5. **The strict expected-failure test stays.** Its stuck chains start at
+   `u = 15`, at the float32 edge, the mechanism of point 2. It will pass when
+   that is fixed.
