@@ -49,7 +49,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/anvil-warmup-lost-walkers.md](docs/anvil-warmup-lost-walkers.md) | Brief for anvil: lost ensemble walkers pass its diagnostics (needed / recommended / optional changes), with an anvil-only reproducer |
 | [docs/anvil-chees-stuck-chains.md](docs/anvil-chees-stuck-chains.md) | Proposed investigation for anvil: three ChEES chains whose recorded log-probability disagrees with their position, invisible to the 0.6.0 lost-chain check |
 | [docs/anvil-chees-stuck-chains-measurement.md](docs/anvil-chees-stuck-chains-measurement.md) | The production measurement anvil asked for: ChEES step size against initial spread at 1024 and 4096 chains. The default is not exposed; the collapse at wide spread is one chain reaching the float32 edge through the unbounded GP amplitude, now refused by `GPPolicy.kappa_max` |
-| [docs/anvil-chees-production-note.md](docs/anvil-chees-production-note.md) | Draft note to anvil answering its production question: the default is not exposed, and the collapse is one chain at our float32 edge, fixed on our side by `GPPolicy.kappa_max` |
+| [docs/anvil-chees-production-note.md](docs/anvil-chees-production-note.md) | Note to anvil answering its production question: the default is not exposed, and the collapse is one chain at our float32 edge, fixed on our side by `GPPolicy.kappa_max` |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
