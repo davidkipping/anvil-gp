@@ -252,8 +252,12 @@ def test_one_failed_chain_does_not_zero_its_neighbours():
                           KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
     gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
                    GPPolicy(block=64))
-    u = mx.array(np.array([[30.0, 30.0, 30.0], [0.0, 0.0, 0.0]],
-                          dtype=np.float32))
+    # The healthy lane sits at sigma = 1e-3 (10 x yerr), rho = 1, Q = 3.
+    # It used to be u = 0 (sigma/yerr = 1e8, rho = 1e6), which evaluated to
+    # something finite but is far past GPPolicy.kappa_max and now refused.
+    healthy = np.log([1e-3 / 1e4, 1.0 / 1e6, 3.0 / 1e3])
+    u = mx.array(np.array([[30.0, 30.0, 30.0], healthy], dtype=np.float32))
+    assert float(np.array(gp.kappa(u))[1]) < 1e3
     with mx.stream(mx.gpu):
         out = gp(u)
         _, grad = mx.vjp(gp, [u], [mx.ones((2,), dtype=mx.float32)])

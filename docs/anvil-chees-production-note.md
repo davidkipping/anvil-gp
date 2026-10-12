@@ -27,13 +27,27 @@ Measured 2026-10-11 on anvil 0.7.0, MLX 0.32.2, M2 Max. Full numbers in
   that were behind all climb to the same maximum as the rest: no secondary
   mode.
 
-## What we are doing
+## What we did
 
-The fix is ours, as you said: make the failure boundary sharp, so a chain
-that reaches the float32-inaccurate region gets our failure value, which
-0.7.0 already leaves out of the step-size statistic. That turns this case
-into one you already handle, so **we are not asking for the trimmed
-statistic**. We will tell you if the fix does not clear the trapped seed.
+The fix was ours, as you said: a sharp failure boundary. We mapped where
+float32 goes wrong and found it is set by one number, `kappa`, the GP's
+stationary variance over the variance one step adds, which measures how
+nearly deterministic the state is between samples. Past `kappa ~ 1e6` the
+float32 likelihood is off by a log-unit or more, and past ~3e7 it fails.
+`GPPolicy.kappa_max` (default 1e6) now gives chains there our failure value,
+which 0.7.0 already leaves out of the step-size statistic. On the trapped
+seed the final step goes from 2.9e-7 to 4.7e-4 (300 warmup) and from 3.3e-7
+to 1.6e-3 (3000 warmup), and our former strict-xfail test (8 of 16 chains
+stuck) goes from 3.1e-10 to 1.6e-2. So **we are not asking for the trimmed
+statistic.**
+
+One thing you may see: a start far outside the prior still converges slowly
+under ChEES, because the chains still travelling in are finite stragglers on
+a smooth slope and the harmonic mean waits for them. That is the design
+working. A start of one prior sigma converges with 3000 warmup steps (R-hat
+1.003); `u0(spread=1.0)`, where one unit is 3.4 prior sigmas for our jitter, still
+had R-hat 1.4 to 3.7 after 3000 with the guard on. We document the second as
+too wide a start; it is not a request.
 
 ## Two observations, for you to weigh
 

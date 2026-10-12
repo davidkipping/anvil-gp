@@ -731,6 +731,11 @@ def test_a_healthy_value_never_comes_with_a_dead_gradient():
     rounds to a negative ulp along ``h`` when ``h.h/r ~ 1e8`` and an
     undamped propagator grew that ulp until the replay overflowed.  The
     Joseph-form update fixed it.  Fails with the plain update restored.
+
+    Run with ``kappa_max=None``: this point's kappa is far past the default
+    guard, which now refuses it before the kernel runs (and "right to
+    2e-4" relative is ~0.4 log-units here, as the kappa map predicts).  The
+    test pins the kernel's own behaviour, which the guard must not hide.
     """
     from anvilgp.likelihood import GPLogLike, ParamMap, a64
     from anvilgp.oracle import sample_ssm
@@ -742,9 +747,11 @@ def test_a_healthy_value_never_comes_with_a_dead_gradient():
          + rng.standard_normal(n) * yerr)
     pm = ParamMap.log([1e4 * yerr, 1000 * dt, 500.0])
     gp = GPLogLike(None, t, None, y, np.full(n, yerr), ag.SHOTerm(), pm,
-                   GPPolicy(block=1024, hi_block=1024, metal=True))
+                   GPPolicy(block=1024, hi_block=1024, metal=True,
+                             kappa_max=None))
     assert gp.metal_eligible()[0]
     u = mx.zeros((1, 3), dtype=mx.float32)
+    assert float(np.array(gp.kappa(u))[0]) > 1e6
     with mx.stream(mx.gpu):
         val = gp(u)
         _, grad = mx.vjp(gp, [u], [mx.ones((1,), dtype=mx.float32)])

@@ -112,9 +112,81 @@ Requirements, all implemented:
   sentinel, so no posterior moves -- only recovery from the infeasible
   region changes.
 
-Still owed at M3: the *map* of the float32 feasibility boundary over
-`(sigma_GP/yerr, timescale/cadence, Q)`, and the documented ParamSpec bound
-guidance derived from it.
+* a chain past the float32 feasibility boundary is **refused** before it is
+  evaluated, and gets the same failure value (`GPPolicy.kappa_max`, next
+  section).
+
+## 6. The feasibility map, and the kappa guard
+
+Measured 2026-10-12 with `benchmarks/kappa_map.py` (M2 Max, MLX 0.32.2, SHO
+kernel, error = |float32 − float64 `.hi`| in log-units). Owed since M3.
+
+**One number predicts the error.** Not amplitude, not timescale, but
+
+    kappa = k(0) / (h Q h^T + r)
+
+the process variance over the variance one step adds: the GP's own process
+noise over one median cadence, plus the white noise `r` (median `yerr^2`
+plus jitter). It measures how nearly deterministic the state is between
+samples, which float32 (`eps ~ 1.2e-7`, `1/eps ~ 8e6`) cannot resolve once
+`kappa * eps` nears 1. Amplitude alone does not do it: at `sigma/yerr = 1e14`
+with a timescale of two cadences the error is 0.002, because each step adds
+a lot of fresh variance; at `sigma/yerr = 100` with `rho/dt = 1000` and
+`Q = 30` it is 0.2, because each step adds almost none.
+`GPLogLike.kappa(v)` computes it per chain.
+
+**Fixed data, parameters anywhere** (where a wandering chain goes; the
+tutorial data, max error over 2125 points spanning `sigma/yerr` 1e-2 to
+1e14, `rho/dt` 2 to 1000, `Q` 0.05 to 500, jitter 1e-3 to 1e3 times `yerr`):
+
+| kappa | fused kernel, N = 2e3 / 2e4 / 1e5 | MLX path, N = 2e3 / 2e4 / 1e5 |
+|---|---|---|
+| 1e4 – 1e6 | ≤ 0.009 / 0.023 / 0.096 | ≤ 0.014 / 0.11 / 0.54 |
+| 1e6 – 1e7 | ≤ 0.17 / 0.087 / 0.24 | ≤ 0.11 / 0.65 / 3.3 |
+| 1e7 – 3e7 | ≤ 0.75 / 0.71 / 0.84 | fails |
+| > 3e7 | fails | fails |
+
+The boundary does not move with N; only the low-kappa floor does, and that
+is the summation error of the section above.
+
+**Data drawn at the parameters** (where a posterior lives; N = 4000, one
+draw each, 45 settings): harder, and the scatter between draws at the same
+kappa is a factor of ten. Fused kernel: ≤ 0.08 below kappa 1e4; 0.008 to
+0.2 from 1e4 to 1e5; 0.008 to 0.8 from 1e5 to 1e6; 0.6 to 14 near 3e6; 1.9
+to 19 near 2e7; 322 or a failure above 6e7. The MLX path is worse
+throughout: up to 1.9 near kappa 1e4, 0.03 to 3 from 2e4 to 8e5, and 7 to
+499 from about 1e6.
+
+**The guard.** `GPPolicy.kappa_max` (default `1e6`, `None` to disable)
+refuses any chain past it: the likelihood returns the failure value of
+section 5 with a zero gradient, without trusting a float32 evaluation that
+is wrong there by a log-unit or more. Pinned in `tests/test_contract.py`:
+everywhere at or below `kappa_max` the value is bit-identical to the
+unguarded one, and so is the fused kernel's gradient (the MLX path's
+gradient is not bit-reproducible run to run, guarded or not, and agrees to
+that noise, ~1e-5). `make_target`'s defaults put the tutorial posterior at
+kappa 64 to 124.
+
+**Why it matters for sampling.** A chain that reaches kappa ~1e9 sees a
+density that is rough by a log-unit between neighbouring points, so it
+accepts only steps smaller than float32's resolution of `u`, which do not
+move it at all; acceptance then reads 1.00. ChEES adapts one step size from
+the harmonic mean of all chains' acceptance, so it follows that chain down.
+Measured at 1024 chains, `u0(spread=1.0)` (docs/anvil-chees-stuck-chains-measurement.md):
+one chain at kappa 3e9 held the step size at 2.9e-7 through 3000 warmup
+steps, with 78 ordinary chains frozen behind it. With the guard the same
+seed ends warmup at 4.7e-4 (300 steps) and 1.6e-3 (3000 steps), and none of
+the chains still behind is a refused one: all have kappa below 6e3. Those
+are a wide start that needs a longer warmup, not a precision problem.
+
+**Limits.** Measured on the SHO kernel at a regular cadence; the other terms
+use the same formula and are tested for it, not mapped. `kappa` is taken at
+the *median* cadence, so a dataset with much shorter gaps can be worse
+locally. A posterior whose bulk sits past `kappa_max` cannot be sampled in
+float32 at all: every chain is refused. `GPLogLike` warns at construction
+when the data's rms over the median error bar exceeds `sqrt(kappa_max)`,
+since only then can a posterior get there (`kappa <= sigma^2 / r` for any
+timescale).
 
 ## Error growth: measured
 
@@ -146,9 +218,9 @@ the absolute error follows it. Consequences:
   10–300 with a timescale far above the cadence. Across that whole range the
   worst relative error measured here is 4.3e-7, with no sign of the
   innovation-variance cancellation. **The cancellation-free process noise
-  appears to have removed the hazard.** This is one slice, not the map; M3
-  still owes the full `(sigma/yerr, timescale/cadence, Q)` survey and the
-  ParamSpec bound guidance derived from it.
+  appears to have removed the hazard.** This is one slice, not the map. The
+  map (section 6) found that the hazard is set by `kappa`, not by
+  `sigma/yerr` on its own.
 
 ## Where the tiling goes
 

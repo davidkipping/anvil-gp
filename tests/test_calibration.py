@@ -271,8 +271,8 @@ def _chees_sampling_health(n_stuck):
 def test_healthy_chains_keep_sampling_when_no_chain_is_stuck():
     """The control: the assertions below must PASS when nothing is stuck.
 
-    Measured: step size 2.4e-2, healthy chains travel 0.35 across the 20
-    sampling steps.  Without this, the xfail beside it could be failing for
+    Measured 2026-10-12: step size 2.4e-2, healthy chains travel 0.48 across
+    the 20 sampling steps, the same with ``kappa_max=None``.  Without this, the xfail beside it could be failing for
     any reason; with it, the failure is attributable to the stuck chains.
     """
     step, motion = _chees_sampling_health(n_stuck=0)
@@ -281,28 +281,20 @@ def test_healthy_chains_keep_sampling_when_no_chain_is_stuck():
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=(
-    "ChEES adapts ONE step size from the harmonic mean of every chain's "
-    "acceptance, so a single finite chain stranded near anvil-gp's float32 "
-    "feasibility edge drags it down for all: measured 3.1e-10 with 8 of 16 "
-    "stranded, healthy chains moving exactly 0 across sampling (control: "
-    "2.4e-2 and 0.35).  anvil 0.7.0 excludes chains at the failure value "
-    "from the statistic but cannot exclude a finite straggler.  See "
-    "docs/anvil-chees-stuck-chains-reply.md.  strict: when this starts "
-    "passing, the edge has been fixed -- delete the xfail."))
 def test_healthy_chains_keep_sampling_when_some_chains_are_stuck():
-    """What a user of anvil-gp actually wants, which does not hold today.
+    """Stranded chains must not stop the rest of the run.
 
-    The finiteness contract above is met.  This is the stronger property --
-    that stranded chains do not stop the rest of the run -- and anvil's reply
-    shows it fails for a reason that sits in anvil-gp's likelihood, not in
-    ChEES: a band near the float32 feasibility edge where only steps of
-    order 1e-7 are accepted, and where compiled and eager evaluation
-    disagree.  It cannot bias a posterior (adaptation only sets the step
-    size) but it can make a whole run slow.  The default initialisation is
-    NOT exposed; the exposure is graded by initial spread and is measured in
-    `docs/anvil-chees-stuck-chains-measurement.md`.  This test starts half
-    the chains at ``u = 15``, deep in the exposed range.
+    ChEES adapts ONE step size from the harmonic mean of every chain's
+    acceptance.  Before ``GPPolicy.kappa_max``, the 8 chains started at
+    ``u = 15`` sat finite but past float32's feasibility boundary, where the
+    density is rough by a log-unit between neighbouring points; they
+    accepted only steps too small to move them, and the step size followed
+    them to 3.1e-10, with the healthy chains moving exactly 0 across
+    sampling.  This was a strict xfail until the guard landed.  With it
+    those chains are refused (failure value, which anvil 0.7.0 leaves out
+    of the statistic): measured step 1.6e-2 and healthy motion 0.21, against
+    the control's 2.4e-2 and 0.48.  Rerun with ``kappa_max=None`` it is back
+    to 3.1e-10 and 0.0.  See docs/float32.md, section 6.
     """
     step, motion = _chees_sampling_health(n_stuck=8)
     assert step > 1e-3, f"step size collapsed to {step:.2e}"

@@ -48,8 +48,8 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/statistical-foundation.md](docs/statistical-foundation.md) | Why the state-space form is exact |
 | [docs/anvil-warmup-lost-walkers.md](docs/anvil-warmup-lost-walkers.md) | Brief for anvil: lost ensemble walkers pass its diagnostics (needed / recommended / optional changes), with an anvil-only reproducer |
 | [docs/anvil-chees-stuck-chains.md](docs/anvil-chees-stuck-chains.md) | Proposed investigation for anvil: three ChEES chains whose recorded log-probability disagrees with their position, invisible to the 0.6.0 lost-chain check |
-| [docs/anvil-chees-stuck-chains-measurement.md](docs/anvil-chees-stuck-chains-measurement.md) | The production measurement anvil asked for: ChEES step size against initial spread at 1024 and 4096 chains. The default is not exposed; the collapse at wide spread is one chain reaching the float32 edge through the unbounded GP amplitude |
-| [docs/anvil-chees-production-note.md](docs/anvil-chees-production-note.md) | Draft note to anvil answering its production question: the default is not exposed, and the collapse is one chain at our float32 edge, ours to fix |
+| [docs/anvil-chees-stuck-chains-measurement.md](docs/anvil-chees-stuck-chains-measurement.md) | The production measurement anvil asked for: ChEES step size against initial spread at 1024 and 4096 chains. The default is not exposed; the collapse at wide spread is one chain reaching the float32 edge through the unbounded GP amplitude, now refused by `GPPolicy.kappa_max` |
+| [docs/anvil-chees-production-note.md](docs/anvil-chees-production-note.md) | Draft note to anvil answering its production question: the default is not exposed, and the collapse is one chain at our float32 edge, fixed on our side by `GPPolicy.kappa_max` |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
@@ -212,8 +212,14 @@ One notable negative result: the brief predicted a float32-infeasible corner
 at `sigma_GP/yerr` of 10–300 with a timescale far above the cadence. Across
 that whole range the worst relative error measured is 4.3e-7, with no sign of
 the innovation-variance cancellation — the cancellation-free process noise
-appears to have removed the hazard. That is one slice, not the map; M3 still
-owes the full feasibility survey.
+appears to have removed the hazard. That was one slice, not the map. The map
+(2026-10-12, [docs/float32.md](docs/float32.md) section 6,
+`benchmarks/kappa_map.py`) found the hazard is set by one number,
+`kappa = k(0) / (h Q h^T + r)`, how nearly deterministic the GP is between
+samples. Past `kappa ~ 1e6` float32 is off by a log-unit or more where a
+posterior lives, and past ~3e7 it fails. `GPPolicy.kappa_max` (default 1e6)
+now refuses chains there; one such chain used to collapse ChEES's step size
+for every chain.
 
 ## Performance: the fused Metal kernel
 
@@ -768,9 +774,11 @@ Three more are worked around and pinned as regression tests
   (it is 255-376x against a single-core loop). `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
-  model. Still owed: m > 4 and the float32
-  feasibility map (per-instrument jitter landed in-kernel in M5 stage 2); the thread-layout work landed with M4's stage B. The feasibility map now has evidence that
-  it matters: amplitude and correlation length are **not separable**. At
+  model. Still owed: m > 4 (per-instrument jitter landed in-kernel in M5
+  stage 2; the thread-layout work landed with M4's stage B; the float32
+  feasibility map landed 2026-10-12, see docs/float32.md section 6). The map
+  explains why amplitude and correlation length are **not separable**: the
+  error is set by their combination `kappa`. At
   `sigma/yerr = 100` *and* `rho/dt = 1000` the MLX path is off by 1.5
   log-units where either axis alone stays under 0.2, while the kernel holds
   0.02. See `test_the_joint_high_amplitude_long_correlation_corner`.

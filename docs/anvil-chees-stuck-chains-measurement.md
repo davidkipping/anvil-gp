@@ -153,15 +153,17 @@ up to the T/2 bound, the amplitude 0.03 to 97) and are still travelling.
 1. **The likelihood is right wherever float32 is in range.** Nothing to fix
    for the slow chains: they are a warmup-length matter, and the table above
    shows a 3000-step warmup clears a one-prior-sigma start.
-2. **The trap is ours to fix, at the source.** It needs one chain to reach a
-   region where float32 is off by order one log-unit, here through an
-   amplitude 1e13 times the error bar, about 20 prior sigmas out on an
-   *unbounded* `log_gp_sigma`. anvil's suggested fix still stands: make the
-   failure boundary sharp, so such a chain gets the failure value, which
-   anvil 0.7.0 already leaves out of the step-size statistic and our sloped
-   sentinel pulls back. Not done yet: it wants the float32 feasibility map
-   (owed since M3) to place the boundary, and a check that it clears the
-   trapped seed.
+2. **The trap was ours, and is fixed at the source (2026-10-12).** It needs
+   one chain to reach a region where float32 is off by order one log-unit,
+   here through an amplitude 1e13 times the error bar, about 20 prior sigmas
+   out on an *unbounded* `log_gp_sigma`. The float32 feasibility map
+   (docs/float32.md, section 6) showed the error is set by one number,
+   `kappa`, and `GPPolicy.kappa_max` (default 1e6) now gives chains past it
+   the failure value, which anvil 0.7.0 leaves out of the step-size
+   statistic. The trapped seed: final step 4.7e-4 at 300 warmup (was
+   2.9e-7) and 1.6e-3 at 3000 (was 3.3e-7), divergences 0 to 11 (were 100
+   to 116). Its remaining lost chains all have kappa below 6e3: a wide start
+   still travelling in, not a precision problem.
 3. **`GPTarget.u0` documents all this,** and `units="prior"` makes an
    overdispersed start mean what it says.
 4. **Our own tests that use `spread=0.3`** (the ChEES kernel test and the
@@ -169,6 +171,6 @@ up to the T/2 bound, the amplitude 0.03 to 97) and are still travelling.
    problem, a 300-step warmup ends with R-hat 1.07 to 1.13. They still pass
    their assertions, but they are not exercising converged sampling, and a
    reader should know that.
-5. **The strict expected-failure test stays.** Its stuck chains start at
-   `u = 15`, at the float32 edge, the mechanism of point 2. It will pass when
-   that is fixed.
+5. **The strict expected-failure test now passes** and is an ordinary test:
+   with the guard, 8 of 16 chains stuck at `u = 15` leave the step size at
+   1.6e-2 (control 2.4e-2); with `kappa_max=None` it is back to 3.1e-10.

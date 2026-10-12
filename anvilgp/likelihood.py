@@ -136,8 +136,21 @@ class GPPolicy:
     #: Values >= 1 are refused: they would change the value, and the
     #: kernel's backward does not differentiate the floor (stage R).
     s_floor_rel: float = 1e-6
+    #: refuse a chain whose conditioning number :meth:`GPLogLike.kappa`
+    #: exceeds this, returning the failure value instead of a float32
+    #: evaluation; ``None`` evaluates everywhere.  Above ~1e6 float32 is
+    #: off by about a log-unit or more where a posterior actually lives
+    #: (data drawn at those parameters), and above ~3e7 the evaluation
+    #: fails outright.  Chains that wander there are what collapse ChEES's
+    #: shared step size: the error makes the density rough enough that only
+    #: steps below float32's resolution of ``u`` are "accepted".  See
+    #: docs/float32.md.
+    kappa_max: float | None = 1e6
 
     def __post_init__(self):
+        if self.kappa_max is not None and not self.kappa_max > 0:
+            raise ValueError(
+                f"kappa_max = {self.kappa_max!r} must be positive or None")
         if self.metal_block is not None and int(self.metal_block) < 1:
             raise ValueError(
                 f"metal_block = {self.metal_block!r} must be None or >= 1")
@@ -504,6 +517,7 @@ class GPLogLike:
                     f"{len(param_map.offset)} offset)")
         self._inst32 = (None if inst is None
                         else mx.array(np.asarray(inst, dtype=np.int32)))
+        self._init_kappa(inst)
 
         #: float64 host constant ``-1/2 sum log(2 pi yerr^2)``.
         #: Deliberately *outside* the graph: at N = 1e5 and 500 ppm it is
@@ -1058,16 +1072,99 @@ class GPLogLike:
                      mx.full(g.shape, _PULL_CLIP, dtype=g.dtype))
         return mx.stop_gradient(mx.log1p(mx.mean(g * g, axis=1)))
 
+    def _init_kappa(self, inst) -> None:
+        """Host constants for :meth:`kappa`, and a warning if the data alone
+        say a posterior could sit past ``policy.kappa_max``."""
+        lags = self._dt64[1:]
+        lags = lags[lags > 0]
+        self._kappa_dt = float(np.median(lags)) if lags.size else None
+        n_jit = len(self.param_map.jitter)
+        if n_jit > 1:
+            lab = np.asarray(inst)
+            r = [float(np.median(self._yerr64[lab == i] ** 2))
+                 if np.any(lab == i) else np.inf for i in range(n_jit)]
+        else:
+            r = [float(np.median(self._yerr64 ** 2))]
+        self._kappa_r = np.array(r)
+        kmax = self.policy.kappa_max
+        if kmax is None or self._kappa_dt is None:
+            return
+        # kappa <= sigma^2 / r for any timescale, and a fitted sigma is about
+        # the data's rms, so this ratio bounds the kappa of a posterior.
+        rms2 = float(np.mean((self._y64 - self._y64.mean()) ** 2))
+        if rms2 / float(np.min(self._kappa_r)) > kmax:
+            warnings.warn(
+                f"the data's rms is {np.sqrt(rms2 / np.min(self._kappa_r)):.3g}"
+                f" times the median error bar, so a GP posterior with a long "
+                f"timescale could reach kappa > kappa_max = {kmax:.3g}, where "
+                f"float32 is not accurate and chains are refused. Check "
+                f"GPLogLike.kappa at your posterior draws; see docs/float32.md.",
+                stacklevel=3)
+
+    def kappa(self, v: mx.array) -> mx.array:
+        """Float32 conditioning number per chain, ``(n_chains,)``.
+
+        ``k(0) / (h Q h^T + r)``: the process variance over the variance a
+        single step adds, the GP's own process noise ``h Q h^T`` at the
+        median cadence plus the white noise ``r`` (the median ``yerr^2`` plus
+        the jitter, the smallest over instruments).  It measures how nearly
+        deterministic the state is between samples, which is what float32
+        cannot resolve: with ``eps ~ 1.2e-7`` the trouble starts where
+        ``kappa * eps`` approaches 1.
+
+        Measured on SHO kernels (docs/float32.md), the float32 error is a
+        function of ``kappa`` alone to within the scatter, does not move with
+        N from 2e3 to 1e5, and crosses about a log-unit near ``kappa = 1e6``
+        when the data are drawn at those parameters.  Evaluated at the
+        median cadence, so a dataset with much shorter gaps can be worse
+        locally than ``kappa`` says.
+        """
+        n = v.shape[0]
+        if self._kappa_dt is None:
+            return mx.zeros((n,), dtype=v.dtype)
+        kp = self.param_map.kernel_params(v)
+        dt = mx.full((n, 1), self._kappa_dt, dtype=kp.dtype)
+        _, qs, h = self.term.matrices_blocks(kp, dt)
+        p_inf = self.term.p_inf_blocks(kp)
+        k0 = hqh = 0.0
+        off = 0
+        for b, qb in enumerate(qs):
+            mb = qb.shape[-1]
+            hb = h[:, off:off + mb]
+            off += mb
+            hqh = hqh + mx.sum(hb * (qb[:, 0] @ hb[..., None])[..., 0], -1)
+            pb = hb if p_inf is None else (p_inf[b] @ hb[..., None])[..., 0]
+            k0 = k0 + mx.sum(hb * pb, -1)
+        r = mx.array(self._kappa_r, dtype=kp.dtype)
+        jit = self.param_map.jitter_var_per_instrument(v)
+        w = mx.broadcast_to(r if jit is None else r + jit, (n, r.shape[0]))
+        # h Q h^T can come out slightly negative in float32 (see the clamp
+        # in elements.py); it is a variance, so floor it at zero.
+        return k0 / (mx.maximum(hqh, 0.0) + mx.min(w, axis=-1))
+
+    def _refuse_ill_conditioned(self, v: mx.array, out: mx.array) -> mx.array:
+        """NaN on chains past ``policy.kappa_max``, so ``_sanitize`` gives
+        them the failure value.  ``mx.where`` selects, so a feasible lane's
+        value and gradient pass through bit for bit."""
+        kmax = self.policy.kappa_max
+        if kmax is None:
+            return out
+        k = mx.stop_gradient(self.kappa(v))
+        # `not <=` so that a NaN kappa (inf / inf) is refused too.
+        bad = mx.logical_not(k <= kmax)
+        return mx.where(bad, mx.array(float("nan"), dtype=out.dtype), out)
+
     def _raw_call(self, v: mx.array) -> mx.array:
         """The float32 likelihood itself, sanitised but not gradient-guarded."""
         pull = self._infeasible_pull(v)
         if self._metal_ok:
-            return _sanitize(self._evaluate_metal(v), pull)
-        out = self._evaluate(
-            v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
-            self._inst32, _pow2(self.policy.block), self.policy.eval_blocks,
-            uniq=self._uniq32)
-        return _sanitize(out, pull)
+            out = self._evaluate_metal(v)
+        else:
+            out = self._evaluate(
+                v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
+                self._inst32, _pow2(self.policy.block),
+                self.policy.eval_blocks, uniq=self._uniq32)
+        return _sanitize(self._refuse_ill_conditioned(v, out), pull)
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`.

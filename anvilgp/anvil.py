@@ -96,7 +96,10 @@ class GPTarget:
         single chain wandered to an amplitude 1e13 times the error bar,
         where float32 is off by 2 log-units and only steps of ~1e-7 are
         accepted, and the step size stayed at 3e-7 through 3000 warmup with
-        78 other chains frozen behind it.  None of this can bias a posterior
+        78 other chains frozen behind it.  ``GPPolicy.kappa_max`` now refuses
+        such chains (docs/float32.md, section 6): the same seed ends warmup
+        at 4.7e-4, and at 1.6e-3 after 3000 steps with R-hat 1.5, a wide
+        start still travelling in.  None of this can bias a posterior
         -- adaptation only sets the step size -- and ``warmup_report`` names
         the stranded chains.  See
         ``docs/anvil-chees-stuck-chains-measurement.md``.  The stretch move

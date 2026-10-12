@@ -498,3 +498,161 @@ def test_the_pull_ignores_mean_model_columns():
                             n_dim=5, mean=slice(0, 2)),
                    GPPolicy())
     assert np.array(gp._pull_cols).tolist() == [2, 3, 4]
+
+
+# --- the kappa guard ---------------------------------------------------------
+# A chain whose float32 conditioning number is past GPPolicy.kappa_max gets
+# the failure value instead of an evaluation float32 cannot do.  One such
+# chain used to collapse ChEES's shared step size for every chain; see
+# docs/float32.md.
+
+def _kappa_np(term, kp, dt, r):
+    """float64 reference: k(0) / (h Q h^T + r) for P_inf = I terms."""
+    with mx.stream(mx.cpu):
+        _, q, h = [np.array(o, np.float64) for o in term.matrices(
+            mx.array(np.asarray(kp, np.float64)),
+            mx.array(np.full((len(kp), 1), dt)))]
+    h = h.reshape(len(kp), -1)
+    q = q.reshape(len(kp), h.shape[1], h.shape[1])
+    return (np.einsum("ni,ni->n", h, h)
+            / (np.einsum("ni,nij,nj->n", h, q, h) + r))
+
+
+def _guard_gp(metal=False, **policy):
+    rng = np.random.default_rng(11)
+    n = 400
+    t = np.arange(n) * 0.02
+    yerr = np.full(n, 0.15)
+    y = rng.standard_normal(n)
+    return GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
+                     ParamMap.log([0.15, 5.0, 4.0]),
+                     GPPolicy(metal=metal, **policy))
+
+
+def test_kappa_matches_the_float64_formula():
+    gp = _guard_gp()
+    v = np.random.default_rng(2).uniform([-2, -3, -3], [25, 2, 4], (64, 3))
+    kp = np.array([0.15, 5.0, 4.0]) * np.exp(v)
+    want = _kappa_np(ag.SHOTerm(), kp, 0.02, 0.15 ** 2)
+    got = np.array(gp.kappa(mx.array(v.astype(np.float32))), np.float64)
+    np.testing.assert_allclose(got, want, rtol=1e-3)
+    assert want.min() < 1e2 and want.max() > 1e8, "want both sides covered"
+
+
+@pytest.mark.parametrize("term,p", [
+    (ag.SHOTerm() + ag.Matern32Term(), [1.0, 5.0, 4.0, 0.5, 2.0]),
+    (ag.RotationTerm(), [1.0, 5.0, 3.0, 1.0, 0.5]),
+    (ag.Matern52Term(), [1.0, 5.0]),
+])
+def test_kappa_is_finite_and_grows_with_amplitude_for_every_term(term, p):
+    """Blocked terms sum their blocks; amplitude raises k(0) and h Q h^T
+    together, so kappa climbs to k(0)/(hQh^T) as the white noise drops out."""
+    n = 200
+    t = np.arange(n) * 0.02
+    gp = GPLogLike(None, t, None, np.zeros(n), np.full(n, 0.15), term,
+                   ParamMap.log(p), GPPolicy())
+    amp = np.zeros((6, len(p)), np.float32)
+    amp[:, 0] = np.linspace(-4, 10, 6)
+    k = np.array(gp.kappa(mx.array(amp)))
+    assert np.all(np.isfinite(k)) and np.all(k > 0)
+    assert np.all(np.diff(k) >= 0), k
+
+
+def test_kappa_uses_the_convolved_stationary_covariance():
+    """TermConvolution's P_inf is not the identity; kappa must use it."""
+    from anvilgp.terms import TermConvolution
+    n = 200
+    t = np.arange(n) * 0.02
+    term = TermConvolution(ag.Matern52Term(), 0.01)
+    gp = GPLogLike(None, t, None, np.zeros(n), np.full(n, 0.15), term,
+                   ParamMap.log([1.0, 5.0]), GPPolicy())
+    v = mx.zeros((1, 2), dtype=mx.float32)
+    kp = gp.param_map.kernel_params(v)
+    _, (q,), h = term.matrices_blocks(kp, mx.full((1, 1), 0.02))
+    (p_inf,) = term.p_inf_blocks(kp)
+    h = np.array(h, np.float64)[0]
+    k0 = h @ np.array(p_inf, np.float64)[0] @ h
+    hqh = h @ np.array(q, np.float64)[0, 0] @ h
+    np.testing.assert_allclose(float(np.array(gp.kappa(v))[0]),
+                               k0 / (max(hqh, 0.0) + 0.15 ** 2), rtol=1e-4)
+
+
+def test_kappa_takes_the_smallest_white_noise_over_instruments():
+    n = 200
+    t = np.arange(n) * 0.02
+    inst = np.arange(n) % 2
+    yerr = np.where(inst == 0, 0.1, 1.0)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate([1.0, 5.0, 4.0])],
+                  n_dim=5, instrument=inst,
+                  jitter=[KernelParam(link="log", index=3, ref=1.0),
+                          KernelParam(link="log", index=4, ref=1.0)])
+    gp = GPLogLike(None, t, None, np.zeros(n), yerr, ag.SHOTerm(), pm,
+                   GPPolicy())
+    v = np.array([[0, 0, 0, np.log(0.3), np.log(0.01)],
+                  [0, 0, 0, np.log(0.01), np.log(0.01)]], np.float32)
+    r = np.array([min(0.1 ** 2 + 0.3 ** 2, 1.0 + 1e-4),
+                  min(0.1 ** 2 + 1e-4, 1.0 + 1e-4)])
+    want = _kappa_np(ag.SHOTerm(), [[1.0, 5.0, 4.0]] * 2, 0.02, r)
+    np.testing.assert_allclose(np.array(gp.kappa(mx.array(v))), want,
+                               rtol=1e-4)
+
+
+@pytest.mark.parametrize("metal", [False, True])
+def test_the_kappa_guard_refuses_past_kappa_max_and_nothing_else(metal):
+    """Refused lanes get the failure value and a zero gradient; every other
+    lane is bit-identical, value and gradient, to ``kappa_max=None``.  And
+    the guard is what refused them: some were finite without it."""
+    v = mx.array(np.random.default_rng(4)
+                 .uniform([-2, -3, -3], [18, 2, 4], (128, 3))
+                 .astype(np.float32))
+    one = mx.ones((128,), dtype=mx.float32)
+    out = {}
+    for kmax in (1e6, None):
+        gp = _guard_gp(metal=metal, kappa_max=kmax)
+        with mx.stream(mx.gpu):
+            val = gp(v)
+            _, g = mx.vjp(gp, [v], [one])
+            mx.eval(val, g)
+        out[kmax] = (np.array(val), np.array(g[0]))
+    k = np.array(_guard_gp().kappa(v))
+    refused = k > 1e6
+    assert 10 < refused.sum() < 118, f"want both sides: {refused.sum()}"
+    (gv, gg), (nv, ng) = out[1e6], out[None]
+    assert np.all(gv[refused] <= -1e29)
+    assert np.all(gg[refused] == 0.0)
+    assert np.array_equal(gv[~refused], nv[~refused])
+    if metal:
+        assert np.array_equal(gg[~refused], ng[~refused])
+    else:
+        # The MLX path's gradient is not bit-reproducible run to run, guard
+        # or no guard: two identical kappa_max=None calls differ by up to
+        # 1.0e-5 relative here (measured over 6 runs), and the guarded
+        # against the unguarded by 1.3e-5 -- the same noise.
+        np.testing.assert_allclose(gg[~refused], ng[~refused], rtol=1e-4,
+                                   atol=1e-4)
+    assert np.any(nv[refused] > -1e29), "the guard refused nothing new"
+
+
+def test_construction_warns_when_the_data_could_reach_kappa_max():
+    n = 200
+    t = np.arange(n) * 0.02
+    rng = np.random.default_rng(0)
+    with pytest.warns(UserWarning, match="kappa_max"):
+        GPLogLike(None, t, None, 3000.0 * rng.standard_normal(n),
+                  np.full(n, 1.0), ag.SHOTerm(), ParamMap.log([1, 1, 1]),
+                  GPPolicy())
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        GPLogLike(None, t, None, 5.0 * rng.standard_normal(n),
+                  np.full(n, 1.0), ag.SHOTerm(), ParamMap.log([1, 1, 1]),
+                  GPPolicy())
+        GPLogLike(None, t, None, 3000.0 * rng.standard_normal(n),
+                  np.full(n, 1.0), ag.SHOTerm(), ParamMap.log([1, 1, 1]),
+                  GPPolicy(kappa_max=None))
+
+
+def test_kappa_max_must_be_positive():
+    with pytest.raises(ValueError, match="kappa_max"):
+        GPPolicy(kappa_max=0.0)
