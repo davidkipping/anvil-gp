@@ -50,6 +50,9 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/anvil-chees-stuck-chains.md](docs/anvil-chees-stuck-chains.md) | Proposed investigation for anvil: three ChEES chains whose recorded log-probability disagrees with their position, invisible to the 0.6.0 lost-chain check |
 | [docs/anvil-chees-stuck-chains-measurement.md](docs/anvil-chees-stuck-chains-measurement.md) | The production measurement anvil asked for: ChEES step size against initial spread at 1024 and 4096 chains. The default is not exposed; the collapse at wide spread is one chain reaching the float32 edge through the unbounded GP amplitude, now refused by `GPPolicy.kappa_max` |
 | [docs/anvil-chees-production-note.md](docs/anvil-chees-production-note.md) | Note to anvil answering its production question: the default is not exposed, and the collapse is one chain at our float32 edge, fixed on our side by `GPPolicy.kappa_max` |
+| [docs/anvil-chees-production-reply.md](docs/anvil-chees-production-reply.md) | anvil's reply to the production note: agrees with `kappa_max`, no trimmed statistic, `warmup_report` climbing-chain fix in 0.7.1 |
+| [docs/anvil-0.10.2-fused-kernel-test-note.md](docs/anvil-0.10.2-fused-kernel-test-note.md) | anvil's note: on 0.10.2 the fused-kernel ChEES test's width check fails, inflated by a few lost chains |
+| [docs/anvil-0.10.2-fused-kernel-test-reply.md](docs/anvil-0.10.2-fused-kernel-test-reply.md) | Our reply: the lost chains are still climbing back (not trapped, not at the float32 boundary); the test now takes the median per-chain width |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;

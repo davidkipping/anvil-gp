@@ -316,6 +316,18 @@ def test_chees_runs_on_the_fused_kernel():
     find in the budget.  (The stretch move gives 0.046 here: two of its
     1024 chains trapped in a secondary mode; see docs/anvil-stretch-width.md.)
 
+    The width is the **median per-chain** standard deviation, not the
+    standard deviation over all chains.  From ``spread=0.3`` a 300-step
+    warmup leaves a few chains still climbing back from saturated bounds
+    (rho at T/2, jitter at its floor): 5, 10 and 9 of 256 for seeds 3-5 on
+    anvil 0.10.2, each reaching the main mode by gradient ascent, none near
+    the float32 boundary (kappa <= 2e3).  Over all chains they put the width
+    at 0.016-0.019, which measures how far the stragglers still are, not the
+    gradient; the median per-chain width is 0.0108-0.0109 on all three
+    seeds.  A random walk fails it from below, and the lost-chain cap keeps
+    a genuine sampling failure from hiding behind the median.  See
+    docs/anvil-0.10.2-fused-kernel-test-reply.md.
+
     Runs with compilation on: the fused-argument limit that used to force
     `mx.disable_compile()` was one function in `special.py` and is fixed.
     """
@@ -343,10 +355,15 @@ def test_chees_runs_on_the_fused_kernel():
 
     acc = float(np.mean(res.accept_fraction))
     assert acc > 0.5, f"acceptance {acc:.2f}: the gradient is not right"
-    flat = gt.transform.model_np(res.get_chain(flat=True).astype(np.float64))
-    jit_sd = float(gt.natural(flat)["jitter"].std())
-    assert 0.007 < jit_sd < 0.016, (
-        f"jitter posterior width {jit_sd:.4f}; float64 Laplace gives 0.0107")
+    lost = res.extras["lost_chains"]
+    assert len(lost) <= 26, f"{len(lost)} of 256 chains lost"
+    chain = np.asarray(res.get_chain(), dtype=np.float64)    # (draw, chain, d)
+    jit = gt.natural(gt.transform.model_np(
+        chain.reshape(-1, chain.shape[-1])))["jitter"].reshape(chain.shape[:2])
+    jit_sd = float(np.median(jit.std(axis=0)))
+    assert 0.009 < jit_sd < 0.013, (
+        f"median per-chain jitter width {jit_sd:.4f}; float64 Laplace gives "
+        f"0.0107")
 
 
 # ---------------------------------------------------------------------------
