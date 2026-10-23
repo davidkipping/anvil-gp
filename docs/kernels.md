@@ -159,15 +159,23 @@ cannot sample faster than you expose.
 
 *The exposure must not be wider than the kernel's fastest correlation
 time.* Concretely `||F delta|| <= 8`, where `F` is the generator; beyond it
-the matrix series below lose float32 digits and `GPLogLike` refuses. The
-regime is degenerate anyway — the process is nearly white across one frame,
-so model it as white noise, or bin.
+the matrix series below stop converging. `GPLogLike` refuses at
+construction if the reference point is past it, and gives any *chain* that
+walks past it the failure value. The regime is degenerate anyway — the
+process is nearly white across one frame, so model it as white noise, or
+bin.
+
+*Convolve the sum, not a member of it.* `TermConvolution(a + b, delta)` is
+supported; `TermConvolution(a, delta) + b` raises. The exposure integrates
+the whole signal, and a sum with one convolved member used to be scored as
+the wrong kernel, silently (0.04 to 5.3 log-units off).
 
 **Every term with a generator can be wrapped**, which is every term in this
 library: `RealTerm`, `SHOTerm` at *any* `Q`, `ComplexTerm`, `Matern32Term`,
 `Matern52Term`, `RotationTerm`, and sums. In particular **a convolved
 Matern-5/2 is something celerite2 cannot do at all**, and a convolved
-overdamped SHO (`Q <= 1/2`) works too.
+overdamped SHO (`Q <= 1/2`) works too — within the region described under
+[Where it refuses](#where-it-refuses-a-chain).
 
 ### How it works, and why that matters for what is supported
 
@@ -193,18 +201,47 @@ badly.
 The diagonal correction is `h (W - M) h^T`, and `P_inf` is no longer the
 identity: it is the symmetric PSD matrix with `P h^T = M h^T`.
 
-**One accuracy caveat, and it is structural.** A convolved kernel whose
-exponential-sum continuation is not a positive-definite function *cannot*
-have a PSD process noise — if it could, that continuation would be a valid
-covariance — and the reduction factors `Q`. Measured minimum eigenvalue of
-`Q`, relative: exactly `0` for `RealTerm`, `ComplexTerm`, `RotationTerm` and
-`SHOTerm` at `Q > 1/2`; `-1e-12` to `-3e-2` for Matern-3/2, Matern-5/2 and
-the overdamped SHO, growing with `delta`. End to end that costs nothing
-almost everywhere (1e-14 to 1e-16 against a dense float64 Cholesky over
-`delta` from 1e-3 to 0.3), with one measured exception: **a convolved
-Matern-5/2 near `delta/rho ~ 0.01` is accurate to 7e-7 rather than 1e-11**.
-That is well inside the float32 path's own error budget and matters only if
-you use `.hi` as an oracle there.
+### Where it refuses a chain
+
+The state-space form above is only *formally* Gaussian. The convolved
+exponential sum is not a positive-definite function for every parameter —
+a kernel with a corner at zero lag (`RealTerm`, Matern-3/2, a low-`Q` SHO)
+has a negative zero-lag correction, and its `P_inf` and `Q` can be
+indefinite. The likelihood is still **exact**: the formal model reproduces
+the true covariance of the data, and the sequential filter matches the
+dense float64 oracle to 2e-9 or better at every point checked, including
+all of the refused ones below. What breaks is the *parallel* reduction,
+which factors intermediate covariances by Cholesky; where one of them is
+indefinite there is no factor to take.
+
+So the reduction refuses those chains — the failure value, as for any
+other infeasible point — rather than returning a number. Until 2026-10-23
+it floored the factor and positivity-clamped two variances, and each of
+those silently substituted a different number: **a convolved `RealTerm` at
+signal-to-noise 10 to 100 came back 1 to 500 log-units wrong**, a
+convolved Matern-5/2 at `rho` = 10 to 50 exposures 0.004 to 0.46 wrong (at
+N = 300), and some errors were too *high*, which attracts chains. The old
+parity tests against celerite2 ran at signal-to-noise ~4, where none of
+this binds.
+
+Measured at signal-to-noise 3 to 100 (every region grows as the error bars
+shrink), chains are refused for:
+
+| term | refused when |
+|---|---|
+| `RealTerm` | `yerr² + jitter²` is below the magnitude of its zero-lag correction, `≈ sigma² c delta / 3`: signal-to-noise above roughly `sqrt(3 / (c delta))`, ~17 at `c delta = 0.01`. **Most of the high signal-to-noise regime — the main limitation today.** |
+| low-`Q` `SHOTerm` | `rho` up to ~5 `delta` at `Q <= 1/2`, ~3 `delta` at `Q = 1/sqrt 2` |
+| `Matern32Term` | `rho` about one exposure |
+
+Everywhere else all three paths agree with the dense oracle: 1e-11 in
+float64, float32 noise on the fused kernel and the MLX path, gradients
+matching between the two. The `h Q hᵀ` clamp is simply dropped for a
+convolved term — the algebra needs the negative value — which is what fixed
+the Matern-5/2 case outright rather than refusing it.
+
+Making the refused points evaluable needs a reduction that does not
+factor indefinite matrices, or an exact augmented-state form of the
+exposure average; neither exists yet.
 
 **One thing is not a kernel.** Below the exposure width the convolution is
 not an exponential sum, and the difference at zero lag is a constant added

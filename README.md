@@ -900,6 +900,7 @@ regression); Foreman-Mackey et al.
 the pre-registered numerical fallback if float32 covariance-form composition
 ever fails its gates); S+LEAF
 [2201.02440](https://arxiv.org/abs/2201.02440) (integrated kernels; anvil-gp
-does exposure-time smearing by the celerite convolution instead -- see
-`TermConvolution` -- and S+LEAF remains the more general route, including for
-the Matern terms the convolution cannot wrap).
+does exposure-time smearing by a state-space convolution instead -- see
+`TermConvolution`, which wraps every term here but refuses a convolved
+`RealTerm` at high signal-to-noise -- and S+LEAF remains the more general
+route).

@@ -170,7 +170,12 @@ message naming the offending pair. See
 it is a refusal rather than a warning.
 
 Any term in this library can be wrapped — including `Matern52Term`, which
-**celerite2 cannot convolve at all**, and an `SHOTerm` at any `Q`.
+**celerite2 cannot convolve at all**, and an `SHOTerm` at any `Q`. Wrap a
+sum as a whole (`TermConvolution(a + b, delta)`); a convolved term cannot be
+one member of a sum. **A convolved `RealTerm` is refused at high
+signal-to-noise** (roughly above `sqrt(3 / (c delta))`), and a few
+short-timescale corners of the others are too — see
+[kernels.md](kernels.md#where-it-refuses-a-chain).
 
 ## Why the batch is the whole point
 

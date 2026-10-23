@@ -160,24 +160,14 @@ _SRC = """
         // elements.leaf_elements clamps.  The sfloor line is a secondary
         // guard that cannot bind once this one is in place.
         //
-        // ONE EXCEPTION.  For a TermConvolution, Q is only formally a
-        // covariance and h Q h^T really can go negative -- and *not* only
-        // below dt ~ delta/2, as an earlier version of this comment said.
-        // With the state-space form (P_inf != I) the sign flip reaches
-        // dt ~ 1.8 delta for the terms whose convolved exponential sum is
-        // not a positive-definite function: Matern-3/2, Matern-5/2 and an
-        // overdamped SHO.  Those *cannot* have a PSD Q -- if they could,
-        // that continuation would be a valid covariance -- so the clamp
-        // does bind there, and it changes the value rather than repairing a
-        // rounding error.  Measured cost end to end: nothing at 1e-14
-        // almost everywhere, 7e-7 for a convolved Matern-5/2 near
-        // delta/rho ~ 0.01.  See docs/kernels.md; for every other term
-        // h Q h^T is exactly non-negative and this clamp cannot bind.
+        // NOT in the FORMAL variant (a TermConvolution), whose Q is only
+        // formally a covariance: h Q h^T is genuinely negative there, the
+        // algebra is exact with the negative value, and clamping it is what
+        // made the answer wrong.  See elements.leaf_elements.  A sum that
+        // is not positive is a real failure, and log/rsqrt make it a NaN.
         float rr = r_ref[t];
         JIT_PER_OBS_T
-        sq = max(sq, 0.0f);
-        sq += rr + jit2v;
-        sq = max(sq, sfloor * rr);              // PSD failure is defined
+        LEAF_VARIANCE
 
         float inv_s = 1.0f / sq;
         float inv_rs = metal::precise::rsqrt(sq);
@@ -350,18 +340,53 @@ def _jit_key(n_jit: int) -> int:
     return 0 if n_jit <= 1 else n_jit
 
 
-def _kernel(m: int, n_jit: int = 0):
-    key = (m, _jit_key(n_jit))
+def _formal_src(src: str, formal: bool) -> str:
+    """Specialise a kernel source for a formal (convolved) model, or not.
+
+    A :class:`~anvilgp.terms.TermConvolution`'s state-space form is only
+    formally Gaussian, so its variances can be genuinely negative and the
+    positivity clamps that repair float32 rounding for every other term
+    would *change* its answer instead.  The formal variant drops those
+    clamps and refuses -- NaN -- a Cholesky pivot below
+    ``-linalg.FORMAL_PIVOT_TOL * |trace|/m``, exactly as
+    :func:`anvilgp.linalg.chol` does under ``strict``.  The non-formal
+    variant is the code it always was: identical to the previous source
+    once comments and whitespace are stripped (checked when this was
+    written; ``tests/test_metal.py`` pins that every clamp survives in it).
+    """
+    from .linalg import FORMAL_PIVOT_TOL
+    if formal:
+        leaf = "sq += rr + jit2v;"
+        pivot = (f"if (d < -{FORMAL_PIVOT_TOL!r}f * fabs(tr) / (float)M) "
+                 "L1[j][j] = NAN;")
+        hch, rk, clamped = "hch", "", "false"
+    else:
+        leaf = ("sq = max(sq, 0.0f);\n"
+                "        sq += rr + jit2v;\n"
+                "        sq = max(sq, sfloor * rr);              "
+                "// PSD failure is defined")
+        pivot = ""
+        hch, rk, clamped = "max(hch, 0.0f)", " + max(-hch, 0.0f)", "hch < 0.0f"
+    return (src.replace("LEAF_VARIANCE", leaf)
+               .replace("STRICT_PIVOT", pivot)
+               .replace("HCH_CLAMPED", hch)
+               .replace("RK_CLAMP_TERM", rk)
+               .replace("CLAMPED_TEST", clamped))
+
+
+def _kernel(m: int, n_jit: int = 0, formal: bool = False):
+    key = (m, _jit_key(n_jit), bool(formal))
     if key not in _kernels:
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"anvilgp_scan_m{m}_j{key[1]}",
+            name=f"anvilgp_scan_m{m}_j{key[1]}" + ("_formal" if formal else ""),
             input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
                          "r_ref",
                          "jit2", "sfloor", "npts", "n_lags", "n_blocks",
                          "n_chains", "blk_len", "n_jit"],
             output_names=["out_A", "out_b", "out_C", "out_eta", "out_J",
                           "out_ell"],
-            source=_jitter_src(_SRC, n_jit).replace("MDIM", str(m)),
+            source=_formal_src(_jitter_src(_SRC, n_jit), formal)
+            .replace("MDIM", str(m)),
         )
     return _kernels[key]
 
@@ -408,7 +433,9 @@ _SRC_REDUCE = """
             }
         }
 
-        // L1 = chol(C1), with linalg.diag_floor's eps*max(trace,0)/m pivot floor
+        // L1 = chol(C1), with linalg.diag_floor's eps*max(trace,0)/m pivot
+        // floor -- and, in the FORMAL variant, linalg.chol's strict refusal
+        // of a pivot that flooring would not repair but replace.
         float tr = 0.0f;
         for (uint i = 0; i < M; ++i) tr += Cm[i][i];
         float fl = 1.1920929e-7f * max(tr, 0.0f) / (float)M + 3.0e-38f;
@@ -417,6 +444,7 @@ _SRC_REDUCE = """
             float d = Cm[j][j];
             for (uint t = 0; t < j; ++t) d -= L1[j][t] * L1[j][t];
             L1[j][j] = metal::precise::sqrt(max(d, fl));
+            STRICT_PIVOT
             float inv = 1.0f / L1[j][j];
             for (uint i = j + 1; i < M; ++i) {
                 float a = Cm[i][j];
@@ -565,24 +593,25 @@ _SRC_REDUCE = """
 _reduce_kernels: dict = {}
 
 
-def _reduce_kernel(m: int):
-    if m not in _reduce_kernels:
-        _reduce_kernels[m] = mx.fast.metal_kernel(
-            name=f"anvilgp_reduce_m{m}",
+def _reduce_kernel(m: int, formal: bool = False):
+    key = (m, bool(formal))
+    if key not in _reduce_kernels:
+        _reduce_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_reduce_m{m}" + ("_formal" if formal else ""),
             input_names=["in_A", "in_b", "in_C", "in_eta", "in_J", "in_ell",
                          "n_blocks", "n_chains"],
             output_names=["out_ell"],
-            source=_SRC_REDUCE.replace("MDIM", str(m)),
+            source=_formal_src(_SRC_REDUCE, formal).replace("MDIM", str(m)),
         )
-    return _reduce_kernels[m]
+    return _reduce_kernels[key]
 
 
-def reduce_blocks(el: Element) -> mx.array:
+def reduce_blocks(el: Element, formal: bool = False) -> mx.array:
     """Fold ``(n_chains, n_blocks)`` block elements to ``(n_chains,)``."""
     n_chains, n_blocks, m = el.b.shape[0], el.b.shape[1], el.b.shape[-1]
     if n_blocks == 1:
         return el.ell[:, 0]
-    out = _reduce_kernel(m)(
+    out = _reduce_kernel(m, formal)(
         inputs=[el.A, el.b, el.C, el.eta, el.J, el.ell,
                 int(n_blocks), int(n_chains)],
         output_shapes=[(n_chains,)], output_dtypes=[mx.float32],
@@ -626,7 +655,7 @@ _FWD_STEP = """
                 ch[i] = a; hch += hv[i] * a;
             }
             JIT_PER_OBS
-            float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
+            float sv = HCH_CLAMPED + r_ref[gi] + jit2v;
             float vv = resid[gi * (uint)n_chains + chain];
             for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
             float kg[MDIM];
@@ -653,7 +682,7 @@ _FWD_STEP = """
                     for (uint u = 0; u < M; ++u) a += am[i][u] * cp[u][j];
                     tc[i][j] = a;
                 }
-            float rk = r_ref[gi] + jit2v + max(-hch, 0.0f);
+            float rk = r_ref[gi] + jit2v RK_CLAMP_TERM;
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
                     float a = rk * kg[i] * kg[j];
@@ -810,9 +839,9 @@ _SRC_BWD_CKPT = """
                 for (uint j = 0; j < M; ++j) a += cp[i][j] * hv[j];
                 ch[i] = a; hch += hv[i] * a;
             }
-            bool clamped = hch < 0.0f;
+            bool clamped = CLAMPED_TEST;
             JIT_PER_OBS
-            float sv = max(hch, 0.0f) + r_ref[gi] + jit2v;
+            float sv = HCH_CLAMPED + r_ref[gi] + jit2v;
             float vv = resid[gi * (uint)n_chains + chain];
             for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
             for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
@@ -934,12 +963,14 @@ _bwd_ckpt_kernels: dict = {}
 _SUB_LEN = {1: 32, 2: 32, 3: 16, 4: 8}
 
 
-def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0):
-    key = (m, slen, _jit_key(n_jit))
+def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0, formal: bool = False):
+    key = (m, slen, _jit_key(n_jit), bool(formal))
     if key not in _bwd_ckpt_kernels:
-        body = _jitter_src(_SRC_BWD_CKPT.replace("FWD_STEP", _FWD_STEP), n_jit)
+        body = _formal_src(_jitter_src(
+            _SRC_BWD_CKPT.replace("FWD_STEP", _FWD_STEP), n_jit), formal)
         _bwd_ckpt_kernels[key] = mx.fast.metal_kernel(
-            name=f"anvilgp_bwd_ckpt_m{m}_s{slen}_j{key[2]}",
+            name=f"anvilgp_bwd_ckpt_m{m}_s{slen}_j{key[2]}"
+                 + ("_formal" if formal else ""),
             input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
                          "r_ref",
                          "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
@@ -955,7 +986,7 @@ def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0):
 
 def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                   ent_m, ent_C, seed_m, seed_C, slot_id, slot_start, n_slots,
-                  blk_len, sub_len=None):
+                  blk_len, sub_len=None, formal=False):
     """Checkpointed reverse sweep for every (chain, block), independently.
 
     Inputs are the forward's table form plus the per-block entry state
@@ -999,7 +1030,7 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
               (n_chains, n_blocks, m), (npts, n_chains),
               (n_chains, n_blocks, max(1, n_jit)),
               (n_chains, n_blocks, n_ckpt, m + m * m)]
-    outs = _bwd_ckpt_kernel(m, slen, n_jit)(
+    outs = _bwd_ckpt_kernel(m, slen, n_jit, formal)(
         inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                 ent_m, ent_C, seed_m, seed_C, slot_id, slot_start,
                 int(npts), int(n_lags), int(n_blocks), int(n_chains),
@@ -1335,7 +1366,8 @@ def metal_available() -> bool:
 
 
 def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                s_floor_rel, blk_len, n_blocks=None) -> Element:
+                s_floor_rel, blk_len, n_blocks=None,
+                formal=False) -> Element:
     """Condense every block of ``blk_len`` observations into one element.
 
     ``phi_tab``/``q_tab``: (n_chains, n_lags, m, m) propagator and process
@@ -1343,7 +1375,8 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     ``lag``: (npts,) int32.  ``resid``: **(npts, n_chains)** residuals --
     time-major, so adjacent threads (adjacent chains) read adjacent floats.
     ``r_ref``: (npts,) float32 reference variances.  ``jit2``: (n_chains, 1)
-    jitter variance, or a (n_chains, 0) array for none.
+    jitter variance, or a (n_chains, 0) array for none.  ``formal`` selects
+    the convolved-term variant; see :func:`_formal_src`.
 
     Returns an :class:`~anvilgp.elements.Element` with batch shape
     (n_chains, n_blocks), ready for :func:`anvilgp.elements.tree_reduce`.
@@ -1362,7 +1395,7 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     scalars = [float(s_floor_rel), int(npts), int(n_lags), int(n_blocks),
                int(n_chains), int(blk_len), int(n_jit)]
 
-    outs = _kernel(m, n_jit)(
+    outs = _kernel(m, n_jit, formal)(
         inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, *scalars],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
@@ -1372,7 +1405,7 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
 
 def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                 s_floor_rel, blk_len, slots=None) -> mx.array:
+                 s_floor_rel, blk_len, slots=None, formal=False) -> mx.array:
     """``(n_chains,)`` log-likelihood: the kernel's blocks, reduced.
 
     **This, not :func:`scan_blocks`, is where the differentiation boundary
@@ -1392,8 +1425,8 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
         el = scan_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len)
-        return reduce_blocks(el)
+                         blk_len, formal=formal)
+        return reduce_blocks(el, formal=formal)
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
@@ -1450,11 +1483,11 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 f"use GPPolicy(metal=False) for the gradient.")
 
         el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len)
+                         blk_len, formal=formal)
         ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
             p_t, q_t, lg, inst, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m,
-            seed_C, slot_id, slot_start, n_slots, blk_len)
+            seed_C, slot_id, slot_start, n_slots, blk_len, formal=formal)
 
         # `lag` is an integer index and `r_ref` is the data's own yerr^2 --
         # neither is ever a function of the sampled parameters, so neither

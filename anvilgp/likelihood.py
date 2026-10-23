@@ -31,8 +31,11 @@ already solved and rides ordinary autodiff through ``mean_fn``.
 
 Known v1 limitations, stated rather than discovered
 ---------------------------------------------------
-* No exposure-time integration of the kernel (long-cadence smearing).
-  S+LEAF (2201.02440) is the v2 path.
+* Exposure-time integration (:class:`~anvilgp.terms.TermConvolution`)
+  refuses part of its parameter space -- a convolved ``RealTerm`` at high
+  signal-to-noise above all -- because the parallel reduction cannot factor
+  the indefinite covariances of its formal state-space form.  See
+  docs/kernels.md.
 * No 2D/multiband GPs.
 * ``predict`` / conditional mean is deliberately out of the hot path; see
   :func:`anvilgp.oracle.dense_predict` for the offline float64 utility.
@@ -600,6 +603,14 @@ class GPLogLike:
                 param_map.kernel_params(
                     mx.zeros((1, param_map.n_dim), dtype=mx.float64))
             ) is not None
+        #: Whether the state-space form is only *formally* Gaussian, which is
+        #: exactly when ``P_inf`` is not the identity: a convolved term.  Its
+        #: ``Q`` can be indefinite for ordinary parameters and the algebra
+        #: is still exact, so long as no positivity clamp alters a number;
+        #: on this path the clamps are dropped and a factorisation that
+        #: would have needed one refuses the chain instead.  See
+        #: `linalg.chol`'s ``strict``.  Every other term is untouched.
+        self._formal = self._has_p_inf
 
         self._lag_np = lag
         # Assigning `metal_block` (a property) builds the kernel's slot map
@@ -967,7 +978,8 @@ class GPLogLike:
                             slots=(self._metal_slot_id,
                                    self._metal_slot_start,
                                    self.n_metal_slots,
-                                   self._metal_fold_plan))
+                                   self._metal_fold_plan),
+                            formal=self._formal)
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,).
@@ -987,12 +999,14 @@ class GPLogLike:
         for s in range(0, self.n_data, block):
             e = min(s + block, self.n_data)
             args = self.leaf_inputs(v, dt, y, r_ref, x_mean, idx, s, e, get_mat)
+            fm = self._formal
             if self.blocked:
-                root = chunked_reduce_blocked(leaf_parts(*args),
-                                              sub_len=self.sub_block)
+                root = chunked_reduce_blocked(leaf_parts(*args, formal=fm),
+                                              sub_len=self.sub_block,
+                                              strict=fm)
             else:
-                root = chunked_reduce(*leaf_elements(*args),
-                                      sub_len=self.sub_block)
+                root = chunked_reduce(*leaf_elements(*args, formal=fm),
+                                      sub_len=self.sub_block, strict=fm)
             if do_eval:
                 # bound peak memory: the block's leaf arrays die here, and
                 # the root that survives is one element per chain.
@@ -1002,7 +1016,7 @@ class GPLogLike:
             return roots[0].ell
         stacked = Element(*(mx.stack([getattr(r, f) for r in roots], axis=1)
                             for f in Element._fields))
-        return tree_reduce(stacked).ell
+        return tree_reduce(stacked, strict=self._formal).ell
 
     # -- the anvil LogDensity contract ------------------------------------
 
@@ -1154,6 +1168,27 @@ class GPLogLike:
         bad = mx.logical_not(k <= kmax)
         return mx.where(bad, mx.array(float("nan"), dtype=out.dtype), out)
 
+    def _refuse_outside_series(self, v: mx.array, out: mx.array) -> mx.array:
+        """NaN on chains whose ``||F delta||`` leaves the convolution's
+        validated range.
+
+        The construction-time check only looks at the reference point, and a
+        chain can walk anywhere: at ``rho = 2 dt``, ``Q = 0.05`` (inside the
+        default prior box) ``||F delta|| = 63``, the 20-term series has not
+        converged, and the value came back 432 log-units wrong in float64.
+        Same norm as the construction check, per chain.  A no-op for every
+        term but a convolved one.
+        """
+        if not self._formal:
+            return out
+        kp = mx.stop_gradient(self.param_map.kernel_params(v))
+        worst = None
+        for g in self.term.term.generator(kp):
+            nrm = mx.max(mx.abs(g), axis=(-2, -1)) * self.term.delta
+            worst = nrm if worst is None else mx.maximum(worst, nrm)
+        bad = mx.logical_not(worst <= terms.MAX_FDELTA)
+        return mx.where(bad, mx.array(float("nan"), dtype=out.dtype), out)
+
     def _raw_call(self, v: mx.array) -> mx.array:
         """The float32 likelihood itself, sanitised but not gradient-guarded."""
         pull = self._infeasible_pull(v)
@@ -1164,6 +1199,7 @@ class GPLogLike:
                 v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
                 self._inst32, _pow2(self.policy.block),
                 self.policy.eval_blocks, uniq=self._uniq32)
+        out = self._refuse_outside_series(v, out)
         return _sanitize(self._refuse_ill_conditioned(v, out), pull)
 
     def __call__(self, v: mx.array) -> mx.array:

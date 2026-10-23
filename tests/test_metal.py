@@ -1521,3 +1521,38 @@ def test_instrument_labels_are_range_checked():
     short = np.zeros(n - 1, dtype=np.int32)
     with pytest.raises(ValueError, match="one label per observation"):
         _jitter_gp(3, True, n=n, inst=short)
+
+
+def test_the_formal_variant_changes_only_the_positivity_guards():
+    """The convolved-term variant drops the clamps; nothing else moves.
+
+    Every other term runs the non-formal source, which must be the code it
+    always was -- when the variant was introduced it was compared against
+    the previous source with comments and whitespace stripped, and found
+    identical.  This pins the substitution itself: no placeholder survives
+    in either variant, the non-formal one still carries every clamp, and the
+    formal one carries none of them and refuses a negative pivot instead.
+    """
+    tokens = ("LEAF_VARIANCE", "STRICT_PIVOT", "HCH_CLAMPED",
+              "RK_CLAMP_TERM", "CLAMPED_TEST")
+    fwd = metal._jitter_src(metal._SRC, 1)
+    bwd = metal._jitter_src(
+        metal._SRC_BWD_CKPT.replace("FWD_STEP", metal._FWD_STEP), 1)
+    red = metal._SRC_REDUCE
+    clamps = {
+        "fwd": ["sq = max(sq, 0.0f);", "sq = max(sq, sfloor * rr);"],
+        "bwd": ["max(hch, 0.0f) + r_ref[gi]", "max(-hch, 0.0f)",
+                "bool clamped = hch < 0.0f;"],
+        "red": [],
+    }
+    for name, src in (("fwd", fwd), ("bwd", bwd), ("red", red)):
+        plain = metal._formal_src(src, False)
+        formal = metal._formal_src(src, True)
+        for tok in tokens:
+            assert tok not in plain and tok not in formal, (name, tok)
+        for c in clamps[name]:
+            assert c in plain, (name, c)
+            assert c not in formal, (name, c)
+        assert "NAN" not in plain, name
+    assert "L1[j][j] = NAN;" in metal._formal_src(red, True)
+    assert "bool clamped = false;" in metal._formal_src(bwd, True)

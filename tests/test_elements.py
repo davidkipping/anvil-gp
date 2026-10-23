@@ -338,3 +338,31 @@ def test_use_blocked_leaves_criterion():
     assert use_blocked_leaves((2, 2, 2, 2))        # m=8
     assert use_blocked_leaves((3, 3))              # m=6, Matern-5/2 pair
     assert not use_blocked_leaves((8,))            # single block: nothing to do
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float64])
+def test_strict_chol_refuses_a_clearly_negative_pivot_and_nothing_else(dtype):
+    """``strict`` turns a floored *indefinite* matrix into a NaN factor.
+
+    The formal model of a convolved term hands the composition covariances
+    that are genuinely indefinite; flooring them substitutes a different
+    matrix and a wrong likelihood.  A PSD matrix whose last pivot rounds a
+    hair below zero -- the case the floor exists for -- must factor exactly
+    as before.  In float64 ``strict`` takes the unrolled route (LAPACK on an
+    indefinite input is not checked by MLX), so it is compared against the
+    built-in there.
+    """
+    from anvilgp.linalg import chol
+    with mx.stream(mx.cpu if dtype == mx.float64 else mx.gpu):
+        bad = mx.array([[[1.0, 0.2], [0.2, -0.1]]], dtype=dtype)
+        assert np.all(np.isnan(np.array(chol(bad, strict=True))[0, 1, 1]))
+        assert np.all(np.isfinite(np.array(chol(bad))))
+        eps = 1e-7 if dtype == mx.float32 else 1e-15
+        near = mx.array([[[1.0, 1.0], [1.0, 1.0 - eps]]], dtype=dtype)
+        good = mx.array([[[2.0, 0.3], [0.3, 1.5]]], dtype=dtype)
+        for a in (near, good):
+            s = np.array(chol(a, strict=True), np.float64)
+            p = np.array(chol(a), np.float64)
+            assert np.all(np.isfinite(s))
+            np.testing.assert_allclose(s, p, rtol=1e-6 if dtype == mx.float32
+                                       else 1e-12, atol=0)

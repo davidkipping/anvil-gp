@@ -216,7 +216,7 @@ def first_point(phi, q, dtype=None, p_inf=None):
 
 def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
                   r_var: mx.array, r_ref: mx.array,
-                  s_floor: mx.array | None = None
+                  s_floor: mx.array | None = None, formal: bool = False
                   ) -> tuple[Element, "LeafRank1"]:
     """One element per observation, from the term matrices and the data.
 
@@ -247,6 +247,9 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     discipline applied to the log-determinant, and it is why ``r_ref`` is
     the *fixed* ``yerr^2`` rather than the jitter-dependent ``r_var``: the
     jitter's contribution stays inside the well-conditioned ratio.
+
+    ``formal`` is for a :class:`~anvilgp.terms.TermConvolution`; see the
+    comment at the clamp below.
     """
     # Written as per-plane multiply-adds rather than `mx.sum` over a
     # broadcast product.  The reduction kernels over a size-m axis cost
@@ -259,18 +262,7 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     _m = h.shape[-1]
     hphi = sum(h[:, None, i, None] * phi[:, :, i, :] for i in range(_m))
     qh = sum(q[:, :, :, j] * h[:, None, None, j] for j in range(_m))
-    # `h Q h^T` is a variance, hence non-negative in exact arithmetic --
-    # *except* under a `TermConvolution`, whose `Q` is only formally one.
-    # An earlier version of this comment said it goes negative only below
-    # `dt ~ delta/2` and that the spacing refusal therefore kept it away.
-    # Measured: with the state-space form the sign flip reaches `dt ~ 1.8
-    # delta` for the terms whose convolved exponential sum is not a
-    # positive-definite function (Matern-3/2, Matern-5/2, overdamped SHO),
-    # which provably cannot have a PSD `Q`.  So this clamp *does* bind for
-    # those, and there it changes the value.  The cost is measured and
-    # bounded -- 7e-7 for a convolved Matern-5/2 near `delta/rho ~ 0.01`,
-    # 1e-14 elsewhere; see docs/kernels.md.  For every other term the
-    # sentence below holds on arithmetic alone.
+    # `h Q h^T` is a variance, hence non-negative in exact arithmetic, and
     # float32 can round it slightly negative in the dense-cadence corner.
     # Clamp *it*, not the sum: `r_var` beside it is exact and strictly
     # positive, so clamping the term that can go non-physical leaves
@@ -280,12 +272,29 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
     # filter's own total is a *different* quantity, `h (Phi P Phi^T + Q) h^T
     # + r_var` -- made the two forms clamp different things and disagree by
     # ~0.1 log-units wherever it bound.  See docs/m4-plan.md, stage 0.
+    #
+    # `formal`: NOT for a `TermConvolution`.  Its `Q` is only formally a
+    # covariance -- the convolved exponential sum is not a positive-definite
+    # function for Matern-3/2, Matern-5/2 or a low-Q SHO, so no PSD `Q`
+    # exists -- and `h Q h^T` is genuinely negative there, not by rounding.
+    # The algebra is still exact with the negative value; the clamp is what
+    # breaks it.  Measured on a convolved Matern-5/2 at rho = 10-50
+    # exposures: 0.004 to 0.46 log-units wrong at N = 300 with the clamp,
+    # 1e-11 without (the "7e-7" this comment used to quote came from a grid
+    # with large error bars, where the clamp barely binds).  So the formal
+    # path takes the sum as it is.  If the *sum* is not positive the
+    # representation has genuinely failed, and the log and rsqrt below turn
+    # that into a NaN the likelihood refuses.
     hqh = sum(h[:, None, i] * qh[:, :, i] for i in range(_m))
-    s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + r_var
-    if s_floor is not None:
-        # secondary guard, kept for tests; unreachable in production since
-        # s_q >= r_var >= r_ref and s_floor is a small fraction of r_ref.
-        s_q = mx.maximum(s_q, s_floor)
+    if formal:
+        s_q = hqh + r_var
+    else:
+        s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + r_var
+        if s_floor is not None:
+            # secondary guard, kept for tests; unreachable in production
+            # since s_q >= r_var >= r_ref and s_floor is a small fraction
+            # of r_ref.
+            s_q = mx.maximum(s_q, s_floor)
 
     inv_s = 1.0 / s_q
     inv_rs = mx.rsqrt(s_q)
@@ -311,7 +320,7 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
         LeafRank1(z=z, g=g, ld=ld)
 
 
-def combine(e1: Element, e2: Element) -> Element:
+def combine(e1: Element, e2: Element, strict: bool = False) -> Element:
     """Compose two adjacent elements, ``e1`` earlier than ``e2``.
 
     The Gaussian integral ``int L2(x_out, z) L1(z, x_in) dz`` in closed
@@ -336,12 +345,16 @@ def combine(e1: Element, e2: Element) -> Element:
     ``log|I + C1 J2| = log|S| = 2 sum log diag(chol(S))`` by Sylvester's
     identity: the log-determinant is read straight off a factor that has
     already been computed, never from a separate determinant.
+
+    ``strict`` passes through to :func:`anvilgp.linalg.chol` for ``C1``: a
+    convolved term's formal ``C1`` can be indefinite, and flooring it would
+    change the answer rather than repair rounding.
     """
     m = e1.m
     dtype = e1.A.dtype
     ident = mx.eye(m, dtype=dtype)
 
-    l1 = chol(e1.C)
+    l1 = chol(e1.C, strict=strict)
     x = matmul(mx.swapaxes(l1, -1, -2), matmul(e2.J, l1))
     s = ident + sym(x)
     ls = chol(s)
@@ -454,7 +467,7 @@ def _pairs(e: Element):
     return Element(*out_even), Element(*out_odd)
 
 
-def tree_reduce(e: Element) -> Element:
+def tree_reduce(e: Element, strict: bool = False) -> Element:
     """Reduce elements along axis 1 (time) to a single element per chain.
 
     Balanced pairwise: ``ceil(log2 K)`` levels, each a batched
@@ -479,7 +492,7 @@ def tree_reduce(e: Element) -> Element:
                                         e.A.dtype))
         k = pad
     while k > 1:
-        e = combine(*_pairs(e))
+        e = combine(*_pairs(e), strict=strict)
         k //= 2
     return Element(*(getattr(e, f)[:, 0] for f in Element._fields))
 
@@ -528,7 +541,8 @@ def _fold_ell_tree(acc, step, lo):
     return acc._replace(ell=mx.sum(mx.stack(deltas, axis=-1), axis=-1))
 
 
-def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16) -> Element:
+def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16,
+                   strict: bool = False) -> Element:
     """Reduce along axis 1 by a chunked scan: fold, then tree.
 
     Split the block into sub-blocks of ``sub_len`` observations, fold each
@@ -556,7 +570,7 @@ def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16) -> Element:
     while k % lo:                       # keep both axes exact powers of two
         lo //= 2
     if lo == 1:
-        return tree_reduce(e)
+        return tree_reduce(e, strict=strict)
 
     n_sub = k // lo
     fields = {f: mx.reshape(getattr(e, f),
@@ -574,7 +588,7 @@ def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16) -> Element:
                             LeafRank1(z=zr[:, :, j], g=gr[:, :, j],
                                       ld=ldr[:, :, j]))
 
-    return tree_reduce(_fold_ell_tree(acc, step, lo))
+    return tree_reduce(_fold_ell_tree(acc, step, lo), strict=strict)
 
 # ---------------------------------------------------------------------------
 # block-structured leaves: same algebra, Phi's zeros never touched
@@ -637,7 +651,8 @@ def _add_block_diag(dense, blocks):
     return mx.concatenate(rows, axis=-2)
 
 
-def leaf_parts(phi_blocks, q_blocks, h, y, r_var, r_ref, s_floor=None):
+def leaf_parts(phi_blocks, q_blocks, h, y, r_var, r_ref, s_floor=None,
+               formal=False):
     """Compact leaves: the pieces of :func:`leaf_elements`, unassembled.
 
     Identical arithmetic; the difference is that ``A``, ``C``, ``J``, ``b``
@@ -656,11 +671,15 @@ def leaf_parts(phi_blocks, q_blocks, h, y, r_var, r_ref, s_floor=None):
         [sum(b[:, :, :, j] * h[:, None, None, o + j]
              for j in range(b.shape[-1]))
          for b, o in zip(q_blocks, _offsets(q_blocks))], axis=-1)
-    # clamp the variance term, not the sum -- see `leaf_elements`
+    # clamp the variance term, not the sum, and not at all on the formal
+    # path -- see `leaf_elements`
     hqh = sum(h[:, None, i] * qh[:, :, i] for i in range(h.shape[-1]))
-    s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + r_var
-    if s_floor is not None:
-        s_q = mx.maximum(s_q, s_floor)
+    if formal:
+        s_q = hqh + r_var
+    else:
+        s_q = mx.maximum(hqh, mx.zeros_like(hqh)) + r_var
+        if s_floor is not None:
+            s_q = mx.maximum(s_q, s_floor)
     inv_rs = mx.rsqrt(s_q)
     g_v = y * inv_rs
     ld = -0.5 * mx.log(s_q / r_ref)
@@ -770,7 +789,8 @@ def _pad_parts_to_pow2(parts: LeafParts):
                      grow_vec(parts.ld)), pad
 
 
-def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16) -> Element:
+def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16,
+                           strict: bool = False) -> Element:
     """:func:`chunked_reduce` over compact leaves."""
     parts, k = _pad_parts_to_pow2(parts)
     n = parts.g.shape[0]
@@ -797,7 +817,7 @@ def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16) -> Element:
         acc = combine_leaf_blocked(acc, slice_j(j))
     if n_sub == 1:
         return Element(*(getattr(acc, f)[:, 0] for f in Element._fields))
-    return tree_reduce(acc)
+    return tree_reduce(acc, strict=strict)
 
 
 

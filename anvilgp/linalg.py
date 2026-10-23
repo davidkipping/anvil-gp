@@ -124,14 +124,42 @@ def diag_floor(a: mx.array) -> mx.array:
     return fi.eps * mx.maximum(tr / m, mx.zeros_like(tr)) + 4.0 * fi.smallest_normal
 
 
-def chol(a: mx.array, floor: mx.array | None = None) -> mx.array:
-    """Lower Cholesky factor of a batch of PSD matrices, shape (..., m, m)."""
+#: How negative a pivot :func:`chol` lets ``strict`` mode floor, relative to
+#: ``|trace|/m``.  Rounding puts a PSD matrix's pivots at most a few ulps
+#: below zero; the formal model of a convolved term (see ``strict``) puts
+#: them at -2e-2 to -20 when the tree cannot represent it.  1e-4 sits between
+#: the two by orders of magnitude on both sides.
+FORMAL_PIVOT_TOL = 1e-4
+
+
+def chol(a: mx.array, floor: mx.array | None = None,
+         strict: bool = False) -> mx.array:
+    """Lower Cholesky factor of a batch of PSD matrices, shape (..., m, m).
+
+    ``strict`` is for a :class:`~anvilgp.terms.TermConvolution`, whose
+    state-space form is only *formally* Gaussian: its ``Q`` and the
+    covariances built from it can be indefinite for real parameters, and
+    the element algebra is still exact so long as nothing is clamped.
+    Flooring a clearly negative pivot then does not repair rounding, it
+    substitutes a different matrix -- measured at 0.07 to 2.4 log-units, in
+    both precisions, with no sign anything happened.  So under ``strict`` a
+    pivot below ``-FORMAL_PIVOT_TOL * |trace|/m`` makes the factor NaN, and
+    the likelihood refuses that chain instead of scoring it wrongly.
+    Smaller negatives are floored as usual.
+    """
     m = a.shape[-1]
     fl = diag_floor(a) if floor is None else floor
 
-    if prefer_builtin(a):
+    if prefer_builtin(a) and not strict:
         jit = fl[..., None, None] * mx.eye(m, dtype=a.dtype)
         return mx.linalg.cholesky(a + jit, upper=False, stream=mx.cpu)
+
+    if strict:
+        tr = a[..., 0, 0]
+        for i in range(1, m):
+            tr = tr + a[..., i, i]
+        lim = -FORMAL_PIVOT_TOL * mx.abs(tr) / m
+        nan = mx.array(float("nan"), dtype=a.dtype)
 
     ent: list[list[mx.array]] = [[None] * m for _ in range(m)]  # type: ignore
     for j in range(m):
@@ -139,6 +167,8 @@ def chol(a: mx.array, floor: mx.array | None = None) -> mx.array:
         for k in range(j):
             d = d - ent[j][k] * ent[j][k]
         ljj = mx.sqrt(mx.maximum(d, fl))
+        if strict:
+            ljj = mx.where(d < lim, nan, ljj)
         ent[j][j] = ljj
         inv = 1.0 / ljj
         for i in range(j + 1, m):

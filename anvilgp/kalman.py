@@ -26,14 +26,16 @@ __all__ = ["sequential_loglike"]
 
 def sequential_loglike(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
                        r_var: mx.array, r_ref: mx.array,
-                       s_floor: mx.array | None = None) -> mx.array:
+                       s_floor: mx.array | None = None,
+                       formal: bool = False) -> mx.array:
     """Reference-subtracted log-likelihood by the sequential filter.
 
     Arguments match :func:`anvilgp.elements.leaf_elements` exactly, so the
     same ``GPLogLike.leaf_inputs`` tuple drives both recursions and any
     disagreement is attributable to the recursion alone.  ``phi[:, 0]`` and
     ``q[:, 0]`` must already be ``0`` and ``P_inf = I`` for the first point.
-    Returns ``(n_chains,)``.
+    Returns ``(n_chains,)``.  ``formal`` drops the variance clamp, as in
+    :func:`~anvilgp.elements.leaf_elements`.
     """
     n, k, m = phi.shape[0], phi.shape[1], phi.shape[-1]
     dtype = phi.dtype
@@ -52,9 +54,12 @@ def sequential_loglike(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
         # and strictly positive, so this leaves s >= r_var > 0.  Matches
         # `elements.leaf_elements`, which clamps its own variance term.
         hch = mx.sum(h * ch, axis=-1)                         # (n,)
-        s = mx.maximum(hch, mx.zeros_like(hch)) + r_var[:, i]
-        if s_floor is not None:
-            s = mx.maximum(s, s_floor[i])
+        if formal:
+            s = hch + r_var[:, i]
+        else:
+            s = mx.maximum(hch, mx.zeros_like(hch)) + r_var[:, i]
+            if s_floor is not None:
+                s = mx.maximum(s, s_floor[i])
         v = y[:, i] - mx.sum(h * m_pred, axis=-1)
         gain = ch / s[:, None]
         mean = m_pred + gain * v[:, None]

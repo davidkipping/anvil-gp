@@ -802,10 +802,10 @@ class TermConvolution(Term):
     untouched and rescales the *amplitudes*, and beyond the exposure width
     the convolved kernel is exactly a sum of exponentials with the new
     amplitudes (verified against celerite2 to 3e-16).  So it is a
-    celerite-class term with the same state dimension -- but not the same
-    *parametrisation*: the rescaling breaks the SHO's ``b/a = c/d``, which
-    is why this needs :class:`ComplexTerm` and could not be written before
-    it.
+    celerite-class term with the same state dimension, and the state-space
+    form reuses the wrapped term's propagator unchanged: only the stationary
+    covariance moves, from ``I`` to a matrix function of the generator
+    (:meth:`matrices_blocks`).
 
     **Below the exposure width it is not that sum**, and the difference at
     zero lag is a constant added to the variance -- :meth:`diag_correction`.
@@ -826,16 +826,42 @@ class TermConvolution(Term):
     refused.  :class:`~anvilgp.likelihood.GPLogLike` checks it at
     construction.
 
-    **Limits.** ``term`` must have exact celerite coefficients, so
-    :class:`Matern32Term` (a repeated root) and :class:`Matern52Term` (a
-    triple one) cannot be wrapped -- their convolutions *are* state-space
-    models of the same order, with the same rate and a
-    polynomial-times-exponential form (measured to 1.6e-15), but reaching
-    them needs the ``m = 3`` propagator generalised the way
-    :func:`_complex_matrices` generalised ``m = 2``.  An underdamped
-    ``SHOTerm`` is fine; below ``Q = 1/2`` it decomposes into two real
-    exponentials one of which has a *negative* amplitude, which the
-    ``P_inf = I`` construction cannot carry, and that is refused too.
+    **What can be wrapped.** Any term with a :meth:`Term.generator`, which
+    is every term here, sums included: wrap the *sum*,
+    ``TermConvolution(a + b, delta)``.  A convolved term cannot itself be a
+    member of a sum -- :class:`TermSum` refuses it, because the exposure
+    integrates the whole signal and the sum would score that member as the
+    wrong kernel.
+
+    **Where it refuses a chain.** The state-space form is only *formally*
+    Gaussian: the convolved exponential sum is not a positive-definite
+    function for every parameter, so ``P_inf``, ``Q`` and the zero-lag
+    correction can be indefinite or negative.  The likelihood is still
+    exact -- the formal model reproduces the true covariance of the data,
+    and the sequential filter matches the dense oracle to 2e-9 or better
+    wherever it was checked -- but the parallel reduction factors
+    intermediate covariances, and where one of them is indefinite there is
+    no factor to take.  :class:`~anvilgp.likelihood.GPLogLike` then gives
+    the chain the failure value instead of a number (until 2026-10-23 it
+    floored the factor and returned a wrong value, by up to 500 log-units).
+    Measured, the refused region is:
+
+    * a :class:`RealTerm` whenever ``yerr^2 + jitter^2`` is smaller than
+      the magnitude of its (negative) zero-lag correction, about
+      ``sigma^2 c delta / 3`` -- in signal-to-noise terms above roughly
+      ``sqrt(3 / (c delta))``, so ~17 at ``c delta = 0.01``.  This is most
+      of the high-signal-to-noise regime, and the main limitation;
+    * a low-``Q`` SHO within a few exposures: ``rho`` up to ~5 ``delta`` at
+      ``Q <= 1/2`` and ~3 ``delta`` at ``Q = 1/sqrt 2``;
+    * a Matern-3/2 with ``rho`` about one exposure.
+
+    (Measured at signal-to-noise 3 to 100; every region grows as the error
+    bars shrink.)
+
+    Elsewhere every path agrees with the dense float64 oracle (1e-11 in
+    float64, float32 noise on the fused kernel and the MLX path).  And
+    ``||F delta||`` above :data:`MAX_FDELTA` is refused per chain, since
+    the matrix series stop converging there.
     """
 
     def __init__(self, term: Term, delta: float):
@@ -1350,6 +1376,21 @@ class TermSum(Term):
     terms: tuple[Term, ...]
 
     def __init__(self, *terms: Term):
+        # A convolved member would be scored as the wrong kernel, silently:
+        # the sum keeps the package-wide `P_inf = I` and no zero-lag
+        # correction, which is right for every member but that one, and the
+        # likelihood looks for the exposure width on the term it is given,
+        # not inside it.  Measured 0.04 to 5.3 log-units off on all three
+        # paths.  Physically one detector integrates the *whole* signal, so
+        # the convolution belongs outside the sum, where it is supported.
+        for t in terms:
+            if isinstance(t, TermConvolution):
+                raise TypeError(
+                    "a TermConvolution cannot be a member of a sum: the "
+                    "exposure integrates the whole signal, so convolve the "
+                    "sum instead, e.g. TermConvolution(SHOTerm() + "
+                    "Matern32Term(), delta) rather than "
+                    "TermConvolution(SHOTerm(), delta) + Matern32Term()")
         self.terms = tuple(terms)
         self.n_state = sum(t.n_state for t in terms)
         names: list[str] = []

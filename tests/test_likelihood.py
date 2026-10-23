@@ -691,14 +691,15 @@ def test_the_newly_convolvable_terms_match_the_dense_oracle(name, term, p, delta
     celerite2 has no Matern-5/2, only approximates Matern-3/2, and cannot
     convolve an overdamped SHO either.
 
-    The tolerance is 1e-5, not the 1e-11 the other convolved terms hold, and
-    the slack is real rather than defensive. A convolved kernel whose
-    exponential-sum continuation is not positive definite *cannot* have a PSD
-    process noise -- if it could, that continuation would be a valid
-    covariance -- and the element algebra factors ``Q``. Measured min
-    eigenvalue of ``Q`` for these three: -1e-12 to -3e-2 relative, growing
-    with ``delta``. The worst end-to-end error found over this grid is 7e-7
-    (Matern-5/2 near ``delta/rho ~ 0.01``); everything else is at 1e-14.
+    A convolved kernel whose exponential-sum continuation is not positive
+    definite *cannot* have a PSD process noise -- if it could, that
+    continuation would be a valid covariance -- so ``Q`` here is indefinite
+    (min eigenvalue -1e-12 to -3e-2 relative, growing with ``delta``).  The
+    algebra is exact anyway on the formal path, which drops the positivity
+    clamps for exactly this reason, so the tolerance is the 1e-10 every
+    other convolved term holds.  (It was 1e-5 while the clamps were on, and
+    this grid's large error bars hid how far they could move the answer --
+    see `test_a_convolved_term_is_exact_or_refused_never_wrong`.)
     """
     rng = np.random.default_rng(11)
     n = 200
@@ -710,7 +711,158 @@ def test_the_newly_convolvable_terms_match_the_dense_oracle(name, term, p, delta
     with mx.stream(mx.cpu):
         hi = float(np.array(gp.hi_absolute(a64(np.zeros((1, len(p))))))[0])
     ref = dense_loglike(cv, np.asarray(p, dtype=np.float64), t, y, yerr)
-    assert abs(hi - ref) / abs(ref) < 1e-5, f"{name} delta={delta}"
+    assert abs(hi - ref) / abs(ref) < 1e-10, f"{name} delta={delta}"
+
+
+#: (term, natural parameters in units of (sigma, delta, 1), yerr).  Chosen to
+#: cover both outcomes: points whose formal state-space form the tree cannot
+#: factor (refused), and points that used to come back wrong because a
+#: positivity clamp bound (exact now).  Spacing = exposure, the tightest
+#: cadence the convolution allows.
+_FORMAL_GRID = [
+    ("sho-r2-Q0.71", ag.SHOTerm(), (1.0, 2.0, 0.7071), 3e-4),     # refused
+    ("sho-r3-Q0.5-lownoise", ag.SHOTerm(), (1.0, 3.0, 0.5), 3e-4),  # refused
+    ("sho-r3-Q0.5-highnoise", ag.SHOTerm(), (1.0, 3.0, 0.5), 3e-3),
+    ("sho-r4-Q0.3", ag.SHOTerm(), (1.0, 4.0, 0.3), 3e-3),          # refused
+    ("sho-r7-Q0.3", ag.SHOTerm(), (1.0, 7.0, 0.3), 3e-4),
+    ("sho-r3-Q3", ag.SHOTerm(), (1.0, 3.0, 3.0), 3e-4),
+    ("matern32-r1", ag.Matern32Term(), (1.0, 1.0), 3e-4),          # refused
+    ("matern32-r2", ag.Matern32Term(), (1.0, 2.0), 3e-4),
+    ("matern52-r10", ag.Matern52Term(), (1.0, 10.0), 3e-4),  # was 0.46 off
+    ("matern52-r20", ag.Matern52Term(), (1.0, 20.0), 3e-4),  # was 0.09 off
+]
+
+
+@pytest.mark.parametrize("metal", [False, True], ids=["mlx", "kernel"])
+def test_a_convolved_term_is_exact_or_refused_never_wrong(metal):
+    """Every path either matches the dense oracle or refuses the chain.
+
+    A convolved term's state-space form is only *formally* Gaussian: for a
+    low-``Q`` SHO, Matern-3/2 or Matern-5/2 with ``rho`` within a few
+    exposure widths, its ``P_inf``, ``Q`` and the covariances built from
+    them are indefinite, not by rounding.  The algebra is still exact so
+    long as nothing clamps -- the sequential filter, which never factors
+    anything, matched the dense oracle to 1e-12 at every point here -- but
+    three positivity guards written for float32 rounding did clamp, and
+    each one silently substituted a different number: the ``h Q h^T``
+    clamp (Matern-5/2 at ``rho`` = 10 to 50 exposures, 0.004 to 0.46
+    log-units at this N), the sequential replay's predicted-variance clamp,
+    and the Cholesky pivot floor in the block composition (0.07 to 2.4,
+    and +170 at one point).  Some of those were too *high*, which attracts
+    chains.
+
+    So on the formal path the clamps are gone and a pivot the floor would
+    have replaced is a NaN instead.  The assertion is the contract: float64
+    ``.hi`` is within 1e-9 of the oracle or NaN, the float32 path within
+    float32 noise of it or the failure value, and the two agree on which.
+    The grid is built to contain both outcomes, and the test checks that
+    it does, so it cannot pass by refusing everything.
+    """
+    n, dl = 300, 0.02
+    t = np.arange(n) * dl
+    rng = np.random.default_rng(23)
+    outcome = {}
+    for name, base, p_units, ye in _FORMAL_GRID:
+        p = np.array(p_units, dtype=np.float64) * np.array(
+            [1e-3, dl, 1.0][:len(p_units)])
+        y, yerr = 1e-3 * rng.standard_normal(n), np.full(n, ye)
+        cv = ag.TermConvolution(base, dl)
+        gp = GPLogLike(None, t, None, y, yerr, cv, ParamMap.log(list(p)),
+                       GPPolicy(metal=metal, kappa_max=None))
+        u = np.zeros((1, len(p)))
+        ref = dense_loglike(cv, p, t, y, yerr)
+        with mx.stream(mx.cpu):
+            hi = float(np.array(gp.hi_absolute(a64(u)))[0])
+        lo = float(np.array(gp.log_prob_absolute(
+            mx.array(u, dtype=mx.float32)))[0])
+        if np.isfinite(hi):
+            assert abs(hi - ref) < 1e-9 * abs(ref), f"{name}: .hi {hi} vs {ref}"
+            assert abs(lo - ref) < 5e-3, f"{name}: float32 {lo} vs {ref}"
+            outcome[name] = "exact"
+        else:
+            assert lo < -1e29, f"{name}: .hi refused, float32 gave {lo}"
+            outcome[name] = "refused"
+    assert "refused" in outcome.values() and "exact" in outcome.values(), outcome
+    # the two cases whose clamp used to bind are now answered, not refused
+    assert outcome["matern52-r10"] == outcome["matern52-r20"] == "exact"
+
+
+def test_a_formal_kernel_gradient_matches_the_mlx_path():
+    """The kernel's formal variant differentiates the same thing.
+
+    The backward kernel replays the sequential filter, whose clamp the
+    formal variant also drops; a replay that disagreed with the forward
+    about the clamp would give a gradient for a different function.  Taken
+    where the clamp used to bind (convolved Matern-5/2, ``rho`` = 10
+    exposures) and off the reference point.
+    """
+    n, dl = 300, 0.02
+    t = np.arange(n) * dl
+    rng = np.random.default_rng(5)
+    y, yerr = 1e-3 * rng.standard_normal(n), np.full(n, 3e-4)
+    cv = ag.TermConvolution(ag.Matern52Term(), dl)
+    pm = ParamMap.log([1e-3, 10 * dl])
+    gk = GPLogLike(None, t, None, y, yerr, cv, pm, GPPolicy(metal=True))
+    gm = GPLogLike(None, t, None, y, yerr, cv, pm, GPPolicy(metal=False))
+    assert gk.metal_eligible()[0]
+    u = mx.array([[0.05, -0.1], [-0.1, 0.2]], dtype=mx.float32)
+    grads = [np.array(mx.grad(lambda w, g=g: mx.sum(g(w)))(u), np.float64)
+             for g in (gk, gm)]
+    assert np.all(np.isfinite(grads[0])) and np.abs(grads[0]).max() > 0
+    rel = np.abs(grads[0] - grads[1]).max() / np.abs(grads[1]).max()
+    assert rel < 1e-4, f"kernel vs MLX gradient {rel:.2e}"
+
+
+def test_a_convolved_term_cannot_join_a_sum():
+    """``TermConvolution(a) + b`` was silently the wrong kernel; now it raises.
+
+    The sum kept ``P_inf = I`` and no zero-lag correction for every member,
+    and the likelihood looked for the exposure width on the term it was
+    given rather than inside it -- so the convolved member was scored as
+    neither itself nor its base term (0.04 to 5.3 log-units off, on all
+    three paths).  One detector integrates the whole signal, so the
+    supported form, ``TermConvolution(a + b)``, is also the physical one.
+    """
+    cv = ag.TermConvolution(ag.SHOTerm(), 0.02)
+    for build in (lambda: cv + ag.SHOTerm(), lambda: ag.SHOTerm() + cv,
+                  lambda: ag.TermSum(cv, ag.Matern32Term())):
+        with pytest.raises(TypeError, match="convolve the sum"):
+            build()
+    ok = ag.TermConvolution(ag.SHOTerm() + ag.SHOTerm(), 0.02)
+    assert ok.n_state == 4
+
+
+@pytest.mark.parametrize("metal", [False, True], ids=["mlx", "kernel"])
+def test_a_chain_outside_the_series_range_is_refused(metal):
+    """``||F delta|| <= MAX_FDELTA`` holds per chain, not just at ``v = 0``.
+
+    Construction checks the reference point only, and a chain can walk
+    anywhere: at ``rho = 2 dt``, ``Q = 0.05`` -- inside the default prior box
+    -- the norm is 63, the series has not converged and the value was 432
+    log-units wrong in float64.  Here the reference is well inside the bound
+    (``c = 0.005``, norm 0.1) and the second chain is outside it (``c =
+    0.6``, norm 12).
+
+    The guard is checked directly as well as end to end, because a chain
+    that far out is usually refused by the formal path's pivot check too,
+    and the end-to-end result alone would not show which one fired.
+    """
+    rng = np.random.default_rng(3)
+    n = 100
+    t = np.arange(n) * 20.0
+    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    cv = ag.TermConvolution(ag.RealTerm(), 20.0)
+    p = [1.2, 0.005]
+    gp = GPLogLike(None, t, None, y, yerr, cv, ParamMap.log(p),
+                   GPPolicy(metal=metal))
+    u = mx.array([[0.0, 0.0], [0.0, float(np.log(120.0))]], dtype=mx.float32)
+    guarded = np.array(gp._refuse_outside_series(
+        u, mx.zeros((2,), dtype=mx.float32)))
+    assert guarded[0] == 0.0 and np.isnan(guarded[1]), guarded
+    out = np.array(gp.log_prob_absolute(u), np.float64)
+    ref = dense_loglike(cv, np.array(p), t, y, yerr)
+    assert abs(out[0] - ref) < 1e-3, (out[0], ref)
+    assert out[1] < -1e29, out
 
 
 def test_convolution_refuses_too_wide_an_exposure_for_the_series():
