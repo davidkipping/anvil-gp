@@ -182,11 +182,11 @@ Admissible only as a secondary cross-check, never as the likelihood:
 
 ## Known v1 limitations
 
-* Exposure-time integration (`TermConvolution`) refuses part of its
-  parameter space — a convolved `RealTerm` at high signal-to-noise above
-  all — because the parallel reduction cannot factor the indefinite
-  covariances of its formal state-space form. See
-  [kernels.md](kernels.md#where-it-refuses-a-chain).
+* Exposure-time integration (`TermConvolution`) forms its process noise
+  by subtraction, so its float32 path is 50–100x less accurate than an
+  unconvolved term's on data far off-model (no measurable cost on data
+  drawn from the model). See
+  [kernels.md](kernels.md#indefinite-and-still-exact).
 * No 2D / multiband GPs.
 * `predict` / conditional mean is an offline float64 utility
   (`oracle.dense_predict`), deliberately outside the hot path.

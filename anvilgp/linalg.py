@@ -34,8 +34,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-__all__ = ["chol", "tri_solve_right", "sym_from_factor", "quad_form",
-           "matvec", "matmul", "outer", "sym", "FORCE_UNROLLED"]
+__all__ = ["chol", "inv_logdet", "tri_solve_right", "sym_from_factor",
+           "quad_form", "matvec", "matmul", "outer", "sym", "FORCE_UNROLLED"]
 
 
 #: state dimension at or below which the unrolled elementwise product beats
@@ -124,42 +124,14 @@ def diag_floor(a: mx.array) -> mx.array:
     return fi.eps * mx.maximum(tr / m, mx.zeros_like(tr)) + 4.0 * fi.smallest_normal
 
 
-#: How negative a pivot :func:`chol` lets ``strict`` mode floor, relative to
-#: ``|trace|/m``.  Rounding puts a PSD matrix's pivots at most a few ulps
-#: below zero; the formal model of a convolved term (see ``strict``) puts
-#: them at -2e-2 to -20 when the tree cannot represent it.  1e-4 sits between
-#: the two by orders of magnitude on both sides.
-FORMAL_PIVOT_TOL = 1e-4
-
-
-def chol(a: mx.array, floor: mx.array | None = None,
-         strict: bool = False) -> mx.array:
-    """Lower Cholesky factor of a batch of PSD matrices, shape (..., m, m).
-
-    ``strict`` is for a :class:`~anvilgp.terms.TermConvolution`, whose
-    state-space form is only *formally* Gaussian: its ``Q`` and the
-    covariances built from it can be indefinite for real parameters, and
-    the element algebra is still exact so long as nothing is clamped.
-    Flooring a clearly negative pivot then does not repair rounding, it
-    substitutes a different matrix -- measured at 0.07 to 2.4 log-units, in
-    both precisions, with no sign anything happened.  So under ``strict`` a
-    pivot below ``-FORMAL_PIVOT_TOL * |trace|/m`` makes the factor NaN, and
-    the likelihood refuses that chain instead of scoring it wrongly.
-    Smaller negatives are floored as usual.
-    """
+def chol(a: mx.array, floor: mx.array | None = None) -> mx.array:
+    """Lower Cholesky factor of a batch of PSD matrices, shape (..., m, m)."""
     m = a.shape[-1]
     fl = diag_floor(a) if floor is None else floor
 
-    if prefer_builtin(a) and not strict:
+    if prefer_builtin(a):
         jit = fl[..., None, None] * mx.eye(m, dtype=a.dtype)
         return mx.linalg.cholesky(a + jit, upper=False, stream=mx.cpu)
-
-    if strict:
-        tr = a[..., 0, 0]
-        for i in range(1, m):
-            tr = tr + a[..., i, i]
-        lim = -FORMAL_PIVOT_TOL * mx.abs(tr) / m
-        nan = mx.array(float("nan"), dtype=a.dtype)
 
     ent: list[list[mx.array]] = [[None] * m for _ in range(m)]  # type: ignore
     for j in range(m):
@@ -167,8 +139,6 @@ def chol(a: mx.array, floor: mx.array | None = None,
         for k in range(j):
             d = d - ent[j][k] * ent[j][k]
         ljj = mx.sqrt(mx.maximum(d, fl))
-        if strict:
-            ljj = mx.where(d < lim, nan, ljj)
         ent[j][j] = ljj
         inv = 1.0 / ljj
         for i in range(j + 1, m):
@@ -180,6 +150,58 @@ def chol(a: mx.array, floor: mx.array | None = None,
     rows = [mx.stack([ent[i][j] if j <= i else zero for j in range(m)], axis=-1)
             for i in range(m)]
     return mx.stack(rows, axis=-2)
+
+
+def inv_logdet(x: mx.array) -> tuple[mx.array, mx.array]:
+    """``(x^-1, log|det x|)`` for a batch of small *general* matrices.
+
+    For the composition of a convolved term's elements, whose covariances
+    are only formally Gaussian and can be indefinite, so :func:`chol` has
+    nothing to factor (see :func:`anvilgp.elements.combine`).  Gauss-Jordan
+    with partial pivoting, statically unrolled like :func:`chol`: the pivot
+    row is chosen per batch element by comparison and moved by
+    ``mx.where``, so there is no data-dependent control flow and the graph
+    is ``mx.compile``-safe and differentiable.  The determinant's sign is
+    not returned -- the caller needs only the magnitude (the product of
+    every factor in the likelihood is positive, so the magnitudes carry the
+    whole answer).
+    """
+    m = x.shape[-1]
+    a = [[x[..., i, j] for j in range(m)] for i in range(m)]
+    one, zero = mx.ones_like(a[0][0]), mx.zeros_like(a[0][0])
+    g = [[one if i == j else zero for j in range(m)] for i in range(m)]
+    logdet = zero
+    for k in range(m):
+        # choose the pivot row: largest |a[r][k]| over r >= k
+        best = mx.zeros(a[0][0].shape, dtype=mx.int32) + k
+        bval = mx.abs(a[k][k])
+        for r in range(k + 1, m):
+            better = mx.abs(a[r][k]) > bval
+            best = mx.where(better, r, best)
+            bval = mx.where(better, mx.abs(a[r][k]), bval)
+        if k + 1 < m:
+            rk_a, rk_g = list(a[k]), list(g[k])
+            new_a, new_g = list(a[k]), list(g[k])
+            for r in range(k + 1, m):
+                sel = best == r
+                new_a = [mx.where(sel, a[r][j], new_a[j]) for j in range(m)]
+                new_g = [mx.where(sel, g[r][j], new_g[j]) for j in range(m)]
+                a[r] = [mx.where(sel, rk_a[j], a[r][j]) for j in range(m)]
+                g[r] = [mx.where(sel, rk_g[j], g[r][j]) for j in range(m)]
+            a[k], g[k] = new_a, new_g
+        piv = a[k][k]
+        logdet = logdet + mx.log(mx.abs(piv))
+        inv = 1.0 / piv
+        a[k] = [v * inv for v in a[k]]
+        g[k] = [v * inv for v in g[k]]
+        for r in range(m):
+            if r == k:
+                continue
+            f = a[r][k]
+            a[r] = [a[r][j] - f * a[k][j] for j in range(m)]
+            g[r] = [g[r][j] - f * g[k][j] for j in range(m)]
+    inv_x = mx.stack([mx.stack(row, axis=-1) for row in g], axis=-2)
+    return inv_x, logdet
 
 
 def tri_solve_right(lo: mx.array, b: mx.array) -> mx.array:

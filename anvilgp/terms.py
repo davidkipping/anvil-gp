@@ -833,35 +833,26 @@ class TermConvolution(Term):
     integrates the whole signal and the sum would score that member as the
     wrong kernel.
 
-    **Where it refuses a chain.** The state-space form is only *formally*
-    Gaussian: the convolved exponential sum is not a positive-definite
-    function for every parameter, so ``P_inf``, ``Q`` and the zero-lag
-    correction can be indefinite or negative.  The likelihood is still
-    exact -- the formal model reproduces the true covariance of the data,
-    and the sequential filter matches the dense oracle to 2e-9 or better
-    wherever it was checked -- but the parallel reduction factors
-    intermediate covariances, and where one of them is indefinite there is
-    no factor to take.  :class:`~anvilgp.likelihood.GPLogLike` then gives
-    the chain the failure value instead of a number (until 2026-10-23 it
-    floored the factor and returned a wrong value, by up to 500 log-units).
-    Measured, the refused region is:
-
-    * a :class:`RealTerm` whenever ``yerr^2 + jitter^2`` is smaller than
-      the magnitude of its (negative) zero-lag correction, about
-      ``sigma^2 c delta / 3`` -- in signal-to-noise terms above roughly
-      ``sqrt(3 / (c delta))``, so ~17 at ``c delta = 0.01``.  This is most
-      of the high-signal-to-noise regime, and the main limitation;
-    * a low-``Q`` SHO within a few exposures: ``rho`` up to ~5 ``delta`` at
-      ``Q <= 1/2`` and ~3 ``delta`` at ``Q = 1/sqrt 2``;
-    * a Matern-3/2 with ``rho`` about one exposure.
-
-    (Measured at signal-to-noise 3 to 100; every region grows as the error
-    bars shrink.)
-
-    Elsewhere every path agrees with the dense float64 oracle (1e-11 in
-    float64, float32 noise on the fused kernel and the MLX path).  And
-    ``||F delta||`` above :data:`MAX_FDELTA` is refused per chain, since
-    the matrix series stop converging there.
+    **Indefinite, and still exact.** The state-space form is only
+    *formally* Gaussian: the convolved exponential sum is not a
+    positive-definite function for every parameter, so ``P_inf``, ``Q``,
+    the zero-lag correction and the filter's intermediate covariances can
+    be indefinite or negative.  The likelihood is exact anyway -- the
+    formal model reproduces the data's covariance -- provided nothing
+    assumes positivity, so :class:`~anvilgp.likelihood.GPLogLike` runs a
+    convolved term on a *formal* path: no variance clamps, magnitudes of
+    the intermediate determinants, and a pivoted direct inverse instead of
+    a Cholesky factor (:func:`anvilgp.elements.combine`).  Until 2026-10-23
+    the positivity assumptions were applied anyway and returned wrong
+    values, up to 500 log-units for a convolved :class:`RealTerm` at high
+    signal-to-noise.  Checked now against the dense float64 oracle over six
+    term shapes, timescales of 1 to 100 exposures and signal-to-noise 3 to
+    100: exact everywhere in float64, float32 noise on both float32 paths.
+    One float32 caveat, older than this: ``Q`` is formed as ``P - Phi P
+    Phi^T``, which costs 50-100x the unconvolved term's float32 error on
+    data far off-model (see docs/kernels.md).  ``||F delta||`` above
+    :data:`MAX_FDELTA` is refused per chain, since the matrix series stop
+    converging there.
     """
 
     def __init__(self, term: Term, delta: float):

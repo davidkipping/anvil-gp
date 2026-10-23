@@ -1523,36 +1523,48 @@ def test_instrument_labels_are_range_checked():
         _jitter_gp(3, True, n=n, inst=short)
 
 
-def test_the_formal_variant_changes_only_the_positivity_guards():
-    """The convolved-term variant drops the clamps; nothing else moves.
+def test_the_formal_variant_changes_only_the_positivity_assumptions():
+    """The convolved-term variant drops what assumes positivity; nothing else.
 
     Every other term runs the non-formal source, which must be the code it
     always was -- when the variant was introduced it was compared against
     the previous source with comments and whitespace stripped, and found
     identical.  This pins the substitution itself: no placeholder survives
-    in either variant, the non-formal one still carries every clamp, and the
-    formal one carries none of them and refuses a negative pivot instead.
+    in either variant, the non-formal one still carries every clamp and
+    Cholesky factor, and the formal one carries none of them and composes
+    through the pivoted inverse instead.
     """
-    tokens = ("LEAF_VARIANCE", "STRICT_PIVOT", "HCH_CLAMPED",
-              "RK_CLAMP_TERM", "CLAMPED_TEST")
-    fwd = metal._jitter_src(metal._SRC, 1)
-    bwd = metal._jitter_src(
-        metal._SRC_BWD_CKPT.replace("FWD_STEP", metal._FWD_STEP), 1)
-    red = metal._SRC_REDUCE
-    clamps = {
-        "fwd": ["sq = max(sq, 0.0f);", "sq = max(sq, sfloor * rr);"],
+    tokens = ("LEAF_VARIANCE", "REDUCE_CORE", "LOGDET_ACC", "COMBINE_FACTOR",
+              "LOG_INV_A", "HCH_CLAMPED", "RK_CLAMP_TERM", "CLAMPED_TEST",
+              "C1N")
+    srcs = {
+        "fwd": metal._jitter_src(metal._SRC, 1),
+        "bwd": metal._jitter_src(
+            metal._SRC_BWD_CKPT.replace("FWD_STEP", metal._FWD_STEP), 1),
+        "red": metal._SRC_REDUCE,
+        "seeds": metal._SRC_SEEDS.replace("COMBINE_CORE", metal._COMBINE_CORE),
+    }
+    only_plain = {
+        "fwd": ["sq = max(sq, 0.0f);", "sq = max(sq, sfloor * rr);",
+                "log(inv_a)"],
         "bwd": ["max(hch, 0.0f) + r_ref[gi]", "max(-hch, 0.0f)",
                 "bool clamped = hch < 0.0f;"],
-        "red": [],
+        "red": ["L1[j][j] = metal::precise::sqrt(max(d, fl));",
+                "log(Ls[i][i])"],
+        "seeds": ["L1[j][j] = metal::precise::sqrt(max(d, flc));"],
     }
-    for name, src in (("fwd", fwd), ("bwd", bwd), ("red", red)):
+    only_formal = {
+        "fwd": ["log(fabs(inv_a))"],
+        "bwd": ["bool clamped = false;"],
+        "red": ["ldx += metal::precise::log(fabs(dk));", "0.5f * ldx"],
+        "seeds": ["ldx += metal::precise::log(fabs(dk));"],
+    }
+    for name, src in srcs.items():
         plain = metal._formal_src(src, False)
         formal = metal._formal_src(src, True)
         for tok in tokens:
             assert tok not in plain and tok not in formal, (name, tok)
-        for c in clamps[name]:
-            assert c in plain, (name, c)
-            assert c not in formal, (name, c)
-        assert "NAN" not in plain, name
-    assert "L1[j][j] = NAN;" in metal._formal_src(red, True)
-    assert "bool clamped = false;" in metal._formal_src(bwd, True)
+        for c in only_plain[name]:
+            assert c in plain and c not in formal, (name, c)
+        for c in only_formal[name]:
+            assert c in formal and c not in plain, (name, c)

@@ -44,7 +44,7 @@ from typing import NamedTuple
 
 import mlx.core as mx
 
-from .linalg import (chol, matmul, matvec, outer, quad_form, sym,
+from .linalg import (chol, inv_logdet, matmul, matvec, outer, quad_form, sym,
                      sym_from_factor, tri_solve_right)
 
 __all__ = ["Element", "LeafRank1", "LeafParts", "first_point",
@@ -320,7 +320,7 @@ def leaf_elements(phi: mx.array, q: mx.array, h: mx.array, y: mx.array,
         LeafRank1(z=z, g=g, ld=ld)
 
 
-def combine(e1: Element, e2: Element, strict: bool = False) -> Element:
+def combine(e1: Element, e2: Element, formal: bool = False) -> Element:
     """Compose two adjacent elements, ``e1`` earlier than ``e2``.
 
     The Gaussian integral ``int L2(x_out, z) L1(z, x_in) dz`` in closed
@@ -346,23 +346,40 @@ def combine(e1: Element, e2: Element, strict: bool = False) -> Element:
     identity: the log-determinant is read straight off a factor that has
     already been computed, never from a separate determinant.
 
-    ``strict`` passes through to :func:`anvilgp.linalg.chol` for ``C1``: a
-    convolved term's formal ``C1`` can be indefinite, and flooring it would
-    change the answer rather than repair rounding.
+    ``formal`` is for a :class:`~anvilgp.terms.TermConvolution`, whose
+    state-space form is only formally Gaussian: ``C1`` and ``J2`` can be
+    indefinite, so there may be no Cholesky factor to take, and flooring one
+    substituted a different matrix (up to 500 log-units wrong).  The same
+    three matrices come instead from ``(I + C1 J2)^-1`` by a pivoted direct
+    inverse, with ``log|I + C1 J2|`` off its pivots.  Only magnitudes enter:
+    individual determinants (and :func:`combine_leaf`'s ``alpha``) can be
+    negative, but their product is the data's covariance determinant, which
+    is positive, so the magnitudes carry the whole answer.  Exact wherever
+    the inverse exists; in float32 it matched the Cholesky route to every
+    digit printed on points where both apply.
     """
     m = e1.m
     dtype = e1.A.dtype
     ident = mx.eye(m, dtype=dtype)
 
-    l1 = chol(e1.C, strict=strict)
-    x = matmul(mx.swapaxes(l1, -1, -2), matmul(e2.J, l1))
-    s = ident + sym(x)
-    ls = chol(s)
-    y = tri_solve_right(ls, l1)                    # Y Ls^T = L1
-    m_mat = sym_from_factor(y)                     # (I + C1 J2)^-1 C1
-    g = ident - matmul(m_mat, e2.J)                # (I + C1 J2)^-1
-    v = matmul(e2.J, y)
-    jt = sym(e2.J - sym_from_factor(v))           # (I + J2 C1)^-1 J2
+    if formal:
+        g, logdet_x = inv_logdet(ident + matmul(e1.C, e2.J))
+        m_mat = sym(matmul(g, e1.C))                # (I + C1 J2)^-1 C1
+        jt = sym(matmul(e2.J, g))                   # (I + J2 C1)^-1 J2
+        log_det = 0.5 * logdet_x
+    else:
+        l1 = chol(e1.C)
+        x = matmul(mx.swapaxes(l1, -1, -2), matmul(e2.J, l1))
+        s = ident + sym(x)
+        ls = chol(s)
+        y = tri_solve_right(ls, l1)                 # Y Ls^T = L1
+        m_mat = sym_from_factor(y)                  # (I + C1 J2)^-1 C1
+        g = ident - matmul(m_mat, e2.J)             # (I + C1 J2)^-1
+        v = matmul(e2.J, y)
+        jt = sym(e2.J - sym_from_factor(v))        # (I + J2 C1)^-1 J2
+        log_det = mx.log(ls[..., 0, 0])
+        for i in range(1, m):
+            log_det = log_det + mx.log(ls[..., i, i])
 
     a = matmul(e2.A, matmul(g, e1.A))
     g_b1 = matvec(g, e1.b)                         # G b1 -- the ell term
@@ -376,9 +393,6 @@ def combine(e1: Element, e2: Element, strict: bool = False) -> Element:
     eta = matvec(mx.swapaxes(e1.A, -1, -2), gt_eta) + e1.eta
     j = sym(matmul(mx.swapaxes(e1.A, -1, -2), matmul(jt, e1.A))) + e1.J
 
-    log_det = mx.log(ls[..., 0, 0])
-    for i in range(1, m):
-        log_det = log_det + mx.log(ls[..., i, i])
     ell = (e1.ell + e2.ell
            - log_det
            - 0.5 * quad_form(e1.b, jt)
@@ -387,7 +401,8 @@ def combine(e1: Element, e2: Element, strict: bool = False) -> Element:
     return Element(A=a, b=b, C=c, eta=eta, J=j, ell=ell)
 
 
-def combine_leaf(e1: Element, e2: Element, r1: LeafRank1) -> Element:
+def combine_leaf(e1: Element, e2: Element, r1: LeafRank1,
+                 formal: bool = False) -> Element:
     """``combine(e1, e2)`` where ``e2`` is a raw leaf -- no factorisation.
 
     Because a leaf's information matrix is ``J2 = z z^T``, every inverse in
@@ -411,6 +426,9 @@ def combine_leaf(e1: Element, e2: Element, r1: LeafRank1) -> Element:
 
     This is the composition the fused Metal kernel's pass 1 runs
     sequentially in registers: O(m^2) per observation, nothing to factor.
+
+    ``formal`` (a convolved term): ``C1`` can be indefinite, so ``alpha`` can
+    be negative, and only ``log|alpha|`` enters -- see :func:`combine`.
     """
     z, g = r1.z, r1.g
     p = matvec(e1.C, z)                              # C1 z
@@ -429,7 +447,8 @@ def combine_leaf(e1: Element, e2: Element, r1: LeafRank1) -> Element:
     # sum puts the `g^2/2` straight back, so the two cancel exactly in real
     # arithmetic and lose four digits in float32 whenever g^2 >> ld.
     ell = (e1.ell + r1.ld
-           + 0.5 * mx.log(inv_a) - 0.5 * beta * beta * inv_a)
+           + 0.5 * mx.log(mx.abs(inv_a) if formal else inv_a)
+           - 0.5 * beta * beta * inv_a)
     return Element(A=a, b=b, C=c, eta=eta, J=j, ell=ell)
 
 
@@ -467,7 +486,7 @@ def _pairs(e: Element):
     return Element(*out_even), Element(*out_odd)
 
 
-def tree_reduce(e: Element, strict: bool = False) -> Element:
+def tree_reduce(e: Element, formal: bool = False) -> Element:
     """Reduce elements along axis 1 (time) to a single element per chain.
 
     Balanced pairwise: ``ceil(log2 K)`` levels, each a batched
@@ -492,7 +511,7 @@ def tree_reduce(e: Element, strict: bool = False) -> Element:
                                         e.A.dtype))
         k = pad
     while k > 1:
-        e = combine(*_pairs(e), strict=strict)
+        e = combine(*_pairs(e), formal=formal)
         k //= 2
     return Element(*(getattr(e, f)[:, 0] for f in Element._fields))
 
@@ -542,7 +561,7 @@ def _fold_ell_tree(acc, step, lo):
 
 
 def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16,
-                   strict: bool = False) -> Element:
+                   formal: bool = False) -> Element:
     """Reduce along axis 1 by a chunked scan: fold, then tree.
 
     Split the block into sub-blocks of ``sub_len`` observations, fold each
@@ -570,7 +589,7 @@ def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16,
     while k % lo:                       # keep both axes exact powers of two
         lo //= 2
     if lo == 1:
-        return tree_reduce(e, strict=strict)
+        return tree_reduce(e, formal=formal)
 
     n_sub = k // lo
     fields = {f: mx.reshape(getattr(e, f),
@@ -586,9 +605,9 @@ def chunked_reduce(e: Element, r1: LeafRank1, sub_len: int = 16,
         leaf = Element(*(fields[f][:, :, j] for f in Element._fields))
         return combine_leaf(a, leaf,
                             LeafRank1(z=zr[:, :, j], g=gr[:, :, j],
-                                      ld=ldr[:, :, j]))
+                                      ld=ldr[:, :, j]), formal=formal)
 
-    return tree_reduce(_fold_ell_tree(acc, step, lo), strict=strict)
+    return tree_reduce(_fold_ell_tree(acc, step, lo), formal=formal)
 
 # ---------------------------------------------------------------------------
 # block-structured leaves: same algebra, Phi's zeros never touched
@@ -708,7 +727,8 @@ def expand_leaf(parts: LeafParts):
             LeafRank1(z=z, g=g, ld=parts.ld))
 
 
-def combine_leaf_blocked(e1: Element, parts: LeafParts) -> Element:
+def combine_leaf_blocked(e1: Element, parts: LeafParts,
+                         formal: bool = False) -> Element:
     """:func:`combine_leaf` with the leaf kept in pieces.
 
     Substituting ``A2 = Phi - kappa z^T`` and ``C2 = Q - kappa kappa^T``
@@ -750,7 +770,8 @@ def combine_leaf_blocked(e1: Element, parts: LeafParts) -> Element:
     j = outer(za1, za1) * inv_a[..., None, None] + e1.J
     # see combine_leaf: `parts.ld`, never `parts.ell + g^2/2`
     ell = (e1.ell + parts.ld
-           + 0.5 * mx.log(inv_a) - 0.5 * beta * beta * inv_a)
+           + 0.5 * mx.log(mx.abs(inv_a) if formal else inv_a)
+           - 0.5 * beta * beta * inv_a)
     return Element(A=a, b=b, C=c, eta=eta, J=j, ell=ell)
 
 
@@ -790,7 +811,7 @@ def _pad_parts_to_pow2(parts: LeafParts):
 
 
 def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16,
-                           strict: bool = False) -> Element:
+                           formal: bool = False) -> Element:
     """:func:`chunked_reduce` over compact leaves."""
     parts, k = _pad_parts_to_pow2(parts)
     n = parts.g.shape[0]
@@ -814,10 +835,10 @@ def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16,
 
     acc, _ = expand_leaf(slice_j(0))
     for j in range(1, lo):
-        acc = combine_leaf_blocked(acc, slice_j(j))
+        acc = combine_leaf_blocked(acc, slice_j(j), formal=formal)
     if n_sub == 1:
         return Element(*(getattr(acc, f)[:, 0] for f in Element._fields))
-    return tree_reduce(acc, strict=strict)
+    return tree_reduce(acc, formal=formal)
 
 
 

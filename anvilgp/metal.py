@@ -276,7 +276,7 @@ _SRC = """
         }
         // ell += ell2 + g^2/2 + log(1/alpha)/2 - beta^2/(2 alpha), Kahan
         float add = ld2
-                  + 0.5f * metal::precise::log(inv_a) - 0.5f * beta * bia;
+                  + 0.5f * metal::precise::log(LOG_INV_A) - 0.5f * beta * bia;
         float yk = add - ell_c;
         float tk = ell + yk;
         ell_c = (tk - ell) - yk;
@@ -344,31 +344,38 @@ def _formal_src(src: str, formal: bool) -> str:
     """Specialise a kernel source for a formal (convolved) model, or not.
 
     A :class:`~anvilgp.terms.TermConvolution`'s state-space form is only
-    formally Gaussian, so its variances can be genuinely negative and the
-    positivity clamps that repair float32 rounding for every other term
-    would *change* its answer instead.  The formal variant drops those
-    clamps and refuses -- NaN -- a Cholesky pivot below
-    ``-linalg.FORMAL_PIVOT_TOL * |trace|/m``, exactly as
-    :func:`anvilgp.linalg.chol` does under ``strict``.  The non-formal
-    variant is the code it always was: identical to the previous source
-    once comments and whitespace are stripped (checked when this was
+    formally Gaussian: its variances can be genuinely negative and its
+    covariances indefinite, while the algebra stays exact.  So the formal
+    variant drops the positivity clamps that repair float32 rounding for
+    every other term (they would *change* this answer), takes ``log|alpha|``
+    in the leaf fold, and composes blocks through a pivoted direct inverse
+    instead of a Cholesky factor -- exactly what
+    :func:`anvilgp.elements.combine` does with ``formal=True``.  The
+    non-formal variant is the code it always was: identical to the previous
+    source once comments and whitespace are stripped (checked when this was
     written; ``tests/test_metal.py`` pins that every clamp survives in it).
     """
-    from .linalg import FORMAL_PIVOT_TOL
     if formal:
         leaf = "sq += rr + jit2v;"
-        pivot = (f"if (d < -{FORMAL_PIVOT_TOL!r}f * fabs(tr) / (float)M) "
-                 "L1[j][j] = NAN;")
         hch, rk, clamped = "hch", "", "false"
+        red = _FORMAL_FACTOR.replace("C1N", "Cm")
+        logdet = "if (i == 0) logdet = 0.5f * ldx;"
+        comb = _FORMAL_FACTOR.replace("C1N", "C1")
+        log_a = "fabs(inv_a)"
     else:
         leaf = ("sq = max(sq, 0.0f);\n"
                 "        sq += rr + jit2v;\n"
                 "        sq = max(sq, sfloor * rr);              "
                 "// PSD failure is defined")
-        pivot = ""
         hch, rk, clamped = "max(hch, 0.0f)", " + max(-hch, 0.0f)", "hch < 0.0f"
+        red, comb = _REDUCE_CHOL, _COMBINE_CHOL
+        logdet = "logdet += metal::precise::log(Ls[i][i]);"
+        log_a = "inv_a"
     return (src.replace("LEAF_VARIANCE", leaf)
-               .replace("STRICT_PIVOT", pivot)
+               .replace("REDUCE_CORE", red)
+               .replace("LOGDET_ACC", logdet)
+               .replace("COMBINE_FACTOR", comb)
+               .replace("LOG_INV_A", log_a)
                .replace("HCH_CLAMPED", hch)
                .replace("RK_CLAMP_TERM", rk)
                .replace("CLAMPED_TEST", clamped))
@@ -433,9 +440,67 @@ _SRC_REDUCE = """
             }
         }
 
-        // L1 = chol(C1), with linalg.diag_floor's eps*max(trace,0)/m pivot
-        // floor -- and, in the FORMAL variant, linalg.chol's strict refusal
-        // of a pivot that flooring would not repair but replace.
+REDUCE_CORE
+        float Gb1[MDIM], Met[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f, b = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                a += G[i][j] * bv[j];
+                b += Mm[i][j] * et2[j];
+            }
+            Gb1[i] = a; Met[i] = b;
+        }
+
+        // ell: log|S| off the factor, then the three quadratic cross terms
+        float logdet = 0.0f, qb = 0.0f, ce = 0.0f, qe = 0.0f;
+        for (uint i = 0; i < M; ++i) {
+            LOGDET_ACC
+            float t1 = 0.0f, t2 = 0.0f;
+            for (uint j = 0; j < M; ++j) {
+                t1 += Jt[i][j] * bv[j];
+                t2 += Mm[i][j] * et2[j];
+            }
+            qb += bv[i] * t1;
+            qe += et2[i] * t2;
+            ce += et2[i] * Gb1[i];
+        }
+        float add = in_ell[base + k] - logdet - 0.5f * qb + ce + 0.5f * qe;
+        float yk = add - ell_c;
+        float tk = ell + yk;
+        ell_c = (tk - ell) - yk;
+        ell = tk;
+
+        // b <- A2 (G b1 + M eta2) + b2 ;  C <- sym(A2 M A2^T) + C2
+        float nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = b2[i];
+            for (uint j = 0; j < M; ++j) a += A2[i][j] * (Gb1[j] + Met[j]);
+            nb[i] = a;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += A2[i][t] * Mm[t][j];
+                AM[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += AM[i][t] * A2[j][t];
+                nC[i][j] = a;
+            }
+        for (uint i = 0; i < M; ++i) {
+            bv[i] = nb[i];
+            for (uint j = 0; j < M; ++j)
+                Cm[i][j] = 0.5f * (nC[i][j] + nC[j][i]) + C2[i][j];
+        }
+    }
+    out_ell[chain] = ell;
+"""
+
+
+#: The default factorisation in `_SRC_REDUCE`: Cholesky of C1 and of S.
+_REDUCE_CHOL = """        // L1 = chol(C1), with linalg.diag_floor's eps*max(trace,0)/m pivot floor
         float tr = 0.0f;
         for (uint i = 0; i < M; ++i) tr += Cm[i][i];
         float fl = 1.1920929e-7f * max(tr, 0.0f) / (float)M + 3.0e-38f;
@@ -444,7 +509,6 @@ _SRC_REDUCE = """
             float d = Cm[j][j];
             for (uint t = 0; t < j; ++t) d -= L1[j][t] * L1[j][t];
             L1[j][j] = metal::precise::sqrt(max(d, fl));
-            STRICT_PIVOT
             float inv = 1.0f / L1[j][j];
             for (uint i = j + 1; i < M; ++i) {
                 float a = Cm[i][j];
@@ -532,61 +596,66 @@ _SRC_REDUCE = """
                 Jt[i][j] = a; Jt[j][i] = a;
             }
 
-        float Gb1[MDIM], Met[MDIM];
-        for (uint i = 0; i < M; ++i) {
-            float a = 0.0f, b = 0.0f;
-            for (uint j = 0; j < M; ++j) {
-                a += G[i][j] * bv[j];
-                b += Mm[i][j] * et2[j];
-            }
-            Gb1[i] = a; Met[i] = b;
-        }
+"""
 
-        // ell: log|S| off the factor, then the three quadratic cross terms
-        float logdet = 0.0f, qb = 0.0f, ce = 0.0f, qe = 0.0f;
-        for (uint i = 0; i < M; ++i) {
-            logdet += metal::precise::log(Ls[i][i]);
-            float t1 = 0.0f, t2 = 0.0f;
-            for (uint j = 0; j < M; ++j) {
-                t1 += Jt[i][j] * bv[j];
-                t2 += Mm[i][j] * et2[j];
+#: The formal variant's replacement for a composition's factorisation, for
+#: a convolved term whose ``C1`` and ``J2`` can be indefinite: ``G = (I + C1
+#: J2)^-1`` by Gauss-Jordan with partial pivoting, then ``Mm = sym(G C1)``,
+#: ``Jt = sym(J2 G)`` and ``ldx = log|det(I + C1 J2)|`` -- the same quantities
+#: `elements.combine(formal=True)` forms.  ``C1N`` names the caller's C1.
+_FORMAL_FACTOR = """
+            float Xf[MDIM][MDIM], G[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = (i == j ? 1.0f : 0.0f);
+                    for (uint t = 0; t < M; ++t) a += C1N[i][t] * J2[t][j];
+                    Xf[i][j] = a;
+                    G[i][j] = (i == j ? 1.0f : 0.0f);
+                }
+            float ldx = 0.0f;
+            for (uint k = 0; k < M; ++k) {
+                uint pr = k;
+                float pv = fabs(Xf[k][k]);
+                for (uint r = k + 1; r < M; ++r) {
+                    float av = fabs(Xf[r][k]);
+                    if (av > pv) { pv = av; pr = r; }
+                }
+                if (pr != k) {
+                    for (uint j = 0; j < M; ++j) {
+                        float t1 = Xf[k][j]; Xf[k][j] = Xf[pr][j]; Xf[pr][j] = t1;
+                        float t2 = G[k][j]; G[k][j] = G[pr][j]; G[pr][j] = t2;
+                    }
+                }
+                float dk = Xf[k][k];
+                ldx += metal::precise::log(fabs(dk));
+                float ik = 1.0f / dk;
+                for (uint j = 0; j < M; ++j) { Xf[k][j] *= ik; G[k][j] *= ik; }
+                for (uint r = 0; r < M; ++r) {
+                    if (r == k) continue;
+                    float f = Xf[r][k];
+                    for (uint j = 0; j < M; ++j) {
+                        Xf[r][j] -= f * Xf[k][j];
+                        G[r][j] -= f * G[k][j];
+                    }
+                }
             }
-            qb += bv[i] * t1;
-            qe += et2[i] * t2;
-            ce += et2[i] * Gb1[i];
-        }
-        float add = in_ell[base + k] - logdet - 0.5f * qb + ce + 0.5f * qe;
-        float yk = add - ell_c;
-        float tk = ell + yk;
-        ell_c = (tk - ell) - yk;
-        ell = tk;
-
-        // b <- A2 (G b1 + M eta2) + b2 ;  C <- sym(A2 M A2^T) + C2
-        float nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
-        for (uint i = 0; i < M; ++i) {
-            float a = b2[i];
-            for (uint j = 0; j < M; ++j) a += A2[i][j] * (Gb1[j] + Met[j]);
-            nb[i] = a;
-        }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                float a = 0.0f;
-                for (uint t = 0; t < M; ++t) a += A2[i][t] * Mm[t][j];
-                AM[i][j] = a;
-            }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                float a = 0.0f;
-                for (uint t = 0; t < M; ++t) a += AM[i][t] * A2[j][t];
-                nC[i][j] = a;
-            }
-        for (uint i = 0; i < M; ++i) {
-            bv[i] = nb[i];
-            for (uint j = 0; j < M; ++j)
-                Cm[i][j] = 0.5f * (nC[i][j] + nC[j][i]) + C2[i][j];
-        }
-    }
-    out_ell[chain] = ell;
+            float Mm[MDIM][MDIM], Jt[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f, c = 0.0f;
+                    for (uint t = 0; t < M; ++t) {
+                        a += G[i][t] * C1N[t][j];
+                        c += J2[i][t] * G[t][j];
+                    }
+                    Mm[i][j] = a; Jt[i][j] = c;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < i; ++j) {
+                    float a = 0.5f * (Mm[i][j] + Mm[j][i]);
+                    Mm[i][j] = a; Mm[j][i] = a;
+                    float c = 0.5f * (Jt[i][j] + Jt[j][i]);
+                    Jt[i][j] = c; Jt[j][i] = c;
+                }
 """
 
 
@@ -1047,7 +1116,7 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
 #: ``Mm = (I + C1 J2)^-1 C1``, ``G = (I + C1 J2)^-1``,
 #: ``Jt = (I + J2 C1)^-1 J2`` and ``r = G^T (et2 - J2 b1)`` -- the last two
 #: are what both consumers need.  Same Cholesky route as `reduce_blocks`.
-_COMBINE_CORE = """
+_COMBINE_CHOL = """
             float trc = 0.0f;
             for (uint i = 0; i < M; ++i) trc += C1[i][i];
             float flc = 1.1920929e-7f * max(trc, 0.0f) / (float)M + 3.0e-38f;
@@ -1133,6 +1202,10 @@ _COMBINE_CORE = """
                     float a = 0.5f * (Jt[i][j] + Jt[j][i]);
                     Jt[i][j] = a; Jt[j][i] = a;
                 }
+"""
+
+_COMBINE_CORE = """
+COMBINE_FACTOR
             float rr_[MDIM], jb[MDIM];
             for (uint i = 0; i < M; ++i) {
                 float a = 0.0f;
@@ -1306,21 +1379,23 @@ _SRC_SEEDS = """
 _seed_kernels: dict = {}
 
 
-def _seed_kernel(m: int):
-    if m not in _seed_kernels:
-        body = _SRC_SEEDS.replace("COMBINE_CORE", _COMBINE_CORE)
-        _seed_kernels[m] = mx.fast.metal_kernel(
-            name=f"anvilgp_seeds_m{m}",
+def _seed_kernel(m: int, formal: bool = False):
+    key = (m, bool(formal))
+    if key not in _seed_kernels:
+        body = _formal_src(_SRC_SEEDS.replace("COMBINE_CORE", _COMBINE_CORE),
+                           formal)
+        _seed_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_seeds_m{m}" + ("_formal" if formal else ""),
             input_names=["in_A", "in_b", "in_C", "in_eta", "in_J", "cot",
                          "n_blocks", "n_chains"],
             output_names=["ent_m", "ent_C", "seed_m", "seed_C", "suf_J",
                           "suf_eta"],
             source=body.replace("MDIM", str(m)),
         )
-    return _seed_kernels[m]
+    return _seed_kernels[key]
 
 
-def block_seeds_kernel(el: Element, cot: mx.array):
+def block_seeds_kernel(el: Element, cot: mx.array, formal: bool = False):
     """``(ent_m, ent_C, seed_m, seed_C)`` for every (chain, block), in-kernel.
 
     The entry state each block starts from and the ``(m_bar, P_bar)`` it
@@ -1331,7 +1406,7 @@ def block_seeds_kernel(el: Element, cot: mx.array):
     shapes = [(n_chains, n_blocks, m), (n_chains, n_blocks, m, m),
               (n_chains, n_blocks, m), (n_chains, n_blocks, m, m),
               (n_chains, n_blocks, m, m), (n_chains, n_blocks, m)]
-    outs = _seed_kernel(m)(
+    outs = _seed_kernel(m, formal)(
         inputs=[el.A, el.b, el.C, el.eta, el.J, cot,
                 int(n_blocks), int(n_chains)],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
@@ -1484,7 +1559,7 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
         el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
                          blk_len, formal=formal)
-        ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot)
+        ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot, formal)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
             p_t, q_t, lg, inst, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m,
             seed_C, slot_id, slot_start, n_slots, blk_len, formal=formal)

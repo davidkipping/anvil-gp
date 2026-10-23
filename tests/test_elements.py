@@ -341,28 +341,24 @@ def test_use_blocked_leaves_criterion():
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float64])
-def test_strict_chol_refuses_a_clearly_negative_pivot_and_nothing_else(dtype):
-    """``strict`` turns a floored *indefinite* matrix into a NaN factor.
+def test_inv_logdet_matches_numpy_on_general_matrices(dtype):
+    """The formal composition's inverse: pivoted, sign-blind on the det.
 
-    The formal model of a convolved term hands the composition covariances
-    that are genuinely indefinite; flooring them substitutes a different
-    matrix and a wrong likelihood.  A PSD matrix whose last pivot rounds a
-    hair below zero -- the case the floor exists for -- must factor exactly
-    as before.  In float64 ``strict`` takes the unrolled route (LAPACK on an
-    indefinite input is not checked by MLX), so it is compared against the
-    built-in there.
+    Covers a matrix that *needs* the pivot (zero leading entry), an
+    indefinite one, a negative determinant, and an ordinary SPD one, against
+    numpy's LAPACK inverse and ``slogdet``.
     """
-    from anvilgp.linalg import chol
+    from anvilgp.linalg import inv_logdet
+    mats = np.array([
+        [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 2.0]],   # needs pivot
+        [[1.0, 2.0, 0.5], [2.0, -1.0, 0.3], [0.5, 0.3, 0.1]],  # indefinite
+        [[-2.0, 0.1, 0.0], [0.1, 1.5, 0.2], [0.0, 0.2, 1.0]],  # det < 0
+        [[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]],   # SPD
+    ])
     with mx.stream(mx.cpu if dtype == mx.float64 else mx.gpu):
-        bad = mx.array([[[1.0, 0.2], [0.2, -0.1]]], dtype=dtype)
-        assert np.all(np.isnan(np.array(chol(bad, strict=True))[0, 1, 1]))
-        assert np.all(np.isfinite(np.array(chol(bad))))
-        eps = 1e-7 if dtype == mx.float32 else 1e-15
-        near = mx.array([[[1.0, 1.0], [1.0, 1.0 - eps]]], dtype=dtype)
-        good = mx.array([[[2.0, 0.3], [0.3, 1.5]]], dtype=dtype)
-        for a in (near, good):
-            s = np.array(chol(a, strict=True), np.float64)
-            p = np.array(chol(a), np.float64)
-            assert np.all(np.isfinite(s))
-            np.testing.assert_allclose(s, p, rtol=1e-6 if dtype == mx.float32
-                                       else 1e-12, atol=0)
+        inv, ld = inv_logdet(mx.array(mats, dtype=dtype))
+        inv, ld = np.array(inv, np.float64), np.array(ld, np.float64)
+    rtol = 1e-5 if dtype == mx.float32 else 1e-12
+    np.testing.assert_allclose(inv, np.linalg.inv(mats), rtol=rtol, atol=rtol)
+    np.testing.assert_allclose(ld, np.linalg.slogdet(mats)[1], rtol=rtol,
+                               atol=rtol)

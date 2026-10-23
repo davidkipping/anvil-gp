@@ -32,10 +32,9 @@ already solved and rides ordinary autodiff through ``mean_fn``.
 Known v1 limitations, stated rather than discovered
 ---------------------------------------------------
 * Exposure-time integration (:class:`~anvilgp.terms.TermConvolution`)
-  refuses part of its parameter space -- a convolved ``RealTerm`` at high
-  signal-to-noise above all -- because the parallel reduction cannot factor
-  the indefinite covariances of its formal state-space form.  See
-  docs/kernels.md.
+  forms its process noise by subtraction, so its float32 path is 50-100x
+  less accurate than an unconvolved term's on data far off-model (no
+  measurable cost on data drawn from the model).  See docs/kernels.md.
 * No 2D/multiband GPs.
 * ``predict`` / conditional mean is deliberately out of the hot path; see
   :func:`anvilgp.oracle.dense_predict` for the offline float64 utility.
@@ -606,10 +605,10 @@ class GPLogLike:
         #: Whether the state-space form is only *formally* Gaussian, which is
         #: exactly when ``P_inf`` is not the identity: a convolved term.  Its
         #: ``Q`` can be indefinite for ordinary parameters and the algebra
-        #: is still exact, so long as no positivity clamp alters a number;
-        #: on this path the clamps are dropped and a factorisation that
-        #: would have needed one refuses the chain instead.  See
-        #: `linalg.chol`'s ``strict``.  Every other term is untouched.
+        #: is still exact, so long as nothing assumes positivity: on this
+        #: path the variance clamps are dropped and the block composition
+        #: uses a direct inverse instead of a Cholesky factor.  See
+        #: `elements.combine`.  Every other term is untouched.
         self._formal = self._has_p_inf
 
         self._lag_np = lag
@@ -1003,10 +1002,10 @@ class GPLogLike:
             if self.blocked:
                 root = chunked_reduce_blocked(leaf_parts(*args, formal=fm),
                                               sub_len=self.sub_block,
-                                              strict=fm)
+                                              formal=fm)
             else:
                 root = chunked_reduce(*leaf_elements(*args, formal=fm),
-                                      sub_len=self.sub_block, strict=fm)
+                                      sub_len=self.sub_block, formal=fm)
             if do_eval:
                 # bound peak memory: the block's leaf arrays die here, and
                 # the root that survives is one element per chain.
@@ -1016,7 +1015,7 @@ class GPLogLike:
             return roots[0].ell
         stacked = Element(*(mx.stack([getattr(r, f) for r in roots], axis=1)
                             for f in Element._fields))
-        return tree_reduce(stacked, strict=self._formal).ell
+        return tree_reduce(stacked, formal=self._formal).ell
 
     # -- the anvil LogDensity contract ------------------------------------
 
