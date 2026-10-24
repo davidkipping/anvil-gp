@@ -104,7 +104,10 @@ class GPPolicy:
     #: N = 1e4: 16 at m = 2 and 4, 32 at m = 6, 64 at m = 8.
     #: See :func:`anvilgp.elements.chunked_reduce`; 1 recovers the pure tree.
     sub_block: int | None = None
-    hi_chain_block: int = 16
+    #: chains per tile of the float64 ``.hi`` pass.  Bit-identical at any
+    #: value; 64 was 3.1-3.3x faster than 16 (SHO N = 2000, SHO+SHO
+    #: N = 2e4, Rotation N = 5000 x 256 chains) at a peak of <= 0.06 GiB.
+    hi_chain_block: int = 64
     hi_block: int = 1024
     eval_blocks: bool = False
     #: keep leaves in compact block form (None = decide from the term's block
@@ -906,12 +909,13 @@ class GPLogLike:
         self._metal_matrices_fn = ((v.shape[0], n_chunk), core)
         return core(v)
 
-    def _evaluate_metal(self, v: mx.array) -> mx.array:
+    def _evaluate_metal(self, v: mx.array):
         """Design C: one kernel condenses the blocks, a second folds them.
 
         The whole thing sits behind :func:`anvilgp.metal.scan_loglike`'s
         ``custom_function``, whose VJP runs the backward kernels, so this
-        path is differentiable (M4).
+        path is differentiable (M4).  Returns ``(log L, (Q, h))``: the lag
+        table goes on to :meth:`kappa`.
         """
         from .metal import scan_loglike
         pm = self.param_map
@@ -971,14 +975,15 @@ class GPLogLike:
         # differentiation boundary has to enclose the reduction so the
         # custom function's output is one scalar per chain.  See its
         # docstring.
-        return scan_loglike(pt, qt, self._metal_lag, self._metal_inst, h, r,
-                            self._r_ref32,
-                            jit2, self.policy.s_floor_rel, self.metal_block,
-                            slots=(self._metal_slot_id,
-                                   self._metal_slot_start,
-                                   self.n_metal_slots,
-                                   self._metal_fold_plan),
-                            formal=self._formal)
+        out = scan_loglike(pt, qt, self._metal_lag, self._metal_inst, h, r,
+                           self._r_ref32,
+                           jit2, self.policy.s_floor_rel, self.metal_block,
+                           slots=(self._metal_slot_id,
+                                  self._metal_slot_start,
+                                  self.n_metal_slots,
+                                  self._metal_fold_plan),
+                           formal=self._formal)
+        return out, (q, h)
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,).
@@ -1091,6 +1096,16 @@ class GPLogLike:
         lags = self._dt64[1:]
         lags = lags[lags > 0]
         self._kappa_dt = float(np.median(lags)) if lags.size else None
+        # The median lag's row in the kernel's lag table, when it has one
+        # (any regular or gapped-regular cadence): `kappa` can then read
+        # h Q h^T from the forward's own table instead of rebuilding the
+        # term's matrices, which cost ~1.1 ms a call eager.
+        self._kappa_row = None
+        if self._kappa_dt is not None:
+            hit = np.flatnonzero(np.unique(self._dt64.astype(np.float32))
+                                 == np.float32(self._kappa_dt))
+            if hit.size:
+                self._kappa_row = int(hit[0])
         n_jit = len(self.param_map.jitter)
         if n_jit > 1:
             lab = np.asarray(inst)
@@ -1114,7 +1129,7 @@ class GPLogLike:
                 f"GPLogLike.kappa at your posterior draws; see docs/float32.md.",
                 stacklevel=3)
 
-    def kappa(self, v: mx.array) -> mx.array:
+    def kappa(self, v: mx.array, tables=None) -> mx.array:
         """Float32 conditioning number per chain, ``(n_chains,)``.
 
         ``k(0) / (h Q h^T + r)``: the process variance over the variance a
@@ -1131,10 +1146,25 @@ class GPLogLike:
         when the data are drawn at those parameters.  Evaluated at the
         median cadence, so a dataset with much shorter gaps can be worse
         locally than ``kappa`` says.
+
+        ``tables`` is the kernel path's ``(Q, h)`` lag table for these
+        chains; with it, ``h Q h^T`` is read from the median lag's row
+        rather than rebuilt (same value to float32 rounding).  Not for a
+        convolved term, whose ``k(0)`` needs its own ``P_inf``.
         """
         n = v.shape[0]
         if self._kappa_dt is None:
             return mx.zeros((n,), dtype=v.dtype)
+        r = mx.array(self._kappa_r, dtype=v.dtype)
+        jit = self.param_map.jitter_var_per_instrument(v)
+        w = mx.broadcast_to(r if jit is None else r + jit, (n, r.shape[0]))
+        if (tables is not None and self._kappa_row is not None
+                and not self._has_p_inf):
+            q, h = (mx.stop_gradient(x) for x in tables)
+            qm = q[:, self._kappa_row]
+            hqh = mx.sum(h * (qm @ h[..., None])[..., 0], -1)
+            return mx.sum(h * h, -1) / (mx.maximum(hqh, 0.0)
+                                        + mx.min(w, axis=-1))
         kp = self.param_map.kernel_params(v)
         dt = mx.full((n, 1), self._kappa_dt, dtype=kp.dtype)
         _, qs, h = self.term.matrices_blocks(kp, dt)
@@ -1148,21 +1178,25 @@ class GPLogLike:
             hqh = hqh + mx.sum(hb * (qb[:, 0] @ hb[..., None])[..., 0], -1)
             pb = hb if p_inf is None else (p_inf[b] @ hb[..., None])[..., 0]
             k0 = k0 + mx.sum(hb * pb, -1)
-        r = mx.array(self._kappa_r, dtype=kp.dtype)
-        jit = self.param_map.jitter_var_per_instrument(v)
-        w = mx.broadcast_to(r if jit is None else r + jit, (n, r.shape[0]))
         # h Q h^T can come out slightly negative in float32 (see the clamp
         # in elements.py); it is a variance, so floor it at zero.
         return k0 / (mx.maximum(hqh, 0.0) + mx.min(w, axis=-1))
 
-    def _refuse_ill_conditioned(self, v: mx.array, out: mx.array) -> mx.array:
+    def _refuse_ill_conditioned(self, v: mx.array, out: mx.array,
+                                tables=None) -> mx.array:
         """NaN on chains past ``policy.kappa_max``, so ``_sanitize`` gives
         them the failure value.  ``mx.where`` selects, so a feasible lane's
-        value and gradient pass through bit for bit."""
+        value passes through bit for bit.  Its gradient does too on the MLX
+        path; on the kernel path, where ``kappa`` reads the forward's own
+        lag table, it moves by up to 4e-6 relative.  Reading the table
+        in-graph changes MLX's scheduling of the backward even with the
+        gradient stopped (a host copy of the same numbers does not), and the
+        two gradients are equally accurate: 5.1e-7 and 5.7e-7 median error
+        against a float64 finite difference, the same maximum."""
         kmax = self.policy.kappa_max
         if kmax is None:
             return out
-        k = mx.stop_gradient(self.kappa(v))
+        k = mx.stop_gradient(self.kappa(v, tables))
         # `not <=` so that a NaN kappa (inf / inf) is refused too.
         bad = mx.logical_not(k <= kmax)
         return mx.where(bad, mx.array(float("nan"), dtype=out.dtype), out)
@@ -1191,15 +1225,16 @@ class GPLogLike:
     def _raw_call(self, v: mx.array) -> mx.array:
         """The float32 likelihood itself, sanitised but not gradient-guarded."""
         pull = self._infeasible_pull(v)
+        tables = None
         if self._metal_ok:
-            out = self._evaluate_metal(v)
+            out, tables = self._evaluate_metal(v)
         else:
             out = self._evaluate(
                 v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
                 self._inst32, _pow2(self.policy.block),
                 self.policy.eval_blocks, uniq=self._uniq32)
         out = self._refuse_outside_series(v, out)
-        return _sanitize(self._refuse_ill_conditioned(v, out), pull)
+        return _sanitize(self._refuse_ill_conditioned(v, out, tables), pull)
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`.
@@ -1241,12 +1276,24 @@ class GPLogLike:
                       mx.array(self.log_norm_const, dtype=mx.float64),
                       stream=mx.cpu)
 
-    def hi(self, v: mx.array) -> mx.array:
+    def hi(self, v: mx.array, refuse: bool = True) -> mx.array:
         """Full-float64 CPU evaluation, tiled over CHAINS.
 
         A GP factorisation is global-sequential over data, so unlike
         ``ChunkedGaussianLogLike.hi`` this cannot tile the data axis -- it
         streams it in recursion order and tiles chains instead.
+
+        By default this is the float64 value of the *same target* as
+        :meth:`__call__`: chains that the float32 path refuses (past
+        ``kappa_max``, or outside a convolution's series range) and lanes
+        whose value is not finite get the same finite failure value.  That
+        matters because anvil's ``reanchor_every`` writes this value into
+        each chain's stored ``log_prob``: unguarded, it handed a refused
+        chain a real likelihood (undoing the inward ratchet ``_sanitize``
+        exists for) and a float64 NaN went straight in.
+
+        ``refuse=False`` returns the raw float64 likelihood everywhere, for
+        measuring float32 error where the float32 path refuses.
         """
         self._check_v(v)
         pol = self.policy
@@ -1263,15 +1310,19 @@ class GPLogLike:
                 vb = v64[c:c + pol.hi_chain_block]
                 acc = self._evaluate(vb, dt, y, r_ref, xm, self._inst32,
                                      blk, True, uniq=self._uniq64)
+                if refuse:
+                    acc = _sanitize(self._refuse_ill_conditioned(
+                        vb, self._refuse_outside_series(vb, acc)),
+                        self._infeasible_pull(vb))
                 mx.eval(acc)
                 out[c:c + vb.shape[0]] = np.array(acc, dtype=np.float64)
         return a64(out)
 
-    def hi_absolute(self, v: mx.array) -> mx.array:
+    def hi_absolute(self, v: mx.array, refuse: bool = True) -> mx.array:
         """float64 absolute log-likelihood.  The addition is pinned to the CPU
         stream: float64 does not exist on Metal, and the default stream is
         the GPU in any normal session."""
-        return mx.add(self.hi(v),
+        return mx.add(self.hi(v, refuse=refuse),
                       mx.array(self.log_norm_const, dtype=mx.float64),
                       stream=mx.cpu)
 

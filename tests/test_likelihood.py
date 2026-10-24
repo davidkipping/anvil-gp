@@ -328,6 +328,33 @@ def test_block_size_is_not_a_float32_precision_knob():
     assert max(errs) - min(errs) < 1e-3, errs
 
 
+def test_the_blocked_leaf_path_does_not_make_sub_block_a_precision_knob():
+    """The compact block-structured leaf (the default at m >= 6) must sum
+    ``ell`` the way the dense leaf does.  It folded it sequentially, which
+    at m = 6, N = 16384, sub_block 1024 drifted -1.02 log-units while the
+    dense path sat at -0.012 for every sub-block (fixed 2026-10-23).
+    Compared path against path in float32, so no float64 reference is
+    needed: regular cadence, where both paths are otherwise accurate."""
+    n = 4096
+    term = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()
+    kp = [0.1, 0.3, 3.0, 0.05, 0.6, 1.0, 0.03, 1.0, 0.7]
+    y = sample_ssm(term, kp, 0.1, n, np.random.default_rng(1))
+    y = y + 0.001 * np.random.default_rng(2).standard_normal(n)
+    t = np.arange(n) * 0.1
+    pm = ParamMap(kernel=[KernelParam(link="const", value=x) for x in kp],
+                  n_dim=1)
+    vals = {}
+    for blocked in (False, True):
+        for sb in (32, 256):
+            gp = GPLogLike(None, t, None, y, np.full(n, 0.001), term, pm,
+                           GPPolicy(sub_block=sb, blocked=blocked))
+            with mx.stream(mx.gpu):
+                vals[blocked, sb] = float(np.array(
+                    gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
+    ref = vals[False, 32]
+    assert max(abs(v - ref) for v in vals.values()) < 5e-3, vals
+
+
 def test_float64_path_is_float64_accurate_through_a_log_link():
     """``.hi`` is the reference everything else is measured against.
 

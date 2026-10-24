@@ -601,8 +601,9 @@ def test_kappa_takes_the_smallest_white_noise_over_instruments():
 @pytest.mark.parametrize("metal", [False, True])
 def test_the_kappa_guard_refuses_past_kappa_max_and_nothing_else(metal):
     """Refused lanes get the failure value and a zero gradient; every other
-    lane is bit-identical, value and gradient, to ``kappa_max=None``.  And
-    the guard is what refused them: some were finite without it."""
+    lane is bit-identical in value to ``kappa_max=None``, and in gradient
+    to rounding (see ``GPLogLike._refuse_ill_conditioned``).  And the guard
+    is what refused them: some were finite without it."""
     v = mx.array(np.random.default_rng(4)
                  .uniform([-2, -3, -3], [18, 2, 4], (128, 3))
                  .astype(np.float32))
@@ -623,7 +624,11 @@ def test_the_kappa_guard_refuses_past_kappa_max_and_nothing_else(metal):
     assert np.all(gg[refused] == 0.0)
     assert np.array_equal(gv[~refused], nv[~refused])
     if metal:
-        assert np.array_equal(gg[~refused], ng[~refused])
+        # kappa reads the kernel's lag table in-graph, which moves MLX's
+        # backward by up to 4.2e-6 relative (measured); both gradients
+        # match a float64 finite difference equally well.
+        np.testing.assert_allclose(gg[~refused], ng[~refused], rtol=2e-5,
+                                   atol=1e-4)
     else:
         # The MLX path's gradient is not bit-reproducible run to run, guard
         # or no guard: two identical kappa_max=None calls differ by up to
@@ -632,6 +637,61 @@ def test_the_kappa_guard_refuses_past_kappa_max_and_nothing_else(metal):
         np.testing.assert_allclose(gg[~refused], ng[~refused], rtol=1e-4,
                                    atol=1e-4)
     assert np.any(nv[refused] > -1e29), "the guard refused nothing new"
+
+
+@pytest.mark.parametrize("term,p", [
+    (ag.SHOTerm(), [0.15, 5.0, 4.0]),
+    (ag.SHOTerm() + ag.Matern32Term(), [1.0, 5.0, 4.0, 0.5, 2.0]),
+])
+def test_kappa_read_from_the_kernel_lag_table_matches_the_rebuilt_one(term, p):
+    """The kernel path reads h Q h^T from its own lag table at the median
+    lag instead of rebuilding the term's matrices (the rebuild cost ~1.1 ms
+    a call, +66% on a 2000 x 256 eager value).  Same number, to float32
+    rounding, over a range wide enough to cross kappa_max."""
+    n = 400
+    t = np.arange(n) * 0.02
+    gp = GPLogLike(None, t, None, np.random.default_rng(0).standard_normal(n),
+                   np.full(n, 0.15), term, ParamMap.log(p),
+                   GPPolicy(metal=True))
+    assert gp._kappa_row is not None
+    lo = [-2.0] + [-1.0] * (len(p) - 1)
+    hi = [18.0] + [1.0] * (len(p) - 1)
+    v = mx.array(np.random.default_rng(1).uniform(lo, hi, (64, len(p)))
+                 .astype(np.float32))
+    with mx.stream(mx.gpu):
+        _, tables = gp._evaluate_metal(v)
+        got = np.array(gp.kappa(v, tables), np.float64)
+        want = np.array(gp.kappa(v), np.float64)
+    assert want.min() < 1e3 and want.max() > 1e6
+    np.testing.assert_allclose(got, want, rtol=1e-5)
+
+
+def test_the_float64_path_refuses_what_the_float32_path_refuses():
+    """``.hi`` is the same target in float64.  anvil's ``reanchor_every``
+    writes it into the chains' stored ``log_prob``, so an unguarded ``.hi``
+    handed a refused chain a real likelihood again (and passed a float64
+    NaN straight through).  Same refusals, same failure value -- to float32
+    rounding of the ``1e30`` sentinel -- and ``refuse=False`` still gives
+    the raw float64 value for measuring float32 error past the guard."""
+    v = mx.array(np.random.default_rng(4)
+                 .uniform([-2, -3, -3], [18, 2, 4], (64, 3))
+                 .astype(np.float32))
+    gp = _guard_gp(kappa_max=1e6)
+    refused = np.array(gp.kappa(v)) > 1e6
+    assert 5 < refused.sum() < 59, refused.sum()
+    with mx.stream(mx.gpu):
+        lo = np.array(gp(v), np.float64)
+    hi = np.array(gp.hi(v), np.float64)
+    raw = np.array(gp.hi(v, refuse=False), np.float64)
+    assert np.all(hi[refused] <= -1e29)
+    np.testing.assert_allclose(hi[refused], lo[refused], rtol=1e-6)
+    assert np.all(np.isfinite(raw)) and np.all(raw[refused] > -1e29)
+    assert np.array_equal(hi[~refused], raw[~refused])
+    # a non-finite float64 value is sanitised too
+    nan_gp = _guard_gp(kappa_max=None)
+    bad = mx.array(np.array([[0.0, 0.0, float("nan")]], np.float32))
+    assert float(np.array(nan_gp.hi(bad))[0]) <= -1e29
+    assert np.isnan(float(np.array(nan_gp.hi(bad, refuse=False))[0]))
 
 
 def test_construction_warns_when_the_data_could_reach_kappa_max():

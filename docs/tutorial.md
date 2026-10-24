@@ -281,6 +281,9 @@ assert abs(gp.log_prob_absolute(v)[0] - ll_c2) < 1e-2 * max(1, abs(ll_c2))
 There is also a float64 path, `gp.hi(...)`, which runs the same algebra
 in double precision on the CPU and agrees with a dense Cholesky to ~1e-11.
 Use it when you want to know whether a discrepancy is float32 or a bug.
+It refuses the same chains the float32 path does (it is the float64 value
+of the same target, and anvil's `reanchor_every` writes it into the chain
+state); `gp.hi(v, refuse=False)` gives the raw float64 number everywhere.
 
 ## Where to go next
 

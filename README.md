@@ -514,7 +514,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
 | `eval_blocks` | `False` | you are memory-bound and can give up `mx.compile`. The `.hi` path sets it itself. |
 | `blocked` | `None` (measured) | you have profiled both and disagree with `use_blocked_leaves`. |
-| `hi_chain_block` / `hi_block` | 16 / 1024 | the float64 reference pass runs out of memory. |
+| `hi_chain_block` / `hi_block` | 64 / 1024 | the float64 reference pass runs out of memory. |
 | `s_floor_rel` | `1e-6` | essentially never: it defines what a positive-definiteness failure means. |
 
 ### What is left, and what it is worth

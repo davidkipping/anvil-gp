@@ -833,9 +833,13 @@ def chunked_reduce_blocked(parts: LeafParts, sub_len: int = 16,
                          ka[:, :, j], zr[:, :, j], gr[:, :, j], er[:, :, j],
                          ldr[:, :, j])
 
-    acc, _ = expand_leaf(slice_j(0))
-    for j in range(1, lo):
-        acc = combine_leaf_blocked(acc, slice_j(j), formal=formal)
+    def step(a, j):
+        return combine_leaf_blocked(a, slice_j(j), formal=formal)
+
+    # The same pairwise ell sum as chunked_reduce: a sequential float32 fold
+    # here drifted -1.02 log-units at m = 6, N = 16384, sub_block 1024,
+    # where the dense path stayed at -0.012 whatever the sub-block.
+    acc = _fold_ell_tree(expand_leaf(slice_j(0))[0], step, lo)
     if n_sub == 1:
         return Element(*(getattr(acc, f)[:, 0] for f in Element._fields))
     return tree_reduce(acc, formal=formal)

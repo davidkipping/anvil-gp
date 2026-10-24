@@ -162,9 +162,12 @@ refuses any chain past it: the likelihood returns the failure value of
 section 5 with a zero gradient, without trusting a float32 evaluation that
 is wrong there by a log-unit or more. Pinned in `tests/test_contract.py`:
 everywhere at or below `kappa_max` the value is bit-identical to the
-unguarded one, and so is the fused kernel's gradient (the MLX path's
-gradient is not bit-reproducible run to run, guarded or not, and agrees to
-that noise, ~1e-5). `make_target`'s defaults put the tutorial posterior at
+unguarded one. The gradient agrees to rounding: the MLX path's gradient is
+not bit-reproducible run to run, guarded or not (~1e-5), and on the fused
+kernel, where kappa reads the forward's own lag table (since 2026-10-24;
+rebuilding it cost +29-66% of an eager call at 2000 x 256), the backward
+moves by up to 4e-6 relative, with both versions equally close to a float64
+finite difference. The guard costs nothing measurable on either path. `make_target`'s defaults put the tutorial posterior at
 kappa 64 to 124.
 
 **Why it matters for sampling.** A chain that reaches kappa ~1e9 sees a
