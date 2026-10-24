@@ -260,30 +260,95 @@ worst relative gradient error against a float64 finite difference):
 | uniform random (another draw), 100; every `sub_block` 1-1024, dense and blocked leaves, m = 2, 4, 6 | up to 101 | <= 0.012 |
 | near-duplicates or uniform, 1000 (value only) | up to 2.1e4 / 2.9e5 / 297 | 0.02-0.88 / 0.09-1.2 / 0.03-0.14 |
 
-**What is left** is older than this bug and independent of it: the dense
-information form itself. An element stores its log-normaliser for a *zero*
-incoming state, so a leaf holds `ell = ld - g^2/2` and a composite of k
-leaves holds roughly `-1/2 sum g^2` over them -- ~1e4 at s/e = 30 when the
-timescale outlasts the block -- and every general composition cancels that
-against a cross term of the same size. The arithmetic is now right; the
-float32 *storage* of those numbers is the floor. It shows as:
+### What is left: the dense information form
 
-* the default MLX path 0.6-1.3 log-units out at kappa ~1e4 on the
-  single-SHO and simultaneous-instrument rows above, and 0.02-0.14,
-  scattering with `sub_block`, on the TESS regression case in
-  `tests/test_likelihood.py`. The fused kernel, which composes only a dozen
-  or so blocks per chain, stays within 0.2 everywhere measured: at high
-  s/e, use `GPPolicy(metal=True)`;
-* the single-SHO `sub_block` trend in `_auto_sub_block` (-0.64 at 16,
-  -0.04 at 128, N = 1e5, s/e = 30), which this fix did not change; at
-  m = 4 and 6 the same scan went from 0.2-1.8 to 0.01-0.18;
-* at s/e = 1000 with near-duplicates, `g^2 ~ 1e6` per leaf: composing the
-  float32 leaves *in float64* is off by 0.25-0.52, and the sequential
-  filter by up to 0.14.
+What is left is older than this bug and independent of it. An element
+stores its log-normaliser for a *zero* incoming state, so a leaf holds
+`ell = ld - g^2/2` and a composite of k leaves holds roughly
+`-1/2 sum g^2` over them -- ~1e4 at s/e = 30 when the timescale outlasts
+the block -- and every general composition cancels that against a cross
+term of the same size. The arithmetic is now right; the float32 *storage*
+of those numbers is the floor. It grows with **both** how predictable one
+sample is from the last (timescale over cadence, times s/e) and N, and
+**kappa does not track it**: kappa saturates at `k(0)/r` once `hQh << r`,
+and was only 1.5e3 in the worst case below. `kappa_max` cannot guard it.
 
-A square-root information form, carrying `J = Z Z^T`, `eta = Z gamma` and
-the log-normaliser centred on `gamma`, would remove it, at the price of a
-QR per composition.
+**Exposure, measured where a sampler feels it** (`benchmarks/floor_exposure.py`,
+2026-10-24). A constant offset is invisible to MCMC; what moves a posterior
+is how the error varies over it. The float32 target is the true one times
+`exp(e)`, so to first order no posterior mean moves by more than `sd(e)`
+posterior standard deviations. Each row: data drawn on-model, 32 draws from
+the float64 Laplace posterior, `sd(e)` across them (worst in brackets), and
+the float32 gradient error per posterior sigma of motion. Rotation (3 d,
+or 10 d for Kepler) plus granulation, SHO + SHO, unless noted:
+
+| setup | N | kappa | default MLX: sd(e) (max), grad | fused kernel: sd(e) (max), grad |
+|---|---|---|---|---|
+| RV, 600 points, s/e 10-30 | 601 | <= 1e3 | 0.002 (0.005), 0.04 | 0.000, 0.04 |
+| Kepler long cadence, one quarter, s/e 30 / 300 | 4.3k | 1e3-6e3 | 0.009 / 0.055 (0.16), <= 0.09 | 0.003 / 0.023 (0.08), <= 0.11 |
+| TESS 2-min sector, s/e 3 / 10 | 19k | 13 / 150 | 0.006 / 0.036 (0.13), 0.06 | 0.001 / 0.004, 0.06 |
+| TESS 2-min sector, s/e 30 | 19k | 1.3e3 | 0.12 (0.24), 0.08 | 0.017 (0.06), 0.08 |
+| TESS 2-min sector, s/e 100 | 19k | 1.4e4 | **1.05 (2.7)**, 0.18 | 0.09 (0.39), **0.48** |
+| TESS 2-min, single SHO, s/e 30 / 100 / 300 | 19k | 1e3-1e5 | 0.13 / **0.78 / 3.5 (10.4)**, <= 0.98 | 0.007 / 0.024 / 0.09, <= 0.02 |
+| Kepler long cadence, 16 quarters, s/e 30 / 100 | 68k | 900-3.5e3 | 0.12 / **0.42 (1.1)**, -- | 0.012 / 0.031, <= 0.08 |
+| TESS 20-s sector, s/e 10 | 114k | 160 | **0.46 (1.0)**, -- | 0.14 (0.51), 0.07 |
+| TESS 20-s sector, s/e 30 | 114k | 1.5e3 | **2.8 (8.7)**, -- | **1.7 (5.9)**, **0.53** |
+
+(`--`: the default MLX gradient exceeds Metal's buffer-count limit at this
+N; see the README, "What is left".) Separating the two causes at s/e = 30:
+20-s cadence at a 2-min sector's N (19k) gives 0.49 / 0.27, and 2-min
+cadence at a 20-s sector's N (114k) gives 0.63 / 0.06.
+
+So: transit fits detrended with a GP on quiet or mildly active stars
+(s/e <~ 10), RV, and single Kepler quarters are clear on either path.
+Bright active stars (s/e >~ 100) and long baselines are not, on the default
+path; `GPPolicy(metal=True)` clears them where m <= 4. **TESS 20-s data at
+s/e >~ 10-30 is not clear on either path.** An earlier version of this
+section said the fused kernel stayed within 0.2 everywhere measured; that
+was true only at N <= 19k and 2-min cadence.
+
+### The fix: replay the filter, do not compose ell
+
+The prefix over the block elements already gives every block its entry
+state `(b, C)` -- the filtered mean and covariance, O(1) numbers -- and the
+kernel's backward already replays each block from it. Taking log L from
+that replay instead of from the composed `ell` makes every term an O(1)
+innovation, `-1/2 (log S + v^2/S)`, and the ~1e4 numbers never exist.
+`benchmarks/block_replay_prototype.py` emulates it in NumPy float32 from the
+kernel's own float32 block elements (value only; 16 posterior draws):
+
+| case | default MLX | fused kernel | **replay** | one float32 filter, no blocks |
+|---|---|---|---|---|
+| TESS 20-s, SHO + SHO, s/e = 30 (N = 114k) | 1.6 (2.9) | 1.7 (5.9) | **0.017 (0.061)** | 0.40 (1.7) |
+| TESS 2-min, SHO + SHO, s/e = 100 | 0.73 (1.3) | 0.067 (0.31) | **0.006 (0.019)** | 0.038 (0.092) |
+| TESS 2-min, single SHO, s/e = 300 | 4.0 (12.8) | 0.13 (0.28) | **0.005 (0.010)** | 0.060 (0.14) |
+
+sd(e) (max). The replay is 25-100x better than the kernel and leaves the
+worst case at 0.06. The last column says the blocks matter for a second
+reason: one float32 accumulator over 1e5 O(1) terms loses ~0.4 on its own,
+and per-block partial sums are what avoid it.
+
+That is the recommended fix, ahead of the square-root information form
+(`J = Z Z^T`, `eta = Z gamma`, `ell` centred on `gamma`). The square-root
+form would change every composition, in the MLX algebra, both Metal folds
+and the hand VJPs, and add a QR to each. The replay changes how the value
+is read out, reuses the prefix and the replay the backward already has, and
+removes the large numbers instead of storing them more carefully. Plan:
+
+1. **Kernel.** Pass 2 becomes a prefix over the dozen or so block elements
+   (it carries `b, C` already); a third pass replays each block from its
+   entry state, as the backward does, and sums the innovations per block.
+   Expected cost: one extra sweep of the data on the forward, nothing new
+   on the backward. Not measured yet.
+2. **Gradient.** The backward seeds read the suffix `J, eta`, which are
+   dense-information composites too; the 0.48-0.53 sigma gradient errors
+   above are likely the same floor reaching the seeds. Measure after step 1;
+   the replay-side adjoint (`filter_backward` from the entry state) is
+   already the gradient of the replayed value.
+3. **Default MLX path** (all m, and the only path for m > 4). The same
+   structure at sub-block scale: fold leaves into sub-block elements, a
+   prefix over them instead of the reduction, then a 32-step replay batched
+   over sub-blocks.
 
 ## Error growth: measured
 

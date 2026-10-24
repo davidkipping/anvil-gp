@@ -211,6 +211,12 @@ Extrapolated, N = 1e5 gives ~7e-2 log-units (an order of magnitude under the
 decision scale) and N = 1e6 gives ~0.7 — which is where `reanchor_every`, or
 composing the per-block roots in float64, starts to matter.
 
+That scan was a single SHO at moderate predictability. On realistic
+active-star cadences a different floor dominates -- the dense information
+form's large cancelling log-normalisers -- and it is far larger at
+N = 1e5: up to 2.8 log-units of spread across a posterior on a TESS 20-s
+sector. See [docs/float32.md](docs/float32.md), section 7.
+
 One notable negative result: the brief predicted a float32-infeasible corner
 at `sigma_GP/yerr` of 10–300 with a timescale far above the cadence. Across
 that whole range the worst relative error measured is 4.3e-7, with no sign of
@@ -552,6 +558,26 @@ marked as an estimate.
   other parameter stays under 1.1e-4. Rounding `metal_block` up rather than
   to the nearest power of two would halve the blocks and cost forward
   speed; not done.
+* **The residual float32 floor on bright, densely sampled data.** Blocks
+  store their log-normaliser for a zero incoming state, ~1e4 numbers that
+  every composition cancels; it grows with timescale over cadence, s/e and
+  N, and `kappa_max` cannot see it. Clear for GP-detrended transit fits at
+  s/e <~ 10, RV and single Kepler quarters; on the default path, active
+  stars at s/e >~ 100 and long baselines vary by ~0.4-3.5 log-units across
+  the posterior; a TESS 20-s sector at s/e = 30 by 2.8 on the default path
+  and **1.7 on the kernel**. Recommended fix, prototyped at 0.06 worst case
+  on all three of the worst rows: read log L from a float32 filter replayed
+  through each block from its prefix entry state, which the backward
+  already does, instead of from the composed `ell`. Expected cost one extra
+  forward sweep, not measured. Table and plan:
+  [docs/float32.md](docs/float32.md), section 7.
+* **The default MLX gradient at N ~ 1e5.** It fails with
+  `[metal::malloc] Resource limit (499000) exceeded` (Metal's limit on live
+  buffers, not memory): uncompiled at N = 114k for one chain of a single
+  SHO, and already at N = 32k for 8 chains of SHO + SHO; compiled, at
+  N = 114k for 8 chains of SHO + SHO. The kernel is unaffected. Found
+  2026-10-24, not investigated; the same at `a46e0ff`, so not a recent
+  regression.
 * ~~**Kernel thread and residual layout (measured 1.5–1.9x).**~~ Landed
   with M4's stage B: flat chains-fastest grid, residual stored
   `(npts, n_chains)`, `ell` bit-identical.
