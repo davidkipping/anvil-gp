@@ -193,26 +193,35 @@ timescale).
 
 ## 7. Compose in the innovation, through the factor
 
-Found 2026-10-23, fixed 2026-10-24. Sums of terms (m >= 4) were wrong by
-1 to 100 log-units, in value and gradient, whenever two observations fell
-much closer together than the cadence at high SNR. Kappa saw none of it:
-it reads the median lag, and was 3.7.
+Found 2026-10-23, fixed 2026-10-24 (`46d392d`). Sums of terms (m >= 4: two
+SHOs, SHO + Matern, `RotationTerm`) were wrong by up to 160 log-units in
+value, and up to 270% in gradient, whenever the GP was nearly predictable
+from one sample to the next. That covers ordinary photometry of an active
+star: a regular TESS cadence with a 3-day rotation at s/e = 30 (amplitude
+over error bar) was 3 log-units wrong, and 70 at s/e = 100. Near-duplicate
+timestamps are the extreme case, not the only one. Kappa was 1e3-1e4 in
+every case measured, far below `kappa_max`, so the guard refused none of
+them. Single terms (m = 2) were not affected.
 
-**Mechanism.** A block whose first observation follows the previous one
-almost at once predicts that observation almost exactly: `hQh << r`, so the
-block's information matrix `J2` reaches `sigma^2 / r`, 1e4 at
-`sigma/yerr = 100`, and `eta2 ~ 2e4`. The general composition formed its
-log-normaliser as three cross terms of ~1e4 each, cancelling to O(1):
+**Mechanism.** A block whose first observation is predicted almost exactly
+from the state entering it -- `hQh << r`, which is what a timescale much
+longer than the cadence does at high s/e, and what a near-duplicate
+timestamp does at any timescale -- has an information matrix `J2` of order
+`sigma^2 / r` (1e4 at s/e = 100) and `eta2 ~ 2e4`. The general composition
+formed its log-normaliser as three cross terms of ~1e4 each, cancelling to
+O(1):
 
     -1/2 b1^T Jt b1 + eta2^T G b1 + 1/2 eta2^T M eta2
 
 with `G = I - M J2` built as a matrix. Each entry of `G` carried an
 absolute error of `eps |M| |J2| ~ 1e-3`, and `eta2^T G b1` multiplied it by
 3e4. The stored elements were not the problem: composing the float32 leaves
-in float64 was within 0.008, and the per-composition errors summed to the whole.
-The rank-one leaf fold never had the problem, because it is already written
-in the innovation `beta`. That is why the default MLX path (16-point folds)
-was hurt less than the pure tree, and m = 2 hardly at all.
+in float64 was within 0.008, and the per-composition errors summed to the
+whole. The rank-one leaf fold never had the problem, because it is already
+written in the innovation `beta`. That is why the default MLX path
+(32-point folds) was hurt less than the pure tree, and why the Metal kernel,
+which runs only a dozen or so general compositions per chain, was hurt less
+again.
 
 **Fix.** The same algebra, written in the innovation `d = eta2 - J2 b1` and
 through the Cholesky factor `Y` (with `M = Y Y^T`, `V = J2 Y`, `w = Y^T d`):
@@ -226,23 +235,55 @@ Both halves matter: the innovation form alone left `G^T d` with the same
 1e-3 error, and the composite `eta` carried it into the next level, which
 cost another log-unit on a uniform-random cadence.
 
-**Measured** (SHO + SHO, N = 4096, data on-model; value error in log-units,
-then worst relative gradient error against a float64 finite difference):
+**Measured on realistic cadences** (SHO + SHO, N = 4096, data drawn at the
+parameters, worst of two draws; value error in log-units, before -> after;
+`benchmarks/cadence_exposure.py`, 2026-10-24):
 
-| cadence, `sigma/yerr` | before: default / pure tree / kernel | after |
+| setup | kappa | default MLX | fused kernel |
+|---|---|---|---|
+| TESS 2-min, rotation 3 d + granulation 0.2 d, s/e = 10 | 1e2 | 0.07 -> 0.006 | 0.003 -> 0.004 |
+| same, s/e = 30 | 1e3 | 3.1 -> 0.015 | 0.20 -> 0.009 |
+| same, s/e = 100 | 1e4 | 70 -> 0.04 | 18 -> 0.19 |
+| Kepler 30-min, rotation 10 d + granulation 1 d, s/e = 100 | 3e3 | 3.7 -> 0.03 | 0.51 -> 0.006 |
+| two instruments, simultaneous to 1 s, s/e = 30 | 1e3 | 2.0 -> 0.16 | 1.8 -> 0.04 |
+| same, s/e = 100 | 1e4 | 160 -> 0.59 | 20 -> 0.10 |
+| RV, 600 points, 1-3 per night, rotation 25 d, s/e = 3-30 | <= 1e3 | <= 0.08 -> <= 0.001 | <= 0.02 -> <= 0.001 |
+| single SHO (m = 2), TESS 2-min or two instruments, s/e = 30-300 | <= 8e4 | unchanged, 0.01-1.7 | unchanged, 0.01-0.17 |
+
+**Measured on stress cadences** (SHO + SHO, N = 4096; value error, then
+worst relative gradient error against a float64 finite difference):
+
+| cadence, s/e | before: default / pure tree / kernel | after |
 |---|---|---|
-| 20 near-duplicates (1e-4 cadences), 100 | -3.8, 53% / +18.3, 260% / -0.002, 0.08% | ≤ 0.007, 0.4% |
-| uniform random, 100 | -2.9, 110% / +58.9, 270% / -1.3, 2.9% | ≤ 0.005, 0.13% |
-| uniform random (another draw), 100; every `sub_block` 1-1024, dense and blocked leaves, m = 2, 4, 6 | up to 101 | ≤ 0.012 |
+| 20 near-duplicates (1e-4 cadences), 100 | -3.8, 53% / +18.3, 260% / -0.002, 0.08% | <= 0.007, 0.4% |
+| uniform random, 100 | -2.9, 110% / +58.9, 270% / -1.3, 2.9% | <= 0.005, 0.13% |
+| uniform random (another draw), 100; every `sub_block` 1-1024, dense and blocked leaves, m = 2, 4, 6 | up to 101 | <= 0.012 |
 | near-duplicates or uniform, 1000 (value only) | up to 2.1e4 / 2.9e5 / 297 | 0.02-0.88 / 0.09-1.2 / 0.03-0.14 |
 
-**What is left** is the last row. At `sigma/yerr = 1000` a near-duplicate
-leaf stores `ell = ld - g^2/2` with `g^2 ~ 1e6`, so float32 storage alone
-costs a few hundredths of a log-unit per such leaf. Composing the float32
-leaves *in float64* is off by 0.25-0.52, and the sequential filter by up to
-0.14. That is a limit of the dense information representation, not of the
-arithmetic. A square-root information form would remove it, at the price of
-a QR per composition. Regular cadences are unaffected at every SNR tried.
+**What is left** is older than this bug and independent of it: the dense
+information form itself. An element stores its log-normaliser for a *zero*
+incoming state, so a leaf holds `ell = ld - g^2/2` and a composite of k
+leaves holds roughly `-1/2 sum g^2` over them -- ~1e4 at s/e = 30 when the
+timescale outlasts the block -- and every general composition cancels that
+against a cross term of the same size. The arithmetic is now right; the
+float32 *storage* of those numbers is the floor. It shows as:
+
+* the default MLX path 0.6-1.3 log-units out at kappa ~1e4 on the
+  single-SHO and simultaneous-instrument rows above, and 0.02-0.14,
+  scattering with `sub_block`, on the TESS regression case in
+  `tests/test_likelihood.py`. The fused kernel, which composes only a dozen
+  or so blocks per chain, stays within 0.2 everywhere measured: at high
+  s/e, use `GPPolicy(metal=True)`;
+* the single-SHO `sub_block` trend in `_auto_sub_block` (-0.64 at 16,
+  -0.04 at 128, N = 1e5, s/e = 30), which this fix did not change; at
+  m = 4 and 6 the same scan went from 0.2-1.8 to 0.01-0.18;
+* at s/e = 1000 with near-duplicates, `g^2 ~ 1e6` per leaf: composing the
+  float32 leaves *in float64* is off by 0.25-0.52, and the sequential
+  filter by up to 0.14.
+
+A square-root information form, carrying `J = Z Z^T`, `eta = Z gamma` and
+the log-normaliser centred on `gamma`, would remove it, at the price of a
+QR per composition.
 
 ## Error growth: measured
 

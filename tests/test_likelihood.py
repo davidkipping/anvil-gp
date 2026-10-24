@@ -355,23 +355,30 @@ def test_the_blocked_leaf_path_does_not_make_sub_block_a_precision_knob():
     assert max(abs(v - ref) for v in vals.values()) < 5e-3, vals
 
 
-@pytest.fixture(scope="module", params=["near-duplicates", "uniform"])
+@pytest.fixture(scope="module",
+                params=["near-duplicates", "uniform", "tess-regular"])
 def near_duplicate_problem(request):
-    """SHO + SHO at sigma/yerr = 100, drawn on-model, on a regular cadence
-    with 20 observations moved to 1e-4 cadences after their predecessor, or
-    on a uniform-random one (whose closest pairs do the same thing)."""
+    """SHO + SHO, drawn on-model, on three cadences that each predict some
+    observations almost exactly from the last: a regular one with 20
+    observations moved to 1e-4 cadences after their predecessor, a
+    uniform-random one (whose closest pairs do the same), both at s/e = 100;
+    and a plain regular TESS 2-min cadence with a 3-day rotation and a
+    0.2-day granulation at s/e = 30, where the timescale does it."""
     from anvilgp.oracle import dense_covariance
     n, dt = 4096, 400 / 4096
     r = np.random.default_rng(101)
+    kp = [0.1, 0.3, 3.0, 0.05, 0.6, 1.0]
     if request.param == "uniform":
         t = np.sort(r.uniform(0.0, 400.0, n))
+    elif request.param == "tess-regular":
+        t = np.arange(n) * (2 / 1440)
+        kp = [0.03, 3 / (2 * np.pi), 5.0, 0.009, 0.2, 1 / np.sqrt(2)]
     else:
         t = np.arange(n) * dt
         idx = np.sort(r.choice(np.arange(10, n - 10), 20, replace=False))
         t[idx] = t[idx - 1] + 1e-4 * dt
         t = np.sort(t)
     term = ag.SHOTerm() + ag.SHOTerm()
-    kp = [0.1, 0.3, 3.0, 0.05, 0.6, 1.0]
     yerr = np.full(n, 0.001)
     y = np.linalg.cholesky(dense_covariance(term, np.array(kp), t, yerr)) \
         @ np.random.default_rng(1).standard_normal(n)
@@ -386,8 +393,13 @@ def near_duplicate_problem(request):
         vs[2 + 2 * i, i] -= h
     with mx.stream(mx.cpu):
         f = np.array(gp.hi(mx.array(vs).astype(mx.float64)))
+    # (value, gradient rtol).  The TESS case sits on a separate, smaller
+    # floor -- composites store ell for a zero incoming state, ~-1/2 sum g^2,
+    # and every composition cancels it -- which scatters 0.02-0.14 with
+    # sub_block and is not this bug; see docs/float32.md, section 7.
+    tol = (0.2, 3e-2) if request.param == "tess-regular" else (0.05, 1e-2)
     return (t, y, yerr, term, pm, v0, f[0],
-            (f[1::2] - f[2::2]) / (2 * h))
+            (f[1::2] - f[2::2]) / (2 * h), tol)
 
 
 @pytest.mark.parametrize("policy", [
@@ -404,21 +416,23 @@ def test_near_duplicate_timestamps_cost_float32_nothing(
         cadence           default         pure tree       metal
         near-duplicates   -3.8   53%      +18.3  260%     -0.002  0.08%
         uniform           -2.9  110%      +58.9  270%     -1.3    2.9%
+        tess-regular      -0.85  20%      -0.34   58%     +1.8    0.5%
 
-    and the kappa guard (3.7, at the median lag) saw none of it.  Written
-    in the innovation and through the Cholesky factor (`elements.combine`),
-    every cell is within 0.007 and 0.4%."""
+    and the kappa guard (3.7 and 1e3, at the median lag) saw none of it.
+    Written in the innovation and through the Cholesky factor
+    (`elements.combine`), every near-duplicate and uniform cell is within
+    0.007 and 0.4%; tess-regular is -0.058 1.3%, -0.023 0.7%, +0.004 0.4%."""
     from anvilgp.metal import metal_available
     if policy.metal and not metal_available():
         pytest.skip("no Metal device")
-    t, y, yerr, term, pm, v0, hi, fd = near_duplicate_problem
+    t, y, yerr, term, pm, v0, hi, fd, (tol_v, tol_g) = near_duplicate_problem
     gp = GPLogLike(None, t, None, y, yerr, term, pm, policy)
     with mx.stream(mx.gpu):
         v = mx.array(v0, dtype=mx.float32)
         lo = float(np.array(gp(v))[0])
         grad = np.array(mx.grad(lambda u: mx.sum(gp(u)))(v))[0]
-    assert abs(lo - hi) < 0.05, lo - hi
-    np.testing.assert_allclose(grad, fd, rtol=1e-2)
+    assert abs(lo - hi) < tol_v, lo - hi
+    np.testing.assert_allclose(grad, fd, rtol=tol_g)
 
 
 def test_float64_path_is_float64_accurate_through_a_log_link():

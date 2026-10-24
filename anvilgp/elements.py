@@ -375,8 +375,9 @@ def combine(e1: Element, e2: Element, formal: bool = False) -> Element:
     #
     # The left-hand sides are what this used to compute, and they are a
     # float32 disaster whenever J2 is large.  A block whose first
-    # observation closely follows the previous one (hQh << r) has
-    # |J2| ~ sigma^2/r -- 1e4 at sigma/yerr = 100 -- and |eta2| ~ 2e4, so
+    # observation is predicted almost exactly (hQh << r: a timescale much
+    # longer than the cadence at high SNR, or a near-duplicate timestamp)
+    # has |J2| ~ sigma^2/r -- 1e4 at sigma/yerr = 100 -- and |eta2| ~ 2e4, so
     # the three cross terms were each ~1e4 and cancelled to O(1), while
     # G = I - M J2 carried an absolute error of eps |M| |J2| ~ 1e-3 that
     # eta2^T G b1 multiplied by 3e4.  Measured with 20 near-duplicate
@@ -385,7 +386,9 @@ def combine(e1: Element, e2: Element, formal: bool = False) -> Element:
     # form, -0.005 to -0.010.  The same 1e-3 error in G^T d, carried into
     # the composite eta, cost another ~1 log-unit at the next level up on a
     # uniform-random cadence (eta enters the next ell weighted by the state
-    # mean); through the factor it is 0.023.
+    # mean); through the factor it is 0.023.  On a regular TESS-like
+    # cadence with a 3-day rotation at s/e = 100 this was 70 log-units on
+    # the default path; now 0.04 (docs/float32.md, section 7).
     j_b1 = matvec(e2.J, e1.b)
     d = e2.eta - j_b1
     if formal:

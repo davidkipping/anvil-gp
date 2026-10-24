@@ -1351,6 +1351,22 @@ def _auto_sub_block(m: int) -> int:
     than 16.  Past it accuracy is still bought, but with real time.  Raise
     it by hand for a large, high-amplitude problem -- ``validate_precision``
     on your own data is the thing to trust, and it will say so.
+
+    That table is a single SHO (m = 2, rho = 100 cadences, Q = 3).  Sums of
+    terms also suffered a separate cancellation in the general composition
+    until 2026-10-24 (docs/float32.md, section 7), so the default was
+    re-checked after that fix, same N and amplitude, worst of two draws:
+
+        sub_block       8       16      32      64      128
+        m = 2         -0.63   -0.64   -0.18   -0.08   -0.04   (as above)
+        m = 4  before -0.33   +0.57   -0.18   -0.44   -0.21
+               after  +0.18   +0.18   +0.05   +0.04   +0.06
+        m = 6  before -1.81   +1.62   -0.95   +0.10   -0.25
+               after  -0.10   +0.02   +0.04   -0.01   +0.02
+
+    32 still stands; what remains at m = 2 is the composites' stored
+    log-normaliser, not the composition's arithmetic.  m >= 7 (the 64) was
+    not re-measured.
     """
     if m <= 6:
         return 32
