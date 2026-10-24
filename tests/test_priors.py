@@ -238,14 +238,53 @@ def test_zero_baseline_is_refused():
         priors.default_hypers(ag.SHOTerm(), t, y, yerr)
 
 
-def test_u0_spread_in_u_is_unchanged():
-    """The default draws exactly what it always drew: spread * N(0, 1)."""
+def test_u0_spread_in_u_is_a_ball_around_the_reference():
+    """The default draws u_ref + spread * N(0, 1), the same normals as
+    before u_ref existed."""
     pytest.importorskip("anvil")
     from anvilgp.anvil import make_target
     gt = make_target(ag.SHOTerm(), T, Y, YERR)
     z = np.random.default_rng(7).standard_normal((64, gt.transform.dim))
     np.testing.assert_array_equal(np.array(gt.u0(64, seed=7, spread=0.3)),
-                                  (0.3 * z).astype(np.float32))
+                                  (gt.u_ref() + 0.3 * z).astype(np.float32))
+
+
+@pytest.mark.parametrize("term,seed_period", [
+    (ag.SHOTerm(), False), (ag.RotationTerm(), False),
+    (ag.RotationTerm(), True), (ag.SHOTerm() + ag.Matern32Term(), False)])
+def test_u0_starts_every_hyperparameter_at_its_reference(term, seed_period):
+    """u = 0 is the middle of a bounded parameter's box, which is not its
+    reference when the bounds are asymmetric about it: the SHO Q box is
+    [0.05, 500] around 3, and the rotation period's [2 cadence, T] around
+    the periodogram peak.  Centred on u = 0, seed_period moved nothing and
+    every Q started at 5.  The centre must map to model-space v = 0."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    gt = make_target(term, T, Y, YERR, seed_period=seed_period)
+    v = gt.transform.model_np(gt.u_ref())
+    np.testing.assert_allclose(v, 0.0, atol=1e-12)
+    nat = {k: c[0] for k, c in gt.natural(v[None]).items()}
+    for h in gt.hypers:
+        key = h.name.split("_", 1)[1] if h.link != "linear" else h.name
+        expect = 0.5 if h.link == "logit" else h.ref
+        np.testing.assert_allclose(nat[key], expect, rtol=1e-6, atol=1e-12)
+    if seed_period:
+        assert abs(nat["gp_P"] - 7.3) / 7.3 < 0.02
+
+
+def test_u0_clips_a_reference_on_a_bound():
+    """A periodogram peak at the edge of its grid puts the reference on a
+    bound, where the inverse transform is infinite.  The start is clipped
+    just inside instead."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    gt = make_target(ag.RotationTerm(), T, Y, YERR)
+    j = gt.names.index("log_gp_P")
+    gt.transform.specs[j].lo = 0.0
+    gt.transform = type(gt.transform)(gt.transform.specs)
+    u = gt.u_ref()
+    assert np.all(np.isfinite(u)) and u[j] == -gt.U_REF_MAX
+    assert np.all(np.isfinite(np.array(gt.u0(8, units="prior"))))
 
 
 def test_u0_prior_units_put_one_prior_sigma_in_every_column():
@@ -259,7 +298,7 @@ def test_u0_prior_units_put_one_prior_sigma_in_every_column():
     eps = 1e-4
     u = np.array(gt.u0(1, seed=0, spread=eps, units="prior"), dtype=np.float64)
     z = np.random.default_rng(0).standard_normal(gt.transform.dim)
-    v = gt.transform.model_np(u[0]) - gt.transform.model_np(np.zeros_like(u[0]))
+    v = gt.transform.model_np(u[0]) - gt.transform.model_np(gt.u_ref())
     sd_v = v / (eps * z)
     expected = []
     for h, s in zip(gt.hypers, gt.transform.specs):

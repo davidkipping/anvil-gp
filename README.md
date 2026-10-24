@@ -650,8 +650,9 @@ announcing itself as an error:
   rejection and no discontinuity. Without it, R-hat across label-switched
   modes means nothing. (anvil's `Transform` has no ordered-vector transform;
   this keeps the fix local rather than requiring an engine change.)
-* `priors.periodogram_period` seeds rotation kernels inside one harmonic —
-  the legitimate use of spectral machinery, as an *initialiser*. The Whittle
+* `priors.periodogram_period` seeds rotation kernels inside one harmonic
+  (`make_target(..., seed_period=True)`; `gt.u0` then starts the chains at
+  the peak) — the legitimate use of spectral machinery, as an *initialiser*. The Whittle
   likelihood itself is a quasi-likelihood and fails the exactness rule.
 
 Named identifiability ridges to expect, none of them bugs: σ_GP vs jitter as

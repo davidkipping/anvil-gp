@@ -61,23 +61,31 @@ class GPTarget:
 
     def u0(self, n_chains: int, seed: int = 0, spread: float = 0.05,
            units: str = "u"):
-        """Initial states: a Gaussian ball around ``u = 0``, which the
-        parametrisation has arranged to be a sensible guess (every scale
-        parameter near its data-derived host reference).
+        """Initial states: a Gaussian ball around :meth:`u_ref`, the point
+        where every hyperparameter sits at its data-derived host reference
+        (and, with ``seed_period``, a rotation period at the periodogram
+        peak).
+
+        That point is *not* ``u = 0`` for a bounded parameter whose bounds
+        are asymmetric about its reference: anvil maps ``u = 0`` to the
+        middle of the box.  Before 2026-10-23 the ball was centred on
+        ``u = 0``, so a rotation period started at ``sqrt(2 cadence T)``
+        whatever the periodogram said, and every SHO/rotation quality factor
+        at 5 rather than its reference 3.
 
         ``units`` says what ``spread`` is measured in:
 
         * ``"u"`` (default): the sampler's unconstrained coordinates.  One
           unit means very different things for different parameters: for a
           bounded parameter it is ``(hi - lo) / 4`` in model space at the
-          centre, which for the default jitter (bounds 1e-3 to 1e3 times the
+          middle of the box, and less off it, which for the default jitter (bounds 1e-3 to 1e3 times the
           error bar, prior sd 1) is **3.4 prior standard deviations**, about
           a factor of 30 in jitter.
         * ``"prior"``: prior standard deviations, per parameter, so a spread
           of 1 is one prior sigma for every column.  The width comes from the
           parameter's Gaussian prior, or for a bounded parameter without one
           from its uniform prior, ``(hi - lo) / sqrt(12)``, and is converted
-          to ``u`` with the transform's slope at ``u = 0``.  Columns with
+          to ``u`` with the transform's slope at the centre.  Columns with
           neither (the mean model's, an unbounded flat parameter) keep
           ``spread`` in ``u``.  This is the one to use for an overdispersed
           start, e.g. for R-hat.
@@ -88,7 +96,8 @@ class GPTarget:
         outside the prior can trap the run.**  ChEES adapts one step size for
         all chains from the harmonic mean of their acceptance, so the
         slowest chain sets it for everyone.  Measured on the tutorial problem
-        at 1024 chains, 300 warmup: the final step size is 0.29 at the
+        at 1024 chains, 300 warmup, with the old ``u = 0`` centre (Q starting
+        at 5, not 3): the final step size is 0.29 at the
         default ``spread=0.05``; 0.03 at ``spread=0.3``; 3e-3 at
         ``spread=1, units="prior"``, with R-hat 2 to 5.  That run is slow,
         not stuck: with 3000 warmup it reaches step 0.09 to 0.26 and R-hat
@@ -110,13 +119,33 @@ class GPTarget:
         rng = np.random.default_rng(seed)
         z = rng.standard_normal((n_chains, self.transform.dim))
         scale = spread if units == "u" else spread * self._prior_sd_in_u()
-        return mx.array((scale * z).astype(np.float32))
+        return mx.array((self.u_ref() + scale * z).astype(np.float32))
+
+    #: how far inside its box a reference on or past a bound is started:
+    #: ``|u| <= U_REF_MAX``, i.e. within 1.8% of the box width of the edge.
+    U_REF_MAX = 4.0
+
+    def u_ref(self) -> np.ndarray:
+        """The unconstrained point of the hyperparameters' host references.
+
+        Every hyperparameter is sampled as an offset from its reference, so
+        the reference is model-space ``v = 0``; this maps it through the
+        transform's inverse.  The mean model's columns stay at ``u = 0``:
+        their reference is the caller's business.  A reference on a bound
+        (a periodogram peak at the edge of its grid) would map to infinity,
+        so the result is clipped to ``|u| <= U_REF_MAX``.
+        """
+        n_mean = self.transform.dim - len(self.hypers)
+        u = self.transform.from_model_np(np.zeros(self.transform.dim))
+        u[:n_mean] = 0.0
+        return np.clip(u, -self.U_REF_MAX, self.U_REF_MAX)
 
     def _prior_sd_in_u(self) -> np.ndarray:
         """Each column's prior standard deviation, mapped to ``u`` at
-        ``u = 0``; 1.0 where there is no prior width to use."""
+        :meth:`u_ref`; 1.0 where there is no prior width to use."""
         specs = self.transform.specs
         n_mean = len(specs) - len(self.hypers)
+        jac = self.transform.jacobian_np(self.u_ref())
         out = np.ones(len(specs))
         for j, h in enumerate(self.hypers):
             s = specs[n_mean + j]
@@ -127,10 +156,9 @@ class GPTarget:
                 sd_v = (s.hi - s.lo) / np.sqrt(12.0)
             else:
                 continue
-            # dv/du at u = 0: (hi - lo)/4 for the sigmoid map, scale for the
-            # affine and the half-bounded exp maps.
-            out[n_mean + j] = sd_v / ((s.hi - s.lo) / 4.0 if bounded
-                                      else s.scale)
+            # dv/du at the centre: (hi - lo) p (1 - p) for the sigmoid map,
+            # scale for the affine map.
+            out[n_mean + j] = sd_v / jac[n_mean + j]
         return out
 
     def natural(self, v_model: np.ndarray) -> dict:
