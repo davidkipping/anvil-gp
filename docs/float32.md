@@ -369,9 +369,53 @@ removes the large numbers instead of storing them more carefully.
    0.004 -> 0.012 at N = 1e5, s/e = 30. Three orders under the decision
    scale, and on every row of the table above the replay is the better of
    the two by 10-100x.
-2. **Gradient.** The backward seeds read the suffix `J, eta`, which are
-   dense-information composites too; the 0.48-0.53 sigma gradient errors
-   above are likely the same floor reaching the seeds. Not yet attempted.
+2. **Gradient: diagnosed 2026-10-24, not fixed.** It does not bias a
+   sampler -- HMC accepts or rejects on the value, which is now right, and
+   leapfrog with any position-dependent force is still reversible and
+   volume-preserving -- so a gradient error costs acceptance, not
+   correctness. Gradient error per posterior sigma, against float64 central
+   differences, SHO + SHO at s/e = 100 (the two amplitudes are the
+   affected parameters; the timescales stay at <= 0.03-0.1):
+
+   | case | default kernel | one block (`metal_block = N`) |
+   |---|---|---|
+   | 2-min cadence, N = 8192, 4 blocks of 2048 | 0.07 / 0.25 | 0.001 / 0.017 |
+   | 20-s cadence, N = 4096, 16 blocks of 256 | **3.8 / 2.6** | 0.025 / 0.039 |
+
+   Two boundary quantities fail, both because they compose
+   dense-information block elements across blocks:
+
+   * **the seeds** (`block_seeds_kernel`, from the suffix `J, eta`): the
+     kernel's are 2-3e-4 relative wrong at 2048-point blocks, and replacing
+     them by exact float64 seeds (central differences of a float64 filter
+     from the kernel's own entry states) brings the first row to the
+     one-block level. So do seeds from block elements *centred on the
+     filtered trajectory* -- the same algebra with the innovations `v_t` as
+     residuals and `-K_t v_t` added to each leaf's `b`, which makes
+     `eta_s - J_s mu` the centred `eta_s` itself, with no cancellation
+     (prototyped in MLX float32).
+   * **the entry states** (the prefix's `b, C`): at 256-point blocks of
+     20-s data the kernel's entry means are up to 7% wrong (0.12 against a
+     state of 1.6), in directions the observations barely see -- the
+     rotation / granulation split -- which is why the value, replayed from
+     them, is still right. With exact float64 entry states *and* exact
+     seeds the second row is 0.41 / 0.30; with either alone, 1.9 or 4.2.
+
+   Ruled out, measured: the term front end (chaining the kernel's per-lag
+   adjoints to theta in float64 changes nothing), and the per-lag and `dh`
+   accumulators (Kahan compensation changes nothing). Refining the seeds
+   by a second backward pass -- each block's entry adjoint is exactly the
+   seed the previous block should have had -- fixes the first row
+   (0.25 -> 0.017) and takes a TESS 20-s sector at s/e = 30 from 0.49 to
+   0.17 (its converged floor is 0.155), but makes the second row worse
+   (3.8 -> 5.9): it moves information one block per pass, and a 256-point
+   block of 20-s data is far shorter than the ~860 (granulation) to ~13,000
+   (rotation) steps the filter needs to forget an error. A real fix needs
+   both boundary quantities in a well-conditioned form -- the centred
+   elements, or the square-root information form, for the prefix and the
+   suffix -- and is open. Scripts: the scratch prototypes of 2026-10-24
+   (`exact_seeds.py`, `refine_exp.py`, `centred_proto.py`) are not in the
+   repository.
 3. **Default MLX path** (all m, and the only path for m > 4). The same
    structure at sub-block scale: fold leaves into sub-block elements, a
    prefix over them instead of the reduction, then a 32-step replay batched

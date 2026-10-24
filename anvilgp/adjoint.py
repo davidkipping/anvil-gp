@@ -249,6 +249,12 @@ def block_seeds(mu, sigma, suf, cot):
     the damage grows with the block count (0.6% at 8 blocks, 3% at 32).
     Keep the block count near a dozen, which is also where the forward's
     occupancy saturates.  See docs/m4-plan.md.
+
+    That understates it on bright, densely sampled data (measured
+    2026-10-24, docs/float32.md section 7, step 2): at s/e = 100 the
+    amplitude gradients are off by 0.25 posterior sigma at four 2048-point
+    blocks and by 3.8 at sixteen 256-point blocks of 20-s data, and the
+    prefix's entry states fail there as well as these seeds.
     """
     m = sigma.shape[-1]
     ident = mx.eye(m, dtype=sigma.dtype)
