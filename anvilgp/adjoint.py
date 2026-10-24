@@ -256,9 +256,12 @@ def block_seeds(mu, sigma, suf, cot):
     x = matmul(mx.swapaxes(l1, -1, -2), matmul(suf.J, l1))
     ls = chol(ident + sym(x))
     y = tri_solve_right(ls, l1)
-    g = ident - matmul(sym_from_factor(y), suf.J)
-    jt = sym(suf.J - sym_from_factor(matmul(suf.J, y)))
-    r = matvec(mx.swapaxes(g, -1, -2), suf.eta - matvec(suf.J, mu))
+    v = matmul(suf.J, y)
+    jt = sym(suf.J - sym_from_factor(v))
+    # r = G^T d = d - V (Y^T d), through the factor as in `combine`, not
+    # through G = I - M J_s as a matrix
+    d = suf.eta - matvec(suf.J, mu)
+    r = d - matvec(v, matvec(mx.swapaxes(y, -1, -2), d))
     m_bar = cot[..., None] * r
     p_bar = (cot[..., None, None] * 0.5) * (outer(r, r) - jt)
     return m_bar, p_bar

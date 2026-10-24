@@ -355,6 +355,72 @@ def test_the_blocked_leaf_path_does_not_make_sub_block_a_precision_knob():
     assert max(abs(v - ref) for v in vals.values()) < 5e-3, vals
 
 
+@pytest.fixture(scope="module", params=["near-duplicates", "uniform"])
+def near_duplicate_problem(request):
+    """SHO + SHO at sigma/yerr = 100, drawn on-model, on a regular cadence
+    with 20 observations moved to 1e-4 cadences after their predecessor, or
+    on a uniform-random one (whose closest pairs do the same thing)."""
+    from anvilgp.oracle import dense_covariance
+    n, dt = 4096, 400 / 4096
+    r = np.random.default_rng(101)
+    if request.param == "uniform":
+        t = np.sort(r.uniform(0.0, 400.0, n))
+    else:
+        t = np.arange(n) * dt
+        idx = np.sort(r.choice(np.arange(10, n - 10), 20, replace=False))
+        t[idx] = t[idx - 1] + 1e-4 * dt
+        t = np.sort(t)
+    term = ag.SHOTerm() + ag.SHOTerm()
+    kp = [0.1, 0.3, 3.0, 0.05, 0.6, 1.0]
+    yerr = np.full(n, 0.001)
+    y = np.linalg.cholesky(dense_covariance(term, np.array(kp), t, yerr)) \
+        @ np.random.default_rng(1).standard_normal(n)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
+                          for i, x in enumerate(kp)], n_dim=len(kp))
+    v0 = np.array([[0.05, -0.03, 0.02, -0.04, 0.03, 0.01]])
+    gp = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy())
+    h = 1e-5
+    vs = np.repeat(v0, 1 + 2 * len(kp), 0)
+    for i in range(len(kp)):
+        vs[1 + 2 * i, i] += h
+        vs[2 + 2 * i, i] -= h
+    with mx.stream(mx.cpu):
+        f = np.array(gp.hi(mx.array(vs).astype(mx.float64)))
+    return (t, y, yerr, term, pm, v0, f[0],
+            (f[1::2] - f[2::2]) / (2 * h))
+
+
+@pytest.mark.parametrize("policy", [
+    GPPolicy(), GPPolicy(sub_block=1), GPPolicy(metal=True)],
+    ids=["default", "pure-tree", "metal"])
+def test_near_duplicate_timestamps_cost_float32_nothing(
+        near_duplicate_problem, policy):
+    """Two observations very close together make the next block's
+    information matrix ~sigma^2/r = 1e4, and the general composition used
+    to form its log-normaliser as three ~1e4 cross terms cancelling to
+    O(1), through a ``G = I - M J2`` whose own error was ~1e-3.  Before the
+    fix (2026-10-24), value error and worst relative gradient error:
+
+        cadence           default         pure tree       metal
+        near-duplicates   -3.8   53%      +18.3  260%     -0.002  0.08%
+        uniform           -2.9  110%      +58.9  270%     -1.3    2.9%
+
+    and the kappa guard (3.7, at the median lag) saw none of it.  Written
+    in the innovation and through the Cholesky factor (`elements.combine`),
+    every cell is within 0.007 and 0.4%."""
+    from anvilgp.metal import metal_available
+    if policy.metal and not metal_available():
+        pytest.skip("no Metal device")
+    t, y, yerr, term, pm, v0, hi, fd = near_duplicate_problem
+    gp = GPLogLike(None, t, None, y, yerr, term, pm, policy)
+    with mx.stream(mx.gpu):
+        v = mx.array(v0, dtype=mx.float32)
+        lo = float(np.array(gp(v))[0])
+        grad = np.array(mx.grad(lambda u: mx.sum(gp(u)))(v))[0]
+    assert abs(lo - hi) < 0.05, lo - hi
+    np.testing.assert_allclose(grad, fd, rtol=1e-2)
+
+
 def test_float64_path_is_float64_accurate_through_a_log_link():
     """``.hi`` is the reference everything else is measured against.
 

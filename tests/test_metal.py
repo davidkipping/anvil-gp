@@ -1534,8 +1534,8 @@ def test_the_formal_variant_changes_only_the_positivity_assumptions():
     Cholesky factor, and the formal one carries none of them and composes
     through the pivoted inverse instead.
     """
-    tokens = ("LEAF_VARIANCE", "REDUCE_CORE", "LOGDET_ACC", "COMBINE_FACTOR",
-              "LOG_INV_A", "HCH_CLAMPED", "RK_CLAMP_TERM", "CLAMPED_TEST",
+    tokens = ("LEAF_VARIANCE", "REDUCE_CORE", "REDUCE_MD", "LOGDET_ACC",
+              "COMBINE_FACTOR", "COMBINE_RR", "LOG_INV_A", "HCH_CLAMPED", "RK_CLAMP_TERM", "CLAMPED_TEST",
               "C1N")
     srcs = {
         "fwd": metal._jitter_src(metal._SRC, 1),

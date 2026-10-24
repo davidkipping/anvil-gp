@@ -99,6 +99,18 @@ object -- the one-step innovation variance `S = h Q h^T + r_var`, written
 `log|I + C1 J2| = log|Sig|` by Sylvester's identity, so the log-determinant is
 read straight off a factor that has already been computed.
 
+That is the algebra; the code evaluates it in the innovation
+`d = eta2 - J2 b1` and through the factor, with `V = J2 Y` and `w = Y^T d`:
+
+    G b1 + M eta2           = b1 + Y w
+    G^T (eta2 - J2 b1)      = d - V w
+    the three cross terms   = b1^T (eta2 - 1/2 J2 b1) + 1/2 |w|^2
+
+The two sides are equal in exact arithmetic and not in float32: when a block
+starts just after an observation, `J2 ~ sigma^2/r` and the left-hand sides
+cancel ~1e4-sized terms through a `G` that is only good to ~1e-3. See
+docs/float32.md section 7.
+
 ### The rank-one special case, and why it matters
 
 When `e2` is a raw **leaf**, its information matrix is rank one —

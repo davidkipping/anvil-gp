@@ -351,14 +351,17 @@ def _formal_src(src: str, formal: bool) -> str:
     in the leaf fold, and composes blocks through a pivoted direct inverse
     instead of a Cholesky factor -- exactly what
     :func:`anvilgp.elements.combine` does with ``formal=True``.  The
-    non-formal variant is the code it always was: identical to the previous
-    source once comments and whitespace are stripped (checked when this was
-    written; ``tests/test_metal.py`` pins that every clamp survives in it).
+    non-formal variant was, when this was introduced, identical to the
+    previous source once comments and whitespace are stripped;
+    ``tests/test_metal.py`` pins that every clamp survives in it.  The two
+    also differ in how a composition forms ``M d`` and ``G^T d`` (through
+    the Cholesky factor, or through the inverse) -- see `_COMBINE_RR_CHOL`.
     """
     if formal:
         leaf = "sq += rr + jit2v;"
         hch, rk, clamped = "hch", "", "false"
         red = _FORMAL_FACTOR.replace("C1N", "Cm")
+        red_md, comb_rr = _REDUCE_MD_FORMAL, _COMBINE_RR_FORMAL
         logdet = "if (i == 0) logdet = 0.5f * ldx;"
         comb = _FORMAL_FACTOR.replace("C1N", "C1")
         log_a = "fabs(inv_a)"
@@ -369,12 +372,15 @@ def _formal_src(src: str, formal: bool) -> str:
                 "// PSD failure is defined")
         hch, rk, clamped = "max(hch, 0.0f)", " + max(-hch, 0.0f)", "hch < 0.0f"
         red, comb = _REDUCE_CHOL, _COMBINE_CHOL
+        red_md, comb_rr = _REDUCE_MD_CHOL, _COMBINE_RR_CHOL
         logdet = "logdet += metal::precise::log(Ls[i][i]);"
         log_a = "inv_a"
     return (src.replace("LEAF_VARIANCE", leaf)
                .replace("REDUCE_CORE", red)
+               .replace("REDUCE_MD", red_md)
                .replace("LOGDET_ACC", logdet)
                .replace("COMBINE_FACTOR", comb)
+               .replace("COMBINE_RR", comb_rr)
                .replace("LOG_INV_A", log_a)
                .replace("HCH_CLAMPED", hch)
                .replace("RK_CLAMP_TERM", rk)
@@ -441,40 +447,34 @@ _SRC_REDUCE = """
         }
 
 REDUCE_CORE
-        float Gb1[MDIM], Met[MDIM];
+        // In the innovation d = eta2 - J2 b1, as `elements.combine` (whose
+        // comment has the algebra and the float32 measurements): the
+        // composite mean is A2 (b1 + M d) + b2 and the cross terms are
+        // b1^T (eta2 - J2 b1 / 2) + d^T M d / 2.
+        float jb[MDIM], dv[MDIM], Md[MDIM];
         for (uint i = 0; i < M; ++i) {
-            float a = 0.0f, b = 0.0f;
-            for (uint j = 0; j < M; ++j) {
-                a += G[i][j] * bv[j];
-                b += Mm[i][j] * et2[j];
-            }
-            Gb1[i] = a; Met[i] = b;
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += J2[i][j] * bv[j];
+            jb[i] = a;
+            dv[i] = et2[i] - a;
         }
-
-        // ell: log|S| off the factor, then the three quadratic cross terms
-        float logdet = 0.0f, qb = 0.0f, ce = 0.0f, qe = 0.0f;
+REDUCE_MD
+        float logdet = 0.0f, brk = 0.0f;
         for (uint i = 0; i < M; ++i) {
             LOGDET_ACC
-            float t1 = 0.0f, t2 = 0.0f;
-            for (uint j = 0; j < M; ++j) {
-                t1 += Jt[i][j] * bv[j];
-                t2 += Mm[i][j] * et2[j];
-            }
-            qb += bv[i] * t1;
-            qe += et2[i] * t2;
-            ce += et2[i] * Gb1[i];
+            brk += bv[i] * (et2[i] - 0.5f * jb[i]);
         }
-        float add = in_ell[base + k] - logdet - 0.5f * qb + ce + 0.5f * qe;
+        float add = in_ell[base + k] - logdet + brk + 0.5f * quad;
         float yk = add - ell_c;
         float tk = ell + yk;
         ell_c = (tk - ell) - yk;
         ell = tk;
 
-        // b <- A2 (G b1 + M eta2) + b2 ;  C <- sym(A2 M A2^T) + C2
+        // b <- A2 (b1 + M d) + b2 ;  C <- sym(A2 M A2^T) + C2
         float nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
         for (uint i = 0; i < M; ++i) {
             float a = b2[i];
-            for (uint j = 0; j < M; ++j) a += A2[i][j] * (Gb1[j] + Met[j]);
+            for (uint j = 0; j < M; ++j) a += A2[i][j] * (bv[j] + Md[j]);
             nb[i] = a;
         }
         for (uint i = 0; i < M; ++i)
@@ -565,37 +565,42 @@ _REDUCE_CHOL = """        // L1 = chol(C1), with linalg.diag_floor's eps*max(tra
                 Y[r][c] = a / Ls[c][c];
             }
 
-        float Mm[MDIM][MDIM], G[MDIM][MDIM], V[MDIM][MDIM], Jt[MDIM][MDIM];
+        float Mm[MDIM][MDIM];
         for (uint i = 0; i < M; ++i)
             for (uint j = 0; j < M; ++j) {
                 float a = 0.0f;
                 for (uint t = 0; t < M; ++t) a += Y[i][t] * Y[j][t];
                 Mm[i][j] = a;
             }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                float a = 0.0f;
-                for (uint t = 0; t < M; ++t) a += Mm[i][t] * J2[t][j];
-                G[i][j] = (i == j ? 1.0f : 0.0f) - a;
-            }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                float a = 0.0f;
-                for (uint t = 0; t < M; ++t) a += J2[i][t] * Y[t][j];
-                V[i][j] = a;
-            }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                float a = 0.0f;
-                for (uint t = 0; t < M; ++t) a += V[i][t] * V[j][t];
-                Jt[i][j] = J2[i][j] - a;
-            }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < i; ++j) {
-                float a = 0.5f * (Jt[i][j] + Jt[j][i]);
-                Jt[i][j] = a; Jt[j][i] = a;
-            }
 
+"""
+
+#: ``M d`` and ``d^T M d`` for `_SRC_REDUCE`.  On the Cholesky route both go
+#: through the factor, ``w = Y^T d``, never through ``M`` as a matrix; see
+#: `elements.combine`.  The formal route has no factor and uses ``Mm``.
+_REDUCE_MD_CHOL = """
+        float wv[MDIM], quad = 0.0f;
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += Y[j][i] * dv[j];
+            wv[i] = a;
+            quad += a * a;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += Y[i][j] * wv[j];
+            Md[i] = a;
+        }
+"""
+
+_REDUCE_MD_FORMAL = """
+        float quad = 0.0f;
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint j = 0; j < M; ++j) a += Mm[i][j] * dv[j];
+            Md[i] = a;
+            quad += dv[i] * a;
+        }
 """
 
 #: The formal variant's replacement for a composition's factorisation, for
@@ -1111,11 +1116,12 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
 
 
 
-#: The `combine` core shared by the suffix step and the seed: from the
-#: earlier element's ``(b1, C1)`` and the later one's ``(J2, et2)``, form
-#: ``Mm = (I + C1 J2)^-1 C1``, ``G = (I + C1 J2)^-1``,
-#: ``Jt = (I + J2 C1)^-1 J2`` and ``r = G^T (et2 - J2 b1)`` -- the last two
-#: are what both consumers need.  Same Cholesky route as `reduce_blocks`.
+#: The `combine` core shared by the prefix, the suffix step and the seed:
+#: from the earlier element's ``(b1, C1)`` and the later one's ``(J2,
+#: et2)``, form ``Mm = (I + C1 J2)^-1 C1``, ``Jt = (I + J2 C1)^-1 J2``, and,
+#: in the innovation ``d = et2 - J2 b1``, ``Md = Mm d`` and
+#: ``r = G^T d = (I + J2 C1)^-1 d``.  Same Cholesky route as
+#: `reduce_blocks`; ``Md`` and ``r`` go through the factor (`COMBINE_RR`).
 _COMBINE_CHOL = """
             float trc = 0.0f;
             for (uint i = 0; i < M; ++i) trc += C1[i][i];
@@ -1172,18 +1178,12 @@ _COMBINE_CHOL = """
                     for (uint t = 0; t < c; ++t) a -= Ls[c][t] * Y[rr][t];
                     Y[rr][c] = a / Ls[c][c];
                 }
-            float Mm[MDIM][MDIM], G[MDIM][MDIM], V[MDIM][MDIM], Jt[MDIM][MDIM];
+            float Mm[MDIM][MDIM], V[MDIM][MDIM], Jt[MDIM][MDIM];
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
                     float a = 0.0f;
                     for (uint t = 0; t < M; ++t) a += Y[i][t] * Y[j][t];
                     Mm[i][j] = a;
-                }
-            for (uint i = 0; i < M; ++i)
-                for (uint j = 0; j < M; ++j) {
-                    float a = 0.0f;
-                    for (uint t = 0; t < M; ++t) a += Mm[i][t] * J2[t][j];
-                    G[i][j] = (i == j ? 1.0f : 0.0f) - a;
                 }
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
@@ -1206,16 +1206,40 @@ _COMBINE_CHOL = """
 
 _COMBINE_CORE = """
 COMBINE_FACTOR
-            float rr_[MDIM], jb[MDIM];
+            float rr_[MDIM], dv[MDIM], Md[MDIM];
             for (uint i = 0; i < M; ++i) {
                 float a = 0.0f;
                 for (uint j = 0; j < M; ++j) a += J2[i][j] * b1[j];
-                jb[i] = et2[i] - a;
+                dv[i] = et2[i] - a;
             }
+COMBINE_RR
+"""
+
+#: ``Md`` and ``r`` through the factor: with ``w = Y^T d``, ``Md = Y w`` and
+#: ``r = d - V w`` (``V = J2 Y``).  Forming ``G = I - Mm J2`` as a matrix
+#: instead left an absolute error of eps |Mm| |J2| in it, ~1e-3 when a block
+#: starts right after an observation, and ``r`` multiplies it by ``|d|``.
+_COMBINE_RR_CHOL = """
+            float wv[MDIM];
             for (uint i = 0; i < M; ++i) {
                 float a = 0.0f;
-                for (uint j = 0; j < M; ++j) a += G[j][i] * jb[j];
-                rr_[i] = a;
+                for (uint j = 0; j < M; ++j) a += Y[j][i] * dv[j];
+                wv[i] = a;
+            }
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f, c = 0.0f;
+                for (uint j = 0; j < M; ++j) { a += Y[i][j] * wv[j]; c += V[i][j] * wv[j]; }
+                Md[i] = a;
+                rr_[i] = dv[i] - c;
+            }
+"""
+
+_COMBINE_RR_FORMAL = """
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f, c = 0.0f;
+                for (uint j = 0; j < M; ++j) { a += Mm[i][j] * dv[j]; c += G[j][i] * dv[j]; }
+                Md[i] = a;
+                rr_[i] = c;
             }
 """
 
@@ -1264,16 +1288,11 @@ _SRC_SEEDS = """
             }
         }
         COMBINE_CORE
-        // b <- A2 (G b1 + Mm eta2) + b2 ;  C <- sym(A2 Mm A2^T) + C2
-        float Gb1[MDIM], Met[MDIM], nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
-        for (uint i = 0; i < M; ++i) {
-            float a = 0.0f, b = 0.0f;
-            for (uint j = 0; j < M; ++j) { a += G[i][j] * b1[j]; b += Mm[i][j] * et2[j]; }
-            Gb1[i] = a; Met[i] = b;
-        }
+        // b <- A2 (b1 + Mm d) + b2 ;  C <- sym(A2 Mm A2^T) + C2
+        float nb[MDIM], AM[MDIM][MDIM], nC[MDIM][MDIM];
         for (uint i = 0; i < M; ++i) {
             float a = b2[i];
-            for (uint j = 0; j < M; ++j) a += A2[i][j] * (Gb1[j] + Met[j]);
+            for (uint j = 0; j < M; ++j) a += A2[i][j] * (b1[j] + Md[j]);
             nb[i] = a;
         }
         for (uint i = 0; i < M; ++i)

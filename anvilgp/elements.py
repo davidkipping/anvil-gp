@@ -44,7 +44,7 @@ from typing import NamedTuple
 
 import mlx.core as mx
 
-from .linalg import (chol, inv_logdet, matmul, matvec, outer, quad_form, sym,
+from .linalg import (chol, inv_logdet, matmul, matvec, outer, sym,
                      sym_from_factor, tri_solve_right)
 
 __all__ = ["Element", "LeafRank1", "LeafParts", "first_point",
@@ -333,8 +333,8 @@ def combine(e1: Element, e2: Element, formal: bool = False) -> Element:
         S  = I + L1^T J2 L1        (SPD, eigenvalues >= 1 -- no pivoting)
         Y  = L1 chol(S)^{-T}
         M  = Y Y^T = (I + C1 J2)^{-1} C1
-        G  = I - M J2 = (I + C1 J2)^{-1}
-        Jt = J2 - (J2 Y)(J2 Y)^T = (I + J2 C1)^{-1} J2
+        V  = J2 Y,  so  G = (I + C1 J2)^{-1} = I - Y V^T
+        Jt = J2 - V V^T = (I + J2 C1)^{-1} J2
 
     ``S`` is positive definite with every eigenvalue at least 1 (those of
     ``L1^T J2 L1`` are non-negative), so its Cholesky needs no pivoting and
@@ -362,11 +362,41 @@ def combine(e1: Element, e2: Element, formal: bool = False) -> Element:
     dtype = e1.A.dtype
     ident = mx.eye(m, dtype=dtype)
 
+    # Everything is written in the innovation ``d = eta2 - J2 b1``, the
+    # information form's analogue of combine_leaf's ``beta``, and on the
+    # Cholesky route through the factor ``w = Y^T d`` rather than through
+    # ``M`` or ``G`` as matrices.  Exact algebra:
+    #
+    #   G b1 + M eta2 = b1 + M d                       = b1 + Y w
+    #   G^T (eta2 - J2 b1) = d - J2 M d                = d - V w
+    #   -1/2 b1^T Jt b1 + eta2^T G b1 + 1/2 eta2^T M eta2
+    #                 = b1^T (eta2 - 1/2 J2 b1) + 1/2 d^T M d
+    #                 = b1^T (eta2 - 1/2 J2 b1) + 1/2 |w|^2
+    #
+    # The left-hand sides are what this used to compute, and they are a
+    # float32 disaster whenever J2 is large.  A block whose first
+    # observation closely follows the previous one (hQh << r) has
+    # |J2| ~ sigma^2/r -- 1e4 at sigma/yerr = 100 -- and |eta2| ~ 2e4, so
+    # the three cross terms were each ~1e4 and cancelled to O(1), while
+    # G = I - M J2 carried an absolute error of eps |M| |J2| ~ 1e-3 that
+    # eta2^T G b1 multiplied by 3e4.  Measured with 20 near-duplicate
+    # timestamps (1e-4 cadences apart) in 4096 points, on the pure tree:
+    # 10-18 log-units per composition and -13 to -54 over the series; this
+    # form, -0.005 to -0.010.  The same 1e-3 error in G^T d, carried into
+    # the composite eta, cost another ~1 log-unit at the next level up on a
+    # uniform-random cadence (eta enters the next ell weighted by the state
+    # mean); through the factor it is 0.023.
+    j_b1 = matvec(e2.J, e1.b)
+    d = e2.eta - j_b1
     if formal:
         g, logdet_x = inv_logdet(ident + matmul(e1.C, e2.J))
         m_mat = sym(matmul(g, e1.C))                # (I + C1 J2)^-1 C1
         jt = sym(matmul(e2.J, g))                   # (I + J2 C1)^-1 J2
         log_det = 0.5 * logdet_x
+        g_a1 = matmul(g, e1.A)
+        m_d = matvec(m_mat, d)
+        quad = mx.sum(d * m_d, axis=-1)
+        gt_d = matvec(mx.swapaxes(g, -1, -2), d)
     else:
         l1 = chol(e1.C)
         x = matmul(mx.swapaxes(l1, -1, -2), matmul(e2.J, l1))
@@ -374,30 +404,28 @@ def combine(e1: Element, e2: Element, formal: bool = False) -> Element:
         ls = chol(s)
         y = tri_solve_right(ls, l1)                 # Y Ls^T = L1
         m_mat = sym_from_factor(y)                  # (I + C1 J2)^-1 C1
-        g = ident - matmul(m_mat, e2.J)             # (I + C1 J2)^-1
         v = matmul(e2.J, y)
         jt = sym(e2.J - sym_from_factor(v))        # (I + J2 C1)^-1 J2
         log_det = mx.log(ls[..., 0, 0])
         for i in range(1, m):
             log_det = log_det + mx.log(ls[..., i, i])
+        # G A1 = A1 - M J2 A1 = A1 - Y (V^T A1)
+        g_a1 = e1.A - matmul(y, matmul(mx.swapaxes(v, -1, -2), e1.A))
+        w = matvec(mx.swapaxes(y, -1, -2), d)
+        m_d = matvec(y, w)
+        quad = mx.sum(w * w, axis=-1)
+        gt_d = d - matvec(v, w)
 
-    a = matmul(e2.A, matmul(g, e1.A))
-    g_b1 = matvec(g, e1.b)                         # G b1 -- the ell term
-    # b carries the extra M eta2 that the log-normaliser must NOT: the
-    # composite mean is A2 (G b1 + M eta2) + b2, while the ell cross term is
-    # eta2^T G b1 alone.  Folding them together double-counts eta2^T M eta2.
-    b = matvec(e2.A, g_b1 + matvec(m_mat, e2.eta)) + e2.b
+    a = matmul(e2.A, g_a1)
+    b = matvec(e2.A, e1.b + m_d) + e2.b
     c = sym(matmul(e2.A, matmul(m_mat, mx.swapaxes(e2.A, -1, -2)))) + e2.C
-
-    gt_eta = matvec(mx.swapaxes(g, -1, -2), e2.eta - matvec(e2.J, e1.b))
-    eta = matvec(mx.swapaxes(e1.A, -1, -2), gt_eta) + e1.eta
+    eta = matvec(mx.swapaxes(e1.A, -1, -2), gt_d) + e1.eta
     j = sym(matmul(mx.swapaxes(e1.A, -1, -2), matmul(jt, e1.A))) + e1.J
 
     ell = (e1.ell + e2.ell
            - log_det
-           - 0.5 * quad_form(e1.b, jt)
-           + mx.sum(e2.eta * g_b1, axis=-1)
-           + 0.5 * quad_form(e2.eta, m_mat))
+           + mx.sum(e1.b * (e2.eta - 0.5 * j_b1), axis=-1)
+           + 0.5 * quad)
     return Element(A=a, b=b, C=c, eta=eta, J=j, ell=ell)
 
 

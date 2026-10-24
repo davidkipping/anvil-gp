@@ -185,11 +185,64 @@ are a wide start that needs a longer warmup, not a precision problem.
 **Limits.** Measured on the SHO kernel at a regular cadence; the other terms
 use the same formula and are tested for it, not mapped. `kappa` is taken at
 the *median* cadence, so a dataset with much shorter gaps can be worse
-locally. A posterior whose bulk sits past `kappa_max` cannot be sampled in
+locally (section 7 measures how much). A posterior whose bulk sits past `kappa_max` cannot be sampled in
 float32 at all: every chain is refused. `GPLogLike` warns at construction
 when the data's rms over the median error bar exceeds `sqrt(kappa_max)`,
 since only then can a posterior get there (`kappa <= sigma^2 / r` for any
 timescale).
+
+## 7. Compose in the innovation, through the factor
+
+Found 2026-10-23, fixed 2026-10-24. Sums of terms (m >= 4) were wrong by
+1 to 100 log-units, in value and gradient, whenever two observations fell
+much closer together than the cadence at high SNR. Kappa saw none of it:
+it reads the median lag, and was 3.7.
+
+**Mechanism.** A block whose first observation follows the previous one
+almost at once predicts that observation almost exactly: `hQh << r`, so the
+block's information matrix `J2` reaches `sigma^2 / r`, 1e4 at
+`sigma/yerr = 100`, and `eta2 ~ 2e4`. The general composition formed its
+log-normaliser as three cross terms of ~1e4 each, cancelling to O(1):
+
+    -1/2 b1^T Jt b1 + eta2^T G b1 + 1/2 eta2^T M eta2
+
+with `G = I - M J2` built as a matrix. Each entry of `G` carried an
+absolute error of `eps |M| |J2| ~ 1e-3`, and `eta2^T G b1` multiplied it by
+3e4. The stored elements were not the problem: composing the float32 leaves
+in float64 was within 0.008, and the per-composition errors summed to the whole.
+The rank-one leaf fold never had the problem, because it is already written
+in the innovation `beta`. That is why the default MLX path (16-point folds)
+was hurt less than the pure tree, and m = 2 hardly at all.
+
+**Fix.** The same algebra, written in the innovation `d = eta2 - J2 b1` and
+through the Cholesky factor `Y` (with `M = Y Y^T`, `V = J2 Y`, `w = Y^T d`):
+
+    b1^T (eta2 - 1/2 J2 b1) + 1/2 |w|^2         (log-normaliser)
+    b1 + Y w                                     (G b1 + M eta2)
+    d - V w                                      (G^T d, into the next eta)
+
+`elements.combine`, both Metal block folds and the backward seeds use it.
+Both halves matter: the innovation form alone left `G^T d` with the same
+1e-3 error, and the composite `eta` carried it into the next level, which
+cost another log-unit on a uniform-random cadence.
+
+**Measured** (SHO + SHO, N = 4096, data on-model; value error in log-units,
+then worst relative gradient error against a float64 finite difference):
+
+| cadence, `sigma/yerr` | before: default / pure tree / kernel | after |
+|---|---|---|
+| 20 near-duplicates (1e-4 cadences), 100 | -3.8, 53% / +18.3, 260% / -0.002, 0.08% | ≤ 0.007, 0.4% |
+| uniform random, 100 | -2.9, 110% / +58.9, 270% / -1.3, 2.9% | ≤ 0.005, 0.13% |
+| uniform random (another draw), 100; every `sub_block` 1-1024, dense and blocked leaves, m = 2, 4, 6 | up to 101 | ≤ 0.012 |
+| near-duplicates or uniform, 1000 (value only) | up to 2.1e4 / 2.9e5 / 297 | 0.02-0.88 / 0.09-1.2 / 0.03-0.14 |
+
+**What is left** is the last row. At `sigma/yerr = 1000` a near-duplicate
+leaf stores `ell = ld - g^2/2` with `g^2 ~ 1e6`, so float32 storage alone
+costs a few hundredths of a log-unit per such leaf. Composing the float32
+leaves *in float64* is off by 0.25-0.52, and the sequential filter by up to
+0.14. That is a limit of the dense information representation, not of the
+arithmetic. A square-root information form would remove it, at the price of
+a QR per composition. Regular cadences are unaffected at every SNR tried.
 
 ## Error growth: measured
 
