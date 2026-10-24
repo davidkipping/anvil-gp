@@ -304,6 +304,40 @@ def test_the_kernel_holds_high_amplitude_on_model(sig_over_yerr):
         f"kernel off by {lo - hi:+.4f} at sigma/yerr = {sig_over_yerr:g}")
 
 
+def test_the_value_does_not_carry_the_dense_information_floor():
+    """Bright, densely sampled data: a TESS 20-s cadence, a 3-day rotation
+    plus granulation, s/e = 100.  Each block element stores its
+    log-normaliser for a zero incoming state, ~-1/2 sum g^2 over the block,
+    and composing blocks cancels those against cross terms of the same
+    size; the kernel took its value from that fold and was off by 0.45
+    here (5.9 on a full 20-s sector at s/e = 30).  The value now comes from
+    the filter replayed through each block from its entry state, every term
+    an O(1) innovation: 0.055.  docs/float32.md, section 7.
+    """
+    from anvilgp.oracle import sample_ssm
+
+    n, dt = 4096, 1.0 / 4320                # 20 s, in days
+    term = ag.SHOTerm() + ag.SHOTerm()
+    kp = [0.1, 3 / (2 * np.pi), 5.0, 0.03, 0.2, 1 / np.sqrt(2)]
+    rng = np.random.default_rng(1)
+    t = np.arange(n) * dt
+    yerr = np.full(n, 1e-3)
+    y = sample_ssm(term, kp, dt, n, rng) + yerr * rng.standard_normal(n)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
+                          for i, x in enumerate(kp)], n_dim=len(kp))
+    v = np.random.default_rng(3).normal(0.0, 0.01, (8, len(kp)))
+    v[0] = 0.0
+    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(kappa_max=None))
+    with mx.stream(mx.cpu):
+        hi = np.array(ref.hi(mx.array(v).astype(mx.float64)))
+    gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None))
+    with mx.stream(mx.gpu):
+        lo = np.array(gp(mx.array(v, dtype=mx.float32)))
+    err = np.abs(lo - hi)
+    assert err.max() < 0.15, f"kernel off by up to {err.max():.3f}"
+
+
 def test_the_differentiation_boundary_encloses_the_reduction():
     """M4 requirement: the custom_function's OUTPUT is one scalar per chain.
 
@@ -341,6 +375,40 @@ def test_the_differentiation_boundary_encloses_the_reduction():
         f"the custom_function must return (n_chains,); it returned "
         f"{seen['custom_function_output']}")
 
+
+
+@pytest.mark.parametrize("name,term,kp", TERMS, ids=[c[0] for c in TERMS])
+def test_pass_one_without_its_ell_changes_nothing_else(name, term, kp):
+    """The value and the backward run pass 1 with its blocks' own
+    log-normalisers stripped (`metal._ell_src`); the five fields the prefix
+    and the seeds read must be bit-identical to the full kernel's, and the
+    stripped `ell` zero."""
+    from anvilgp.metal import scan_blocks
+
+    gp = _build(term, kp, True, blk=64)
+    n_chains = 3
+    v = mx.zeros((n_chains, 1), dtype=mx.float32)
+    m = term.n_state
+    phi, q, h = term.matrices(gp.param_map.kernel_params(v),
+                              gp._metal_uniq_dt)
+    pt = mx.concatenate([mx.zeros((n_chains, 1, m, m), dtype=v.dtype), phi],
+                        axis=1)
+    qt = mx.concatenate(
+        [mx.broadcast_to(mx.eye(m, dtype=v.dtype), (n_chains, 1, m, m)), q],
+        axis=1)
+    r = mx.broadcast_to(gp._y32[:, None], (gp.n_data, n_chains))
+    j2 = mx.zeros((n_chains, 0), dtype=v.dtype)
+    with mx.stream(mx.gpu):
+        full = scan_blocks(pt, qt, gp._metal_lag, gp._metal_inst, h, r,
+                           gp._r_ref32, j2, gp.policy.s_floor_rel, 64)
+        bare = scan_blocks(pt, qt, gp._metal_lag, gp._metal_inst, h, r,
+                           gp._r_ref32, j2, gp.policy.s_floor_rel, 64,
+                           with_ell=False)
+        mx.eval(full, bare)
+    for f in ("A", "b", "C", "eta", "J"):
+        assert np.array_equal(np.array(getattr(full, f)),
+                              np.array(getattr(bare, f))), f
+    assert not np.any(np.array(bare.ell)) and np.any(np.array(full.ell))
 
 
 @pytest.mark.parametrize("name,term,kp", TERMS, ids=[c[0] for c in TERMS])
@@ -1536,13 +1604,17 @@ def test_the_formal_variant_changes_only_the_positivity_assumptions():
     """
     tokens = ("LEAF_VARIANCE", "REDUCE_CORE", "REDUCE_MD", "LOGDET_ACC",
               "COMBINE_FACTOR", "COMBINE_RR", "LOG_INV_A", "HCH_CLAMPED", "RK_CLAMP_TERM", "CLAMPED_TEST",
-              "C1N")
+              "C1N", "FWD_ELL", "FWD_STEP", "COMBINE_CORE")
     srcs = {
         "fwd": metal._jitter_src(metal._SRC, 1),
         "bwd": metal._jitter_src(
-            metal._SRC_BWD_CKPT.replace("FWD_STEP", metal._FWD_STEP), 1),
+            metal._SRC_BWD_CKPT.replace("FWD_STEP", metal._fwd_step()), 1),
         "red": metal._SRC_REDUCE,
         "seeds": metal._SRC_SEEDS.replace("COMBINE_CORE", metal._COMBINE_CORE),
+        "entry": (metal._SEEDS_HEAD + metal._SRC_PREFIX)
+        .replace("COMBINE_CORE", metal._COMBINE_CORE),
+        "replay": metal._jitter_src(
+            metal._SRC_REPLAY.replace("FWD_STEP", metal._fwd_step(True)), 1),
     }
     only_plain = {
         "fwd": ["sq = max(sq, 0.0f);", "sq = max(sq, sfloor * rr);",
@@ -1552,12 +1624,16 @@ def test_the_formal_variant_changes_only_the_positivity_assumptions():
         "red": ["L1[j][j] = metal::precise::sqrt(max(d, fl));",
                 "log(Ls[i][i])"],
         "seeds": ["L1[j][j] = metal::precise::sqrt(max(d, flc));"],
+        "entry": ["L1[j][j] = metal::precise::sqrt(max(d, flc));"],
+        "replay": ["max(hch, 0.0f) + r_ref[gi]", "max(-hch, 0.0f)"],
     }
     only_formal = {
         "fwd": ["log(fabs(inv_a))"],
         "bwd": ["bool clamped = false;"],
         "red": ["ldx += metal::precise::log(fabs(dk));", "0.5f * ldx"],
         "seeds": ["ldx += metal::precise::log(fabs(dk));"],
+        "entry": ["ldx += metal::precise::log(fabs(dk));"],
+        "replay": ["float sv = hch + r_ref[gi]"],
     }
     for name, src in srcs.items():
         plain = metal._formal_src(src, False)

@@ -548,7 +548,8 @@ def test_the_joint_high_amplitude_long_correlation_corner():
     error is not monotone in `sub_block` (64 measures worse than 32), so it
     is not simple accumulation.
 
-    The fused kernel is fine there (~0.02), and `anvil.validate_precision`
+    The fused kernel is fine there (~0.002 since its value is a replayed
+    filter, 2026-10-24; ~0.02 before), and `anvil.validate_precision`
     warns on the MLX path and passes the kernel, so this is a *detected*
     limitation rather than a silent wrong answer. It is a named deliverable
     of M4, whose backward kernel makes the kernel path differentiable and

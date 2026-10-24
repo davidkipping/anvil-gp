@@ -240,8 +240,9 @@ res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32), gt.target,
                 gt.u0(256, seed=1), n_warmup=300, n_samples=300, seed=3)
 ```
 
-On the injection-recovery example this runs in 4.0 s against 126 s on the
-MLX graph, and mixes better. Nothing extra is needed: until 2026-09-27
+On the injection-recovery example this ran in 4.0 s against 126 s on the
+MLX graph (2026-09; 5.5 s on the kernel on 2026-10-24, after its value
+moved to a replayed filter), and mixes better. Nothing extra is needed: until 2026-09-27
 this required a process-global `mx.disable_compile()`, because
 `mx.compile` over the backward pass exceeded MLX's fused-argument limit.
 One function was responsible and it is fixed; see

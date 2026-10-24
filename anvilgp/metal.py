@@ -8,10 +8,13 @@ moving data fast, it is moving it too many times.  A kernel that walks a
 block of observations with the running element **in registers** writes none
 of it: one element per *block* reaches memory instead of one per point.
 
-This is Design C's pass 1.  Pass 2 -- composing the ~N/L block elements per
-chain -- is a second kernel, `reduce_blocks`.  It was an MLX tree until
-2026-09-20; those levels are launch-bound, costing a flat ~5.1 ms whatever
-the block count, which was 79% of the whole path at N = 1e4.
+This is Design C's pass 1.  The value then takes two more kernels: a
+prefix over the ~N/L block elements per chain gives each block its entry
+state (`entry_states`), and the filter replayed through each block from it
+gives the log-likelihood (`replay_blocks`).  Until 2026-10-24 the second
+pass was `reduce_blocks`, a fold of the block elements' own log-normalisers,
+which carry the dense information form's floor (`_SRC_REPLAY`); and until
+2026-09-20 that fold was an MLX tree, launch-bound at a flat ~5.1 ms.
 
 What the kernel does *not* do, deliberately
 -------------------------------------------
@@ -49,6 +52,7 @@ import mlx.core as mx
 from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
+           "entry_states", "replay_blocks",
            "backward_ckpt", "block_seeds_kernel",
            "metal_available", "MAX_STATE", "MAX_JITTER",
            "MAX_ADJOINT_BUFFER_BYTES"]
@@ -195,8 +199,10 @@ _SRC = """
         // elements.leaf_elements; measured 11x better at the default block
         // in that corner.  `ell2` is still needed for the first point,
         // whose element is the leaf itself.
+        //ELL{
         float ld2 = -0.5f * metal::precise::log(sq / rr);
         float ell2 = ld2 - 0.5f * gg * gg;
+        //ELL}
 
         if (first) {
             for (uint i = 0; i < M; ++i) {
@@ -208,7 +214,9 @@ _SRC = """
                     Jm[i][j] = zz[i] * zz[j];
                 }
             }
+            //ELL{
             ell = ell2; ell_c = 0.0f;
+            //ELL}
             first = false;
             continue;
         }
@@ -275,12 +283,14 @@ _SRC = """
             }
         }
         // ell += ell2 + g^2/2 + log(1/alpha)/2 - beta^2/(2 alpha), Kahan
+        //ELL{
         float add = ld2
                   + 0.5f * metal::precise::log(LOG_INV_A) - 0.5f * beta * bia;
         float yk = add - ell_c;
         float tk = ell + yk;
         ell_c = (tk - ell) - yk;
         ell = tk;
+        //ELL}
     }
 
     uint omm = (chain * (uint)n_blocks + blk_i) * M * M;
@@ -324,6 +334,24 @@ def _jitter_src(src: str, n_jit: int) -> str:
                .replace("JIT_PER_OBS", per_obs.replace("GI", "gi"))
                .replace("JIT_IDX", jit_idx)
                .replace("NJIT", str(max(1, n_jit))))
+
+
+def _ell_src(src: str, with_ell: bool) -> str:
+    """Keep or drop pass 1's own log-likelihood (the ``//ELL{`` ... ``//ELL}``
+    regions).  Only :func:`reduce_blocks` reads it now; the value comes from
+    the replay and the backward never used it, so both run without -- one
+    precise ``log`` and a Kahan step per observation saved.  ``out_ell`` is
+    then written as zero."""
+    out, keep = [], True
+    for line in src.split("\n"):
+        tag = line.strip()
+        if tag == "//ELL{":
+            keep = with_ell
+        elif tag == "//ELL}":
+            keep = True
+        elif keep:
+            out.append(line)
+    return "\n".join(out)
 
 
 def _jit_key(n_jit: int) -> int:
@@ -387,19 +415,21 @@ def _formal_src(src: str, formal: bool) -> str:
                .replace("CLAMPED_TEST", clamped))
 
 
-def _kernel(m: int, n_jit: int = 0, formal: bool = False):
-    key = (m, _jit_key(n_jit), bool(formal))
+def _kernel(m: int, n_jit: int = 0, formal: bool = False,
+            with_ell: bool = True):
+    key = (m, _jit_key(n_jit), bool(formal), bool(with_ell))
     if key not in _kernels:
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"anvilgp_scan_m{m}_j{key[1]}" + ("_formal" if formal else ""),
+            name=f"anvilgp_scan_m{m}_j{key[1]}" + ("_formal" if formal else "")
+                 + ("" if with_ell else "_noell"),
             input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
                          "r_ref",
                          "jit2", "sfloor", "npts", "n_lags", "n_blocks",
                          "n_chains", "blk_len", "n_jit"],
             output_names=["out_A", "out_b", "out_C", "out_eta", "out_J",
                           "out_ell"],
-            source=_formal_src(_jitter_src(_SRC, n_jit), formal)
-            .replace("MDIM", str(m)),
+            source=_formal_src(_jitter_src(_ell_src(_SRC, with_ell), n_jit),
+                               formal).replace("MDIM", str(m)),
         )
     return _kernels[key]
 
@@ -732,6 +762,7 @@ _FWD_STEP = """
             float sv = HCH_CLAMPED + r_ref[gi] + jit2v;
             float vv = resid[gi * (uint)n_chains + chain];
             for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+FWD_ELL
             float kg[MDIM];
             for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
             for (uint i = 0; i < M; ++i) mean[i] = mp[i] + kg[i] * vv;
@@ -770,6 +801,24 @@ _FWD_STEP = """
                 }
         }
 """
+
+#: The replay's log-likelihood term, ``-1/2 (log(S / r_ref) + v^2 / S)``,
+#: Kahan-summed into ``ell``/``ell_c`` as pass 1 sums its own.
+_FWD_ELL = """            {
+                float add = -0.5f * (metal::precise::log(sv / r_ref[gi])
+                                     + vv * vv / sv);
+                float yk = add - ell_c;
+                float tk = ell + yk;
+                ell_c = (tk - ell) - yk;
+                ell = tk;
+            }"""
+
+
+def _fwd_step(with_ell: bool = False) -> str:
+    """`_FWD_STEP`, accumulating the log-likelihood or not.  The backward's
+    replays take it without, so their source is what it always was."""
+    return _FWD_STEP.replace("FWD_ELL\n", _FWD_ELL + "\n" if with_ell else "")
+
 
 #: Stage F: the checkpointed reverse sweep, one thread per (chain, block).
 #:
@@ -1041,7 +1090,7 @@ def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0, formal: bool = False):
     key = (m, slen, _jit_key(n_jit), bool(formal))
     if key not in _bwd_ckpt_kernels:
         body = _formal_src(_jitter_src(
-            _SRC_BWD_CKPT.replace("FWD_STEP", _FWD_STEP), n_jit), formal)
+            _SRC_BWD_CKPT.replace("FWD_STEP", _fwd_step()), n_jit), formal)
         _bwd_ckpt_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_bwd_ckpt_m{m}_s{slen}_j{key[2]}"
                  + ("_formal" if formal else ""),
@@ -1253,12 +1302,18 @@ _COMBINE_RR_FORMAL = """
 #: build ~2 x n_blocks sequential compositions in the graph: 42 ms at
 #: m = 2 and 1.5 s at m = 4 for N = 1e5, against a backward kernel of 33
 #: and 112 ms.  Here the whole thing is ~0.1 ms.
-_SRC_SEEDS = """
+_SEEDS_HEAD = """
     uint chain = thread_position_in_grid.x;
     if (chain >= (uint)n_chains) return;
     const uint M = MDIM;
     uint base = chain * (uint)n_blocks;
+"""
 
+#: The prefix over a chain's block elements, emitting each block's entry
+#: state.  Shared by the seeds kernel and the forward's entry-state kernel,
+#: so the replay that gives the value starts from exactly the states the
+#: backward replays from.
+_SRC_PREFIX = """
     // ---- prefix: fold (b, C) forward, emitting the ENTRY state of each
     // block, i.e. the state after the previous one; block 0 enters at 0.
     float bv[MDIM], Cm[MDIM][MDIM];
@@ -1312,7 +1367,9 @@ _SRC_SEEDS = """
             for (uint j = 0; j < M; ++j) Cm[i][j] = 0.5f * (nC[i][j] + nC[j][i]) + C2[i][j];
         }
     }
-    // exit state of the last block, needed for its (zero) seed below
+"""
+
+_SRC_SEEDS = _SEEDS_HEAD + _SRC_PREFIX + """    // exit state of the last block, needed for its (zero) seed below
     float xb[MDIM], xC[MDIM][MDIM];
     for (uint i = 0; i < M; ++i) { xb[i] = bv[i]; for (uint j = 0; j < M; ++j) xC[i][j] = Cm[i][j]; }
 
@@ -1433,6 +1490,119 @@ def block_seeds_kernel(el: Element, cot: mx.array, formal: bool = False):
     return outs[0], outs[1], outs[2], outs[3]
 
 
+_entry_kernels: dict = {}
+
+
+def _entry_kernel(m: int, formal: bool = False):
+    key = (m, bool(formal))
+    if key not in _entry_kernels:
+        body = _formal_src((_SEEDS_HEAD + _SRC_PREFIX)
+                           .replace("COMBINE_CORE", _COMBINE_CORE), formal)
+        _entry_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_entry_m{m}" + ("_formal" if formal else ""),
+            input_names=["in_A", "in_b", "in_C", "in_eta", "in_J",
+                         "n_blocks", "n_chains"],
+            output_names=["ent_m", "ent_C"],
+            source=body.replace("MDIM", str(m)),
+        )
+    return _entry_kernels[key]
+
+
+def entry_states(el: Element, formal: bool = False):
+    """``(ent_m, ent_C)``: the filtered state each block starts from.
+
+    The prefix half of :func:`block_seeds_kernel`, the same source, so the
+    forward's replay starts from exactly the states the backward replays
+    from.  One thread per chain.
+    """
+    n_chains, n_blocks, m = el.b.shape[0], el.b.shape[1], el.b.shape[-1]
+    outs = _entry_kernel(m, formal)(
+        inputs=[el.A, el.b, el.C, el.eta, el.J, int(n_blocks), int(n_chains)],
+        output_shapes=[(n_chains, n_blocks, m), (n_chains, n_blocks, m, m)],
+        output_dtypes=[mx.float32] * 2,
+        grid=(n_chains, 1, 1), threadgroup=(min(64, n_chains), 1, 1))
+    return outs[0], outs[1]
+
+
+#: Pass 3: the value, by replaying the filter through each block from its
+#: entry state.  One thread per (chain, block), as pass 1.
+#:
+#: Why the value is not pass 2's fold of the block ``ell``: an element's
+#: log-normaliser is for a *zero* incoming state, ~-1/2 sum g^2 over its
+#: block -- 1e4-1e6 on bright, densely sampled data -- and every
+#: composition cancels it against a cross term of the same size, so the
+#: float32 storage of those numbers alone cost up to 1.7 log-units of
+#: spread across a posterior on a TESS 20-s sector (docs/float32.md,
+#: section 7).  Here every term is one O(1) innovation, and the ~1e4
+#: numbers never exist.  The step is `_FWD_STEP`, the backward's own, so
+#: the value is the function the backward differentiates.
+_SRC_REPLAY = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    uint start = blk_i * (uint)blk_len;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint ei = chain * (uint)n_blocks + blk_i;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    JIT_HOIST
+
+    float mean[MDIM], cov[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        mean[i] = ent_m[ei * M + i];
+        for (uint j = 0; j < M; ++j) cov[i][j] = ent_C[ei * M * M + i * M + j];
+    }
+    float ell = 0.0f, ell_c = 0.0f;          // Kahan accumulator
+    for (uint gi = start; gi < stop; ++gi) {
+        FWD_STEP
+    }
+    out_ell[ei] = ell;
+"""
+
+_replay_kernels: dict = {}
+
+
+def _replay_kernel(m: int, n_jit: int = 0, formal: bool = False):
+    key = (m, _jit_key(n_jit), bool(formal))
+    if key not in _replay_kernels:
+        body = _formal_src(_jitter_src(
+            _SRC_REPLAY.replace("FWD_STEP", _fwd_step(True)), n_jit), formal)
+        _replay_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_replay_m{m}_j{key[1]}"
+                 + ("_formal" if formal else ""),
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref", "jit2", "ent_m", "ent_C",
+                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                         "n_jit"],
+            output_names=["out_ell"],
+            source=body.replace("MDIM", str(m)),
+        )
+    return _replay_kernels[key]
+
+
+def replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                  ent_m, ent_C, blk_len, formal=False) -> mx.array:
+    """``(n_chains, n_blocks)`` log-likelihood of each block, by the filter
+    replayed from its entry state ``(ent_m, ent_C)`` (:func:`entry_states`).
+    Inputs otherwise as :func:`scan_blocks`."""
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts = resid.shape[0]
+    n_blocks = ent_m.shape[1]
+    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    outs = _replay_kernel(m, n_jit, formal)(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
+                int(n_chains), int(blk_len), int(n_jit)],
+        output_shapes=[(n_chains, n_blocks)], output_dtypes=[mx.float32],
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    return outs[0]
+
+
 def metal_available() -> bool:
     """Probe: can the fused kernel actually run here?"""
     global _metal_ok
@@ -1461,7 +1631,7 @@ def metal_available() -> bool:
 
 def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 s_floor_rel, blk_len, n_blocks=None,
-                formal=False) -> Element:
+                formal=False, with_ell=True) -> Element:
     """Condense every block of ``blk_len`` observations into one element.
 
     ``phi_tab``/``q_tab``: (n_chains, n_lags, m, m) propagator and process
@@ -1470,7 +1640,9 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     time-major, so adjacent threads (adjacent chains) read adjacent floats.
     ``r_ref``: (npts,) float32 reference variances.  ``jit2``: (n_chains, 1)
     jitter variance, or a (n_chains, 0) array for none.  ``formal`` selects
-    the convolved-term variant; see :func:`_formal_src`.
+    the convolved-term variant; see :func:`_formal_src`.  ``with_ell=False``
+    skips the blocks' own log-normalisers (``ell`` comes back zero), which
+    only :func:`reduce_blocks` reads; see :func:`_ell_src`.
 
     Returns an :class:`~anvilgp.elements.Element` with batch shape
     (n_chains, n_blocks), ready for :func:`anvilgp.elements.tree_reduce`.
@@ -1489,7 +1661,7 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     scalars = [float(s_floor_rel), int(npts), int(n_lags), int(n_blocks),
                int(n_chains), int(blk_len), int(n_jit)]
 
-    outs = _kernel(m, n_jit, formal)(
+    outs = _kernel(m, n_jit, formal, with_ell)(
         inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, *scalars],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
@@ -1511,16 +1683,25 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     output to one scalar per chain, and a scalar cotangent is exactly what
     ``filter_backward`` takes.
 
-    Both passes are kernels: :func:`scan_blocks` condenses the blocks and
-    :func:`reduce_blocks` folds them.  The MLX tree this replaced was
-    launch-bound, costing a flat ~5.1 ms whatever the block count, which
-    was 79% of the whole path at N = 1e4.
+    Three kernels: :func:`scan_blocks` condenses the blocks,
+    :func:`entry_states` runs the prefix over them, and
+    :func:`replay_blocks` replays the filter through each block from its
+    entry state, giving one partial log-likelihood per block.  Until
+    2026-10-24 the value was :func:`reduce_blocks`' fold of the block
+    elements' own ``ell`` instead -- one pass cheaper, and carrying the
+    dense information form's floor: up to 5.9 log-units on a TESS 20-s
+    sector (see `_SRC_REPLAY`).  The fold stays as the element-level
+    reduction the tests pin; the value no longer uses it.
     """
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
         el = scan_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len, formal=formal)
-        return reduce_blocks(el, formal=formal)
+                         blk_len, formal=formal, with_ell=False)
+        ent_m, ent_C = entry_states(el, formal)
+        # Partial sums per block, then a sum over a dozen or so: a single
+        # float32 accumulator over 1e5 O(1) terms costs ~0.4 on its own.
+        return mx.sum(replay_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2,
+                                    ent_m, ent_C, blk_len, formal), axis=1)
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
@@ -1577,7 +1758,7 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 f"use GPPolicy(metal=False) for the gradient.")
 
         el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len, formal=formal)
+                         blk_len, formal=formal, with_ell=False)
         ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot, formal)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
             p_t, q_t, lg, inst, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m,

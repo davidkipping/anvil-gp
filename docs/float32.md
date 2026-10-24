@@ -282,30 +282,34 @@ the float64 Laplace posterior, `sd(e)` across them (worst in brackets), and
 the float32 gradient error per posterior sigma of motion. Rotation (3 d,
 or 10 d for Kepler) plus granulation, SHO + SHO, unless noted:
 
-| setup | N | kappa | default MLX: sd(e) (max), grad | fused kernel: sd(e) (max), grad |
-|---|---|---|---|---|
-| RV, 600 points, s/e 10-30 | 601 | <= 1e3 | 0.002 (0.005), 0.04 | 0.000, 0.04 |
-| Kepler long cadence, one quarter, s/e 30 / 300 | 4.3k | 1e3-6e3 | 0.009 / 0.055 (0.16), <= 0.09 | 0.003 / 0.023 (0.08), <= 0.11 |
-| TESS 2-min sector, s/e 3 / 10 | 19k | 13 / 150 | 0.006 / 0.036 (0.13), 0.06 | 0.001 / 0.004, 0.06 |
-| TESS 2-min sector, s/e 30 | 19k | 1.3e3 | 0.12 (0.24), 0.08 | 0.017 (0.06), 0.08 |
-| TESS 2-min sector, s/e 100 | 19k | 1.4e4 | **1.05 (2.7)**, 0.18 | 0.09 (0.39), **0.48** |
-| TESS 2-min, single SHO, s/e 30 / 100 / 300 | 19k | 1e3-1e5 | 0.13 / **0.78 / 3.5 (10.4)**, <= 0.98 | 0.007 / 0.024 / 0.09, <= 0.02 |
-| Kepler long cadence, 16 quarters, s/e 30 / 100 | 68k | 900-3.5e3 | 0.12 / **0.42 (1.1)**, -- | 0.012 / 0.031, <= 0.08 |
-| TESS 20-s sector, s/e 10 | 114k | 160 | **0.46 (1.0)**, -- | 0.14 (0.51), 0.07 |
-| TESS 20-s sector, s/e 30 | 114k | 1.5e3 | **2.8 (8.7)**, -- | **1.7 (5.9)**, **0.53** |
+| setup | N | kappa | default MLX: sd(e) (max), grad | fused kernel, fold (before 2026-10-24) | fused kernel, replay: sd(e) (max), grad |
+|---|---|---|---|---|---|
+| RV, 600 points, s/e 10-30 | 601 | <= 1e3 | 0.002 (0.005), 0.04 | 0.000 | 0.000, 0.04 |
+| Kepler long cadence, one quarter, s/e 30 / 300 | 4.3k | 1e3-6e3 | 0.009 / 0.055 (0.16), <= 0.09 | 0.003 / 0.023 (0.08) | 0.000 / 0.005 (0.013), <= 0.11 |
+| TESS 2-min sector, s/e 3 / 10 | 19k | 13 / 150 | 0.006 / 0.036 (0.13), 0.06 | 0.001 / 0.004 | 0.001 / 0.001, 0.06 |
+| TESS 2-min sector, s/e 30 | 19k | 1.3e3 | 0.12 (0.24), 0.08 | 0.017 (0.06) | 0.003 (0.007), 0.08 |
+| TESS 2-min sector, s/e 100 | 19k | 1.4e4 | **1.05 (2.7)**, 0.18 | 0.09 (0.39) | 0.008 (0.020), **0.48** |
+| TESS 2-min, single SHO, s/e 30 / 100 / 300 | 19k | 1e3-1e5 | 0.13 / **0.78 / 3.5 (10.4)**, <= 0.98 | 0.007 / 0.024 / 0.09 | 0.001 / 0.001 / 0.002 (0.005), <= 0.02 |
+| Kepler long cadence, 16 quarters, s/e 30 / 100 | 68k | 900-3.5e3 | 0.12 / **0.42 (1.1)**, -- | 0.012 / 0.031 | 0.004 / 0.005 (0.011), <= 0.08 |
+| TESS 20-s sector, s/e 10 | 114k | 160 | **0.46 (1.0)**, -- | 0.14 (0.51) | 0.004 (0.010), 0.07 |
+| TESS 20-s sector, s/e 30 | 114k | 1.5e3 | **2.8 (8.7)**, -- | **1.7 (5.9)** | 0.023 (0.061), **0.53** |
 
 (`--`: the default MLX gradient exceeds Metal's buffer-count limit at this
-N; see the README, "What is left".) Separating the two causes at s/e = 30:
-20-s cadence at a 2-min sector's N (19k) gives 0.49 / 0.27, and 2-min
-cadence at a 20-s sector's N (114k) gives 0.63 / 0.06.
+N; see the README, "What is left".) Separating the two causes at s/e = 30
+(default / old kernel / replay): 20-s cadence at a 2-min sector's N (19k)
+gives 0.49 / 0.27 / 0.022, and 2-min cadence at a 20-s sector's N (114k)
+gives 0.63 / 0.06 / 0.004.
 
 So: transit fits detrended with a GP on quiet or mildly active stars
 (s/e <~ 10), RV, and single Kepler quarters are clear on either path.
-Bright active stars (s/e >~ 100) and long baselines are not, on the default
-path; `GPPolicy(metal=True)` clears them where m <= 4. **TESS 20-s data at
-s/e >~ 10-30 is not clear on either path.** An earlier version of this
-section said the fused kernel stayed within 0.2 everywhere measured; that
-was true only at N <= 19k and 2-min cadence.
+Bright active stars (s/e >~ 100), long baselines and TESS 20-s data are
+not, on the default path. **`GPPolicy(metal=True)` clears every row above
+in value, at m <= 4, since the replay (below) landed on 2026-10-24**; before
+it the kernel too was 1.7 (5.9) on a 20-s sector at s/e = 30. An earlier
+version of this section said the kernel stayed within 0.2 everywhere
+measured; that was true only at N <= 19k and 2-min cadence. The kernel's
+*gradient* still carries 0.48-0.53 posterior sigma at the two worst rows
+(step 2 below).
 
 ### The fix: replay the filter, do not compose ell
 
@@ -328,27 +332,50 @@ worst case at 0.06. The last column says the blocks matter for a second
 reason: one float32 accumulator over 1e5 O(1) terms loses ~0.4 on its own,
 and per-block partial sums are what avoid it.
 
-That is the recommended fix, ahead of the square-root information form
-(`J = Z Z^T`, `eta = Z gamma`, `ell` centred on `gamma`). The square-root
-form would change every composition, in the MLX algebra, both Metal folds
-and the hand VJPs, and add a QR to each. The replay changes how the value
-is read out, reuses the prefix and the replay the backward already has, and
-removes the large numbers instead of storing them more carefully. Plan:
+The replay was chosen ahead of the square-root information form (`J = Z
+Z^T`, `eta = Z gamma`, `ell` centred on `gamma`). The square-root form
+would change every composition, in the MLX algebra, both Metal folds and
+the hand VJPs, and add a QR to each. The replay changes how the value is
+read out, reuses the prefix and the replay the backward already has, and
+removes the large numbers instead of storing them more carefully.
 
-1. **Kernel.** Pass 2 becomes a prefix over the dozen or so block elements
-   (it carries `b, C` already); a third pass replays each block from its
-   entry state, as the backward does, and sums the innovations per block.
-   Expected cost: one extra sweep of the data on the forward, nothing new
-   on the backward. Not measured yet.
+1. **Kernel: done 2026-10-24.** `metal.scan_loglike` now runs pass 1, then
+   `entry_states` (the seeds kernel's own prefix source, so the forward
+   replays from exactly the states the backward replays from), then
+   `replay_blocks`, which runs the backward's `_FWD_STEP` through each
+   block from its entry state and Kahan-sums the innovations; the value is
+   the sum of the per-block partials. Measured in the table above:
+   **0.023 (0.061) on a 20-s sector at s/e = 30, against 1.7 (5.9)**, and
+   <= 0.008 sd on every other row. Pinned by
+   `tests/test_metal.py::test_the_value_does_not_carry_the_dense_information_floor`
+   (0.45 -> 0.055). Pass 1 no longer forms its blocks' own `ell` on this
+   path or the backward's (one precise `log` per observation saved);
+   `reduce_blocks` keeps it for the tests that pin the element fold.
+
+   **Cost**, interleaved A/B on a quiet machine against the fold, compiled,
+   regular cadence: forward 1.50 -> 2.43 ms at N = 1e4 x 1024 chains, m = 2
+   (1.6x); 10.9 -> 19.0 ms at N = 1e5 (1.74x); 11.7 -> 18.1 ms at N = 1e4,
+   m = 4 (1.55x). Value + gradient: 6.57 -> 7.10 ms (1.08x), 51.6 -> 57.8
+   ms (1.12x), and 53.9 -> 58.0 ms at m = 4, 256 chains (1.08x) -- the
+   backward dominates, and it lost its `ell` work too. Forming `Phi C
+   Phi^T` as two m^3 products instead of one m^4 sum was tried for the
+   shared step and bought nothing (5% slower at m = 4).
+
+   **What it gives up.** On well-conditioned long series the replay's own
+   floor is the larger one: a covariance propagated recursively in float32
+   puts a small systematic bias into each innovation variance, and it adds
+   up with N, where pass 1 read `hQh` from a fixed table. A single SHO,
+   `rho/dt = 100`, on-model: 0.0004 -> 0.0016 at N = 25k, s/e = 100, and
+   0.004 -> 0.012 at N = 1e5, s/e = 30. Three orders under the decision
+   scale, and on every row of the table above the replay is the better of
+   the two by 10-100x.
 2. **Gradient.** The backward seeds read the suffix `J, eta`, which are
    dense-information composites too; the 0.48-0.53 sigma gradient errors
-   above are likely the same floor reaching the seeds. Measure after step 1;
-   the replay-side adjoint (`filter_backward` from the entry state) is
-   already the gradient of the replayed value.
+   above are likely the same floor reaching the seeds. Not yet attempted.
 3. **Default MLX path** (all m, and the only path for m > 4). The same
    structure at sub-block scale: fold leaves into sub-block elements, a
    prefix over them instead of the reduction, then a 32-step replay batched
-   over sub-blocks.
+   over sub-blocks. Not yet attempted.
 
 ## Error growth: measured
 

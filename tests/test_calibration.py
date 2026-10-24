@@ -621,7 +621,7 @@ def test_the_sbc_check_detects_a_mis_scaled_posterior():
 GEOM_WARM, GEOM_SAMP, GEOM_CHAINS = 600, 1200, 128
 
 
-def _geometry_run(y, t, yerr, seed=3):
+def _geometry_run(y, t, yerr, seed=3, n_warmup=GEOM_WARM):
     """ChEES on `make_target`'s own priors; returns natural draws + diagnostics.
 
     ChEES rather than the stretch move because only an HMC kernel reports
@@ -639,7 +639,7 @@ def _geometry_run(y, t, yerr, seed=3):
     with mx.stream(mx.gpu):
         res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=32), gt.target,
                         gt.u0(GEOM_CHAINS, seed=1, spread=0.3),
-                        n_warmup=GEOM_WARM, n_samples=GEOM_SAMP, seed=seed,
+                        n_warmup=n_warmup, n_samples=GEOM_SAMP, seed=seed,
                         progress=False)
     rhat = split_rhat(np.asarray(res.get_chain(), dtype=np.float64))
     flat = gt.transform.model_np(res.get_chain(flat=True).astype(np.float64))
@@ -723,6 +723,15 @@ def test_timescale_near_cadence_samples_the_sigma_jitter_ridge():
     being individually sharp.  Measured here: correlation -0.41, and the
     coefficient of variation is 0.046 for ``sqrt(sigma^2 + jitter^2)``
     against 0.34 for the jitter alone -- a factor of 7.
+
+    **Twice the shared warmup, because 600 steps sat on an edge.** ChEES
+    adapts one step size for every chain, and on this ridge it sometimes
+    ends warmup collapsed (final acceptance >= 0.997), which mixes slowly.
+    Over sampler seeds 3-12 at 600 warmup the old kernel value reached
+    R-hat 1.02 (seeds 6, 11, 12 above 1.009) and the replayed one
+    (2026-10-24) 1.11 on seed 3 alone, every other seed <= 1.0013 -- the
+    same lottery, drawn differently, with both values within 1e-4 of float64
+    at every draw.  At 1200 warmup seed 3 gives 1.0005.
     """
     rng = np.random.default_rng(11)
     n = 600
@@ -736,7 +745,7 @@ def test_timescale_near_cadence_samples_the_sigma_jitter_ridge():
                            jitter=jit_true)
     y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
 
-    out = _geometry_run(y, t, yerr)
+    out = _geometry_run(y, t, yerr, n_warmup=2 * GEOM_WARM)
     nat = out["nat"]
     s, j = nat["gp_sigma"], nat["jitter"]
 

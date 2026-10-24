@@ -17,7 +17,7 @@ from anvilgp.anvil import make_target
 
 from anvilgp import GPPolicy
 
-# metal=True turns on the fused kernel: ~45-75x on the forward and ~100x on
+# metal=True turns on the fused kernel: ~27-38x on the forward and ~90x on
 # the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
 # is off by default; `gt.loglike.metal_eligible()` says whether it can be honoured
 # (m <= 4, up to 8 jitters), and a request it cannot honour warns rather than
@@ -59,11 +59,12 @@ single likelihood and seven orders more accurate in absolute terms;
 anvil-gp is tens of times a 12-core celerite2 pool once you need hundreds
 of *hyperparameter settings* scored at once — an ensemble sampler's walker
 count, not the data size — carries its own gradient, and has Matern-5/2,
-which celerite2 lacks. Break-even is about 26 walkers at
-N = 1000 and about 1.4 at N = 1e5. The exact multiple depends on the
-cadence: 35-42x on a regular grid (the milestone-3 figures below) and
-20-46x on a gapped one (docs/benchmarks.md), because a gap adds a lag-table
-row and costs the kernel ~1.5-1.7x. End to end inside a sampler it is
+which celerite2 lacks. Break-even is about 23 walkers at
+N = 1000 and about 2 at N = 1e5. The exact multiple depends on the
+cadence: 22-25x on the figures below and 15-24x on docs/benchmarks.md's
+cadence, because a gap adds a lag-table row and costs the kernel
+~1.5-1.7x. (Both roughly halved on 2026-10-24, when the kernel's value
+moved to a replayed filter for accuracy; docs/float32.md, section 7.) End to end inside a sampler it is
 lower again; benchmarks.md says by how much and why.
 
 ## Why a state-space model rather than celerite's Cholesky
@@ -240,9 +241,9 @@ same problem, same answers:
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| N=1e4, 1024 chains | 75.1 ms | **1.67 ms** | 45x | 1.20 GiB | 0.04 GiB |
-| N=1e4, 4096 chains | 326 ms | **4.40 ms** | 74x | 3.74 GiB | 0.16 GiB |
-| N=1e5, 1024 chains | 719 ms | **11.5 ms** | 63x | 0.82 GiB | 0.39 GiB |
+| N=1e4, 1024 chains | 73.1 ms | **2.73 ms** | 27x | 1.20 GiB | 0.04 GiB |
+| N=1e4, 4096 chains | 326 ms | **8.53 ms** | 38x | 3.74 GiB | 0.16 GiB |
+| N=1e5, 1024 chains | 703 ms | **21.7 ms** | 32x | 0.82 GiB | 0.39 GiB |
 
 (Minimum of 12 sustained evaluations, compiled, gapped cadence with three
 distinct lags, `block=4096`, `metal_block` at its default, all rows in one
@@ -253,30 +254,47 @@ average, which is a poor proxy — a CPU-bound indexer can sit at 14 while
 the GPU is steady to 0.6%.) The speedups are smaller than the
 37-71x first reported here because the MLX path itself got faster in the
 meantime, twice — see "Unroll the leaf reductions" and the sub_block change
-in the history. The kernel is unchanged.)
+in the history. The kernel was unchanged until 2026-10-24.)
+
+**The kernel's forward is 1.6-1.9x slower since 2026-10-24, on purpose.**
+Its value used to be a fold of the block elements' own log-normalisers,
+which are ~1e4 numbers on bright, densely sampled data and cancel at every
+composition; on a TESS 20-s sector at s/e = 30 that was 1.7 log-units of
+spread across a posterior (5.9 worst). The value now comes from the filter
+replayed through each block from its entry state: 0.023 (0.061) on the
+same sector, at the price of one more sweep of the data. The table above
+was 1.67 / 4.40 / 11.5 ms before it (45x / 74x / 63x); value + gradient
+moved 1.05-1.15x. Measurements and the one regime where the old fold was
+more accurate (well-conditioned single SHO, 0.004 against 0.012 at
+N = 1e5, both negligible): docs/float32.md, section 7.
 
 Against celerite2 on the CPU, measured in the same session:
 
 | config | vs 1 core | vs 12 cores |
 |---|---:|---:|
-| N=1e4, 1024 chains | **255x faster** | **35x faster** |
-| N=1e5, 1024 chains | **376x faster** | **42x faster** |
+| N=1e4, 1024 chains | **150x faster** | **22x faster** |
+| N=1e5, 1024 chains | **185x faster** | **25x faster** |
+
+(celerite2 from `benchmarks/bench_docs_tables.py` and the kernel from
+`verify_readme.py`, the same quiet window, 2026-10-24. Before the replayed
+value: 255x / 35x and 376x / 42x.)
 
 **The >=100x gate is not yet cleared.** The brief is explicit that "the honest
 >=100x denominator is the multiprocess one", and against a fully parallelised
-12-core celerite2 we are **35-42x**, not 100x. The single-core column is
+12-core celerite2 we are **22-25x**, not 100x. The single-core column is
 reported because it is the comparison most users' code actually makes (one
 CPU process, one chain at a time), not because it clears the gate. What the
 kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
-20-30x behind. Closing the remaining factor is future work; see
+22-25x behind. Closing the remaining factor is future work; see
 "What is left" below.
 
 The brief predicted "~10-50 ms forward at 1024 x 1e5"; the measurement is
-16.4 ms, at the fast end of its own range.
+21.7 ms, inside its own range.
 
 End to end, `examples/gp_injection_recovery.py` (1000 points, 1024 chains,
-5800 stretch steps) goes from **91 s to 15.7 s**, 226 -> **1,300 ESS/s**,
-with the posteriors agreeing to three decimals. Run it either way:
+5800 stretch steps) goes from **90 s to 8.6 s**, 214 -> **2,100 ESS/s**
+(2026-10-24; 7.3 s and 2,470 ESS/s before the replayed value); posteriors
+under "End to end" below. Run it either way:
 
 ```bash
 .venv/bin/python examples/gp_injection_recovery.py           # MLX graph
@@ -290,8 +308,10 @@ M4 landed: the kernel carries its own VJP, so a gradient sampler can use it.
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| value+grad, N=1e4, 1024 chains | 884 ms | **8.9 ms** | 99x | 6.10 GiB | 0.17 GiB |
-| value+grad, N=1e5, 1024 chains | 15.4 s | **58 ms** | 264x | 34.5 GiB | 1.61 GiB |
+| value+grad, N=1e4, 1024 chains | 847 ms | **9.38 ms** | 90x | 6.10 GiB | 0.17 GiB |
+| value+grad, N=1e5, 1024 chains | 15.4 s | **66.9 ms** | 230x | 34.5 GiB | 1.61 GiB |
+
+(2026-10-24, `verify_readme.py`; 8.9 and 58 ms before the replayed value.)
 
 The gradient matches float64 central differences to ~1e-7 on every
 parameter including the jitter, and the two paths agree with each other to
@@ -299,7 +319,10 @@ parameter including the jitter, and the two paths agree with each other to
 
 End to end, ChEES-HMC on the injection-recovery problem (1500 points, 64
 chains, 300 iterations) runs in **4.0 s on the kernel against 126 s on the
-MLX graph**, and samples better for it: minimum ESS 239 against 94.
+MLX graph**, and samples better for it: minimum ESS 239 against 94. (As
+measured in 2026-09. The kernel run took 5.5 s on 2026-10-24, 6.2 s on the
+pre-replay kernel alongside it; ChEES's adapted trajectory lengths differ
+between the two, so that is not a clean speed comparison.)
 
 Three passes, all with the forward's launch shape because the backward
 blocks are **independent**: the forward kernel emits one element per block;
@@ -514,7 +537,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `False` | you want the fused kernel: ~45-75x on the forward, ~100x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
+| `metal` | `False` | you want the fused kernel: ~27-38x on the forward, ~90x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
 | `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
@@ -614,10 +637,18 @@ marked as an estimate.
 ### End to end
 
 `examples/gp_injection_recovery.py` fits an SHO kernel plus a jitter to 1000
-points with **1024 chains**, 5800 stretch steps, in **15.7 s** on the fused
-kernel (1,300 ESS/s) or **91 s** on the MLX graph (226 ESS/s), against
+points with **1024 chains**, 5800 stretch steps, in **8.6 s** on the fused
+kernel (2,100 ESS/s) or **90 s** on the MLX graph (214 ESS/s), 2026-10-24, against
 684 s for the same example before any of this work (at 256 chains). Both paths recover all four parameters,
 and now agree to three decimals on every one:
+
+*(This table is from 2026-09 and is stale: re-run on 2026-10-24, the two
+paths give σ_GP 1.154 ± 0.426 / 1.148 ± 0.365, ρ 6.957 ± 0.432 /
+6.955 ± 0.430, Q 6.8 ± 19.0 / 6.5 ± 14.4 and jitter 0.1123 ± 0.0336 /
+0.1123 ± 0.0334 (kernel / MLX), max R-hat 1.04. The pre-replay kernel is within
+0.001 of the kernel column in ρ and jitter. The σ and Q widths are
+dominated by the few trapped walkers the next paragraph describes, which is
+also where the two paths part; refreshing this section is open.)*
 
 | parameter | Metal | MLX | truth | z |
 |---|---:|---:|---:|---:|
@@ -801,7 +832,8 @@ Three more are worked around and pinned as regression tests
 * **M3 — fused Metal blocked-scan kernel: pass 1 done.**
   45-74x over the MLX path and 35-42x ahead of a 12-core celerite2 pool,
   which is the brief's denominator, so the >=100x gate is **not** cleared
-  (it is 255-376x against a single-core loop). `tests/test_metal.py` pins
+  (it is 255-376x against a single-core loop). Since the replayed value of
+  2026-10-24 those are 27-38x, 22-25x and 150-185x. `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
   model. Still owed: m > 4 (per-instrument jitter landed in-kernel in M5
@@ -811,10 +843,11 @@ Three more are worked around and pinned as regression tests
   error is set by their combination `kappa`. At
   `sigma/yerr = 100` *and* `rho/dt = 1000` the MLX path is off by 1.5
   log-units where either axis alone stays under 0.2, while the kernel holds
-  0.02. See `test_the_joint_high_amplitude_long_correlation_corner`.
+  0.002 (0.02 before the replayed value of 2026-10-24). See
+  `test_the_joint_high_amplitude_long_correlation_corner`.
 * **M4 — checkpointed backward kernel: done.** The kernel carries its own
   VJP; see [Gradients](#gradients) for the numbers (99x at N = 1e4, 264x at
-  N = 1e5, matching float64 central differences to ~1e-7) and
+  N = 1e5 when it landed, 90x and 230x since the replayed value; matching float64 central differences to ~1e-7) and
   [docs/m4-plan.md](docs/m4-plan.md) for the stages, what each measured,
   and the adversarial review that closed it. The design that shipped is
   not the one first sketched here. The backward blocks are **independent**:
