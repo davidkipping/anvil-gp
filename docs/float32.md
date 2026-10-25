@@ -536,6 +536,8 @@ removes the large numbers instead of storing them more carefully.
    heavier fold; cost not measured. Not yet confirmed by a ChEES run,
    which needs the kernel (the prototype is far too slow to sample with).
    Reference implementation: `benchmarks/boundary_prototype.py`.
+   Being built to `docs/boundary-plan.md`; the oracle and the failing
+   tests are `tests/boundary_oracle.py` and `tests/test_boundary.py`.
 
    Ruled out, measured: the term front end (chaining the kernel's per-lag
    adjoints to theta in float64 changes nothing), and the per-lag and `dh`
