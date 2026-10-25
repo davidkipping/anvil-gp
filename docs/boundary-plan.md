@@ -1050,6 +1050,6 @@ anvil (0.11.0, 231d41f): no `GPPolicy` guidance anywhere -- its
 mentions of anvil-gp are provenance for its own fixes. Nothing to send.
 Elómë (61cb449): tutorial 2 says `GPPolicy(metal=True)` "turns on"
 the kernel, stale since the default flip; its code is correct as it
-stands. Draft note: `docs/elome-gppolicy-default-note.md`, not sent.
+stands. Fixed in Elómë ef876dd.
 anvil-gp's own tutorial and example still pass `metal=True`, which is
 valid (insist, and warn if it cannot) and the tutorial says so.
