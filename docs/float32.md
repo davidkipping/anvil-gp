@@ -588,10 +588,14 @@ removes the large numbers instead of storing them more carefully.
    fewer effective samples per gradient outweighs its 4.5x cheaper
    gradient (44 against 196 ms at 1024 chains): one block converged in
    ~60% of the wall time the default blocks spent *not* converging.
-   **Until this is fixed, pass `metal_block` = N (up to the 8192 the
-   policy allows; one 8192-point block at m = 4 runs, 0.4-0.5 s per
-   gradient at 256-4096 chains, no watchdog kill) for short, densely
-   sampled, high-s/e series.** Machine
+   **Fixed 2026-10-25** by the square-root boundary, now the default:
+   ChEES at the default 16 x 256 blocks, same settings, step size
+   0.0208-0.0225, 27-36 leapfrog / iter, max R-hat 1.12-1.19 (one block's
+   own: 1.11), **0.68-0.81 ESS per 1000 gradients**, 9-12 min, pooled
+   posterior within 0.022 sigma of one block's (docs/boundary-plan.md,
+   stage 5). Before the fix the advice was `metal_block` = N for short,
+   densely sampled, high-s/e series; at 2-s cadence and s/e 100 it still
+   is (see the plan). Machine
    not quiet during these runs; the per-gradient columns do not depend on
    it, the wall column does. Script: `benchmarks/chees_block_cost.py`.
 3. **Default MLX path** (all m, and the only path for m > 4). The same

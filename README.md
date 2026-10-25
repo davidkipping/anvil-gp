@@ -17,8 +17,8 @@ from anvilgp.anvil import make_target
 
 from anvilgp import GPPolicy
 
-# metal=True turns on the fused kernel: ~27-38x on the forward and ~90x on
-# the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
+# metal=True turns on the fused kernel: ~17-24x on the forward and ~65-150x
+# on the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
 # is off by default; `gt.loglike.metal_eligible()` says whether it can be honoured
 # (m <= 4, up to 8 jitters), and a request it cannot honour warns rather than
 # falling back in silence.
@@ -59,13 +59,16 @@ single likelihood and seven orders more accurate in absolute terms;
 anvil-gp is tens of times a 12-core celerite2 pool once you need hundreds
 of *hyperparameter settings* scored at once — an ensemble sampler's walker
 count, not the data size — carries its own gradient, and has Matern-5/2,
-which celerite2 lacks. Break-even is about 23 walkers at
-N = 1000 and about 2 at N = 1e5. The exact multiple depends on the
-cadence: 22-25x on the figures below and 15-24x on docs/benchmarks.md's
-cadence, because a gap adds a lag-table row and costs the kernel
-~1.5-1.7x. (Both roughly halved on 2026-10-24, when the kernel's value
-moved to a replayed filter for accuracy; docs/float32.md, section 7.) End to end inside a sampler it is
-lower again; benchmarks.md says by how much and why.
+which celerite2 lacks. The exact multiple depends on the cadence: about
+13x on the figures below. It has been cut twice for accuracy: roughly
+halved on 2026-10-24, when the kernel's value moved to a replayed filter
+(docs/float32.md, section 7), and cut again by 1.6-1.8x on 2026-10-25,
+when its block boundaries moved to the square-root information form so
+that gradient samplers converge on bright, densely sampled data
+([docs/boundary-plan.md](docs/boundary-plan.md)). docs/benchmarks.md's
+figures, including its break-even walker counts, predate the second cut.
+End to end inside a sampler it is lower again; benchmarks.md says by how
+much and why.
 
 ## Why a state-space model rather than celerite's Cholesky
 
@@ -239,20 +242,18 @@ element per *block* reaches memory instead of one per point, and M4's
 checkpointed backward sweep gives it its own VJP. Against the MLX path,
 same problem, same answers:
 
-*The timings in this section predate the square-root block boundary,
-the kernel's default since 2026-10-25, which adds a pass over the data to
-the forward and to the gradient; they are being re-measured
-([docs/boundary-plan.md](docs/boundary-plan.md), stage 5).*
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| N=1e4, 1024 chains | 73.1 ms | **2.73 ms** | 27x | 1.20 GiB | 0.04 GiB |
-| N=1e4, 4096 chains | 326 ms | **8.53 ms** | 38x | 3.74 GiB | 0.16 GiB |
-| N=1e5, 1024 chains | 703 ms | **21.7 ms** | 32x | 0.82 GiB | 0.39 GiB |
+| N=1e4, 1024 chains | 73.1 ms | **4.4 ms** | 17x | 1.20 GiB | 0.04 GiB |
+| N=1e4, 4096 chains | 326 ms | **13.8 ms** | 24x | 3.74 GiB | 0.16 GiB |
+| N=1e5, 1024 chains | 703 ms | **37.6 ms** | 19x | 0.82 GiB | 0.39 GiB |
 
-(Minimum of 12 sustained evaluations, compiled, gapped cadence with three
-distinct lags, `block=4096`, `metal_block` at its default, all rows in one
-window on 2026-09-20. `benchmarks/verify_readme.py` re-checks every number
+(Minimum of 12-15 sustained evaluations, compiled, gapped cadence with
+three distinct lags, `block=4096`, `metal_block` at its default. The MLX
+column is from 2026-09-20 and re-verified within 3% on 2026-10-25; the
+Metal column is 2026-10-25, `benchmarks/bench_reference.py`, stability
+probe at its quiet level. `benchmarks/verify_readme.py` re-checks every number
 here; it gates on a measured stability probe -- both its spread *and* its
 level, since sustained contention keeps the spread tight -- rather than on the load
 average, which is a poor proxy — a CPU-bound indexer can sit at 14 while
@@ -261,14 +262,29 @@ the GPU is steady to 0.6%.) The speedups are smaller than the
 meantime, twice — see "Unroll the leaf reductions" and the sub_block change
 in the history. The kernel was unchanged until 2026-10-24.)
 
-**The kernel's forward is 1.6-1.9x slower since 2026-10-24, on purpose.**
+**The kernel's forward is 1.6-1.8x slower again since 2026-10-25, on
+purpose.** The state each block starts from, and the adjoint each block's
+backward is seeded with, are composed across blocks; in the dense
+information form float32 got both wrong on bright, densely sampled data,
+the gradient was 4-5 posterior sigma off at the worst posterior draws and
+ChEES did not converge at the default blocks. The kernel now re-condenses
+every block in the square-root information form, centred on the replayed
+filter: one more sweep of the data, at ~2.3x the first sweep's per-step
+work. On the 20-s problem that exposed it, ChEES now converges at the
+default blocks at 0.68-0.81 ESS per 1000 gradients, against 0.08-0.09
+before. The table above was 2.73 / 8.53 / 21.7 ms before it (27x / 38x /
+32x); `GPPolicy(metal_boundary="dense")` keeps the old boundary for one
+release. A single block skips the extra sweep and is unchanged.
+Measurements: [docs/boundary-plan.md](docs/boundary-plan.md).
+
+**Slower since 2026-10-24 too, also on purpose.**
 Its value used to be a fold of the block elements' own log-normalisers,
 which are ~1e4 numbers on bright, densely sampled data and cancel at every
 composition; on a TESS 20-s sector at s/e = 30 that was 1.7 log-units of
 spread across a posterior (5.9 worst). The value now comes from the filter
 replayed through each block from its entry state: 0.023 (0.061) on the
-same sector, at the price of one more sweep of the data. The table above
-was 1.67 / 4.40 / 11.5 ms before it (45x / 74x / 63x); value + gradient
+same sector, at the price of one more sweep of the data. The table was
+1.67 / 4.40 / 11.5 ms before that (45x / 74x / 63x); value + gradient
 moved 1.05-1.15x. Measurements and the one regime where the old fold was
 more accurate (well-conditioned single SHO, 0.004 against 0.012 at
 N = 1e5, both negligible): docs/float32.md, section 7.
@@ -277,28 +293,32 @@ Against celerite2 on the CPU, measured in the same session:
 
 | config | vs 1 core | vs 12 cores |
 |---|---:|---:|
-| N=1e4, 1024 chains | **150x faster** | **22x faster** |
-| N=1e5, 1024 chains | **185x faster** | **25x faster** |
+| N=1e4, 1024 chains | **97x faster** | **13x faster** |
+| N=1e5, 1024 chains | **115x faster** | **13x faster** |
 
-(celerite2 from `benchmarks/bench_docs_tables.py` and the kernel from
-`verify_readme.py`, the same quiet window, 2026-10-24. Before the replayed
-value: 255x / 35x and 376x / 42x.)
+(celerite2 from `benchmarks/bench_docs_tables.py`, 2026-10-24: 426 and
+4327 ms on one core, 59 and 486 ms on twelve; not re-measured on
+2026-10-25, when the CPU was busy. The kernel from the table above,
+2026-10-25. With the dense boundary: 150x / 22x and 185x / 25x; before the
+replayed value: 255x / 35x and 376x / 42x.)
 
 **The >=100x gate is not yet cleared.** The brief is explicit that "the honest
 >=100x denominator is the multiprocess one", and against a fully parallelised
-12-core celerite2 we are **22-25x**, not 100x. The single-core column is
+12-core celerite2 we are **13x**, not 100x. The single-core column is
 reported because it is the comparison most users' code actually makes (one
 CPU process, one chain at a time), not because it clears the gate. What the
 kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
-22-25x behind. Closing the remaining factor is future work; see
+13x behind (22-25x before the square-root boundary). Closing the remaining factor is future work; see
 "What is left" below.
 
 The brief predicted "~10-50 ms forward at 1024 x 1e5"; the measurement is
-21.7 ms, inside its own range.
+37.6 ms, inside its own range (21.7 ms with the dense boundary).
 
 End to end, `examples/gp_injection_recovery.py` (1000 points, 1024 chains,
-5800 stretch steps) goes from **90 s to 8.6 s**, 214 -> **2,100 ESS/s**
-(2026-10-24; 7.3 s and 2,470 ESS/s before the replayed value); posteriors
+5800 stretch steps) goes from **90 s to 14.7 s**, 214 -> **1,435 ESS/s**
+(2026-10-25; the dense boundary alongside: 10.2 s and 1,766 ESS/s; 8.6 s
+and 2,100 ESS/s on 2026-10-24, and 7.3 s and 2,470 ESS/s before the
+replayed value); posteriors
 under "End to end" below. Run it either way:
 
 ```bash
@@ -313,10 +333,13 @@ M4 landed: the kernel carries its own VJP, so a gradient sampler can use it.
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| value+grad, N=1e4, 1024 chains | 847 ms | **9.38 ms** | 90x | 6.10 GiB | 0.17 GiB |
-| value+grad, N=1e5, 1024 chains | 15.4 s | **66.9 ms** | 230x | 34.5 GiB | 1.61 GiB |
+| value+grad, N=1e4, 1024 chains | 847 ms | **12.9 ms** | 66x | 6.10 GiB | 0.13 GiB |
+| value+grad, N=1e5, 1024 chains | 15.4 s | **104 ms** | 148x | 34.5 GiB | 1.24 GiB |
 
-(2026-10-24, `verify_readme.py`; 8.9 and 58 ms before the replayed value.)
+(2026-10-25, `bench_reference.py`, square-root boundary; 9.38 and 66.9 ms
+with the dense one, 8.9 and 58 ms before the replayed value. The peaks
+fell because the residuals are now made contiguous once: MLX was handing
+every further kernel that read them its own 0.38 GiB copy at N = 1e5.)
 
 The gradient matches float64 central differences to ~1e-7 on every
 parameter including the jitter, and the two paths agree with each other to
@@ -327,7 +350,8 @@ chains, 300 iterations) runs in **4.0 s on the kernel against 126 s on the
 MLX graph**, and samples better for it: minimum ESS 239 against 94. (As
 measured in 2026-09. The kernel run took 5.5 s on 2026-10-24, 6.2 s on the
 pre-replay kernel alongside it; ChEES's adapted trajectory lengths differ
-between the two, so that is not a clean speed comparison.)
+between the two, so that is not a clean speed comparison. Not re-measured
+since the square-root boundary.)
 
 Three passes, all with the forward's launch shape because the backward
 blocks are **independent**: the forward kernel emits one element per block;
@@ -545,7 +569,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `False` | you want the fused kernel: ~27-38x on the forward, ~90x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
+| `metal` | `False` | you want the fused kernel: ~17-24x on the forward, ~65-150x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
 | `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
@@ -602,7 +626,7 @@ marked as an estimate.
   the posterior; a TESS 20-s sector at s/e = 30 by 2.8 on the default path
   (1.7 on the kernel before 2026-10-24). **The kernel's value is fixed**
   (replayed filter, 0.023 on that sector); the default MLX path is not.
-  **Short blocks on the kernel: fixed 2026-10-25, confirmation pending.**
+  **Short blocks on the kernel: fixed 2026-10-25, confirmed by ChEES.**
   At N <~ 6k with m = 4 the automatic block is 256 points, and on densely
   sampled high-s/e data the dense information form's entry states and
   backward seeds broke in float32: the gradient was 11-18 posterior sigma
@@ -613,12 +637,29 @@ marked as an estimate.
   filter (`GPPolicy.metal_boundary`): at 16 posterior draws of that
   problem the worst gradient error goes from 4.0 to 0.31 posterior
   sigma at 16 x 256, and from 5.0 to 0.34 at 4 x 1024, and the value's spread
-  across the posterior from sd 0.066 to 0.020. **Not yet confirmed by a
-  ChEES run, and its cost is not yet measured**; until then
-  `GPPolicy(metal_block=N)` (up to 8192) remains the safe choice for
-  short, densely sampled, high-s/e series. Convolved terms keep the dense
-  boundary. Tables: [docs/float32.md](docs/float32.md), section 7; plan
+  across the posterior from sd 0.066 to 0.020, and ChEES converges at
+  the default blocks at the one-block rate (0.68-0.81 ESS per 1000
+  gradients against 0.08-0.09). Convolved terms keep the dense boundary.
+  **Still open:** at 2-s cadence and s/e 100 (m = 4) the gradient stays
+  ~6-9 posterior sigma off, and that is not the boundary -- exact float64
+  boundary quantities give 6.4 sigma too. The backward takes the entry
+  covariance and seeds as dense float32 matrices, whose small eigen-
+  directions (~12 decades below the large ones there) do not survive the
+  rounding; fixing it needs a square-root backward. `metal_block=N` (up
+  to 8192) gives 0.7-0.9 there. Tables: [docs/float32.md](docs/float32.md), section 7; plan
   and status: [docs/boundary-plan.md](docs/boundary-plan.md).
+* **The kernel's gradient recomputes its forward boundary.** The VJP
+  reruns pass 1, the dense prefix and the square-root pass instead of
+  reusing the forward's, as it always reran pass 1; that is most of the
+  square-root boundary's 1.4-1.8x on value + gradient. Reusing them is
+  estimated to bring it near the dense boundary's cost; not done
+  ([docs/boundary-plan.md](docs/boundary-plan.md)).
+* **The GPU watchdog at m = 4, N = 1e5.** A value + gradient at 256
+  chains ran cleanly in a quiet session and was killed ("Impacting
+  Interactivity") later the same day while the display was in use -- on
+  either boundary. The watchdog is stricter when the window server needs
+  the GPU; run long m = 4 gradients with fewer chains per call, or a
+  smaller `metal_block`, on a machine that is in use.
 * **The default MLX gradient at N ~ 1e5.** It fails with
   `[metal::malloc] Resource limit (499000) exceeded` (Metal's limit on live
   buffers, not memory): uncompiled at N = 114k for one chain of a single

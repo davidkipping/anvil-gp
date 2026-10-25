@@ -1,6 +1,6 @@
 # Plan: the kernel's block boundaries in the square-root information form
 
-Status: agreed 2026-10-25; stages 0-5 done 2026-10-25 (the new boundary is the kernel's default); the gating decision is open.
+Status: agreed 2026-10-25; all six stages done 2026-10-25. The square-root boundary is the kernel's unconditional default (decision 2, revised: B).
 
 ## The problem
 
@@ -37,7 +37,12 @@ the backward, unchanged.
    exist. A J-orthogonal QR could serve it; not in scope.
 2. **Gate or ship at +25% value + gradient** on the README configurations
    (forward +50%). Over that, gate by state dimension or block length
-   instead of paying it everywhere.
+   instead of paying it everywhere. **Revised after stage 5: ship
+   everywhere (option B).** It came in at 1.4-1.8x; state dimension cannot
+   gate it (m = 2 fails too), and a gate on the data's signal-to-noise was
+   judged too likely to fail silently on a posterior it did not anticipate
+   -- the failure it would let back in is ChEES not converging, while the
+   cost is visible and bounded.
 3. **The old boundary stays behind a policy switch for one release**, for
    A/B comparison and as the formal terms' path.
 
@@ -51,7 +56,7 @@ the backward, unchanged.
 | 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days, **done** |
 | 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day, **done** |
 | 5 | Measure on a quiet machine: README timings, watchdog at m = 4, the exposure matrix (m = 2-4, gapped and 2-s cadences), then ChEES | 1 day + machine time, **done** |
-| 6 | Docs and README | 0.5 day |
+| 6 | Docs and README | 0.5 day, **done** |
 
 ## Acceptance
 
@@ -371,3 +376,49 @@ than paid everywhere. What the measurements say about each gate:
   square-root one.
 * **None**: keep the square-root boundary everywhere and pay 1.4-1.8x on
   every gradient, including the problems that never needed it.
+
+## Stage 6 (2026-10-25)
+
+Decision 2 resolved as B: no gate. README, docs/float32.md and
+docs/benchmarks.md updated; the README's tables re-measured on a quiet
+GPU (`bench_reference.py`, which takes `--boundary` now, and
+`verify_readme.py`, whose claims now hold the new figures):
+
+| | dense | square-root |
+|---|---|---|
+| forward, N = 1e4 x 1024 / 1e4 x 4096 / 1e5 x 1024 | 2.73 / 8.53 / 21.7 ms | 4.4 / 13.8 / 37.6 ms |
+| value + gradient, N = 1e4 / 1e5, 1024 chains | 9.3 / 66.8 ms | 12.9 / 104 ms |
+| peak, value + gradient, N = 1e4 / 1e5 | 0.13 / 1.23 GiB | 0.13 / 1.24 GiB |
+| injection-recovery example, stretch | 10.2 s, 1,766 ESS/s | 14.7 s, 1,435 ESS/s |
+
+Against celerite2's 12-core pool (its 2026-10-24 figures; the CPU was busy)
+the kernel's forward is now ~13x, from 22-25x. docs/benchmarks.md is
+marked as predating the change rather than regenerated, for the same
+reason.
+
+**Found on the way: a residual copy per kernel.** Inside `scan_loglike`
+MLX handed every further `metal_kernel` that read the residuals its own
+copy of them (0.38 GiB each at N = 1e5 x 1024 chains): the forward's peak
+was 0.77 GiB on the dense boundary and 1.15 on the square-root one, the
+gradient's 2.00 and 2.76. Making them contiguous once in the forward and
+the VJP removes every copy, for both boundaries: 0.39 and 1.23-1.24 GiB,
+time unchanged. The README's peak columns had predated the replayed value
+and now match again.
+
+**The watchdog, again.** The A/B's m = 4, N = 1e5, 256-chain gradient,
+clean in the morning, was killed ("Impacting Interactivity") in the
+afternoon on *both* boundaries and with or without the copy fix, while the
+display was in use (screen sharing, a user at the machine). A pre-existing
+hazard, recorded in the README.
+
+### Open, for a later plan
+
+* **Reuse the forward's boundary in the VJP.** The VJP reruns pass 1, the
+  prefix and the square-root pass. From the per-kernel timings, reusing
+  them would take value + gradient to ~71 ms at m = 4, N = 1e4, 256 chains
+  (now 102) and ~9.4 ms at m = 2, N = 1e4 (now 12.9), near the dense
+  boundary's cost today. Needs `custom_function` to carry the boundary out
+  of the forward; estimated a day. Forward-only samplers would not gain.
+* **A square-root backward**, for the 2-s, s/e 100 floor that exact
+  boundaries do not fix.
+* **Regenerate docs/benchmarks.md** on a quiet CPU and GPU.

@@ -2433,6 +2433,12 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
+        # Every kernel below reads the residuals, and MLX handed each
+        # further `metal_kernel` use its own copy of them: one (npts x
+        # n_chains) buffer per extra use, 0.38 GiB each at N = 1e5 x 1024
+        # chains.  Made contiguous once here, no use copies; measured
+        # 2026-10-25, the cause inside MLX not pinned down.
+        rs = mx.contiguous(rs)
         el = scan_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
                          blk_len, formal=formal, with_ell=False)
         ent_m, ent_C = boundary_states(phi_t, q_t, lg, hv, rs, rr, j2, el)
@@ -2455,6 +2461,7 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         # which is every gap in the data.  Replay forward, always -- which
         # is why the block elements are recomputed here.
         p_t, q_t, lg, hv, rs, rr, j2 = primals
+        rs = mx.contiguous(rs)          # see `core`
         cot = cotangents[0] if isinstance(cotangents, (list, tuple)) \
             else cotangents
 

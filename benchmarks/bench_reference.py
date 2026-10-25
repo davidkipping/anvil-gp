@@ -34,6 +34,8 @@ p.add_argument("--cadence", choices=("regular","gapped","random"), default="gapp
 p.add_argument("--metal", action="store_true",
                help="use the fused Metal kernel (value and gradient)")
 p.add_argument("--metal-block", type=int, default=None)
+p.add_argument("--boundary", choices=("dense", "sqrt"), default=None,
+               help="the kernel's block boundary (default: the policy's)")
 a = p.parse_args()
 
 TERMS = {"sho": (ag.SHOTerm(), [1.0, 4.0, 3.0]),
@@ -62,6 +64,7 @@ yerr = np.full(a.n_data, 0.3)
 y = rng.standard_normal(a.n_data) * 0.9
 pm = ParamMap.log(refs)
 pol = GPPolicy(block=a.block, sub_block=a.sub_block, metal=a.metal,
+               metal_boundary=a.boundary,
                **({} if a.metal_block is None
                   else {"metal_block": a.metal_block}))
 gp = GPLogLike(None, t, None, y, yerr, term, pm, pol)
