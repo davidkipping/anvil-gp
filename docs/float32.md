@@ -411,8 +411,25 @@ removes the large numbers instead of storing them more carefully.
      rotation / granulation split. Near the mode the value replayed from
      them is still right, but not across the posterior: 0.081 (0.77)
      against 0.023 (0.13) at one block (see "Except on short blocks"
-     above). With exact float64 entry states *and* exact seeds the second
-     row is 0.41 / 0.30; with either alone, 1.9 or 4.2.
+     above).
+
+   **Both quantities must be fixed, at any block length** (measured
+   2026-10-24 on the second row's problem; "exact seeds" are the adjoints
+   of a float64 filter's state at each block boundary, from one reverse-
+   mode sweep, and "exact entries" that filter's states; worst over three
+   posterior draws, the two amplitudes):
+
+   | blocks | kernel as is | exact seeds only | exact entries + exact seeds |
+   |---|---|---|---|
+   | 16 x 256 | 3.8 / 2.6 | 5.4 / 4.4 | **0.05 / 0.11** |
+   | 4 x 1024 | 10.7 / 9.8 | 0.83 / 0.64 | **0.013 / 0.037** |
+
+   Short blocks are dominated by the entry states, long ones by the
+   seeds, and with both right either block length comes within ~2x of one
+   block (0.025 / 0.039): nothing inside a float32 block is the problem.
+   An earlier version of this section gave 0.41 / 0.30 for "both exact"
+   and called the remainder unexplained; those seeds were central
+   differences, 3-7e-4 relative off -- as wrong as the kernel's own.
 
    Ruled out, measured: the term front end (chaining the kernel's per-lag
    adjoints to theta in float64 changes nothing), and the per-lag and `dh`
@@ -444,6 +461,13 @@ removes the large numbers instead of storing them more carefully.
    | one (`metal_block = 4096`) | 300 | 0.0225-0.0228 | 35-38 | **1.11** | **0.81-0.86** | 32-34 min |
    | default, 16 x 256 | 300 | 0.0078-0.0093 | 12 | 2.8-3.3 | -- | 3 min |
    | default, 16 x 256 | 2000 | **0.0042-0.0043** | 33-41 | **1.57-1.74** | **0.084-0.093** | 52-55 min |
+   | 4 x 1024 | 300 | 0.0019-0.0063 | 6-11 | **6.8-11** | -- | 4-6 min |
+
+   Longer blocks are *not* a mitigation: at 4 x 1024 the value improves
+   (0.035 (0.20) across the posterior, against 0.081 (0.77) at 16 x 256)
+   but the gradient is worse (median 0.47-0.98 sigma, worst 36-43 sigma in
+   the amplitudes), because the seeds' cancellation grows with the data in
+   each block.
 
    The step size kept shrinking through warmup as chains reached more of
    the posterior. The pooled default-block posterior agrees with the
