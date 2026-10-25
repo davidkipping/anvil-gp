@@ -52,7 +52,7 @@ import mlx.core as mx
 from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
-           "entry_states", "replay_blocks",
+           "entry_states", "replay_blocks", "q_factor",
            "backward_ckpt", "block_seeds_kernel",
            "metal_available", "MAX_STATE", "MAX_JITTER",
            "MAX_ADJOINT_BUFFER_BYTES"]
@@ -1601,6 +1601,67 @@ def replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
     return outs[0]
+
+
+#: The square-root boundary's process-noise factor: ``L`` with ``L L^T =
+#: Q`` for every entry of the lag table, one thread per (chain, lag).
+#: docs/boundary-plan.md, stage 1.
+#:
+#: Each pivot is clamped at zero and there is **no floor**, unlike the
+#: composition kernels' ``eps * trace / m`` (`_COMBINE_CHOL`).  At 20-s
+#: cadence ``Q``'s eigenvalues run from 2.5e-2 down to 1.7e-9, under that
+#: floor, so the floor rewrote exactly the directions a high-s/e filter
+#: depends on and cost the boundary seeds 20-50x; the clamp matches a
+#: float64 eigendecomposition at 2-s, 20-s and 2-min cadences.  A pivot
+#: that rounds to zero or below zeroes its column, which is the right
+#: factor of a rank-deficient ``Q`` (row 0's ``P_inf`` and a zero lag
+#: included).  Only for a positive semi-definite ``Q``: a convolved
+#: term's is indefinite and keeps the dense boundary.
+_SRC_QFACTOR = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_entries) return;
+    const uint M = MDIM;
+    uint off = gid * M * M;
+    float L[MDIM][MDIM];
+    for (uint j = 0; j < M; ++j) {
+        float d = qtab[off + j * M + j];
+        for (uint t = 0; t < j; ++t) d -= L[j][t] * L[j][t];
+        float piv = metal::precise::sqrt(max(d, 0.0f));
+        L[j][j] = piv;
+        float inv = piv > 0.0f ? 1.0f / piv : 0.0f;
+        for (uint i = j + 1; i < M; ++i) {
+            float a = 0.5f * (qtab[off + i * M + j] + qtab[off + j * M + i]);
+            for (uint t = 0; t < j; ++t) a -= L[i][t] * L[j][t];
+            L[i][j] = a * inv;
+        }
+        for (uint i = 0; i < j; ++i) L[i][j] = 0.0f;
+    }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) out_L[off + i * M + j] = L[i][j];
+"""
+
+_qfactor_kernels: dict = {}
+
+
+def q_factor(q_tab: mx.array) -> mx.array:
+    """Lower-triangular ``L`` with ``L L^T = Q`` for every lag-table entry.
+
+    ``q_tab``: ``(n_chains, n_lags, m, m)``, as :func:`scan_blocks` takes
+    it.  Not differentiated: the boundary quantities it feeds only fix
+    where each block's replay and backward start (see `_SRC_QFACTOR`).
+    """
+    m = q_tab.shape[-1]
+    if m > MAX_STATE:
+        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
+    if m not in _qfactor_kernels:
+        _qfactor_kernels[m] = mx.fast.metal_kernel(
+            name=f"anvilgp_qfactor_m{m}", input_names=["qtab", "n_entries"],
+            output_names=["out_L"], source=_SRC_QFACTOR.replace("MDIM", str(m)))
+    n_entries = q_tab.shape[0] * q_tab.shape[1]
+    return _qfactor_kernels[m](
+        inputs=[q_tab, int(n_entries)], output_shapes=[q_tab.shape],
+        output_dtypes=[mx.float32], grid=(n_entries, 1, 1),
+        threadgroup=(min(64, n_entries), 1, 1))[0]
 
 
 def metal_available() -> bool:

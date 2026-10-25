@@ -25,6 +25,7 @@ import pytest
 import anvilgp as ag
 import boundary_oracle as bo
 from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from anvilgp.metal import q_factor
 from anvilgp.oracle import sample_ssm
 
 N, DT, N_DRAWS = 4096, 1.0 / 4320, 16          # 20 s, in days
@@ -171,3 +172,102 @@ def test_the_kernel_boundary_quantities_meet_the_bounds(case):
 def test_the_kernel_gradient_is_within_half_a_sigma_across_the_posterior(case):
     e = _grad_sigma(case, case["g_kernel"])
     assert e.max() < GRAD_SIGMA, f"per posterior sigma {np.round(e, 3)}"
+
+
+# ------------------------------------------------- stage 1: the Q factor
+FACTOR_TERMS = [
+    ("real", ag.RealTerm(), [1.0, 2.0]),
+    ("sho", ag.SHOTerm(), [0.1, 0.48, 5.0]),
+    ("sho-overdamped", ag.SHOTerm(), [1.0, 0.3, 0.2]),
+    ("matern32", ag.Matern32Term(), [1.0, 0.5]),
+    ("matern52", ag.Matern52Term(), [1.1, 2.5]),
+    ("sho+sho", ag.SHOTerm() + ag.SHOTerm(), KP),
+    ("rotation", ag.RotationTerm(), [1.5, 7.0, 3.0, 1.0, 0.4]),
+    ("sho+matern32", ag.SHOTerm() + ag.Matern32Term(), [1.0, 5.0, 4.0, 0.5, 2.0]),
+]
+#: a duplicate timestamp, 2 s, 20 s, 2 min, 30 min, and a 10-day gap
+FACTOR_LAGS = np.array([0.0, 2.0, 20.0, 120.0, 1800.0, 864000.0]) / 86400
+
+
+def _factor(q):
+    with mx.stream(mx.gpu):
+        L = q_factor(mx.array(np.asarray(q, np.float32)))
+        mx.eval(L)
+    return np.array(L)
+
+
+@pytest.mark.parametrize("name,term,p", FACTOR_TERMS,
+                         ids=[t[0] for t in FACTOR_TERMS])
+def test_the_q_factor_keeps_every_direction_of_q(name, term, p):
+    """``L L^T = Q`` direction by direction, not just entry by entry.
+
+    The eigenvalues of these ``Q`` span up to 22 decades (Matern-5/2 at
+    2 s), and the small ones are what a high-s/e filter depends on.  The
+    composition kernels' ``eps * trace / m`` floor reproduces every entry
+    of ``Q`` to 1e-7 and still inflated the smallest eigenvalue 1.7x at
+    20 s and 70x at 2 s, which cost the boundary seeds 20-50x.  Measured
+    with the clamp: every direction to <= 3e-5, entries to 1e-7.
+    """
+    with mx.stream(mx.gpu):
+        _, q, _ = term.matrices(mx.array([p], dtype=mx.float32),
+                                mx.array(FACTOR_LAGS, dtype=mx.float32))
+        mx.eval(q)
+    Q = np.array(q)
+    L = _factor(Q)
+    Q, L = Q[0], L[0]
+    assert np.all(np.isfinite(L))
+    assert np.all(np.triu(L, 1) == 0) and np.all(np.diagonal(L, 0, -2, -1) >= 0)
+    np.testing.assert_allclose(L, bo.sqrt_q(Q), rtol=0,
+                               atol=1e-5 * np.abs(L).max())
+    for k, lag in enumerate(FACTOR_LAGS):
+        q64, l64 = Q[k].astype(np.float64), L[k].astype(np.float64)
+        if not np.any(q64):
+            assert not np.any(l64), f"lag {lag}: Q = 0 but L != 0"
+            continue
+        llt = l64 @ l64.T
+        assert np.abs(llt - q64).max() < 1e-6 * np.abs(q64).max(), lag
+        w, U = np.linalg.eigh(q64)
+        for i in np.flatnonzero(w > 0):
+            ratio = U[:, i] @ llt @ U[:, i] / w[i]
+            assert abs(np.log(ratio)) < 1e-3, (
+                f"lag {lag * 86400:g} s: eigenvalue {w[i]:.2e} "
+                f"(of {w[-1]:.2e}) reproduced x{ratio:.4f}")
+
+
+def test_the_q_factor_of_a_rank_deficient_q_is_finite_and_exact():
+    """Pivots at or below zero zero their column instead of dividing by
+    them: a rank-one ``Q``, one whose last pivot rounds negative, and zero
+    -- every case a lag table can hand it (row 0's P_inf aside, which is
+    the identity)."""
+    v = np.array([0.3, -1.2, 0.7, 2.0], np.float32)
+    rank1 = np.outer(v, v)
+    near = np.array([[1.0, 1.0], [1.0, 1.0 - 3e-8]], np.float32)  # pivot < 0
+    for Q in (rank1, near, np.zeros((3, 3), np.float32), np.eye(4, dtype=np.float32)):
+        L = _factor(Q[None, None])[0, 0].astype(np.float64)
+        assert np.all(np.isfinite(L)), Q
+        assert np.all(np.triu(L, 1) == 0)
+        assert np.abs(L @ L.T - Q).max() <= 1e-6 * max(np.abs(Q).max(), 1e-30), Q
+
+
+def test_the_q_factor_batches_chains_and_lags_independently():
+    """One thread per (chain, lag) entry: a batch gives what each entry
+    gives alone."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((3, 5, 4, 4)).astype(np.float32)
+    Q = X @ np.swapaxes(X, -1, -2)
+    L = _factor(Q)
+    for c in range(3):
+        for k in range(5):
+            np.testing.assert_array_equal(L[c, k], _factor(Q[c:c + 1, k:k + 1])[0, 0])
+    with pytest.raises(ValueError, match="m <= "):
+        q_factor(mx.zeros((1, 1, 5, 5), dtype=mx.float32))
+
+
+def test_the_oracle_on_the_kernels_q_factor_meets_the_bounds(case):
+    """The stage 1 factor in the stage 0 oracle, on the 20-s problem: the
+    boundary quantities stay inside the bounds the kernel must meet."""
+    a, k = case["inputs"], case["kernel"]
+    got = bo.sqrt_boundary(a["pt"], a["qt"], a["lag"], a["h"], a["res"],
+                           a["r"], a["cot"], k[0], k[1], a["blk"],
+                           lq=_factor(a["qt"]))
+    _check_bounds(got, case["exact"])

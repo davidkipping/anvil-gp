@@ -241,7 +241,7 @@ def replay(pt, qt, lag, h, res, r, ent_m, ent_C, blk, dt=np.float32):
 
 
 def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
-                  dt=np.float32):
+                  dt=np.float32, lq=None):
     """Entry states and seeds from block-local centred square-root elements.
 
     ``start_m``, ``start_C``: approximate entry states (the kernel's own
@@ -251,7 +251,8 @@ def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
     describes the correction to that trajectory.  A block's output is then
     relative to its own trajectory end, the next block's input to *its*
     start, and the difference is moved into the output ``b`` (``eta`` and
-    ``J`` untouched).  Requires ``npts % blk == 0``.
+    ``J`` untouched).  Requires ``npts % blk == 0``.  ``lq``: a factor
+    table of ``qt`` to use instead of :func:`sqrt_q` (the kernel's own).
     """
     nc, m = pt.shape[0], pt.shape[-1]
     n = res.shape[1]
@@ -263,7 +264,8 @@ def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
     phi = pt[:, lag].astype(dt)
     pm = np.einsum("cnij,cnj->cni", phi, Mprev)
     resid = res.astype(dt) - np.einsum("cni,ci->cn", pm, h.astype(dt))
-    e = leaves_sqrt(phi, sqrt_q(qt, dt)[:, lag], h.astype(dt), resid,
+    lq = sqrt_q(qt, dt) if lq is None else np.asarray(lq).astype(dt)
+    e = leaves_sqrt(phi, lq[:, lag], h.astype(dt), resid,
                     r.astype(dt))
     e[1] = e[1] + (pm - M)
     e = [x.reshape((nc, nb, blk) + x.shape[2:]) for x in e]

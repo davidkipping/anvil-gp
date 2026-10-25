@@ -1,6 +1,6 @@
 # Plan: the kernel's block boundaries in the square-root information form
 
-Status: agreed 2026-10-25; stage 0 done 2026-10-25.
+Status: agreed 2026-10-25; stages 0 and 1 done 2026-10-25.
 
 ## The problem
 
@@ -46,7 +46,7 @@ the backward, unchanged.
 | stage | what | estimate |
 |---|---|---|
 | 0 | Oracle and red tests | 0.5-1 day, **done** |
-| 1 | Q factor table, a small Metal kernel (Cholesky, pivots clamped at 0, no floor) | 0.5 day |
+| 1 | Q factor table, a small Metal kernel (Cholesky, pivots clamped at 0, no floor) | 0.5 day, **done** |
 | 2 | Centred square-root block pass, one thread per (chain, block); rank-1 leaf update | 2 days |
 | 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days |
 | 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day |
@@ -95,3 +95,34 @@ Cholesky with each pivot clamped at zero and no floor matches a float64
 eigendecomposition (4.8e-5 / 3.7e-5); so does a 1e-3 smaller floor. Stage
 1 uses the clamp. Ruled out alongside: storing `Q` in float32 is not the
 loss (a float64 eigendecomposition of the float32 table is as good).
+
+## Stage 1: what it found (2026-10-25)
+
+`metal.q_factor` factors every `(chain, lag)` entry of the `Q` table, one
+thread each: Cholesky, each pivot clamped at zero, a non-positive pivot
+zeroing its column, no floor. Not wired in yet, and not differentiated
+(the boundary quantities only fix where each block starts).
+
+* **Every direction of `Q` survives**, not just every entry. Across
+  `RealTerm`, `SHOTerm` (under- and overdamped), Matern-3/2 and -5/2,
+  `RotationTerm`, SHO + SHO and SHO + Matern-3/2, at lags 0, 2 s, 20 s,
+  2 min, 30 min and 10 days, `u^T L L^T u / lambda` is within 3e-5 of 1
+  for every eigenvector, though the eigenvalues span up to 22 decades
+  (Matern-5/2 at 2 s). Entries to 1e-7 of `max |Q|`; the NumPy oracle's
+  factor to 2e-7. The planned `eps * trace / m` floor inflated the
+  smallest eigenvalue 1.7x at 20 s and 70x at 2 s.
+* **The clamp holds at denser cadences.** In the oracle, the kernel-style
+  factor matches a float64 eigendecomposition in every boundary quantity
+  at 2 s (SHO + SHO, eigenvalues to 1e-12 of the largest), 20 s and
+  2 min, m = 2 and 4.
+* **Pinned** in `tests/test_boundary.py`: the direction test over the
+  terms and lags above, rank-deficient and slightly indefinite `Q`
+  (finite, `L L^T = Q`), batching, and the oracle on the kernel's factor
+  meeting the stage 0 bounds on the 20-s problem. Mutation-checked: the
+  old floor fails 7 of them, removing the clamp 8.
+
+For stage 5, seen on the way. At 2-s cadence, SHO + SHO, s/e = 100, the
+kernel's entry covariances are **57%** wrong at 16 x 256 (17% at
+4 x 1024), against 2% at 20 s: the exposure grows fast with cadence. And
+the oracle's entry means reach 1.2e-3 at 2 s, 4 x 1024, just over the
+1e-3 bound, with either factor, so that is not the factor's doing.
