@@ -998,3 +998,48 @@ Pinned: `tests/test_metal.py` -- m = 5 and 6 against float64 at the caps
 < 0.5 sigma), m = 6 with three instruments' jitter against the MLX path,
 the caps; `tests/test_docs.py` -- kernels.md's sum table (m = 5, 6 on the
 kernel, m = 8 not).
+
+## Follow-on steps 3 and 4: IV deferred, VII settled (2026-10-25)
+
+**IV (the MLX path's float32 floor) is deferred, not dropped.** Step 2
+moved m = 5 and 6 onto the kernel, so the MLX path now serves only
+m > 6, `GPPolicy(metal=False)` and machines without
+`mx.fast.metal_kernel`. Fixing its floor would not fix its larger
+limit: its gradient runs out of Metal buffers from N ~ 16384 at m = 6,
+and sooner above, so on a sector-length series those users would get a
+more accurate value and still no gradient. Picked up if someone needs
+m > 6 or a non-Metal machine on short, bright, densely sampled series;
+the design above stands. Meanwhile docs/float32.md (section 7, step 3)
+and docs/kernels.md tell users of the path what it carries.
+
+**New deferred item: the kernel's thread layout.** m = 5-6 spill
+registers (value + gradient ~8x m = 4 against the arithmetic's 3.4x;
+replay 22x, `sqrt_blocks` 9x), and m > 6 needs the element out of
+registers anyway: threadgroup memory, or one chain across several lanes.
+That, not IV, is what would give m > 6 a gradient at sector length.
+
+**VII: `metal_boundary="dense"` stays, as a documented speed option**
+for samplers that use the value alone (stretch move, nested sampling),
+at m <= 3 only. It is not removed after one release (decision 3's plan):
+its code path is needed regardless for convolved terms with a `RealTerm`
+member or `||F delta|| > 0.5`. The evidence, from the exposure table in
+stage 5 (16 x 256 blocks, value sd across 16 draws, dense / square-root)
+and step 2's probes (worst value error):
+
+* m <= 3: 0.001-0.012 / 0.000-0.006 on every row, the worst m = 3 SHO +
+  Real at 2 s, s/e 100. Negligible for a value-only sampler.
+* m = 4, bright data: 0.064 / 0.015 (SHO + SHO, 20 s, s/e 100), 0.085 /
+  0.043 (rotation, 2 min), 0.053 / 0.027 (20 s, gapped).
+* m = 5-6: worst error 0.17 / 0.06 (SHO + Matern-5/2, 20 s), 5.8 / 0.38
+  (rotation + SHO, 20 s).
+* The gradient is never safe on it: 1.6-1.8 posterior sigma at m = 2,
+  s/e 300.
+
+What it buys: the README's forward rows (m = 2) 1.6-1.7x faster (2.73 /
+8.53 / 21.7 against 4.4 / 13.8 / 37.6 ms). Documented in the `GPPolicy`
+docstring and the README's knob table; no code change.
+
+Remaining: step 5 (anvil's docs for stale `GPPolicy(metal=True)`
+guidance), step 6 (VIII, benchmarks.md on a quiet CPU), and, longer
+term, the square-root backward -- now owed for rotation at TESS 20 s as
+well as the 2-s floor (step 2).

@@ -150,12 +150,19 @@ class GPPolicy:
     #: adjoint each block's backward is seeded with: ``"sqrt"``, the
     #: square-root information form centred on the replayed filter, or
     #: ``"dense"``, the dense information form it replaced.  ``None`` picks
-    #: ``"sqrt"``, except for a convolved term, whose ``Q`` is indefinite
-    #: and has no square root, which keeps ``"dense"``.  On bright, densely
-    #: sampled data the dense form's float32 boundaries left the gradient
-    #: 4-5 posterior sigma off at the default blocks and ChEES did not
-    #: converge; see docs/boundary-plan.md and docs/float32.md, section 7.
-    #: ``"dense"`` stays for one release, for comparison.
+    #: ``"sqrt"``, except for a convolved term with a `RealTerm` member or
+    #: an exposure long against the timescale (``||F delta|| > 0.5``), whose
+    #: indefinite ``Q`` the square-root form cannot clamp harmlessly, which
+    #: keeps ``"dense"``.  On bright, densely sampled data the dense form's
+    #: float32 boundaries left the gradient 4-5 posterior sigma off at the
+    #: default blocks and ChEES did not converge; see docs/boundary-plan.md
+    #: and docs/float32.md, section 7.  ``"dense"`` stays, as a speed option
+    #: for samplers that use the value alone, at m <= 3 only: a 1.6-1.7x
+    #: faster forward, its value within sd 0.012 of float64 across the
+    #: posterior at every m <= 3 row measured; on bright data 2-4x worse
+    #: than the default's at m = 4 and up to 15x at m = 6.  Its gradient is
+    #: 1.6-1.8 sigma off even at m = 2 (docs/boundary-plan.md, follow-on
+    #: step 4).
     metal_boundary: str | None = None
     #: floor on the leaf innovation variance, in units of the reference
     #: variance.  Positive-definiteness failure is a *defined* outcome:

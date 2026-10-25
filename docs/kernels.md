@@ -317,9 +317,14 @@ unsupported. The default (`metal=None`) takes the kernel wherever this
 says `True`.
 
 A request the kernel cannot honour **warns and falls back** to the MLX
-reference path. That path is correct and is what the kernel is verified
-against, but it is 30–70x slower depending on the kernel (see
-[benchmarks.md](benchmarks.md)), so it is a fallback rather than a plan.
+reference path. That path is correct in float64 and is what the kernel is
+verified against, but in float32 it is a fallback rather than a plan:
+30–70x slower depending on the kernel (see
+[benchmarks.md](benchmarks.md)), less accurate than the kernel on bright,
+densely sampled data (it carries the dense float32 floor of
+[float32.md](float32.md) section 7, whose fix on this path is deferred),
+and its gradient runs out of Metal buffers from N ~ 16384 at m = 6, sooner
+above.
 
 ## Not supported
 

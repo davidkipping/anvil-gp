@@ -614,7 +614,19 @@ removes the large numbers instead of storing them more carefully.
 3. **Default MLX path** (all m, and the only path for m > 6). The same
    structure at sub-block scale: fold leaves into sub-block elements, a
    prefix over them instead of the reduction, then a 32-step replay batched
-   over sub-blocks. Not yet attempted.
+   over sub-blocks. **Deferred 2026-10-25, not attempted.** Since the
+   kernel took m <= 6, this path serves only m > 6, `GPPolicy(metal=False)`
+   and machines without `mx.fast.metal_kernel`, and fixing its floor would
+   not fix its larger limit: its gradient runs out of Metal buffers
+   ("Resource limit (499000) exceeded") from N ~ 16384 at m = 6, and
+   sooner above. Picked up if someone needs m > 6 or a non-Metal machine
+   on short, bright, densely sampled series (docs/boundary-plan.md,
+   follow-on steps 3-4). **What it means for you on this path:** it
+   carries the dense information form's float32 floor described above --
+   on bright, densely sampled data its value and gradient are worse than
+   the kernel's (e.g. SHO + Matern-5/2 at 20 s, s/e 100: 1.42 posterior
+   sigma against 0.36-0.67) -- and it has no gradient on a TESS-sector-length
+   series at m >= 5.
 
 ## Error growth: measured
 

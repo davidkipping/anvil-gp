@@ -273,8 +273,9 @@ filter: one more sweep of the data, at ~2.3x the first sweep's per-step
 work. On the 20-s problem that exposed it, ChEES now converges at the
 default blocks at 0.68-0.81 ESS per 1000 gradients, against 0.08-0.09
 before. The table above was 2.73 / 8.53 / 21.7 ms before it (27x / 38x /
-32x); `GPPolicy(metal_boundary="dense")` keeps the old boundary for one
-release. A single block skips the extra sweep and is unchanged.
+32x); `GPPolicy(metal_boundary="dense")` keeps the old boundary, as a
+forward-speed option for value-only samplers at m <= 3 (the `GPPolicy`
+table below). A single block skips the extra sweep and is unchanged.
 Measurements: [docs/boundary-plan.md](docs/boundary-plan.md).
 
 **Slower since 2026-10-24 too, also on purpose.**
@@ -576,8 +577,8 @@ float32 accuracy.
 | field | default | change it when |
 |---|---|---|
 | `metal` | `None` (the kernel where eligible: `m <= 6`, up to 8 per-instrument jitters; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
-| `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3 and 256 at m >= 4) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
-| `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term with a `RealTerm` member or `\|\|F delta\|\| > 0.5`) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
+| `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3, 256 at m = 4, 128 at m = 5 and 64 at m = 6) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
+| `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term with a `RealTerm` member or `\|\|F delta\|\| > 0.5`) | `"dense"` only for a sampler that uses the value alone (stretch move, nested sampling) at m <= 3: the forward is 1.6-1.7x faster and the value measured within sd 0.012 of float64 across the posterior at every m <= 3 row tried. Never with a gradient sampler (its gradient is 1.6-1.8 posterior sigma off at m = 2, s/e 300), and not at m >= 4, where on bright, densely sampled data its value is 2-4x worse than the default's at m = 4 (sd 0.05-0.09) and up to 15x at m = 6. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (32 up to m = 6, 64 above) | below N ~ 2000, try 8-16 for speed, at some float32 accuracy (16 is 3.7x less accurate than 32 at sigma/yerr = 30). |
 | `eval_blocks` | `False` | you are memory-bound and can give up `mx.compile`. The `.hi` path sets it itself. |
