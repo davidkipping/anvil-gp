@@ -422,3 +422,94 @@ def test_the_block_pass_handles_a_short_last_block():
                          dt=np.float64, lq=lq.astype(np.float64))
     err = _block_errors([x[:, -1:] for x in kb], one)
     assert max(err) < 1e-3, err
+
+
+# --------------------------------------------------- stage 3: the scan
+def _gpu_boundary(a, start_m, start_C, seeds=True):
+    """The whole new boundary on the GPU: `q_factor`, `sqrt_blocks`,
+    `sqrt_scan`, from the given start states."""
+    pt, qt, lag, inst, hv, rs, rr, j2 = a["mx"]
+    with mx.stream(mx.gpu):
+        sm = mx.array(start_m, dtype=mx.float32)
+        sC = mx.array(start_C, dtype=mx.float32)
+        blocks = am.sqrt_blocks(pt, qt, q_factor(qt), lag, inst, hv, rs, rr,
+                                j2, sm, sC, a["blk"])
+        out = am.sqrt_scan(blocks, sm, sC,
+                           mx.array(a["cot"], dtype=mx.float32) if seeds
+                           else None)
+        mx.eval(*out)
+    return [np.array(x) for x in out]
+
+
+def test_the_scan_adds_nothing_to_the_block_pass(case):
+    """Kernel scan against a float64 scan of the same (kernel) blocks:
+    under 1e-4 in every boundary quantity, where the bounds are 1e-4 to
+    2.5e-3 -- the error is the block pass's.  Measured <= 1.1e-5 on the
+    20-s problem and <= 3.6e-5 at 2 s."""
+    a, k = case["inputs"], case["kernel"]
+    kb, _ = _kernel_blocks(a, k[0], k[1])
+    got = _gpu_boundary(a, k[0], k[1])
+    want = bo.sqrt_scan([x.astype(np.float64) for x in kb], k[0], k[1],
+                        a["cot"], dt=np.float64)
+    err = _errors(got, want)
+    assert max(err) < 1e-4, err
+    # the structure the backward relies on
+    assert np.array_equal(got[0][:, 0], k[0][:, 0])
+    assert np.array_equal(got[1][:, 0], k[1][:, 0])
+    assert not np.any(got[2][:, -1]) and not np.any(got[3][:, -1]), \
+        "the last block's seed is zero"
+    entry = _gpu_boundary(a, k[0], k[1], seeds=False)
+    assert all(np.array_equal(entry[i], got[i]) for i in range(2)), \
+        "the entry-only variant must give the same entry states"
+
+
+def test_the_new_boundary_meets_the_bounds(case):
+    """`q_factor`, `sqrt_blocks`, `sqrt_scan` -- all on the GPU, from the
+    kernel's own (dense, float32-wrong) entry states, as stage 4 will run
+    them."""
+    a, k = case["inputs"], case["kernel"]
+    _check_bounds(_gpu_boundary(a, k[0], k[1]), case["exact"])
+
+
+def test_the_new_boundary_gives_the_kernel_backward_a_good_gradient(case):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with bo.boundary_from(
+                lambda inputs, kernel: _gpu_boundary(inputs, *kernel[:2])), \
+                mx.stream(mx.gpu):
+            g = np.array(mx.grad(lambda u: case["gp"](u).sum())(
+                mx.array(case["V"], dtype=mx.float32)))
+    e = _grad_sigma(case, g)
+    assert e.max() < GRAD_SIGMA, f"per posterior sigma {np.round(e, 3)}"
+
+
+def test_the_new_boundary_is_per_chain(case):
+    """One thread per chain in the scan, per (chain, block) in the block
+    pass: a chain's boundary does not depend on its neighbours."""
+    a, k = case["inputs"], case["kernel"]
+    full = _gpu_boundary(a, k[0], k[1])
+    pt, qt, lag, inst, hv, rs, rr, j2 = a["mx"]
+    c = slice(1, 2)
+    one = dict(a, cot=a["cot"][c],
+               mx=(pt[c], qt[c], lag, inst, hv[c], rs[:, c], rr, j2[c]))
+    single = _gpu_boundary(one, k[0][c], k[1][c])
+    for f, s in zip(full, single):
+        np.testing.assert_array_equal(f[c], s)
+
+
+def test_one_block_enters_at_its_start_with_a_zero_seed():
+    n = 512
+    rng = np.random.default_rng(3)
+    t = np.arange(n) * DT
+    yerr = np.full(n, 1e-3)
+    term = ag.SHOTerm() + ag.SHOTerm()
+    y = sample_ssm(term, KP, DT, n, rng) + yerr * rng.standard_normal(n)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
+                          for i, x in enumerate(KP)], n_dim=len(KP))
+    gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None, metal_block=n))
+    a, k = _capture(gp, len(KP))
+    got = _gpu_boundary(a, k[0], k[1])
+    assert got[0].shape[1] == 1
+    assert np.array_equal(got[0], k[0]) and np.array_equal(got[1], k[1])
+    assert not np.any(got[2]) and not np.any(got[3])

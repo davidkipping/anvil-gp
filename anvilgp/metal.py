@@ -52,7 +52,7 @@ import mlx.core as mx
 from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
-           "entry_states", "replay_blocks", "q_factor", "sqrt_blocks",
+           "entry_states", "replay_blocks", "q_factor", "sqrt_blocks", "sqrt_scan",
            "backward_ckpt", "block_seeds_kernel",
            "metal_available", "MAX_STATE", "MAX_JITTER",
            "MAX_ADJOINT_BUFFER_BYTES"]
@@ -1892,35 +1892,42 @@ _SRC_SQRT_BLOCKS = """
     }
 """
 
-#: ``tria`` in place on ``X[MDIM][2 * MDIM]``: Householder reflections from
-#: the right zero row k beyond column k, leaving ``L = X[:, :M]`` lower
-#: triangular with ``L L^T`` = the original ``X X^T``; then each column is
-#: signed so the diagonal is non-negative.  A row already zero beyond its
-#: diagonal is left alone.
-_TRIA_X = """
-                for (uint k = 0; k < M; ++k) {
+def _tria_src(x: str, rows: str, cols: str) -> str:
+    """``tria`` in place on the array ``x`` (``rows`` x ``cols``, both MSL
+    expressions, ``rows <= cols``): Householder reflections from the right
+    zero row k beyond column k, leaving the first ``rows`` columns lower
+    triangular, ``L``, with ``L L^T`` the original ``x x^T``; then each
+    column is signed so the diagonal is non-negative.  A row already zero
+    beyond its diagonal is left alone.  Wrapped in its own scope."""
+    return f"""
+                {{
+                for (uint k = 0; k < {rows}; ++k) {{
                     float tail = 0.0f;
-                    for (uint j = k + 1; j < 2 * M; ++j) tail += X[k][j] * X[k][j];
+                    for (uint j = k + 1; j < {cols}; ++j) tail += {x}[k][j] * {x}[k][j];
                     if (tail == 0.0f) continue;
-                    float x0 = X[k][k];
+                    float x0 = {x}[k][k];
                     float nrm = metal::precise::sqrt(x0 * x0 + tail);
                     float al = (x0 >= 0.0f) ? -nrm : nrm;
                     float vk = x0 - al;
                     float tau = 1.0f / (nrm * (nrm + fabs(x0)));   // 2 / |v|^2
-                    for (uint i = k + 1; i < M; ++i) {
-                        float dt = X[i][k] * vk;
-                        for (uint j = k + 1; j < 2 * M; ++j) dt += X[i][j] * X[k][j];
+                    for (uint i = k + 1; i < {rows}; ++i) {{
+                        float dt = {x}[i][k] * vk;
+                        for (uint j = k + 1; j < {cols}; ++j) dt += {x}[i][j] * {x}[k][j];
                         float f = tau * dt;
-                        X[i][k] -= f * vk;
-                        for (uint j = k + 1; j < 2 * M; ++j) X[i][j] -= f * X[k][j];
-                    }
-                    X[k][k] = al;
-                    for (uint j = k + 1; j < 2 * M; ++j) X[k][j] = 0.0f;
-                }
-                for (uint k = 0; k < M; ++k)
-                    if (X[k][k] < 0.0f)
-                        for (uint i = k; i < M; ++i) X[i][k] = -X[i][k];
+                        {x}[i][k] -= f * vk;
+                        for (uint j = k + 1; j < {cols}; ++j) {x}[i][j] -= f * {x}[k][j];
+                    }}
+                    {x}[k][k] = al;
+                    for (uint j = k + 1; j < {cols}; ++j) {x}[k][j] = 0.0f;
+                }}
+                for (uint k = 0; k < {rows}; ++k)
+                    if ({x}[k][k] < 0.0f)
+                        for (uint i = k; i < {rows}; ++i) {x}[i][k] = -{x}[i][k];
+                }}
 """
+
+
+_TRIA_X = _tria_src("X", "M", "2 * M")
 
 _sqrt_block_kernels: dict = {}
 
@@ -1968,6 +1975,315 @@ def sqrt_blocks(phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
         output_shapes=shapes, output_dtypes=[mx.float32] * 5,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1)))
+
+
+#: The square-root boundary's scan: one thread per chain, over its block
+#: elements from `sqrt_blocks`.  docs/boundary-plan.md, stage 3; NumPy
+#: reference ``tests/boundary_oracle.py::sqrt_scan``.
+#:
+#: A prefix gives each block's entry state, ``start_m[k] + b`` and
+#: ``U U^T`` of the composition of blocks 0..k-1 (block k's input is
+#: relative to its own start state, which is where `sqrt_blocks` put the
+#: previous block's output).  It carries only ``(b, U)``: block 0 has
+#: ``A``, ``eta``, ``Z`` exactly zero, and composing onto it keeps them so,
+#: as in the dense prefix.  Then a suffix, backward, carries ``(eta, Z)``,
+#: and block k's seed is formed when the suffix holds blocks k+1.. --
+#: from it and the prefix through block k, the closed form of
+#: `adjoint.block_seeds` -- so no suffix is stored.
+#:
+#: Each composition of ``i`` then ``j`` (Yaghoobi et al. 2022):
+#: ``Xi = tria([[U_i^T Z_j, I], [Z_j, 0]])``, 2m x 2m, splits into
+#: ``X11``, ``X21``, ``X22``, and
+#:
+#:     (I + C_i J_j)^-1 v = v - U_i X11^-T X21^T v
+#:     (I + J_j C_i)^-1 v = v - X21 X11^-1 U_i^T v
+#:     b  = A_j (I + C_i J_j)^-1 (b_i + U_i U_i^T eta_j) + b_j
+#:     U  = tria([A_j U_i X11^-T, U_j])
+#:     eta = A_i^T (I + J_j C_i)^-1 (eta_j - Z_j Z_j^T b_i) + eta_i
+#:     Z  = tria([A_i^T X22, Z_i])
+#:
+#: ``X11 X11^T = I + U_i^T J_j U_i``, so it has a diagonal >= 1 and its
+#: triangular solves are safe.  The seed of a block exiting at ``(mu, U)``
+#: into a suffix ``(eta_s, Z_s)``: with ``d = eta_s - Z_s Z_s^T mu`` and
+#: ``r = (I + J_s C)^-1 d``, ``m_bar = cot r`` and ``P_bar = cot (r r^T -
+#: X22 X22^T) / 2``; ``X22 X22^T = (I + J_s C)^-1 J_s``.
+_SQRT_XI = """
+            // Xi = tria([[UI^T ZJ, I], [ZJ, 0]]) -> X11, X21, X22
+            float XI[2 * MDIM][2 * MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint t = 0; t < M; ++t) a += UI[t][i] * ZJ[t][j];
+                    XI[i][j] = a;
+                    XI[i][M + j] = (i == j) ? 1.0f : 0.0f;
+                    XI[M + i][j] = ZJ[i][j];
+                    XI[M + i][M + j] = 0.0f;
+                }
+            TRIA_XI
+"""
+
+#: ``w = X11^-1 v`` (forward) and ``w = X11^-T v`` (backward), in place on
+#: ``w`` holding ``v``.  ``X11 = XI[:M, :M]``, lower triangular.
+_X11_SOLVE = """
+            for (uint i = 0; i < M; ++i) {
+                float a = WV[i];
+                for (uint t = 0; t < i; ++t) a -= XI[i][t] * WV[t];
+                WV[i] = a / XI[i][i];
+            }"""
+_X11T_SOLVE = """
+            for (int ii = (int)M - 1; ii >= 0; --ii) {
+                uint i = (uint)ii;
+                float a = WV[i];
+                for (uint t = i + 1; t < M; ++t) a -= XI[t][i] * WV[t];
+                WV[i] = a / XI[i][i];
+            }"""
+
+_SRC_SQRT_SCAN = """
+    uint chain = thread_position_in_grid.x;
+    if (chain >= (uint)n_chains) return;
+    const uint M = MDIM;
+    uint base = chain * (uint)n_blocks;
+
+    // ---- prefix: (b, U) through blocks 0..k; entry of block k from 0..k-1
+    float pb[MDIM], PU[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        ent_m[base * M + i] = start_m[base * M + i];
+        pb[i] = in_b[base * M + i];
+        pre_b[base * M + i] = pb[i];
+        for (uint j = 0; j < M; ++j) {
+            ent_C[(base * M + i) * M + j] = start_C[(base * M + i) * M + j];
+            PU[i][j] = in_U[(base * M + i) * M + j];
+            pre_U[(base * M + i) * M + j] = PU[i][j];
+        }
+    }
+    for (uint k = 1; k < (uint)n_blocks; ++k) {
+        uint ov = (base + k) * M, om = (base + k) * M * M;
+        for (uint i = 0; i < M; ++i) {
+            ent_m[ov + i] = start_m[ov + i] + pb[i];
+            for (uint j = 0; j < M; ++j) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += PU[i][t] * PU[j][t];
+                ent_C[om + i * M + j] = a;
+            }
+        }
+        float UI[MDIM][MDIM], ZJ[MDIM][MDIM], AJ[MDIM][MDIM], UJ[MDIM][MDIM];
+        float bj[MDIM], ej[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            bj[i] = in_b[ov + i]; ej[i] = in_eta[ov + i];
+            for (uint j = 0; j < M; ++j) {
+                UI[i][j] = PU[i][j];
+                ZJ[i][j] = in_Z[om + i * M + j];
+                AJ[i][j] = in_A[om + i * M + j];
+                UJ[i][j] = in_U[om + i * M + j];
+            }
+        }
+        SQRT_XI
+        // v = b_i + U_i U_i^T eta_j ; g = (I + C_i J_j)^-1 v
+        float ue[MDIM], vv[MDIM], WV[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint t = 0; t < M; ++t) a += UI[t][i] * ej[t];
+            ue[i] = a;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float a = pb[i];
+            for (uint t = 0; t < M; ++t) a += UI[i][t] * ue[t];
+            vv[i] = a;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint t = 0; t < M; ++t) a += XI[M + t][i] * vv[t];   // X21^T v
+            WV[i] = a;
+        }
+        X11T_SOLVE
+        for (uint i = 0; i < M; ++i) {
+            float a = vv[i];
+            for (uint t = 0; t < M; ++t) a -= UI[i][t] * WV[t];
+            ue[i] = a;                                                // g
+        }
+        // b <- A_j g + b_j ;  W = A_j U_i X11^-T, row by row: X11 w^T = (A_j U_i)^T
+        float X[MDIM][2 * MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = bj[i];
+            for (uint t = 0; t < M; ++t) a += AJ[i][t] * ue[t];
+            pb[i] = a;
+            for (uint j = 0; j < M; ++j) {
+                float c = 0.0f;
+                for (uint t = 0; t < M; ++t) c += AJ[i][t] * UI[t][j];
+                WV[j] = c;
+            }
+            X11_SOLVE
+            for (uint j = 0; j < M; ++j) { X[i][j] = WV[j]; X[i][M + j] = UJ[i][j]; }
+        }
+        TRIA_X
+        for (uint i = 0; i < M; ++i) {
+            pre_b[ov + i] = pb[i];
+            for (uint j = 0; j < M; ++j) {
+                PU[i][j] = X[i][j];
+                pre_U[om + i * M + j] = X[i][j];
+            }
+        }
+    }
+//SEEDS{
+    // ---- suffix, backward; the seed of block k when it holds blocks k+1..
+    float cotv = cot[chain];
+    float sZ[MDIM][MDIM], se[MDIM];
+    for (uint i = 0; i < M; ++i) { se[i] = 0.0f; for (uint j = 0; j < M; ++j) sZ[i][j] = 0.0f; }
+    for (int kk = (int)n_blocks - 1; kk >= 0; --kk) {
+        uint k = (uint)kk;
+        uint ov = (base + k) * M, om = (base + k) * M * M;
+        float UI[MDIM][MDIM], ZJ[MDIM][MDIM], mu[MDIM];
+        {
+            for (uint i = 0; i < M; ++i) {
+                mu[i] = pre_b[ov + i];
+                for (uint j = 0; j < M; ++j) { UI[i][j] = pre_U[om + i * M + j]; ZJ[i][j] = sZ[i][j]; }
+            }
+            SQRT_XI
+            // d = eta_s - Z_s Z_s^T mu ; r = d - X21 X11^-1 U^T d
+            float zm[MDIM], dv[MDIM], WV[MDIM], rv[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += ZJ[t][i] * mu[t];
+                zm[i] = a;
+            }
+            for (uint i = 0; i < M; ++i) {
+                float a = se[i];
+                for (uint t = 0; t < M; ++t) a -= ZJ[i][t] * zm[t];
+                dv[i] = a;
+            }
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint t = 0; t < M; ++t) a += UI[t][i] * dv[t];
+                WV[i] = a;
+            }
+            X11_SOLVE
+            for (uint i = 0; i < M; ++i) {
+                float a = dv[i];
+                for (uint t = 0; t < M; ++t) a -= XI[M + i][t] * WV[t];
+                rv[i] = a;
+            }
+            for (uint i = 0; i < M; ++i) {
+                seed_m[ov + i] = cotv * rv[i];
+                for (uint j = 0; j < M; ++j) {
+                    float jt = 0.0f;
+                    for (uint t = 0; t < M; ++t) jt += XI[M + i][M + t] * XI[M + j][M + t];
+                    seed_C[om + i * M + j] = 0.5f * cotv * (rv[i] * rv[j] - jt);
+                }
+            }
+        }
+        if (k == 0) break;          // nothing composes onto block 0's suffix
+        // absorb block k: i = block k, j = the suffix
+        float AI[MDIM][MDIM], ZI[MDIM][MDIM], bi[MDIM], ei[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            bi[i] = in_b[ov + i]; ei[i] = in_eta[ov + i];
+            for (uint j = 0; j < M; ++j) {
+                UI[i][j] = in_U[om + i * M + j];
+                AI[i][j] = in_A[om + i * M + j];
+                ZI[i][j] = in_Z[om + i * M + j];
+                ZJ[i][j] = sZ[i][j];
+            }
+        }
+        SQRT_XI
+        // d = eta_s - Z_s Z_s^T b_i ; h = d - X21 X11^-1 U_i^T d
+        float zm[MDIM], dv[MDIM], WV[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint t = 0; t < M; ++t) a += ZJ[t][i] * bi[t];
+            zm[i] = a;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float a = se[i];
+            for (uint t = 0; t < M; ++t) a -= ZJ[i][t] * zm[t];
+            dv[i] = a;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float a = 0.0f;
+            for (uint t = 0; t < M; ++t) a += UI[t][i] * dv[t];
+            WV[i] = a;
+        }
+        X11_SOLVE
+        for (uint i = 0; i < M; ++i) {
+            float a = dv[i];
+            for (uint t = 0; t < M; ++t) a -= XI[M + i][t] * WV[t];
+            zm[i] = a;                                               // h
+        }
+        // eta <- A_i^T h + eta_i ;  Z <- tria([A_i^T X22, Z_i])
+        float X[MDIM][2 * MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = ei[i];
+            for (uint t = 0; t < M; ++t) a += AI[t][i] * zm[t];
+            se[i] = a;
+            for (uint j = 0; j < M; ++j) {
+                float c = 0.0f;
+                for (uint t = 0; t < M; ++t) c += AI[t][i] * XI[M + t][M + j];
+                X[i][j] = c;
+                X[i][M + j] = ZI[i][j];
+            }
+        }
+        TRIA_X
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) sZ[i][j] = X[i][j];
+    }
+//SEEDS}
+"""
+
+_sqrt_scan_kernels: dict = {}
+
+
+def _region_src(src: str, tag: str, keep: bool) -> str:
+    """Keep or drop the ``//TAG{`` ... ``//TAG}`` regions of a source."""
+    out, on = [], True
+    for line in src.split("\n"):
+        t = line.strip()
+        if t == f"//{tag}{{":
+            on = keep
+        elif t == f"//{tag}}}":
+            on = True
+        elif on:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _sqrt_scan_kernel(m: int, seeds: bool):
+    key = (m, bool(seeds))
+    if key not in _sqrt_scan_kernels:
+        body = (_region_src(_SRC_SQRT_SCAN, "SEEDS", seeds)
+                .replace("SQRT_XI", _SQRT_XI)
+                .replace("TRIA_XI", _tria_src("XI", "2 * M", "2 * M"))
+                .replace("TRIA_X", _TRIA_X)
+                .replace("X11T_SOLVE", _X11T_SOLVE)
+                .replace("X11_SOLVE", _X11_SOLVE))
+        outs = ["ent_m", "ent_C", "pre_b", "pre_U"]
+        if seeds:
+            outs += ["seed_m", "seed_C"]
+        _sqrt_scan_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_sqrt_scan_m{m}" + ("" if seeds else "_entry"),
+            input_names=["in_A", "in_b", "in_U", "in_eta", "in_Z",
+                         "start_m", "start_C", "cot", "n_blocks", "n_chains"],
+            output_names=outs, source=body.replace("MDIM", str(m)))
+    return _sqrt_scan_kernels[key]
+
+
+def sqrt_scan(blocks, start_m, start_C, cot=None):
+    """Entry states, and seeds if ``cot`` is given, from `sqrt_blocks`'
+    elements: ``(ent_m, ent_C)`` or ``(ent_m, ent_C, seed_m, seed_C)``,
+    each ``(n_chains, n_blocks, m[, m])``, as :func:`block_seeds_kernel`
+    returns them.  ``start_m``, ``start_C``: the start states the blocks
+    were centred on.  One thread per chain; see `_SRC_SQRT_SCAN`.
+    """
+    A, b, U, eta, Z = blocks
+    n_chains, n_blocks, m = b.shape
+    seeds = cot is not None
+    vec, mat = (n_chains, n_blocks, m), (n_chains, n_blocks, m, m)
+    shapes = [vec, mat, vec, mat] + ([vec, mat] if seeds else [])
+    if cot is None:
+        cot = mx.zeros((n_chains,), dtype=mx.float32)
+    outs = _sqrt_scan_kernel(m, seeds)(
+        inputs=[A, b, U, eta, Z, start_m, start_C, cot,
+                int(n_blocks), int(n_chains)],
+        output_shapes=shapes, output_dtypes=[mx.float32] * len(shapes),
+        grid=(n_chains, 1, 1), threadgroup=(min(64, n_chains), 1, 1))
+    return (outs[0], outs[1], outs[4], outs[5]) if seeds else (outs[0], outs[1])
 
 
 def metal_available() -> bool:

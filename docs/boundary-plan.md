@@ -1,6 +1,6 @@
 # Plan: the kernel's block boundaries in the square-root information form
 
-Status: agreed 2026-10-25; stages 0-2 done 2026-10-25.
+Status: agreed 2026-10-25; stages 0-3 done 2026-10-25.
 
 ## The problem
 
@@ -48,7 +48,7 @@ the backward, unchanged.
 | 0 | Oracle and red tests | 0.5-1 day, **done** |
 | 1 | Q factor table, a small Metal kernel (Cholesky, pivots clamped at 0, no floor) | 0.5 day, **done** |
 | 2 | Centred square-root block pass, one thread per (chain, block); rank-1 leaf update | 2 days, **done** |
-| 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days |
+| 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days, **done** |
 | 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day |
 | 5 | Measure on a quiet machine: README timings, watchdog at m = 4, the exposure matrix (m = 2-4, gapped and 2-s cadences), then ChEES | 1 day + machine time |
 | 6 | Docs and README | 0.5 day |
@@ -177,3 +177,31 @@ of them.
 Cost and the m = 4 watchdog: not measured (stage 5). The thread carries
 the replay's state as well as the element, so register pressure at m = 4
 is the risk.
+
+## Stage 3: what it found (2026-10-25)
+
+`metal.sqrt_scan`, one thread per chain over its block elements: a prefix
+carrying `(b, U)` emits each block's entry state, and a backward suffix
+carrying `(eta, Z)` forms each block's seed as it passes, so nothing but
+the prefix is stored. Each composition takes one `2m x 2m` Householder
+`tria` and triangular solves with `X11`, whose diagonal is >= 1. An
+entry-only variant (no `cot`) drops the suffix, for the forward. Not
+wired in yet.
+
+The scan adds nothing measurable. Against a float64 scan of the same
+kernel blocks it is within 1.1e-5 on the 20-s problem and 3.6e-5 at 2 s
+(the NumPy float32 scan: 3.0e-6 and 9.4e-6), and against the exact
+filter it reproduces the NumPy scan's numbers to two digits: entry means
+/ covariances / seeds 3.3e-4 / 1.8e-5 / 2.6e-4 at 16 x 256 and 1.6e-4 /
+2.7e-5 / 1.0e-3 at 4 x 1024 -- the block pass's error, carried through.
+
+**The whole new boundary now runs on the GPU** (`q_factor`,
+`sqrt_blocks`, `sqrt_scan`, from the dense kernel's entry states): inside
+the bounds, and the kernel's own backward from it is inside 0.5 posterior
+sigma at all 16 draws, at both block lengths. Pinned in
+`tests/test_boundary.py`, with the structure the backward relies on
+(block 0 enters at its start, the last seed is exactly zero, the
+entry-only variant agrees bit for bit), per-chain independence, and a
+single block. Mutation-checked: five defects in the scan (the prefix's
+`U U^T eta` term, `X11^-T` swapped for `X11^-1`, the seed's `X22 X22^T`,
+the suffix's `(I + J C)^-1`, its `Z` update) each fail 4-6 tests.
