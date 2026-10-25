@@ -474,6 +474,69 @@ removes the large numbers instead of storing them more carefully.
    the table above silently did its "float64" stages in float32 and
    showed no effect from any of them.
 
+   **The square-root information form, with centring: prototyped, and it
+   works (2026-10-24).** Carry `C = U U^T` and `J = Z Z^T` as triangular
+   factors (the square-root parallel filter of Yaghoobi, Corenflos, Hassan
+   and Sarkka, 2022): every `(I + C_i J_j)^-1` comes from one QR ("tria")
+   of `[[U_i^T Z_j, I], [Z_j, 0]]`, and the composed `U`, `Z` are rebuilt
+   by QR, so both stay PSD and carry the square root of the dense form's
+   condition number. Leaves use the standard square-root measurement
+   update, `tria([[sqrt(r), h L_Q], [0, L_Q]])` with `L_Q L_Q^T = Q`.
+   Dense and square-root algebra side by side in the same NumPy float32
+   code (LAPACK `sgeqrf` / `sgesv`), the kernel's sequential in-block
+   fold, same problem and draws as above; float64 runs of both reproduce
+   the exact entry states (1e-10; 1e-8 with `L_Q` stored in float32):
+
+   | elements, float32 | 16 x 256 | 4 x 1024 | entry means | entry covariances |
+   |---|---|---|---|---|
+   | dense, plain | 3.9 / 2.7 | 13.3 / 11.9 | 17-24% | 3-4% |
+   | dense, centred | 1.4 / 1.4 | 4.4 / 3.8 | 2-5% | 3-4% |
+   | square-root, plain | 6.0 / 4.9 | 4.6 / 4.4 | 13-15% | **8e-6** |
+   | **square-root, centred** | **0.12 / 0.08** | **0.17 / 0.19** | **4-7e-4** | **8e-6** |
+   | exact entry states and seeds | 0.37 / 0.05 | 0.33 / 0.08 | -- | -- |
+
+   (These draws differ from the tables above: fixing `floor_exposure.hi`
+   moved the Hessian behind `posterior_draws`. At these draws the float32
+   backward itself, from exact boundary quantities, carries up to 0.37.)
+   The square-root form fixes the covariances, ~5000x; centring fixes the
+   means, where `eta_j - J_j b_i` still cancels; each alone fails.
+
+   Against one block, at 256 draws from the converged ChEES posterior (the
+   test that exposed the 11-18 sigma tail), median / 99th percentile /
+   worst, the two amplitudes:
+
+   | | 16 x 256 | 4 x 1024 |
+   |---|---|---|
+   | kernel as is | 0.14 / 5.4 / 6.1 | 1.05 / 30 / 54 |
+   | **square-root, centred** | **0.024 / 0.62 / 1.05** | **0.022 / 0.32 / 0.55** |
+
+   And the value replayed from the new entry states, at 128 of those draws
+   against float64: sd 0.025 (worst 0.19) at 16 x 256 and 0.021 (0.14) at
+   4 x 1024, against 0.081 (0.77) for the kernel and 0.023 (0.13) for one
+   block -- the short-block value problem goes with it.
+
+   **What a kernel can do.** The table centres the first leaf of each
+   block on the previous block's trajectory end, which belongs to another
+   thread. The *block-local* form centres each block on its own start
+   state and moves the boundary mismatch into the previous block's
+   *output* offset (`b` only; `eta`, `J` untouched), and is as good --
+   0.12 / 0.10 and 0.16 / 0.18 -- **provided the start states are already
+   approximately right**: from the existing kernel's entry states, or the
+   uncentred square-root ones. From zero it fails (5.9 sigma) until a
+   second round. A second round from a good start buys nothing. Factoring
+   `Q` by float32 Cholesky instead of a float64 eigendecomposition changes
+   nothing here (0.05 / 0.08, 0.19 / 0.21; `Q`'s eigenvalues at 20 s run
+   down to 1e-9), though denser cadences will need the relative floor.
+
+   So the kernel pipeline becomes: today's pass 1 and prefix (approximate
+   entry states) -> one centred square-root pass, the replay fused with
+   the fold, block-local -> square-root prefix and suffix over the block
+   elements, with the output shifts -> entry states and seeds -> the value
+   replay and the backward, unchanged. One extra sweep of the data plus a
+   heavier fold; cost not measured. Not yet confirmed by a ChEES run,
+   which needs the kernel (the prototype is far too slow to sample with).
+   Reference implementation: `benchmarks/boundary_prototype.py`.
+
    Ruled out, measured: the term front end (chaining the kernel's per-lag
    adjoints to theta in float64 changes nothing), and the per-lag and `dh`
    accumulators (Kahan compensation changes nothing). Refining the seeds

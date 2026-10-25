@@ -597,7 +597,10 @@ marked as an estimate.
   s/e = 100 SHO + SHO problem had not converged after 2000 warmup (R-hat
   1.6-1.7, ~10x fewer ESS per gradient) where one block converged in 300.
   Posteriors stay unbiased. Workaround: `GPPolicy(metal_block=N)` up to
-  8192. Table and plan: [docs/float32.md](docs/float32.md), section 7.
+  8192. Fix prototyped, not built: boundary quantities in the square-root
+  information form, centred on a float32 replay, bring both block sizes to
+  the one-block level (`benchmarks/boundary_prototype.py`). Table and
+  plan: [docs/float32.md](docs/float32.md), section 7.
 * **The default MLX gradient at N ~ 1e5.** It fails with
   `[metal::malloc] Resource limit (499000) exceeded` (Metal's limit on live
   buffers, not memory): uncompiled at N = 114k for one chain of a single
