@@ -565,8 +565,9 @@ before comparing against your own.
 costs 7.3 ms at 256 chains and 11.5 ms at 1024 — four times the chains for 1.6
 times the time. Small problems are bound by op count, not by data, so the GPU
 is idle most of the step and extra chains ride along nearly free. Use
-`block = 4096` and the default `sub_block = 16` unless you are below
-N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
+`block = 4096` and the default `sub_block` (32 up to m = 6) unless you are
+below N ~ 2000, where a smaller one shaves a few sequential stages at some
+float32 accuracy.
 
 **The `GPPolicy` knobs**, and when to touch them:
 
@@ -576,11 +577,11 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 | `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3 and 256 at m >= 4) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
-| `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
+| `sub_block` | `None` (32 up to m = 6, 64 above) | below N ~ 2000, try 8-16 for speed, at some float32 accuracy (16 is 3.7x less accurate than 32 at sigma/yerr = 30). |
 | `eval_blocks` | `False` | you are memory-bound and can give up `mx.compile`. The `.hi` path sets it itself. |
 | `blocked` | `None` (measured) | you have profiled both and disagree with `use_blocked_leaves`. |
 | `hi_chain_block` / `hi_block` | 64 / 1024 | the float64 reference pass runs out of memory. |
-| `s_floor_rel` | `1e-6` | essentially never: it defines what a positive-definiteness failure means. |
+| `s_floor_rel` | `1e-6` | never: since `h Q h^T` is clamped at zero on its own the floor cannot bind below 1, and values >= 1 are refused (they would change the value without the kernel gradient following). |
 
 ### What is left, and what it is worth
 
@@ -998,7 +999,7 @@ Three more are worked around and pinned as regression tests
 python -m venv .venv
 .venv/bin/pip install -e ".[test]"        # mlx, numpy; celerite2, mpmath, scipy for tests
 .venv/bin/pip install -e ../anvil         # for the engine integration only
-.venv/bin/python -m pytest tests -q       # 779 tests, ~9.5 min; -m 'not slow' is faster
+.venv/bin/python -m pytest tests -q       # ~900 tests, ~12 min; -m 'not slow' is faster
 .venv/bin/python examples/gp_injection_recovery.py
 ```
 

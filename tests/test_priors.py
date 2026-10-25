@@ -323,3 +323,43 @@ def test_u0_prior_units_leave_mean_columns_in_u():
     assert sd[0] == 1.0 and len(sd) == gt.transform.dim
     with pytest.raises(ValueError, match="units"):
         gt.u0(4, units="sigma")
+
+
+def test_a_convolved_term_gets_the_wrapped_terms_defaults_and_order():
+    """`default_hypers` raised TypeError on a `TermConvolution`, so
+    `make_target` could not take one, and `auto_order_groups` returned []
+    for a convolved sum -- k! label-switching modes, silently.  The
+    convolution keeps the wrapped term's parameters, so both unwrap."""
+    from anvilgp.priors import auto_order_groups, default_hypers
+    n = 800
+    t = np.arange(n) * (2 / 1440)
+    rng = np.random.default_rng(0)
+    y = rng.standard_normal(n) * 0.01
+    yerr = np.full(n, 0.005)
+    for inner in (ag.SHOTerm(), ag.SHOTerm() + ag.SHOTerm(),
+                  ag.RotationTerm()):
+        conv = ag.TermConvolution(inner, 2 / 1440)
+        a = default_hypers(conv, t, y, yerr, period_ref=3.0)
+        b = default_hypers(inner, t, y, yerr, period_ref=3.0)
+        assert [(h.name, h.ref, h.lo, h.hi) for h in a] == \
+               [(h.name, h.ref, h.lo, h.hi) for h in b]
+        assert auto_order_groups(conv) == auto_order_groups(inner)
+    assert auto_order_groups(
+        ag.TermConvolution(ag.SHOTerm() + ag.SHOTerm(), 0.001)) == [[1, 4]]
+
+
+def test_make_target_takes_a_convolved_term():
+    pytest.importorskip("anvil")
+    import warnings
+    from anvilgp.anvil import make_target
+    n = 800
+    t = np.arange(n) * (2 / 1440)
+    y = np.random.default_rng(0).standard_normal(n) * 0.01
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gt = make_target(ag.TermConvolution(ag.SHOTerm(), 2 / 1440), t, y,
+                         np.full(n, 0.005))
+    with mx.stream(mx.gpu):
+        lp = gt.target.log_prob(mx.array(gt.u0(8)))
+        mx.eval(lp)
+    assert np.all(np.isfinite(np.array(lp)))

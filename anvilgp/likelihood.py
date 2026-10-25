@@ -100,8 +100,10 @@ class GPPolicy:
     #: against expensive general ones: raising it cuts general compositions by
     #: the same factor, at the cost of more sequential steps over smaller
     #: batches.  The general composition costs ~13 m^3 against the fold's
-    #: ~3 m^3, so the optimum climbs with m -- measured at 1024 chains x
-    #: N = 1e4: 16 at m = 2 and 4, 32 at m = 6, 64 at m = 8.
+    #: ~3 m^3, so the speed optimum climbs with m (measured at 1024 chains
+    #: x N = 1e4: 16 at m = 2 and 4, 32 at m = 6, 64 at m = 8).  The default
+    #: is 32 up to m = 6 and 64 above, for accuracy: 32 is 3.7x more
+    #: accurate than 16 at no measurable cost (`_auto_sub_block`).
     #: See :func:`anvilgp.elements.chunked_reduce`; 1 recovers the pure tree.
     sub_block: int | None = None
     #: chains per tile of the float64 ``.hi`` pass.  Bit-identical at any
@@ -251,7 +253,17 @@ class KernelParam:
         if self.link == "log":
             return self.ref * exp_acc(col)
         if self.link == "logit":
-            return 1.0 / (1.0 + exp_acc(-col))
+            # sigmoid with no exp that can overflow: z = e^{-|v|} <= 1.  The
+            # textbook 1 / (1 + e^{-v}) has a float32 gradient of
+            # inf / inf = NaN past v ~ -89 (and loses it past ~ -44), which
+            # the guard zeroed -- a healthy value with a dead gradient.  |v|
+            # comes from a `where`, not `abs`, so the gradient at v = 0 is
+            # right (abs's is 0 there), and both branches stay finite, so
+            # the unselected one cannot leak a NaN through `where`'s VJP.
+            # exp_acc keeps the float64 path exact; mx.sigmoid is not.
+            neg_abs = mx.where(col >= 0, -col, col)
+            z = exp_acc(neg_abs)
+            return mx.where(col >= 0, 1.0 / (1.0 + z), z / (1.0 + z))
         if self.link == "linear":
             return self.ref + self.scale * col
         raise ValueError(f"unknown link {self.link!r}")
@@ -1229,8 +1241,23 @@ class GPLogLike:
             hqh = hqh + mx.sum(hb * (qb[:, 0] @ hb[..., None])[..., 0], -1)
             pb = hb if p_inf is None else (p_inf[b] @ hb[..., None])[..., 0]
             k0 = k0 + mx.sum(hb * pb, -1)
+        # A convolved term adds its zero-lag correction c to every
+        # observation (`Term.diag_correction`; the likelihood passes it in
+        # with the jitter).  It is white beyond the exposure, so it belongs
+        # in both halves: the zero-lag variance is k0 + c -- the exact
+        # convolved k(0), positive where the formal k0 = h P_inf h^T can be
+        # negative (P_inf is indefinite; kappa came out as low as -1e8 for
+        # an overdamped SHO and slipped past the refusal, which only refuses
+        # *above* kappa_max) -- and the one-step part is h Q h^T + c.  c runs
+        # from -2e5 r to +1e8 r over ordinary parameters, so omitting it was
+        # no rounding matter.
+        corr = self.term.diag_correction(kp)
+        if corr is not None:
+            k0 = k0 + corr[:, 0]
+            hqh = hqh + corr[:, 0]
         # h Q h^T can come out slightly negative in float32 (see the clamp
-        # in elements.py); it is a variance, so floor it at zero.
+        # in elements.py), and the formal one can be genuinely negative; the
+        # one-step variance it stands for is not, so floor it at zero.
         return k0 / (mx.maximum(hqh, 0.0) + mx.min(w, axis=-1))
 
     def _refuse_ill_conditioned(self, v: mx.array, out: mx.array,

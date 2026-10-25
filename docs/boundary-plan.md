@@ -630,3 +630,65 @@ asked for, and `make_target` gets the kernel.
 
 IV's scope is now m > 4, the only users the MLX path still serves by
 default.
+
+## V. Review remainder and a measurement pass (2026-10-25)
+
+**Fixed.**
+
+* *The logit link's dead gradient.* `1 / (1 + exp(-v))` had a float32
+  gradient of inf / inf = NaN past v ~ -89 (and 0 past ~ -44), which the
+  guard zeroed: a healthy value, a dead gradient. Now written with
+  `z = e^{-|v|} <= 1`, |v| taken by a `where` so the gradient at v = 0
+  stays 1/4 (an `abs` gives 0 there), `exp_acc` so float64 stays exact
+  (`mx.sigmoid` is float32-accurate in float64). Finite and accurate in
+  both dtypes from -120 to 120; the test fails on the old form with the
+  NaN.
+* *`TermConvolution` usability.* `default_hypers` raised `TypeError` on
+  one, so `make_target` could not take a convolved term, and
+  `auto_order_groups` returned `[]` for a convolved sum -- k!
+  label-switching modes without a word. Both unwrap now (the convolution
+  keeps the wrapped term's parameters); `seed_period` reaches a convolved
+  rotation through the same path.
+* *`kappa()` and the convolution's zero-lag correction.* `kappa()` left
+  `diag_correction` c out, and c runs from -2e5 r to +1e8 r over ordinary
+  parameters. Worse, without it the numerator was the formal
+  h P_inf h^T, which is negative for an overdamped SHO -- kappa as low as
+  -1e8, and a negative kappa slips past a refusal that only refuses above
+  `kappa_max`. With c in both halves (k0 + c, the exact convolved k(0);
+  max(h Q h^T + c, 0) + r) kappa is positive everywhere swept, within
+  1-1.3x of the unconvolved term's in typical cases, and equal to it as
+  the exposure shrinks.
+* *Docs.* float32.md rule 1 now names `TermConvolution` as its documented
+  exception, with the measured cost (A13); float32.md's compiled-gradient
+  section no longer opens "a hard MLX limit" and closes "cannot be caught"
+  around the text saying it was fixed (A6); the README's `sub_block`
+  default (16 -> 32, A4), test count (A9) and `s_floor_rel` row (A12).
+  Already fixed before this pass: A1-A3, A5, A7, A15; A10 waits for VIII;
+  A14 is a historical plan's figure.
+
+**Measured: the boundary's margin on two more data draws.** The 20-s,
+s/e = 100 problem with the data seed changed, 16 Laplace draws each:
+
+| data seed | blocks | entry means | seeds | gradient | dense gradient | exact boundary |
+|---|---|---|---|---|---|---|
+| 2 (the tests') | 16 x 256 / 4 x 1024 | 3.0e-4 / 2.6e-4 | 1.3e-4 / 1.1e-3 | 0.35 / 0.24 | 4.0 / 5.0 | 0.28 / 0.18 |
+| 3 | 16 x 256 / 4 x 1024 | 3.3e-4 / **1.7e-3** | 2.6e-4 / 2.1e-3 | **0.51 / 0.58** | 1.1 / 2.9 | 0.15 / 0.12 |
+| 4 | 16 x 256 / 4 x 1024 | 1.8e-4 / 1.6e-4 | 2.7e-4 / 9.4e-4 | 0.30 / 0.19 | 2.7 / 7.9 | 0.42 / 0.22 |
+
+All on the current code. Seed 2 reads 0.35 / 0.24 where stage 4 measured
+0.31 / 0.34: stage 5's rewrite of the QR moved rounding at the 1e-6 level
+(the VJP reuse was bit-identical), and a worst-of-16-draws statistic moves
+by ~0.1 sigma with that alone. The float32 backward's own floor, from
+exact boundaries, is itself 0.12-0.42 sigma depending on the draw.
+
+The acceptance bounds were set on one draw and do not all hold on
+another: seed 3 is over the 0.5 sigma gradient bound at both block
+lengths and over the entry-mean bound at 4 x 1024. That residual is the
+boundary's, not the backward's (exact boundaries give 0.12-0.15 there),
+and it splits between the float32 algebra -- the NumPy oracle leaves 0.41
+/ 0.34 -- and the Metal implementation's rounding, 1.2-1.7x on top. Since
+III, m = 4 always runs 256-point blocks, so the default's worst case
+measured is 0.51 sigma (dense: 1.1). Still 2-40x better than the dense
+boundary on every draw; not at the floor. Candidates if it matters: a
+compensated accumulation in `sqrt_blocks`' fold products, or a second
+centring round (which bought nothing on seed 2).

@@ -8,7 +8,13 @@ a hard requirement, not a contingency, and each is pinned by a test.
 
 ## 1. Process noise via `expm1`, never by difference
 
-`Q(dt) = P_inf - Phi P_inf Phi^T` is **forbidden**. Expand it for the SHO at
+`Q(dt) = P_inf - Phi P_inf Phi^T` is **forbidden** -- with one documented
+exception: `TermConvolution` forms its `Q` this way, because its `P_inf` is
+a matrix function of the generator with no closed-form difference. Measured,
+that costs nothing visible on data drawn from the model (3e-3 log-units
+against 3e-4 to 1e-2 for an unconvolved SHO at matched kappa, delta/rho >=
+0.0025) and 50-100x the unconvolved term's float32 error on data far
+off-model; see docs/kernels.md. Expand it for the SHO at
 `omega_0 dt << 1` and three `O(omega_0 dt)` terms cancel to
 `O((omega_0 dt)^3)`. Measured, at `omega_0 dt = 1e-3` in float32 the
 difference form returns 1.79e-7 where the answer is 5.50e-8 — **225% wrong**.
@@ -666,9 +672,11 @@ At N = 1024 against a dense float64 Cholesky the float32 GPU path is within
 differences to 0.14% relative — uniform across components, i.e. float32
 rounding rather than a defect.
 
-## Compiled gradients: a hard MLX limit
+## Compiled gradients: fixed 2026-09-27
 
-`mx.compile` over the **backward** pass of the whole likelihood fails for
+**Resolved; the history follows** (the README's "Resolved: compiled
+gradients" is the short version). `mx.compile` over the **backward** pass
+of the whole likelihood failed for
 m ≥ 2 with *"Too many inputs/outputs fused in the Metal Compiled
 primitive which exhausted the available argument buffers for the kernel"*.
 MLX fuses a long dependent elementwise chain into one Metal kernel with
@@ -724,12 +732,11 @@ function is rejected outright with a different error, so eval placement was
 never the difference.)
 
 M4's backward kernel was expected to be the proper fix, replacing this
-graph with a hand VJP. It was not: the kernel path aborts identically,
-because the group MLX over-fuses is `terms._sho_matrices`, which the kernel
-consumes rather than replaces (a `RealTerm`, whose front end is trivial,
-compiles its gradient on both paths). Splitting the VJP at the term-matrix
-table is the remaining route. The failure is a process abort from inside
-Metal, not a Python exception, so it cannot be caught.
+graph with a hand VJP. It was not: the kernel path failed identically,
+because the group MLX over-fuses is in `terms._sho_matrices`, which the
+kernel consumes rather than replaces (a `RealTerm`, whose front end is
+trivial, compiled its gradient on both paths). Both of those were
+superseded by the `sincm1_series` fix above.
 
 ## MLX behaviours worked around
 

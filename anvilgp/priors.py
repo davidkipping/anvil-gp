@@ -55,7 +55,7 @@ import numpy as np
 
 from .likelihood import KernelParam, ParamMap
 from .terms import (Matern32Term, Matern52Term, RealTerm, RotationTerm,
-                    SHOTerm, Term, TermSum)
+                    SHOTerm, Term, TermConvolution, TermSum)
 
 __all__ = ["Hyper", "SpecHint", "default_hypers", "build_param_map",
            "make_log_prior", "periodogram_period", "data_references",
@@ -143,6 +143,10 @@ def default_hypers(term: Term, t, y, yerr, prefix: str = "gp",
     peak from :func:`periodogram_period` so the chains start inside one
     harmonic rather than spread over P, P/2 and 2P.
     """
+    if isinstance(term, TermConvolution):
+        # Exposure time rescales the amplitudes and leaves every parameter
+        # the wrapped term's, so its defaults are the wrapped term's.
+        return default_hypers(term.term, t, y, yerr, prefix, period_ref)
     ref = data_references(t, y, yerr)
     if isinstance(term, TermSum):
         out: list[Hyper] = []
@@ -238,6 +242,10 @@ def auto_order_groups(term: Term) -> list[list[int]]:
     and the timescale is ``rho_prev * (1 + exp(v))``.  At ``v = 0`` the
     ratio is exactly 2 whatever unit the epochs are in.
     """
+    if isinstance(term, TermConvolution):
+        # the convolution wraps the whole sum and keeps its parameter order
+        # (it returned [] here, silently leaving k! label-switching modes)
+        term = term.term
     if not isinstance(term, TermSum):
         return []
     by_type: dict = {}

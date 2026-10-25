@@ -1041,3 +1041,60 @@ def test_the_convolved_diagonal_correction_is_not_dead():
     assert float(np.max(np.abs(g_on - g_off))
                  / np.max(np.abs(g_on))) > 1e-4, (
         "the correction does not move the gradient -- it is detached")
+
+
+def test_the_logit_link_has_a_finite_accurate_gradient_everywhere():
+    """`1 / (1 + exp(-v))` had a float32 gradient of NaN past v ~ -89 and
+    of 0 past ~ -44; the guard turned the NaN into 0, so a chain pushed
+    there by warmup kept a healthy value with a dead gradient.  Checked in
+    both dtypes against sigma (1 - sigma) in float64, including v = 0,
+    where an `abs`-based form gets 0."""
+    from anvilgp.likelihood import KernelParam
+    kp = KernelParam(link="logit", index=0)
+    vs = np.array([-120.0, -89.0, -60.0, -20.0, -1e-3, 0.0, 1e-3, 20.0,
+                   60.0, 89.0, 120.0])
+    want_f = 1.0 / (1.0 + np.exp(-vs))
+    e = np.exp(-np.abs(vs))
+    want_g = e / (1.0 + e) ** 2       # not f (1 - f): that cancels for v > 0
+    for dt, stream, rtol in ((mx.float32, mx.gpu, 2e-6), (mx.float64, mx.cpu, 1e-14)):
+        with mx.stream(stream):
+            v = mx.array(vs[:, None], dtype=dt)
+            f = np.array(kp.apply(v))
+            g = np.array(mx.grad(lambda v: kp.apply(v).sum())(v))
+        assert np.all(np.isfinite(f)) and np.all(np.isfinite(g)), (dt, g)
+        tiny = np.finfo(np.float32 if dt == mx.float32 else np.float64).tiny
+        ok = want_g > 1e3 * tiny            # representable in this dtype
+        np.testing.assert_allclose(g[:, 0][ok], want_g[ok], rtol=rtol)
+        assert np.all(np.abs(g[:, 0][~ok]) <= 1e3 * tiny)
+        okf = want_f > 1e3 * tiny
+        np.testing.assert_allclose(f[:, 0][okf], want_f[okf], rtol=rtol)
+        assert np.all(np.abs(f[:, 0][~okf]) <= 1e3 * tiny)
+
+
+def test_kappa_of_a_convolved_term_counts_its_zero_lag_correction():
+    """A convolved term adds `diag_correction` c to every observation;
+    kappa left it out, so its numerator was the formal h P_inf h^T, which
+    is negative for an overdamped SHO (kappa down to -1e8, and a negative
+    kappa slips past a refusal that only refuses above kappa_max).  With c
+    in both halves kappa is positive, and tends to the unconvolved term's
+    as the exposure shrinks."""
+    from anvilgp.likelihood import KernelParam
+    dt, n = 0.02, 400
+    t = np.arange(n) * dt
+    y = np.random.default_rng(0).standard_normal(n)
+    p = [1.0, 0.5, 0.3]                          # overdamped SHO
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
+                          for i, x in enumerate(p)], n_dim=3)
+    V = np.random.default_rng(1).normal(0, 0.7, (64, 3))
+
+    def kappa(term, se):
+        gp = GPLogLike(None, t, None, y, np.full(n, 1.0 / se), term, pm,
+                       GPPolicy(metal=False, kappa_max=None))
+        with mx.stream(mx.cpu):
+            return np.array(gp.kappa(mx.array(V, dtype=mx.float64)))
+
+    for se in (10, 1000):
+        k = kappa(ag.TermConvolution(ag.SHOTerm(), dt), se)   # was < 0
+        assert np.all(k > 0), k.min()
+        small = kappa(ag.TermConvolution(ag.SHOTerm(), 1e-3 * dt), se)
+        np.testing.assert_allclose(small, kappa(ag.SHOTerm(), se), rtol=1e-3)
