@@ -461,3 +461,69 @@ gain nothing from this. README timings (`bench_reference.py`): value +
 gradient 9.9 ms at N = 1e4 and 75.9 ms at N = 1e5, 1024 chains. The
 m = 4, N = 1e5 row was killed by the GPU watchdog on both boundaries,
 as in the afternoon before this change, with the display in use.
+
+## Follow-on plan (agreed 2026-10-25)
+
+In execution order. Decision I is taken; VII is deferred until VI
+reports.
+
+I. **Flip the `metal` default -- agreed, after III.** `GPPolicy.metal`
+   becomes `None`, meaning the fused kernel wherever it is eligible and
+   the MLX path otherwise, with the existing warning and fallback. The
+   kernel is now the more accurate path on every row measured (value and
+   gradient), the only one whose gradient runs at N ~ 1e5, and 17-200x
+   faster; the one way the flip could make things worse is the watchdog,
+   so it waits for III. One line plus a docs and README pass; a one-time
+   message says which path was chosen.
+
+II. **Watchdog diagnosis.** One-hour budget, no estimate before it.
+   Reproduce the m = 4, N = 1e5, 256-chain kill with the display busy;
+   find which kernel dies, whether committing between passes
+   (`mx.eval`) saves it, whether the watchdog responds to per-thread
+   length or to total command-buffer time, and at what threshold. Output:
+   a note here and a go/no-go for III.
+
+III. **Watchdog guard.** Whatever II shows: separately committed passes,
+   chain chunking at the likelihood level, a lower m = 4 block cap, or a
+   combination. Pinned by a stress test under simulated display load.
+   Estimated after II; expected half a day to one day.
+
+IV. **The default MLX path's float32 floor** (docs/float32.md s7,
+   step 3): the kernel's replay fix at sub-block scale -- fold sub-blocks,
+   prefix, replay. After I the scope is m > 4, the only path left on the
+   MLX reduction. 1-2 days. Acceptance: `floor_exposure.py`'s MLX rows at
+   the kernel's level.
+
+V. **Review remainder and a measurement pass**, half a day: the logit
+   link's dead gradient past |v| ~ 88; `TermConvolution` gaps
+   (`make_target` / `default_hypers` reject it, `auto_order_groups`
+   returns nothing silently, `kappa()` omits the diagonal correction);
+   stale docs and A13; the seed margin (1.8e-3 against 2.5e-3)
+   re-measured on a second data draw.
+
+VI. **Size the convolved-term boundary gap.** Convolved terms keep the
+   dense boundary (decision 1), and that is not a corner: exposure-time
+   integration is the right model for Kepler long-cadence and TESS 2-min
+   fits, and the dense boundary failed for an unconvolved `RotationTerm`
+   at 2-min cadence, s/e 100 (3.9 sigma). Measure how indefinite Q is at
+   realistic lags for convolved SHO and Rotation terms and the dense
+   boundary's gradient error on a convolved Rotation at that cadence;
+   then estimate a hyperbolic (J-orthogonal) `tria`. Half a day of
+   measurement; the fix is estimated, not started.
+
+VII. **Resolve the forward cost against decision 3.** Deferred until VI.
+   Either keep `metal_boundary="dense"` as a documented speed option for
+   forward-only samplers (its value is still 5-30x better than the MLX
+   path's) or remove it after one release as agreed and accept the
+   forward's 1.7-2.8x. If the forward cost matters, the deterministic
+   alternative is a block-length gate for the value only (the value's
+   failure was short blocks only, measured); a data-dependent gate was
+   rejected above.
+
+VIII. **Regenerate docs/benchmarks.md** when the CPU is quiet. Under an
+   hour.
+
+Longer term, not scheduled: a square-root backward for the 2-s cadence
+floor (several days, partly research); removing `metal_boundary="dense"`
+per VII; the >= 100x gate against celerite2's 12-core pool, now ~13x on
+the forward.
