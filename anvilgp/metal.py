@@ -1868,12 +1868,15 @@ _SRC_SQRT_BLOCKS = """
                     vz[i] = za[i] * ira;
                 }
                 for (uint k = 0; k < M; ++k) {
+                    // branch-free: a zero pair rotates by the identity
                     float a = Zm[k][k], bb = vz[k];
                     float rr = metal::precise::sqrt(a * a + bb * bb);
-                    if (rr == 0.0f) continue;
-                    float cg = a / rr, sg = bb / rr;
-                    Zm[k][k] = rr;
-                    for (uint i = k + 1; i < M; ++i) {
+                    bool nz = rr > 0.0f;
+                    float ir = nz ? 1.0f / rr : 0.0f;
+                    float cg = nz ? a * ir : 1.0f, sg = bb * ir;
+                    Zm[k][k] = nz ? rr : a;
+                    for (uint i = 0; i < M; ++i) {
+                        if (i <= k) continue;
                         float zi = Zm[i][k], vi = vz[i];
                         Zm[i][k] = cg * zi + sg * vi;
                         vz[i] = cg * vi - sg * zi;
@@ -1905,31 +1908,44 @@ def _tria_src(x: str, rows: str, cols: str) -> str:
     zero row k beyond column k, leaving the first ``rows`` columns lower
     triangular, ``L``, with ``L L^T`` the original ``x x^T``; then each
     column is signed so the diagonal is non-negative.  A row already zero
-    beyond its diagonal is left alone.  Wrapped in its own scope."""
+    beyond its diagonal is left alone.  Wrapped in its own scope.
+
+    Every loop has constant bounds and masks the triangle instead, and a
+    zero tail selects rather than branches: written with triangular bounds
+    and an early ``continue`` this cost 22 of `sqrt_blocks`' 36 ms at
+    m = 4 (N = 1e4, 256 chains), and 9 of 22 written this way -- the
+    compiler fully unrolls only constant bounds."""
     return f"""
                 {{
                 for (uint k = 0; k < {rows}; ++k) {{
                     float tail = 0.0f;
-                    for (uint j = k + 1; j < {cols}; ++j) tail += {x}[k][j] * {x}[k][j];
-                    if (tail == 0.0f) continue;
+                    for (uint j = 0; j < {cols}; ++j)
+                        tail += (j > k) ? {x}[k][j] * {x}[k][j] : 0.0f;
                     float x0 = {x}[k][k];
                     float nrm = metal::precise::sqrt(x0 * x0 + tail);
                     float al = (x0 >= 0.0f) ? -nrm : nrm;
                     float vk = x0 - al;
-                    float tau = 1.0f / (nrm * (nrm + fabs(x0)));   // 2 / |v|^2
-                    for (uint i = k + 1; i < {rows}; ++i) {{
+                    float tau = (tail > 0.0f)
+                        ? 1.0f / (nrm * (nrm + fabs(x0))) : 0.0f;   // 2 / |v|^2
+                    for (uint i = 0; i < {rows}; ++i) {{
+                        if (i <= k) continue;
                         float dt = {x}[i][k] * vk;
-                        for (uint j = k + 1; j < {cols}; ++j) dt += {x}[i][j] * {x}[k][j];
+                        for (uint j = 0; j < {cols}; ++j)
+                            dt += (j > k) ? {x}[i][j] * {x}[k][j] : 0.0f;
                         float f = tau * dt;
                         {x}[i][k] -= f * vk;
-                        for (uint j = k + 1; j < {cols}; ++j) {x}[i][j] -= f * {x}[k][j];
+                        for (uint j = 0; j < {cols}; ++j)
+                            if (j > k) {x}[i][j] -= f * {x}[k][j];
                     }}
-                    {x}[k][k] = al;
-                    for (uint j = k + 1; j < {cols}; ++j) {x}[k][j] = 0.0f;
+                    {x}[k][k] = (tail > 0.0f) ? al : x0;
+                    for (uint j = 0; j < {cols}; ++j)
+                        if (j > k && tail > 0.0f) {x}[k][j] = 0.0f;
                 }}
-                for (uint k = 0; k < {rows}; ++k)
-                    if ({x}[k][k] < 0.0f)
-                        for (uint i = k; i < {rows}; ++i) {x}[i][k] = -{x}[i][k];
+                for (uint k = 0; k < {rows}; ++k) {{
+                    float sg = ({x}[k][k] < 0.0f) ? -1.0f : 1.0f;
+                    for (uint i = 0; i < {rows}; ++i)
+                        if (i >= k) {x}[i][k] *= sg;
+                }}
                 }}
 """
 

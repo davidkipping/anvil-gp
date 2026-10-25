@@ -1,6 +1,6 @@
 # Plan: the kernel's block boundaries in the square-root information form
 
-Status: agreed 2026-10-25; stages 0-4 done 2026-10-25 (the new boundary is the kernel's default).
+Status: agreed 2026-10-25; stages 0-5 done 2026-10-25 (the new boundary is the kernel's default); the gating decision is open.
 
 ## The problem
 
@@ -50,7 +50,7 @@ the backward, unchanged.
 | 2 | Centred square-root block pass, one thread per (chain, block); rank-1 leaf update | 2 days, **done** |
 | 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days, **done** |
 | 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day, **done** |
-| 5 | Measure on a quiet machine: README timings, watchdog at m = 4, the exposure matrix (m = 2-4, gapped and 2-s cadences), then ChEES | 1 day + machine time |
+| 5 | Measure on a quiet machine: README timings, watchdog at m = 4, the exposure matrix (m = 2-4, gapped and 2-s cadences), then ChEES | 1 day + machine time, **done** |
 | 6 | Docs and README | 0.5 day |
 
 ## Acceptance
@@ -235,3 +235,139 @@ pins that `"dense"` still is the old boundary. The boundary the default
 path hands its backward is bit-identical to the stage 2-3 pipeline.
 README and docs/float32.md say what changed, and the README's timing
 tables are marked as predating it.
+
+## Stage 5: what it found (2026-10-25)
+
+### Cost: over the line, by 1.4-1.8x on value + gradient
+
+`benchmarks/boundary_cost.py`, interleaved A/B, minimum of 3 rounds,
+stability probe at 0.99x its quiet level (0.3% spread), no other GPU job:
+
+| config | forward: dense -> sqrt | value + gradient: dense -> sqrt |
+|---|---|---|
+| m = 2, N = 1e4, 1024 chains | 2.68 -> 4.62 ms (1.72x) | 9.33 -> 13.13 ms (1.41x) |
+| m = 2, N = 1e5, 1024 chains | 21.7 -> 39.7 ms (1.83x) | 66.8 -> 102.6 ms (1.54x) |
+| m = 4, N = 1e4, 256 chains | 13.4 -> 33.8 ms (2.51x) | 60.4 -> 101.9 ms (1.69x) |
+| m = 4, N = 1e5, 256 chains | 46.5 -> 127.9 ms (2.75x) | 220 -> 397 ms (1.80x) |
+| m = 4, N = 4096 (16 x 256), 1024 chains, 20 s | 9.14 -> 23.0 ms (2.52x) | 42.0 -> 71.5 ms (1.70x) |
+
+That is after one optimisation found here. Per kernel at m = 4, N = 1e4,
+256 chains: pass 1 8.4 ms, the value replay 4.5, `sqrt_blocks` **36**,
+`sqrt_scan` 2.2 (0.9 entry-only), `q_factor` 0.2, the backward 34. Of
+`sqrt_blocks`' 36 ms, 22 were the `m x 2m` Householder `tria`: written
+with triangular loop bounds and an early `continue`, the compiler did not
+unroll it. Constant bounds with masks, and selects instead of branches
+(also in the Givens update), took `sqrt_blocks` to 19.7 ms (m = 2: 2.85
+-> 2.06; the short-block case 22 -> 12.9), bit-for-bit within float32
+rounding of the old (6.6e-6 in `U U^T`), every test unchanged.
+`#pragma unroll` adds nothing. What is left of it: the replay and leaf
+4.8 ms, the fold's products 5.5, the Givens update ~3, the `tria` ~6.
+
+The structure sets a floor on the ratio. The block pass is a second sweep
+of the data at ~2.3x pass 1's per-step work (a replay plus a fold), and
+the VJP recomputes the forward's boundary, as it always recomputed pass 1,
+so it is paid twice per gradient. Decision 2's +25% is out of reach by
+tuning.
+
+### Watchdog: no kill
+
+m = 4, value + gradient on the square-root boundary: N = 1e5 at 256,
+512, 1024 and 4096 chains with 1024- and 2048-point blocks (2048 was
+recorded as the edge for pass 1 alone), N = 8192-32768 with explicit
+2048-8192-point blocks at up to 4096 chains: all finite, none killed.
+
+### Where the dense boundary fails, and what the square-root one leaves
+
+`benchmarks/boundary_exposure.py`: 16 Laplace draws, default blocks, the
+worst gradient error per posterior sigma and the sd of the value error:
+
+| setup | blocks | gradient: dense | sqrt | value sd: dense | sqrt |
+|---|---|---|---|---|---|
+| m=4 SHO+SHO, 20 s, s/e 100 | 16x256 | 3.16 | **0.44** | 0.064 | 0.015 |
+| m=4 SHO+SHO, 20 s, s/e 30 | 16x256 | 0.14 | 0.12 | 0.005 | 0.004 |
+| m=4 SHO+SHO, 20 s, s/e 10 | 16x256 | 0.013 | 0.015 | 0.002 | 0.001 |
+| m=4 SHO+SHO, 2 s, s/e 100 | 16x256 | 6.78 | **8.55** | 0.192 | 0.155 |
+| m=4 SHO+SHO, 2 s, s/e 30 | 16x256 | 0.98 | **0.57** | 0.019 | 0.017 |
+| m=4 SHO+SHO, 2 min, s/e 100 | 16x256 | 0.30 | 0.05 | 0.003 | 0.004 |
+| m=4 SHO+SHO, 30 min, s/e 100 | 16x256 | 0.001 | 0.001 | 0.001 | 0.001 |
+| m=4 SHO+SHO, 20 s, 1-day gap, N=8192, s/e 100 | 16x512 | 6.86 | **0.89** | 0.053 | 0.027 |
+| m=4 SHO+SHO, 2 min, N=16384, s/e 100 | 16x1024 | 0.09 | 0.21 | 0.008 | 0.007 |
+| m=4 Rotation, 2 min, s/e 100 | 16x256 | 3.92 | **0.74** | 0.085 | 0.043 |
+| m=3 SHO+Real, 20 s, s/e 100 | 16x256 | 0.04 | 0.02 | 0.003 | 0.001 |
+| m=3 SHO+Real, 2 s, s/e 100 | 16x256 | 0.26 | 0.11 | 0.012 | 0.006 |
+| m=2 SHO, 20 s, s/e 100 | 16x256 | 0.34 | 0.01 | 0.001 | 0.001 |
+| m=2 SHO, 20 s, s/e 300 | 16x256 | **1.57** | 0.05 | 0.001 | 0.002 |
+| m=2 SHO, 2 s, s/e 100 | 16x256 | 0.14 | 0.006 | 0.002 | 0.000 |
+| m=2 SHO, 2 s, N=16384, s/e 300 | 16x1024 | **1.79** | 0.05 | 0.002 | 0.002 |
+
+* **m = 2 is not safe on the dense boundary** (1.6-1.8 sigma at s/e 300),
+  so gating by state dimension is ruled out.
+* **Where the square-root boundary is above 0.5, the boundary is mostly
+  not why.** Exact float64 entry states and seeds through the same
+  float32 backward (worst per sigma; `tests/boundary_oracle.py`):
+
+  | setup | exact boundary | sqrt | one block | MLX path |
+  |---|---|---|---|---|
+  | 20 s, s/e 100 | 0.31 | 0.44 | 0.19 | 0.74 |
+  | 2 s, s/e 100 | **6.4** | 8.6 | 0.90 | 0.85 |
+  | 2 s, s/e 30 | 0.58 | 0.57 | 0.11 | 0.04 |
+  | Rotation, 2 min, s/e 100 | 0.49 | 0.74 | 0.08 | 0.77 |
+  | 20 s gapped, N = 8192 | (graph too large) | 0.89 | 0.41 | 1.02 |
+
+  At 2 s, s/e 100 even the exact boundary is 6.4 sigma off: the entry
+  covariance's eigenvalues span ~12 decades there, and handing it to the
+  backward as a dense float32 matrix -- and the seeds likewise -- is
+  what fails, before any composition. One block avoids it because the
+  replay builds its own covariance from the start. That floor belongs to
+  the dense float32 backward, and fixing it means a square-root backward:
+  outside this plan. Rotation at 2 min is the one row where the
+  square-root boundary sits clearly above its floor (0.74 against 0.49).
+
+### ChEES: converges at the default blocks, at the one-block rate
+
+`benchmarks/chees_block_cost.py t20s100 0 {1,2} 1024 300 200 128` (the
+problem docs/float32.md's table measured), square-root boundary, default
+16 x 256 blocks; the earlier rows for comparison:
+
+| boundary, blocks | step size | leapfrog / iter | max R-hat | ESS per 1000 gradients | wall |
+|---|---|---|---|---|---|
+| **sqrt, 16 x 256, seed 1** | 0.0225 | 35.6 | 1.116 | **0.81** | 11.5 min |
+| **sqrt, 16 x 256, seed 2** | 0.0208 | 27.2 | 1.189 | **0.68** | 8.9 min |
+| dense, 16 x 256, 300 warmup | 0.0078-0.0093 | 12 | 2.8-3.3 | -- | 3 min |
+| dense, 16 x 256, 2000 warmup | 0.0042-0.0043 | 33-41 | 1.57-1.74 | 0.084-0.093 | 52-55 min |
+| one block (`metal_block = 4096`) | 0.0225-0.0228 | 35-38 | 1.11 | 0.81-0.86 | 32-34 min |
+
+* **ESS per gradient: met** (0.68-0.81 against >= 0.4; one block
+  0.81-0.86), ~8x the dense boundary's, and the step size back at the
+  one-block value. Minimum ESS per minute of wall time 424-512, against
+  182-195 for the `metal_block = N` workaround (2.2-2.8x; the one-block
+  runs were timed on a machine that was not quiet, so take the ratio as
+  approximate).
+* **R-hat <= 1.1: not met, and the criterion was wrong.** One block
+  itself reaches only 1.11 at 300 warmup and 200 draws. Per parameter,
+  seed 1 matches one block within 0.006 everywhere (worst: the rotation
+  timescale, 1.116 against 1.110 / 1.108). Seed 2 is 1.19 on the same
+  parameter: its adapted trajectory came out shorter (1.11 against
+  1.58), so the slowest direction mixed less in 200 draws; its step size
+  is 8% under one block's, which the residual gradient error may have
+  helped along.
+* The pooled posterior agrees with one block's to <= 0.022 sigma in
+  every mean, widths within 2%.
+
+### The decision this leaves (decision 2)
+
+Over the +25% line, so by decision 2 the boundary should be gated rather
+than paid everywhere. What the measurements say about each gate:
+
+* **By state dimension: ruled out.** m = 2 fails on the dense boundary
+  (1.6-1.8 sigma at s/e 300).
+* **By block count: already done** where it is free (one block skips it).
+* **By the data's signal-to-noise**, decided once at construction from
+  `rms(y) / median(yerr)` (the ratio the kappa warning already computes):
+  the dense boundary was within 0.14 sigma at every s/e <= 10 and 20-s s/e
+  30 row, and failed from s/e 30 at 2 s and from s/e 100 at 20 s and
+  2 min. A threshold near 20 would keep the dense boundary's speed on
+  quiet stars, RV and sparse cadences, and send bright, dense data to the
+  square-root one.
+* **None**: keep the square-root boundary everywhere and pay 1.4-1.8x on
+  every gradient, including the problems that never needed it.

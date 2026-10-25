@@ -7,8 +7,9 @@ max split R-hat, bulk ESS and ESS per 1000 gradient evaluations.
 
 usage: chees_block_cost.py CASE BLK SEED NCH NWARM NSAMP MAXL [OUT.npy]
   docs table: t20s100 {0,4096} {1,2} 1024 300 200 128, and 0 at 2000 / 500
+  BOUNDARY=dense|sqrt  the kernel's block boundary (default: the policy's)
 """
-import sys, time, json, warnings, numpy as np, mlx.core as mx
+import os, sys, time, json, warnings, numpy as np, mlx.core as mx
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import anvil, anvilgp as ag
 from anvil.diagnostics import split_rhat, ess_bulk
@@ -23,9 +24,11 @@ t, kp = np.arange(4096) / 4320, [0.1, 3/TWO_PI, 5.0, 0.03, 0.2, GQ]  # 20-s cade
 term = ag.SHOTerm() + ag.SHOTerm()
 yerr = np.full(len(t), 1e-3)
 y = sample(term, kp, t, yerr, np.random.default_rng(1))
-pol = GPPolicy(metal=True, metal_block=blk or None)
+pol = GPPolicy(metal=True, metal_block=blk or None,
+                metal_boundary=os.environ.get("BOUNDARY") or None)
 gt = make_target(term, t, y, yerr, policy=pol)
-print(case, "metal_block", gt.loglike.metal_block, gt.names, flush=True)
+print(case, "metal_block", gt.loglike.metal_block, "boundary",
+      gt.loglike._metal_boundary, gt.names, flush=True)
 ker = anvil.ChEESHMC(gt.target, max_leapfrog=maxl)
 t0 = time.time()
 with mx.stream(mx.gpu):
@@ -37,7 +40,7 @@ Ls = [max(1, min(maxl, int(np.ceil(halton_jitter(i) * T / eps)))) for i in range
 ch = np.asarray(res.get_chain(), dtype=np.float64)
 rh = split_rhat(ch); ess = ess_bulk(ch)
 ngrad = nch * sum(Ls)
-out = dict(case=case, blk=blk, seed=seed, eps=eps, T=T, meanL=float(np.mean(Ls)),
+out = dict(case=case, blk=blk, boundary=gt.loglike._metal_boundary, seed=seed, eps=eps, T=T, meanL=float(np.mean(Ls)),
            accept=float(np.mean(res.accept_fraction)), ndiv=res.extras["n_divergent"],
            rhat_max=float(rh.max()), ess=ess.tolist(), ess_min=float(ess.min()),
            ess_per_kgrad=float(ess.min() / ngrad * 1e3), mean=ch.reshape(-1, ch.shape[-1]).mean(0).tolist(),
