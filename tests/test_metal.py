@@ -227,7 +227,7 @@ def test_auto_metal_block_matches_the_measured_optimum(n_data, want):
 
 
 @pytest.mark.parametrize("n_state,cap", [(2, 8192), (3, 2048), (4, 256),
-                                         (6, 256)])
+                                         (5, 128), (6, 64), (8, 64)])
 def test_auto_metal_block_caps_long_blocks_at_high_state_dimension(n_state,
                                                                    cap):
     """A thread walks its whole block, so block length is a time limit.
@@ -239,7 +239,10 @@ def test_auto_metal_block_caps_long_blocks_at_high_state_dimension(n_state,
     and 4096 fails too while 2048 failed in one run and not another. With
     the display in use the limit is stricter: m = 4 at 1024 was killed from
     ~224 chains at N = 1e5 and at 4096 chains at N = 1e4, and 512 at 4096
-    chains, so m >= 4 is capped at 256 (docs/boundary-plan.md, III).
+    chains, so m = 4 is capped at 256 (docs/boundary-plan.md, III).  At
+    N = 1e5 m = 5 at 256 and m = 6 at 128 are killed from 512 chains, so
+    they are capped at 128 and 64, which survive 4096 chains (follow-on
+    step 2).
     """
     from anvilgp.likelihood import _auto_metal_block
     assert _auto_metal_block(1_000_000, n_state) == cap
@@ -1716,7 +1719,7 @@ def _default_build(term, p, policy):
 def test_the_default_policy_uses_the_kernel_where_eligible():
     """`GPPolicy.metal` is None by default since 2026-10-25: the kernel
     when it can serve the problem, bit for bit what `metal=True` gives;
-    the MLX path otherwise (m > 4), without the warning `metal=True`
+    the MLX path otherwise (m > 6), without the warning `metal=True`
     gives there."""
     import warnings as _w
     from anvilgp.likelihood import MetalDefaultNotice
@@ -1736,12 +1739,12 @@ def test_the_default_policy_uses_the_kernel_where_eligible():
         np.testing.assert_array_equal(got[0][0], got[1][0])
         np.testing.assert_array_equal(got[0][1], got[1][1])
 
-        big = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()     # m = 6
+        big = ag.RotationTerm() + ag.RotationTerm()     # m = 8
         _w.simplefilter("error", RuntimeWarning)
-        gp6 = _default_build(big, [1.3, 4.0, 3.0] * 3, GPPolicy())
-        assert not gp6._metal_ok
+        gp8 = _default_build(big, [1.3, 4.0, 3.0, 1.0, 0.4] * 2, GPPolicy())
+        assert not gp8._metal_ok
     with pytest.warns(RuntimeWarning, match="cannot be honoured"):
-        _default_build(big, [1.3, 4.0, 3.0] * 3, GPPolicy(metal=True))
+        _default_build(big, [1.3, 4.0, 3.0, 1.0, 0.4] * 2, GPPolicy(metal=True))
 
 
 def test_the_default_says_once_per_process_which_path_it_chose(monkeypatch):
@@ -1758,8 +1761,8 @@ def test_the_default_says_once_per_process_which_path_it_chose(monkeypatch):
         _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0], GPPolicy(metal=False))
         _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0], GPPolicy(metal=True))
         for _ in range(2):
-            _default_build(ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm(),
-                           [1.3, 4.0, 3.0] * 3, GPPolicy())
+            _default_build(ag.RotationTerm() + ag.RotationTerm(),
+                           [1.3, 4.0, 3.0, 1.0, 0.4] * 2, GPPolicy())
     notes = [str(r.message) for r in rec
              if issubclass(r.category, L.MetalDefaultNotice)]
     assert len(notes) == 2, notes
@@ -1777,3 +1780,149 @@ def test_make_target_gets_the_kernel_by_default():
         _w.simplefilter("ignore")
         gt = make_target(ag.SHOTerm(), t, y, np.full(n, 0.3))
     assert gt.loglike._metal_ok
+
+
+# ---------------------------------------- m = 5 and 6 (follow-on step 2)
+def _grad_sigma_vs_float64(term, kp, dt_s, se, n=2048, n_draws=4):
+    """Worst kernel gradient error, in Laplace posterior sigma, over
+    `n_draws` posterior draws, against a float64 central difference; and
+    the value's worst error.  On-model data at s/e = `se`."""
+    from anvilgp.oracle import sample_ssm
+    rng = np.random.default_rng(2)
+    dt = dt_s / 86400
+    t = np.arange(n) * dt
+    y0 = sample_ssm(term, kp, dt, n, rng)
+    yerr = np.full(n, np.std(y0) / se)
+    y = y0 + yerr * rng.standard_normal(n)
+    d = len(kp)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
+                          for i, x in enumerate(kp)], n_dim=d)
+    ref = GPLogLike(None, t, None, y, yerr, term, pm,
+                    GPPolicy(metal=False, kappa_max=None))
+
+    def hi(V):
+        with mx.stream(mx.cpu):
+            return np.array(ref.hi(mx.array(V, dtype=mx.float64),
+                                   refuse=False))
+
+    hs, pts = 1e-3, [np.zeros(d)]
+    for i in range(d):
+        for j in range(i, d):
+            for si, sj in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+                p = np.zeros(d)
+                p[i] += si * hs
+                p[j] += sj * hs
+                pts.append(p)
+    f, H, c = hi(np.array(pts)), np.zeros((d, d)), 1
+    for i in range(d):
+        for j in range(i, d):
+            fpp, fpm, fmp, fmm = f[c:c + 4]
+            c += 4
+            H[i, j] = H[j, i] = -(fpp - fpm - fmp + fmm) / (4 * hs ** 2)
+    w, U = np.linalg.eigh(H)
+    w = np.maximum(w, 4.0)
+    sd = np.sqrt(np.diag((U / w) @ U.T))
+    V = (U / np.sqrt(w) @ np.random.default_rng(99)
+         .standard_normal((d, n_draws))).T
+    gh = 1e-5
+    P = np.repeat(V, 2 * d, axis=0)
+    for k in range(n_draws):
+        for i in range(d):
+            P[k * 2 * d + 2 * i, i] += gh
+            P[k * 2 * d + 2 * i + 1, i] -= gh
+    ff = hi(P).reshape(n_draws, d, 2)
+    G = (ff[..., 0] - ff[..., 1]) / (2 * gh)
+
+    gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None))
+    from anvilgp.likelihood import _MAX_METAL_BLOCK, _MAX_METAL_BLOCK_HI_M
+    assert gp._metal_ok and gp.metal_block == _MAX_METAL_BLOCK.get(
+        term.n_state, _MAX_METAL_BLOCK_HI_M)
+    with mx.stream(mx.gpu):
+        u = mx.array(V, dtype=mx.float32)
+        g = np.array(mx.grad(lambda u: gp(u).sum())(u))
+        lo = np.array(gp(u))
+    return (np.abs(g - G) * sd).max(), np.abs(lo - hi(V)).max()
+
+
+@pytest.mark.parametrize("name,term,kp,dt_s", [
+    ("rotation+sho, 2 min", ag.RotationTerm() + ag.SHOTerm(),
+     [1.0, 3.0, 3.0, 1.0, 0.4, 0.3, 0.2, 1 / np.sqrt(2)], 120.0),
+    ("3 x sho, 20 s", ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm(),
+     [0.1, 3 / (2 * np.pi), 5.0, 0.03, 0.2, 1 / np.sqrt(2),
+      0.05, 0.05, 1 / np.sqrt(2)], 20.0),
+    ("sho+matern52, 2 min", ag.SHOTerm() + ag.Matern52Term(),
+     [0.1, 3 / (2 * np.pi), 5.0, 0.03, 0.5], 120.0),
+])
+def test_the_kernel_at_m5_and_m6_against_float64(name, term, kp, dt_s):
+    """m = 5 and 6 joined the kernel on 2026-10-25 (`MAX_STATE = 6`) at
+    128- and 64-point blocks.  Measured at N = 4096 and 16 draws: 0.12
+    sigma (rotation + SHO, 2 min), 0.12 (3 x SHO, 20 s), 0.07 (SHO +
+    Matern-5/2, 2 min).  Not here, because the fast-cadence floor owns
+    them: SHO + Matern-5/2 at 20 s is 0.6-0.67 (the MLX path 1.42), and
+    rotation + SHO at 20 s is 6.1 (the MLX path 1.07 with 2 of 16 draws
+    refused, and no gradient at all from N ~ 16384); rotation alone at
+    m = 4 is worse (README, "Still open")."""
+    e, v = _grad_sigma_vs_float64(term, kp, dt_s, se=100.0)
+    assert e < 0.5, f"{name}: gradient {e:.3f} posterior sigma"
+    assert v < 0.2, f"{name}: value off by {v:.3f}"
+
+
+def test_m6_per_instrument_jitter_matches_the_mlx_path():
+    """The jitter accumulators share the thread's registers with the m = 6
+    element, which already spills; value and gradient against the MLX path
+    with three instruments."""
+    n, n_jit = 1200, 3
+    rng = np.random.default_rng(4)
+    t = np.arange(n) * 0.05
+    inst = (np.arange(n) % n_jit).astype(np.int32)
+    y = rng.standard_normal(n)
+    kp = (1.0, 3.0, 3.0, 1.0, 0.4, 0.3, 0.5, 0.7)
+
+    def build(metal):
+        pm = ParamMap(
+            kernel=[KernelParam(link="log", index=i, ref=r)
+                    for i, r in enumerate(kp)],
+            jitter=[KernelParam(link="log", index=len(kp) + j, ref=r)
+                    for j, r in enumerate((0.03, 0.09, 0.2))],
+            n_dim=len(kp) + n_jit, instrument=inst)
+        return GPLogLike(None, t, None, y, np.full(n, 0.3),
+                         ag.RotationTerm() + ag.SHOTerm(), pm,
+                         GPPolicy(block=1024, hi_block=1024, metal=metal))
+
+    kern, ref = build(True), build(False)
+    assert kern.metal_eligible()[0], kern.metal_eligible()[1]
+    vk, gk = _vg(kern, len(kp) + n_jit)
+    vm, gm = _vg(ref, len(kp) + n_jit)
+    assert np.max(np.abs(vk - vm)) < 1e-2, f"value: {vk[0]} vs {vm[0]}"
+    rel = np.max(np.abs(gk - gm)) / max(np.max(np.abs(gm)), 1e-30)
+    assert rel < 1e-4, f"gradient rel {rel:.2e}\n kernel {gk[0]}\n mlx {gm[0]}"
+
+
+@pytest.mark.slow
+def test_the_kernel_gradient_survives_many_chains_at_m6():
+    """The m = 6 cap's stress case: N = 1e5, 4096 chains, value + gradient,
+    with the eight per-instrument jitters whose accumulators share the
+    spilled registers.  128-point blocks were killed here from 512 chains
+    with the display in use; 64 survived (37 s an evaluation)."""
+    n, n_chains, n_jit = 100_000, 4096, 8
+    rng = np.random.default_rng(0)
+    t = np.arange(n) * (30.0 / n)
+    kp = [1.0, 3.0, 3.0, 1.0, 0.4, 0.3, 0.5, 0.7]
+    pm = ParamMap(
+        kernel=[KernelParam(link="log", index=i, ref=r)
+                for i, r in enumerate(kp)],
+        jitter=[KernelParam(link="log", index=len(kp) + j, ref=0.05)
+                for j in range(n_jit)],
+        n_dim=len(kp) + n_jit,
+        instrument=(np.arange(n) % n_jit).astype(np.int32))
+    gp = GPLogLike(None, t, None, rng.standard_normal(n) * 0.9,
+                   np.full(n, 0.3), ag.RotationTerm() + ag.SHOTerm(), pm,
+                   GPPolicy(block=4096, metal=True, kappa_max=None))
+    assert gp._metal_ok and gp.metal_block == 64
+    u = mx.array(rng.standard_normal((n_chains, pm.n_dim))
+                 .astype(np.float32) * 0.01)
+    with mx.stream(mx.gpu):
+        v, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
+        mx.eval(v, g)
+    assert np.all(np.isfinite(np.array(v))) and np.all(np.isfinite(np.array(g[0])))

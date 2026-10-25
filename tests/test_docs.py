@@ -151,8 +151,9 @@ def test_anvilgp_usually_but_not_always_beats_celerite2_on_matern32():
     (ag.TermConvolution(ag.RotationTerm(), 0.01), 4, 5, True),
     (ag.TermConvolution(ag.SHOTerm(), 0.01), 2, 3, True),
     (ag.SHOTerm() + ag.SHOTerm(), 4, 6, True),
-    (ag.SHOTerm() + ag.Matern52Term(), 5, 5, False),
-    (ag.RotationTerm() + ag.SHOTerm(), 6, 8, False),
+    (ag.SHOTerm() + ag.Matern52Term(), 5, 5, True),
+    (ag.RotationTerm() + ag.SHOTerm(), 6, 8, True),
+    (ag.RotationTerm() + ag.RotationTerm(), 8, 10, False),
 ])
 def test_the_kernel_tables_state_dimensions_and_eligibility(term, m, n_par,
                                                             eligible):

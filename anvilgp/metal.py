@@ -98,11 +98,17 @@ def _default_adjoint_budget() -> int:
 MAX_ADJOINT_BUFFER_BYTES = _default_adjoint_budget()
 
 #: Largest state dimension the kernel accepts.  The running element is
-#: ``3m^2 + 2m + 1`` floats held in registers -- 17 at m = 2, 57 at m = 4,
-#: 209 at m = 8, which would spill.  m <= 4 covers SHOTerm, Matern-3/2,
-#: Matern-5/2 and RotationTerm; larger sums stay on the MLX path until the
-#: element is moved to threadgroup memory.
-MAX_STATE = 4
+#: ``3m^2 + 2m + 1`` floats held per thread -- 17 at m = 2, 57 at m = 4,
+#: 121 at m = 6, 209 at m = 8.  m <= 6 covers every single kernel and the
+#: sums people use most, rotation + granulation (``RotationTerm() +
+#: SHOTerm()``) and SHO + Matern-5/2 included.  m = 5 and 6 spill
+#: registers: value + gradient is ~8x m = 4 rather than the (6/4)^3 = 3.4x
+#: of the arithmetic (the replay 22x, the square-root block pass 9x), but
+#: still ~10x faster than the MLX path, as accurate or more, and the only
+#: gradient at N >= 16384, where the MLX path runs out of Metal buffers
+#: (docs/boundary-plan.md, follow-on step 2).  Above 6 the MLX path, until
+#: the element is moved to threadgroup memory.
+MAX_STATE = 6
 
 #: Largest number of jitter parameters the kernel accepts.  The backward
 #: holds one ``r_var`` adjoint accumulator per jitter in registers, so this

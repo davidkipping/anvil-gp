@@ -921,3 +921,80 @@ kappa ~ 90 up to 3.6e-2 at ~9700) and a convolved `RealTerm` 4-40x; with
 the float64 table both are at the unconvolved term's level, 1e-5 to 1e-4,
 kernel and MLX paths. The limitation is gone; docs, the `TermConvolution`
 docstring and the oracle test's note corrected.
+
+## Follow-on step 2: the kernel at m = 5 and 6 (2026-10-25)
+
+The probe: compile the kernel at `MAX_STATE = 6` and check it against
+float64 (gradient per Laplace posterior sigma, 16 draws), the watchdog,
+and time. It holds, and m = 5 and 6 now take the kernel: rotation +
+granulation (`RotationTerm() + SHOTerm()`), SHO + Matern-5/2 and three
+SHOs. Nothing in the source changed but `MAX_STATE` and the block caps;
+the kernels were already templated on `MDIM`.
+
+**Accuracy.** Worst gradient error over 16 draws, posterior sigma,
+N = 4096 unless stated, at the shipped caps:
+
+| case | MLX path (the old m = 6 route) | kernel (square-root) | kernel, dense boundary |
+|---|---|---|---|
+| rotation + SHO, 2 min, s/e 100 | 0.05 | 0.12 | 0.33 |
+| rotation + SHO, 2 min, s/e 100, N = 16384 | **fails** (Metal buffer limit) | 0.10 | 0.32 |
+| 3 x SHO, 20 s, s/e 100 | 0.11 | 0.12 | 1.23 |
+| SHO + Matern-5/2, 2 min, s/e 100 | 0.15 | 0.07 | 0.45 |
+| SHO + Matern-5/2, 20 s, s/e 100 | 1.42 | 0.6-0.67 (0.36 at 256-point blocks) | 2.55 |
+| rotation + SHO, 20 s, s/e 100 | 1.07, 2 of 16 draws refused | **6.1**, 1 refused (2.3 at 256) | 66 |
+
+The MLX path's gradient at m = 5-6 runs out of Metal buffers ("Resource
+limit (499000) exceeded") already at N = 16384, not ~1e5 as recorded
+before, so from there the kernel is the only gradient there is.
+
+**The rotation rows are not an m = 6 problem.** `RotationTerm` alone,
+m = 4 and on the kernel since M4, at 20 s, s/e 100: kernel 33 posterior
+sigma, MLX path 3.0, one draw refused on both; at 2 min, s/e 1000: 112
+and 212. The float64 reference is fine at the refused draws, and the lag
+table in float64 (`_Float64FrontEnd` around the plain term) changes
+nothing (33 -> 26). Three SHOs at 20 s are 0.12, so the m = 6 algebra
+is not it. It is the 2-s floor ("Still open" in the README: the backward
+takes dense float32 entry covariances and seeds), reached at 20 s
+because a 3-day rotation's timescale is ~6x a granulation SHO's. The
+square-root backward is now owed for the standard active-star model at
+TESS 20-s cadence, not just at 2 s.
+
+**Watchdog.** N = 1e5, value + gradient, Spotlight indexing (the
+display busy): m = 6 at 256 and at 128 killed from 512 chains, forward
+included; at 64 it survives 512 and 4096 chains, and with 8
+per-instrument jitters. m = 5 at 256 killed from 512 chains; at 128
+survives 4096. Caps at half the shortest block killed, as for m = 4:
+`_MAX_METAL_BLOCK = {..., 4: 256, 5: 128}`, and 64 above. The auto
+rule's floor was 256 for every m; it is now the cap where the cap is
+lower. Shorter blocks cost accuracy where the boundary carries it (the
+20-s rows above at 256 against the caps); m = 5 equally fast at 128 and
+64.
+
+**Cost.** The kernel at m = 6 spills registers. Value + gradient, 512
+chains, ms:
+
+| N | m = 6 kernel (64-point blocks) | MLX path, m = 6 | m = 4 kernel (256) |
+|---|---|---|---|
+| 4096 | 261 | 2546 | 32 |
+| 8192 | 461 | 5400 | 59 |
+| 1e5 | 5373 | fails | 557 |
+
+~10x faster than the MLX path, ~8x slower than m = 4 where the
+arithmetic (6/4)^3 says 3.4x. The forward, per stage, m = 6 against
+m = 4 at the same 64-point blocks: replay 22x, `sqrt_blocks` 9x, pass 1
+4.8x, entry states 4.2x, `sqrt_scan` 4.1x. The backward's checkpoint
+length does not matter (2-16: 921-933 ms at N = 16384). m = 5 at N = 1e5,
+4096 chains: 21.5 s, m = 4 3.5 s. Moving the element to threadgroup
+memory or splitting a chain across lanes would recover the spill; not
+needed to ship. Timings on a loaded machine, minimum of 6.
+
+**What IV becomes.** The MLX path now serves only m > 6 and
+`metal=False`; m = 5-6, the case IV was mostly for, has the kernel's
+accuracy and gradient. IV as designed (the MLX path's floor) is no
+longer worth 1-2 days; the square-root backward is.
+
+Pinned: `tests/test_metal.py` -- m = 5 and 6 against float64 at the caps
+(rotation + SHO and SHO + Matern-5/2 at 2 min, 3 x SHO at 20 s, each
+< 0.5 sigma), m = 6 with three instruments' jitter against the MLX path,
+the caps; `tests/test_docs.py` -- kernels.md's sum table (m = 5, 6 on the
+kernel, m = 8 not).

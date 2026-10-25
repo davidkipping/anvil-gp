@@ -258,13 +258,13 @@ The fused kernel has limits. Ask before relying on it:
 gp.metal_eligible()        # (True, '') or (False, 'reason')
 ```
 
-For example, `SHOTerm() + Matern52Term()` has `m = 5` and reports
-`'m = 5 exceeds the kernel's register budget (max 4)'`.
+For example, `RotationTerm() + RotationTerm()` has `m = 8` and reports
+`'m = 8 exceeds the kernel's register budget (max 6)'`.
 
-It returns `False` first of all when `GPPolicy.metal` is off, which is
-the default — so a fresh `GPLogLike` reports `(False, 'GPPolicy.metal is
-off')` and that means "you did not ask", not "unsupported". It also
-returns `False` for `m > 4`, for more than eight per-instrument jitters
+It returns `False` first of all when `GPPolicy(metal=False)` turned the
+kernel off — `(False, 'GPPolicy.metal is off')` means "you turned it off",
+not "unsupported"; the default, `metal=None`, takes the kernel wherever
+this says `True`. It also returns `False` for `m > 6`, for more than eight per-instrument jitters
 (`metal.MAX_JITTER`), and when `mx.fast.metal_kernel` is unavailable. A request that cannot be honoured
 **warns and falls back** to the MLX path, which is correct but far
 slower — it does not fail silently. See [kernels.md](kernels.md) for the

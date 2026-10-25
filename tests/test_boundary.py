@@ -284,7 +284,7 @@ def test_the_q_factor_batches_chains_and_lags_independently():
         for k in range(5):
             np.testing.assert_array_equal(L[c, k], _factor(Q[c:c + 1, k:k + 1])[0, 0])
     with pytest.raises(ValueError, match="m <= "):
-        q_factor(mx.zeros((1, 1, 5, 5), dtype=mx.float32))
+        q_factor(mx.zeros((1, 1, 7, 7), dtype=mx.float32))
 
 
 def test_the_oracle_on_the_kernels_q_factor_meets_the_bounds(case):

@@ -611,7 +611,7 @@ removes the large numbers instead of storing them more carefully.
    is (see the plan). Machine
    not quiet during these runs; the per-gradient columns do not depend on
    it, the wall column does. Script: `benchmarks/chees_block_cost.py`.
-3. **Default MLX path** (all m, and the only path for m > 4). The same
+3. **Default MLX path** (all m, and the only path for m > 6). The same
    structure at sub-block scale: fold leaves into sub-block elements, a
    prefix over them instead of the reduction, then a 32-step replay batched
    over sub-blocks. Not yet attempted.

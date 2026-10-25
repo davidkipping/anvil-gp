@@ -18,7 +18,7 @@ from anvilgp.anvil import make_target
 from anvilgp import GPPolicy
 
 # The fused Metal kernel is the default wherever it can serve the problem
-# (m <= 4, up to 8 jitters): ~17-24x on the forward and ~85-200x on the
+# (m <= 6, up to 8 jitters): ~17-24x on the forward and ~85-200x on the
 # gradient, and the more accurate float32 path on bright, densely sampled
 # data.  Otherwise the MLX path runs; either way it says once per process
 # which it chose.  GPPolicy(metal=False) forces the MLX path, metal=True
@@ -381,21 +381,23 @@ the kernel special-casing it: row 0 holds `Phi = 0`, `Q = P_inf = I`, and
 `lag_index[0] = 0`. `ell` is accumulated with Kahan compensation in-thread,
 since a block is up to 4096 sequential adds with no tree to spread the error.
 
-Limits, stated: m <= 4 (the running element is `3m^2+2m+1` floats in
-registers — 17 at m = 2, 57 at m = 4, 209 at m = 8, which would spill);
+Limits, stated: m <= 6 (the running element is `3m^2+2m+1` floats per
+thread — 17 at m = 2, 57 at m = 4, 121 at m = 6; m = 5 and 6 spill
+registers, cost ~6-8x m = 4, and take 128- and 64-point blocks for the
+GPU watchdog);
 up to 8 per-instrument jitters (`metal.MAX_JITTER`, a register budget);
 and an all-distinct-lag cadence degenerates
 the table to one row per point, which is correct but gives up the traffic
 saving — the value costs 13.2 GiB at 1024 chains x N = 1e5 where a regular
 cadence costs 0.4. The gradient handles it: its adjoint buffer holds one
 slot per `(block, lag)` pair that occurs, so it is bounded by N rather than
-by N x blocks, and that case runs at 1.3x the forward's peak. Larger m and
-in-kernel propagators are the obvious follow-ons.
+by N x blocks, and that case runs at 1.3x the forward's peak. m > 6, the
+m = 5-6 register spill, and in-kernel propagators are the obvious follow-ons.
 
 ### The MLX reference path
 
 Still the float64 verification path, the thing the kernel is proved against,
-and the only path for m > 4. It is ~40x faster than its first working
+and the only path for m > 6. It is ~40x faster than its first working
 version and beats a single-core CPU, though not a fully parallelised one.
 M2 Max, float32 GPU, compiled forward, **minimum of 15** sustained
 evaluations, `block=4096`, realistic (regular-cadence-with-gaps) times, all
@@ -573,7 +575,7 @@ float32 accuracy.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `None` (the kernel where eligible: `m <= 4`, up to 8 per-instrument jitters; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
+| `metal` | `None` (the kernel where eligible: `m <= 6`, up to 8 per-instrument jitters; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
 | `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3 and 256 at m >= 4) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term with a `RealTerm` member or `\|\|F delta\|\| > 0.5`) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
@@ -607,8 +609,15 @@ marked as an estimate.
   a wrong gradient; it is a property that rebuilds the map now. See
   [docs/lag-slots-plan.md](docs/lag-slots-plan.md); an earlier proposal
   here, per-parameter Jacobian tables, was measured and retracted.
-* **m > 4.** Stays on the MLX gradient path, where a gradient costs 8.8 s
-  at m = 6, 256 chains and N = 1e4. (Per-instrument jitter was the other
+* **m > 6, and the cost of m = 5-6.** m = 5 and 6 (rotation + granulation,
+  SHO + Matern-5/2) run on the kernel since 2026-10-25, as accurate as the
+  MLX path or more and ~10x faster than it, but they spill registers:
+  value + gradient is ~8x m = 4 (5.4 s at 512 chains, N = 1e5) where the
+  arithmetic says 3.4x, and blocks are capped at 128 (m = 5) and 64
+  (m = 6) points, half the shortest the GPU watchdog killed. Moving the element to threadgroup memory or
+  splitting a chain across lanes would recover it. Above m = 6 the MLX
+  path, whose gradient runs out of Metal buffers from N ~ 16384 at m = 6,
+  so in practice from smaller N above it. (Per-instrument jitter was the other
   half of this entry until M5 stage 2 put it in the kernel, up to 8.)
 * **Block count as an accuracy knob for one adjoint.** The backward seed
   amplifies block-element error through `eta_s - J_s mu`, which reaches
@@ -658,16 +667,22 @@ marked as an estimate.
   boundary quantities give 6.4 sigma too. The backward takes the entry
   covariance and seeds as dense float32 matrices, whose small eigen-
   directions (~12 decades below the large ones there) do not survive the
-  rounding; fixing it needs a square-root backward. `metal_block=N` (up
-  to 8192) gives 0.7-0.9 there, at the risk of a GPU watchdog kill while
+  rounding; fixing it needs a square-root backward. The same floor reaches
+  `RotationTerm` at TESS 20-s cadence, because its timescale is long against
+  the cadence: s/e 100, N = 4096 gives a kernel gradient 6.1 posterior
+  sigma off for rotation + granulation at its 64-point blocks (2.3 at 256,
+  which the watchdog kills at N = 1e5; the MLX path 1.1 with 2 of 16 draws
+  refused, and no gradient from N ~ 16384) and up to 33 for rotation alone,
+  with the lag table in float64 changing nothing (follow-on step 2). `metal_block=N` (up
+  to 8192) gives 0.7-0.9 at 2-s SHO, at the risk of a GPU watchdog kill while
   the display is in use (it warns). Tables: [docs/float32.md](docs/float32.md), section 7; plan
   and status: [docs/boundary-plan.md](docs/boundary-plan.md).
 * ~~**The GPU watchdog at m = 4.**~~ **Fixed 2026-10-25.** With the
   display in use, m = 4 gradients at the old 1024-point block cap were
   killed ("Impacting Interactivity") from ~224 chains at N = 1e5 and at
   4096 chains at N = 1e4. The watchdog responds to per-thread length,
-  stretched by how many threads share the GPU, not to total GPU time; m >= 4
-  is now capped at 256-point blocks, which survives every case measured
+  stretched by how many threads share the GPU, not to total GPU time; m = 4
+  is now capped at 256-point blocks (m = 5 at 128, m = 6 at 64), which survives every case measured
   (up to 4096 chains at N = 1e5) and is faster at small chain counts (1.8x
   at 256 chains, N = 1e4) for +12% at N = 1e4 x 1024 chains. An explicit
   `metal_block` above the cap warns. See
@@ -914,7 +929,7 @@ Three more are worked around and pinned as regression tests
   2026-10-24 those are 27-38x, 22-25x and 150-185x. `tests/test_metal.py` pins
   it against the dense float64 oracle and the MLX path across every term type, every block
   length, duplicate timestamps, gaps, irregular cadence, a jitter and a mean
-  model. Still owed: m > 4 (per-instrument jitter landed in-kernel in M5
+  model. Still owed: m > 6 (m = 5-6 landed 2026-10-25; per-instrument jitter landed in-kernel in M5
   stage 2; the thread-layout work landed with M4's stage B; the float32
   feasibility map landed 2026-10-12, see docs/float32.md section 6). The map
   explains why amplitude and correlation length are **not separable**: the

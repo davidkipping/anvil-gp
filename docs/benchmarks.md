@@ -119,7 +119,7 @@ kernel 10% at N = 1000 and 87% at N = 1e4. The same step costs celerite2 a
 factor of 1024. That is the entire argument for this library.
 
 **The MLX column is the reference path**, kept for verification, float64
-parity and kernels with `m > 4`. It is not competitive with celerite2 and
+parity and kernels with `m > 6`. It is not competitive with celerite2 and
 is not meant to be.
 
 ## What this means for an MCMC run
@@ -226,7 +226,8 @@ The kernel's cost scales roughly as `m^2` — it carries `3m^2+2m+1` floats
 per thread — while celerite2's scales closer to `m`. So **the advantage
 narrows sharply with state dimension**: 19x the pool at `m = 1`, 3.6-3.8x
 at `m = 4`. If your model is a rotation kernel plus granulation, expect the
-lower end of the range, and note that `m > 4` leaves the kernel entirely.
+lower end of the range: `m = 6` runs on the kernel since 2026-10-25 at ~8x
+the cost of `m = 4`, and `m > 6` leaves the kernel entirely.
 
 ## Accuracy against a float64 dense Cholesky
 

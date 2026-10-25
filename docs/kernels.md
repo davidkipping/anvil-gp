@@ -3,7 +3,8 @@
 Every kernel here is a **linear Gaussian state-space model**. The state
 dimension `m` is the number that matters for performance: the fused Metal
 kernel holds `3m^2 + 2m + 1` floats per thread in registers, so cost grows
-steeply with `m`, and the kernel refuses `m > 4`.
+steeply with `m`, and the kernel refuses `m > 6` (m = 5 and 6 run, at
+~8x the cost of m = 4).
 
 ## Supported kernels
 
@@ -289,7 +290,7 @@ exactly zero at `1e-4`.
 ```python
 term = ag.SHOTerm() + ag.SHOTerm()          # m = 4, granulation + oscillation
 term = ag.SHOTerm() + ag.Matern32Term()     # m = 4
-term = ag.RotationTerm() + ag.SHOTerm()     # m = 6 -> MLX path only
+term = ag.RotationTerm() + ag.SHOTerm()     # m = 6, rotation + granulation
 ```
 
 `Phi` and `Q` become block-diagonal, `h` concatenates, and the states add
@@ -300,18 +301,20 @@ kernel's limit:
 |---|---:|---|
 | `SHOTerm() + SHOTerm()` | 4 | fused kernel |
 | `SHOTerm() + Matern32Term()` | 4 | fused kernel |
-| `SHOTerm() + Matern52Term()` | 5 | MLX path (warns) |
-| `RotationTerm() + SHOTerm()` | 6 | MLX path (warns) |
+| `SHOTerm() + Matern52Term()` | 5 | fused kernel (~6x the cost of m = 4) |
+| `RotationTerm() + SHOTerm()` | 6 | fused kernel (~8x the cost of m = 4) |
+| `RotationTerm() + RotationTerm()` | 8 | MLX path (warns) |
 
 Check before you commit to a design:
 
 ```python
-gp.metal_eligible()        # (True, '') or (False, 'm = 5 exceeds ...')
+gp.metal_eligible()        # (True, '') or (False, 'm = 8 exceeds ...')
 ```
 
-With the default `GPPolicy` the answer is `(False, 'GPPolicy.metal is
-off')`: that reports you did not ask for the kernel, not that your model
-is unsupported.
+With `GPPolicy(metal=False)` the answer is `(False, 'GPPolicy.metal is
+off')`: that reports you turned the kernel off, not that your model is
+unsupported. The default (`metal=None`) takes the kernel wherever this
+says `True`.
 
 A request the kernel cannot honour **warns and falls back** to the MLX
 reference path. That path is correct and is what the kernel is verified
@@ -379,7 +382,7 @@ tool, at `O(N^3)`.
 accept one jitter only; since 2026-09-27 it indexes the jitter per
 observation from `param_map.instrument`, and the backward gives each
 instrument its own gradient. The cap is `metal.MAX_JITTER = 8`, a register
-budget like `m <= 4` rather than an arbitrary limit; above it
+budget like `m <= 6` rather than an arbitrary limit; above it
 `metal_eligible()` refuses and the MLX path is correct. Several jitters
 require `param_map.instrument`, whose labels are range-checked at
 construction — an out-of-range label used to pass silently through
@@ -394,6 +397,11 @@ table one row per observation, which costs memory in the *value* (13.2 GiB
 at 1024 chains x N = 1e5, against 0.4 GiB for a regular cadence) but is
 handled correctly, gradient included.
 
-**`m > 4`** is the hard kernel ceiling. Raising it means spilling
-registers or restructuring the thread layout; it is listed under "What is
-left" in the README.
+**`m > 6`** is the hard kernel ceiling, and m = 5 and 6 already spill
+registers: value + gradient at m = 6 is ~8x m = 4 where the arithmetic
+says 3.4x (still ~10x faster than the MLX path, whose gradient at m = 6
+runs out of Metal buffers from N ~ 16384), and their blocks are capped at
+128 (m = 5) and 64 (m = 6) points, half the shortest block the GPU
+watchdog killed. Raising the ceiling,
+or recovering the spill, means restructuring the thread layout; it is
+listed under "What is left" in the README.

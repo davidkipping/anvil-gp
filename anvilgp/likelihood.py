@@ -132,7 +132,7 @@ class GPPolicy:
     #: the more accurate path on bright, densely sampled data (value and
     #: gradient), the only one whose gradient runs at N ~ 1e5, and 17-200x
     #: faster (docs/boundary-plan.md, I).  Differentiable since M4: the
-    #: kernel carries its own VJP.  Limits: m <= 4 and at most
+    #: kernel carries its own VJP.  Limits: m <= 6 and at most
     #: :data:`anvilgp.metal.MAX_JITTER` per-instrument jitters.  The
     #: gradient's adjoint buffer is one slot per ``(block, lag)`` pair
     #: that *occurs*, so it is bounded by N rather than by N x blocks,
@@ -689,7 +689,7 @@ class GPLogLike:
         if self._may_use_metal() and self.policy.metal_block is not None:
             cap = _MAX_METAL_BLOCK.get(kernel_spec.n_state,
                                        _MAX_METAL_BLOCK_HI_M)
-            if int(self.policy.metal_block) > max(cap, 256):
+            if int(self.policy.metal_block) > cap:
                 # Allowed -- one long block is a real option, e.g. on a
                 # quiet machine -- but it is the GPU watchdog's trigger:
                 # say so once, here, rather than let a long run die.
@@ -1491,11 +1491,16 @@ def _auto_sub_block(m: int) -> int:
 #: gradient: m = 2 at 8192 and m = 3 at 2048 survive up to 4096 chains at
 #: N = 1e5; m = 4 at 1024 is killed from ~224 chains at N = 1e5 and at 4096
 #: chains even at N = 1e4, at 512 from 4096 chains, and at 256 survives
-#: every case measured (up to 4096 chains at N = 1e5, 3.6 s).  256 is also
-#: the auto rule's floor.  (The earlier cap of 1024 was set on a quiet
-#: machine.)
-_MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048}
-_MAX_METAL_BLOCK_HI_M = 256
+#: every case measured (up to 4096 chains at N = 1e5, 3.6 s).  (The earlier
+#: cap of 1024 was set on a quiet machine.)  m = 6 (rotation + SHO) at 256
+#: and at 128 is killed from 512 chains at N = 1e5, forward included, and
+#: at 64 survives up to 4096 chains, with 8 per-instrument jitters too;
+#: m = 5 (SHO + Matern-5/2) at 256 is killed from 512 chains and at 128
+#: survives 4096 chains.  Each cap is half the shortest block killed.
+#: Shorter blocks cost accuracy where the boundary carries it: m = 5 at
+#: 20 s, s/e 100 is 0.36 posterior sigma at 256, 0.67 at 64.
+_MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048, 4: 256, 5: 128}
+_MAX_METAL_BLOCK_HI_M = 64
 
 
 def _slot_map(lag: np.ndarray, blk_len: int):
@@ -1873,6 +1878,11 @@ def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
         N = 1e5, 1024 chains:  256:978    512:929    1024: KILLED
         N = 1e5, 4096 chains:  256:3557   512: KILLED
 
+    and at m = 6 (rotation + SHO, 512 chains, N = 1e5, display in use):
+    256 and 128 KILLED, value + gradient 5373 at 64 and 7285 at 32; m = 5
+    at 256 KILLED.  The rule's floor is the cap itself, not 256, above
+    m = 4.
+
     The uncapped rule picked 8192 at N = 1e5 for every m, which is a hard
     failure at m = 4 rather than a slow path; the cap was 1024 until
     2026-10-25, set on a quiet machine.
@@ -1884,7 +1894,7 @@ def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
     if target - p > 2 * p - target:   # round to the *nearest*, not up
         p *= 2
     cap = _MAX_METAL_BLOCK.get(n_state, _MAX_METAL_BLOCK_HI_M)
-    return max(256, min(cap, p))
+    return max(min(256, cap), min(cap, p))
 
 
 def _pow2(n: int) -> int:
