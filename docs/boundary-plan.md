@@ -527,3 +527,49 @@ Longer term, not scheduled: a square-root backward for the 2-s cadence
 floor (several days, partly research); removing `metal_boundary="dense"`
 per VII; the >= 100x gate against celerite2's 12-core pool, now ~13x on
 the forward.
+
+## II. Watchdog diagnosis (2026-10-25)
+
+Reproduced: an m = 4 (SHO + SHO), N = 1e5 value + gradient, with the
+display in use, is killed ("Impacting Interactivity") at 224 chains and
+above with the automatic 1024-point blocks, on either boundary; 192
+chains survive (245 ms). The same call ran in ~400 ms that morning.
+
+**Ruled out:**
+
+* *Total GPU time.* Six backward kernels in one evaluation (459 ms)
+  survive; so does the same gradient at 512-point blocks for a whole
+  second (1024 chains).
+* *Any single kernel.* Each kernel of the gradient in its own evaluation
+  survives (longest: the backward, 142 ms).
+* *Command-buffer packing.* `MLX_MAX_OPS_PER_BUFFER` = 1, 2 or 4 is still
+  killed.
+* *Memory.* Peak 0.5-0.7 GiB, 62% of system memory free.
+
+The value and the gradient evaluated separately (131 + 171 ms) survive;
+together they are killed.
+
+**The lever is per-thread length.** At 256 chains, N = 1e5: 256- and
+512-point blocks survive (357, 324 ms), 1024 and 2048 are killed; at
+1024 chains, 256 and 512 survive (1.00 s, 0.96 s). At the other state
+dimensions' caps nothing is killed under the same load: m = 2 at 8192 and
+m = 3 (Matern-5/2) at 2048, up to 4096 chains (0.26 s, 0.80 s), and m = 4
+at 1024 at N = 1e4. Not established: what the watchdog measures exactly.
+The fit to everything above is that the unit it cannot preempt is a
+thread's (or threadgroup's) uninterrupted run, which at N = 1e5 is
+stretched by the number of co-resident threadgroups, so per-thread work
+matters and total work does not.
+
+**A 512-point cap at m = 4 is nearly free**, and mostly a speed-up
+(value + gradient, 1024 -> 512-point blocks): N = 1e4 75 -> 48 ms at 256
+chains and 101 -> 113 ms (+12%) at 1024; N = 3e4, 1024 chains, 340 -> 293;
+N = 1e5, 256 chains, ~400 -> 324 (not killed), and 1024 chains 1304 ->
+958 (not killed). More blocks means more threads for a GPU that m = 4's
+register load keeps under-occupied.
+
+**Go for III**, scoped down: lower `_MAX_METAL_BLOCK_HI_M` (m >= 4) from
+1024 to 512, re-time the README's m = 4 rows and the auto-block test that
+pins the measured optimum, and decide whether an explicit `metal_block`
+above the cap should warn. The stress test cannot rely on display load
+being present; it will pin the cap and run the m = 4, N = 1e5 case as a
+slow test that fails if killed. Estimate: half a day.
