@@ -194,11 +194,15 @@ Admissible only as a secondary cross-check, never as the likelihood:
 
 ## Known v1 limitations
 
-* Exposure-time integration (`TermConvolution`) forms its process noise
-  by subtraction, so its float32 path is 50–100x less accurate than an
-  unconvolved term's on data far off-model (no measurable cost on data
-  drawn from the model). See
-  [kernels.md](kernels.md#indefinite-and-still-exact).
+* Exposure-time integration (`TermConvolution`) rests on a formal
+  state-space form (indefinite `P_inf`, process noise by subtraction), so
+  its float32 path is 50–100x less accurate than an unconvolved term's on
+  data far off-model, and on bright on-model data too: at s/e = 100 on a
+  TESS 2-min convolved rotation the value varies by sd 0.19–0.32 across the
+  posterior (unconvolved 0.018) and the gradient is 1.3–1.6 posterior sigma
+  off even with exact block boundaries. See
+  [kernels.md](kernels.md#indefinite-and-still-exact) and
+  [boundary-plan.md](boundary-plan.md), VI.
 * No 2D / multiband GPs.
 * `predict` / conditional mean is an offline float64 utility
   (`oracle.dense_predict`), deliberately outside the hot path.

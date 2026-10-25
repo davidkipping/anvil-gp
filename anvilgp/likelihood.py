@@ -32,9 +32,14 @@ already solved and rides ordinary autodiff through ``mean_fn``.
 Known v1 limitations, stated rather than discovered
 ---------------------------------------------------
 * Exposure-time integration (:class:`~anvilgp.terms.TermConvolution`)
-  forms its process noise by subtraction, so its float32 path is 50-100x
-  less accurate than an unconvolved term's on data far off-model (no
-  measurable cost on data drawn from the model).  See docs/kernels.md.
+  rests on a formal state-space form (indefinite ``P_inf``, process noise by
+  subtraction), so its float32 path is 50-100x less accurate than an
+  unconvolved term's on data far off-model, and on bright data drawn from
+  the model too: at s/e = 100 on a TESS 2-min convolved rotation the value
+  varies by sd 0.19-0.32 across the posterior (unconvolved: 0.018) and the
+  gradient is 1.3-1.6 posterior sigma off even with exact block boundaries
+  (10 at the default blocks).  At s/e = 30 it is 0.02 and 0.1-0.4.  See
+  docs/boundary-plan.md, VI.
 * No 2D/multiband GPs.
 * ``predict`` / conditional mean is deliberately out of the hot path; see
   :func:`anvilgp.oracle.dense_predict` for the offline float64 utility.

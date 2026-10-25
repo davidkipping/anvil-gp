@@ -234,8 +234,14 @@ unchanged (convolved SHO and rotation value+gradient within 1% of before).
 **One float32 caveat remains, older than all of this.** `Q(dt) = P - Phi P
 Phiᵀ` is formed by subtraction — the form [float32.md](float32.md) forbids
 for every other term — because the convolved `P` is not the identity. On
-data drawn from the model that costs nothing measurable (float32 error
-~1e-4, the same as the unconvolved term). **Far off-model** — white noise
+data drawn from the model at moderate signal-to-noise that costs nothing
+measurable (float32 error ~1e-4, the same as the unconvolved term, N = 300).
+**On bright data it does** (2026-10-25): a TESS 2-min convolved rotation at
+s/e = 100, N = 4096, varies by sd 0.19-0.32 across the posterior against
+0.018 unconvolved, and its gradient is 1.3-1.6 posterior sigma off even with
+exact block boundaries (0.10-0.25 unconvolved), 10 sigma at the default
+blocks; s/e = 30 is clear. [boundary-plan.md](boundary-plan.md), VI, has the
+measurements and a proposed positive-definite realisation. **Far off-model** — white noise
 against a long timescale, as during an early burn-in — it is 50 to 100x
 worse than the unconvolved term at the same `kappa` (0.2 log-units at
 `kappa` = 50, 1.1 at 480, N = 300). A cancellation-free `Q` for the

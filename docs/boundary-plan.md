@@ -692,3 +692,74 @@ measured is 0.51 sigma (dense: 1.1). Still 2-40x better than the dense
 boundary on every draw; not at the floor. Candidates if it matters: a
 compensated accumulation in `sqrt_blocks`' fold products, or a second
 centring round (which bought nothing on seed 2).
+
+## VI. Sizing the convolved-term boundary gap (2026-10-25)
+
+**How indefinite.** Eigenvalues of a convolved term's `P_inf` and `Q(dt)`
+(exposure = cadence), float64, min / max:
+
+| case | delta / rho | `P_inf` | `Q(dt)` |
+|---|---|---|---|
+| TESS 2-min, rotation 3 d | 0.003 | +1.0 | +1.9e-13 |
+| TESS 2-min, granulation SHO, rho 0.2 d | 0.007 | +1.0 | -1.3e-8 |
+| TESS 2-min, granulation SHO, rho 1 h | 0.03 | +0.99 | -8.8e-6 |
+| TESS 20-s, SHO + SHO | 0.0005 | +1.0 | -9.8e-12 |
+| Kepler 30-min, rotation 10 d | 0.013 | +1.0 | +8.7e-11 |
+| Kepler 30-min, granulation SHO, rho 1 d | 0.02 | +1.0 | -1.1e-6 |
+| Kepler 30-min, granulation SHO, rho 3 h | 0.16 | +0.76 | -9.0e-3 |
+| Kepler 30-min, granulation SHO, rho 15 min | 2.0 | all eigenvalues negative | all negative |
+| Kepler 30-min, overdamped SHO, rho 1 h | 0.5 | all negative | all negative |
+
+PSD to rounding at small delta / rho; ~1e-2 negative at 0.16; entirely
+negative definite once the exposure approaches the timescale.
+
+**What it costs, and what fixes it.** Gradient error per posterior sigma
+(worst of 16 Laplace draws) and the value's sd across them; data drawn by
+dense Cholesky from the exact convolved covariance; N = 4096, 16 x 256:
+
+| case | dense (today) | exact boundaries | sqrt, Q clamped | one block | value sd |
+|---|---|---|---|---|---|
+| TESS 2-min, convolved Rotation, s/e 100 | **10.4** | 1.59 | 1.67 | 1.29 | 0.32 (one block 0.19) |
+| same, s/e 30 | 0.43 | 0.10 | 0.49 | 0.08 | 0.019 |
+| TESS 2-min, convolved SHO + SHO, s/e 100 | 0.66 | 0.59 | **10.0** | 0.60 | 0.013 |
+| same, s/e 30 | 0.06 | 0.06 | 1.86 | 0.05 | 0.002 |
+| Kepler 30-min, convolved SHO, rho 1 d, s/e 100 | 0.02 | 0.02 | 0.02 | 0.02 | 0.006 |
+| Kepler 30-min, convolved SHO, rho 3 h, s/e 100 | 0.00 | 0.00 | 0.05 | 0.00 | 0.001 |
+| *TESS 2-min, unconvolved Rotation, s/e 100* | *0.57 (sqrt)* | *0.25* | *0.36* | *0.10* | *0.018* |
+
+* **The default is broken for a mainstream case:** a convolved rotation on
+  a bright TESS 2-min star is 10 sigma off.
+* **Clamping `Q`'s negative part is not a fix:** it matches the floor for
+  the rotation and is 10 sigma off for SHO + SHO, whose `Q` is negative by
+  only 1.3e-8 relative -- in exactly the small directions that matter.
+* **The boundary is not the main problem.** With exact boundaries the
+  convolved rotation is still 1.6 sigma off and its value varies by
+  0.19-0.32, ~10x the unconvolved term's on the same data. That floor is
+  the formal representation itself, and it contradicts the docs' old "no
+  measurable cost on data drawn from the model", which held at the
+  moderate signal-to-noise it was measured at (corrected in kernels.md,
+  float32.md, statistical-foundation.md and the likelihood docstring).
+* **A hyperbolic (J-orthogonal) `tria` is not recommended:** it could take
+  10.4 to ~1.6 at best, it is numerically delicate as the negative part
+  grows, and it cannot represent the regime where the formal model is
+  entirely negative definite.
+
+**Proposed instead: a positive-definite realisation.** Every spacing is
+at least the exposure (already enforced), so the exposure average `y_k`
+over `(t_k - delta, t_k]` is a linear function of the state at the
+*previous* sample plus noise, jointly Gaussian with that step's process
+noise: `x_k = Phi x_{k-1} + w_k`, `y_k = g^T x_{k-1} + e_k`, with
+`[[Q, s], [s^T, sigma^2]]` the joint covariance -- positive semi-definite
+by construction, and with `P_inf = I` (the true state, whitened). The
+leaves keep their rank-one form,
+
+    A = Phi - s g^T / sigma^2,   b = s y / sigma^2,
+    C = Q - s s^T / sigma^2 (PSD),   J = g g^T / sigma^2,
+
+so pass 1, the square-root boundary and the scans apply unchanged once the
+lag table carries `g`, `s` and `sigma^2`; `Q` is the unconvolved term's
+(cancellation-free); the first observation is a predecessor at
+`t_1 - delta` drawn from the stationary state. What changes: the forward
+replay (the observation reads the previous state) and the hand-written
+backward. Estimate: a NumPy float32 prototype first (~1 day) to confirm it
+removes the ~10x floor; the kernel and backward 3-5 days after that.

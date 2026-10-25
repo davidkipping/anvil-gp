@@ -11,10 +11,13 @@ a hard requirement, not a contingency, and each is pinned by a test.
 `Q(dt) = P_inf - Phi P_inf Phi^T` is **forbidden** -- with one documented
 exception: `TermConvolution` forms its `Q` this way, because its `P_inf` is
 a matrix function of the generator with no closed-form difference. Measured,
-that costs nothing visible on data drawn from the model (3e-3 log-units
-against 3e-4 to 1e-2 for an unconvolved SHO at matched kappa, delta/rho >=
-0.0025) and 50-100x the unconvolved term's float32 error on data far
-off-model; see docs/kernels.md. Expand it for the SHO at
+that costs nothing visible on data drawn from the model at moderate
+signal-to-noise (3e-3 log-units against 3e-4 to 1e-2 for an unconvolved SHO
+at matched kappa, delta/rho >= 0.0025), 50-100x the unconvolved term's
+float32 error on data far off-model, and ~10x on bright on-model data (a
+TESS 2-min convolved rotation at s/e = 100: value sd 0.19-0.32 across the
+posterior against 0.018); see docs/kernels.md and docs/boundary-plan.md,
+VI. Expand it for the SHO at
 `omega_0 dt << 1` and three `O(omega_0 dt)` terms cancel to
 `O((omega_0 dt)^3)`. Measured, at `omega_0 dt = 1e-3` in float32 the
 difference form returns 1.79e-7 where the answer is 5.50e-8 — **225% wrong**.
