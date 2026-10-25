@@ -25,6 +25,7 @@ import pytest
 import anvilgp as ag
 import boundary_oracle as bo
 from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+import anvilgp.metal as am
 from anvilgp.metal import q_factor
 from anvilgp.oracle import sample_ssm
 
@@ -271,3 +272,153 @@ def test_the_oracle_on_the_kernels_q_factor_meets_the_bounds(case):
                            a["r"], a["cot"], k[0], k[1], a["blk"],
                            lq=_factor(a["qt"]))
     _check_bounds(got, case["exact"])
+
+
+# ------------------------------------------- stage 2: the block pass
+def _kernel_blocks(a, start_m, start_C):
+    """Stage 2's kernel on captured backward inputs, from given starts."""
+    pt, qt, lag, inst, hv, rs, rr, j2 = a["mx"]
+    with mx.stream(mx.gpu):
+        lq = q_factor(qt)
+        out = am.sqrt_blocks(pt, qt, lq, lag, inst, hv, rs, rr, j2,
+                             mx.array(start_m, dtype=mx.float32),
+                             mx.array(start_C, dtype=mx.float32), a["blk"])
+        mx.eval(lq, *out)
+    return [np.array(x) for x in out], np.array(lq)
+
+
+def _canonical(U):
+    """The lower-triangular factor of ``U U^T`` with non-negative diagonal,
+    in float64: two square roots of one matrix compare through it."""
+    L = bo.tria(np.asarray(U, np.float64))
+    d = np.sign(np.diagonal(L, 0, -2, -1))
+    d[d == 0] = 1
+    return L * d[..., None, :]
+
+
+def _block_errors(got, want):
+    """Per field, max |error| / max |truth|; ``U``, ``Z`` through
+    :func:`_canonical`."""
+    out = []
+    for i, (g, w) in enumerate(zip(got, want)):
+        if i in (2, 4):
+            g, w = _canonical(g), _canonical(w)
+        out.append(float(np.abs(g - w).max() / max(np.abs(w).max(), 1e-30)))
+    return out
+
+
+def _as_good_as_numpy(a, start_m, start_C, blk=None):
+    """Kernel blocks against the float64 oracle, field by field, each no
+    worse than 5x the float32 oracle's own error (floor 2e-5).  Measured on
+    the 20-s problem: within 1-3.5x, the worst being ``U``, whose error is
+    Metal's float32 rounding rather than the algebra (the oracle on the
+    kernel's exact algebra and Householder is within 1.6x of LAPACK)."""
+    kb, lq = _kernel_blocks(a, start_m, start_C)
+    args = (a["pt"], a["qt"], a["lag"], a["h"], a["res"], a["r"],
+            start_m, start_C, a["blk"] if blk is None else blk)
+    f64 = lambda x: np.asarray(x, np.float64)
+    want = bo.sqrt_blocks(f64(args[0]), f64(args[1]), args[2],
+                          *map(f64, args[3:6]), *args[6:], dt=np.float64,
+                          lq=f64(lq))
+    ref32 = bo.sqrt_blocks(*args, lq=lq)
+    ek, en = _block_errors(kb, want), _block_errors(ref32, want)
+    for name, k, n in zip("A b U eta Z".split(), ek, en):
+        assert k <= max(5 * n, 2e-5), (
+            f"{name}: kernel {k:.1e} against the float32 oracle's {n:.1e}")
+    return kb
+
+
+def test_the_block_pass_matches_the_oracle(case):
+    a, k = case["inputs"], case["kernel"]
+    kb = _as_good_as_numpy(a, k[0], k[1])
+    # the first block has no predecessor (Phi = 0 at lag row 0), so its A,
+    # eta and J are exactly zero, as in pass 1 -- stage 3 may rely on it
+    for i in (0, 3, 4):
+        assert not np.any(kb[i][:, 0]), "A, eta, Z of block 0 must be 0"
+
+
+def test_the_block_pass_meets_the_boundary_bounds(case):
+    """Kernel blocks, NumPy scan (stage 3's job): inside the bounds.
+    Measured 3.2e-4 / 1.8e-5 / 2.5e-4 at 16 x 256, 1.6e-4 / 2.7e-5 /
+    1.0e-3 at 4 x 1024."""
+    a, k = case["inputs"], case["kernel"]
+    kb, _ = _kernel_blocks(a, k[0], k[1])
+    _check_bounds(bo.sqrt_scan(kb, k[0], k[1], a["cot"]), case["exact"])
+
+
+def test_the_block_pass_gives_the_kernel_backward_a_good_gradient(case):
+    a0, k0 = case["inputs"], case["kernel"]
+    kb, _ = _kernel_blocks(a0, k0[0], k0[1])
+    scan = bo.sqrt_scan(kb, k0[0], k0[1], a0["cot"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with bo.boundary_from(lambda inputs, kernel: scan), mx.stream(mx.gpu):
+            g = np.array(mx.grad(lambda u: case["gp"](u).sum())(
+                mx.array(case["V"], dtype=mx.float32)))
+    e = _grad_sigma(case, g)
+    assert e.max() < GRAD_SIGMA, f"per posterior sigma {np.round(e, 3)}"
+
+
+def _capture(gp, n_par, n_chains=2, seed=5):
+    v = np.random.default_rng(seed).normal(0, 0.05, (n_chains, n_par))
+    got = {}
+
+    def record(inputs, kernel):
+        got["a"], got["k"] = inputs, kernel
+        return kernel
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with bo.boundary_from(record), mx.stream(mx.gpu):
+            mx.eval(mx.grad(lambda u: gp(u).sum())(
+                mx.array(v, dtype=mx.float32)))
+    return got["a"], got["k"]
+
+
+@pytest.mark.parametrize("n_jit", [0, 1, 3])
+def test_the_block_pass_carries_each_instruments_jitter(n_jit):
+    """The jitter enters both the replay and the leaf variance, per
+    observation when there are several (the instrument-indexed read)."""
+    n, blk = 768, 64
+    rng = np.random.default_rng(4)
+    t = np.arange(n) * 0.02
+    inst = None if n_jit <= 1 else (np.arange(n) % n_jit).astype(np.int32)
+    pm = ParamMap(
+        kernel=[KernelParam(link="log", index=i, ref=r)
+                for i, r in enumerate((1.3, 4.0, 3.0))],
+        jitter=[KernelParam(link="log", index=3 + j, ref=(0.03, 0.3, 0.1)[j])
+                for j in range(n_jit)],
+        n_dim=3 + n_jit, instrument=inst)
+    gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.05),
+                   ag.SHOTerm(), pm,
+                   GPPolicy(metal=True, kappa_max=None, metal_block=blk))
+    a, k = _capture(gp, 3 + n_jit)
+    if n_jit == 3:
+        assert np.ptp(a["r"][0, :3]) > 0, "jitters must differ by instrument"
+    _as_good_as_numpy(a, k[0], k[1])
+
+
+def test_the_block_pass_handles_a_short_last_block():
+    """N not a multiple of the block: the last thread stops early.  Its
+    element is the oracle's single block over the same points."""
+    n, blk = 1000, 128
+    term = ag.SHOTerm() + ag.SHOTerm()
+    rng = np.random.default_rng(2)
+    t = np.arange(n) * DT
+    yerr = np.full(n, 1e-3)
+    y = sample_ssm(term, KP, DT, n, rng) + yerr * rng.standard_normal(n)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
+                          for i, x in enumerate(KP)], n_dim=len(KP))
+    gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None, metal_block=blk))
+    a, k = _capture(gp, len(KP))
+    kb, lq = _kernel_blocks(a, k[0], k[1])
+    tail = slice((n // blk) * blk, n)
+    one = bo.sqrt_blocks(a["pt"].astype(np.float64), a["qt"].astype(np.float64),
+                         a["lag"][tail], a["h"].astype(np.float64),
+                         a["res"][:, tail].astype(np.float64),
+                         a["r"][:, tail].astype(np.float64),
+                         k[0][:, -1:], k[1][:, -1:], n - tail.start,
+                         dt=np.float64, lq=lq.astype(np.float64))
+    err = _block_errors([x[:, -1:] for x in kb], one)
+    assert max(err) < 1e-3, err

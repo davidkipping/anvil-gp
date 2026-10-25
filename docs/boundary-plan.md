@@ -1,6 +1,6 @@
 # Plan: the kernel's block boundaries in the square-root information form
 
-Status: agreed 2026-10-25; stages 0 and 1 done 2026-10-25.
+Status: agreed 2026-10-25; stages 0-2 done 2026-10-25.
 
 ## The problem
 
@@ -47,7 +47,7 @@ the backward, unchanged.
 |---|---|---|
 | 0 | Oracle and red tests | 0.5-1 day, **done** |
 | 1 | Q factor table, a small Metal kernel (Cholesky, pivots clamped at 0, no floor) | 0.5 day, **done** |
-| 2 | Centred square-root block pass, one thread per (chain, block); rank-1 leaf update | 2 days |
+| 2 | Centred square-root block pass, one thread per (chain, block); rank-1 leaf update | 2 days, **done** |
 | 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days |
 | 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day |
 | 5 | Measure on a quiet machine: README timings, watchdog at m = 4, the exposure matrix (m = 2-4, gapped and 2-s cadences), then ChEES | 1 day + machine time |
@@ -126,3 +126,54 @@ kernel's entry covariances are **57%** wrong at 16 x 256 (17% at
 4 x 1024), against 2% at 20 s: the exposure grows fast with cadence. And
 the oracle's entry means reach 1.2e-3 at 2 s, 4 x 1024, just over the
 1e-3 bound, with either factor, so that is not the factor's doing.
+
+## Stage 2: what it found (2026-10-25)
+
+`metal.sqrt_blocks`, one thread per (chain, block): the replay from the
+block's start state fused with the centred square-root leaf fold, and the
+output moved to the next block's start state. Not wired in yet. The
+algebra, in `_SRC_SQRT_BLOCKS`'s comment: the leaf's information is rank
+one, so every `(I + C J)^-1` collapses to the scalar `alpha = 1 + |U^T
+z|^2` that pass 1 already uses, and only two factor updates remain per
+observation -- `Z` by a Givens rank-one update and `U` by one `m x 2m`
+Householder `tria`. The leaf's `U2` and the update's `(I + p p^T)^-1/2`
+are closed-form symmetric roots written without cancellation; no
+`(1+m) x (1+m)` QR per leaf.
+
+Against the float64 oracle from the same start states (relative to each
+field's largest entry; float32 NumPy oracle in brackets):
+
+| | A | b | U | eta | Z |
+|---|---|---|---|---|---|
+| 20 s, 16 x 256 | 6.5e-6 (5.6e-6) | 1.3e-4 (1.3e-4) | 1.5e-5 (4.5e-6) | 1.0e-5 (9.4e-6) | 3.5e-6 (3.6e-6) |
+| 20 s, 4 x 1024 | 9.5e-6 (9.2e-6) | 4.3e-3 (2.0e-3) | 2.1e-5 (1.1e-5) | 1.7e-5 (1.8e-5) | 1.2e-5 (1.1e-5) |
+| 2 s, 16 x 256 | 1.7e-5 (1.9e-5) | 8.4e-3 (1.1e-2) | 6.1e-5 (3.0e-5) | 5.9e-5 (5.7e-5) | 9.4e-7 (1.4e-6) |
+| 2 min, 16 x 256 | 1.1e-5 (5.5e-6) | 7.1e-4 (5.8e-4) | 4.9e-6 (1.4e-6) | 3.3e-6 (3.7e-6) | 1.2e-6 (1.0e-6) |
+
+(`b` is a centred correction, small against its own scale, so its
+relative error reads large; what it feeds is below.) `U` is 2-3.5x the
+NumPy oracle's. Not the algebra: the oracle on the kernel's exact algebra
+is within 1.2x of LAPACK's, and on the kernel's exact Householder within
+1.6x; the rest is Metal's float32 rounding (precise division changes
+nothing, to the digit).
+
+Boundary quantities from the kernel's blocks through the NumPy scan
+(stage 3's job), entry means / covariances / seeds: 3.2e-4 / 1.8e-5 /
+2.5e-4 at 20 s, 16 x 256, and 1.6e-4 / 2.7e-5 / 1.0e-3 at 4 x 1024, all
+inside the bounds (the NumPy blocks: 1.5e-4 / 6.6e-6 / 1.2e-4 and 1.3e-4 /
+1.2e-5 / 8.5e-4). The gradient through the kernel's own backward from
+them is inside 0.5 sigma at all 16 draws. At 2 s the entry covariances
+reach 1.9e-4 at 4 x 1024, over the 1e-4 bound (NumPy blocks 1.0e-4; the
+dense kernel 17%) -- for stage 5.
+
+Pinned in `tests/test_boundary.py`: each field no worse than 5x the
+float32 oracle's error, block 0's `A`, `eta`, `Z` exactly zero (stage 3
+may rely on it), the boundary bounds and the gradient on the 20-s
+problem, per-instrument jitter (0, 1, 3), and a short last block.
+Mutation-checked: dropping the leaf's jitter, the output shift, the `Z`
+update, the centring, or the `(I + p p^T)^-1/2` factor each fails 2-10
+of them.
+
+Cost and the m = 4 watchdog: not measured (stage 5). The thread carries
+the replay's state as well as the element, so register pressure at m = 4
+is the risk.

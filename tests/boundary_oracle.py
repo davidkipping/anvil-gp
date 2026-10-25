@@ -240,9 +240,10 @@ def replay(pt, qt, lag, h, res, r, ent_m, ent_C, blk, dt=np.float32):
     return out
 
 
-def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
-                  dt=np.float32, lq=None):
-    """Entry states and seeds from block-local centred square-root elements.
+def sqrt_blocks(pt, qt, lag, h, res, r, start_m, start_C, blk,
+                dt=np.float32, lq=None):
+    """Block elements ``[A, b, U, eta, Z]``, each ``(nc, nb, ...)``, from
+    block-local centred square-root leaves -- what stage 2's kernel emits.
 
     ``start_m``, ``start_C``: approximate entry states (the kernel's own
     prefix serves; zero does not).  Each block's leaves are centred on the
@@ -265,8 +266,7 @@ def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
     pm = np.einsum("cnij,cnj->cni", phi, Mprev)
     resid = res.astype(dt) - np.einsum("cni,ci->cn", pm, h.astype(dt))
     lq = sqrt_q(qt, dt) if lq is None else np.asarray(lq).astype(dt)
-    e = leaves_sqrt(phi, lq[:, lag], h.astype(dt), resid,
-                    r.astype(dt))
+    e = leaves_sqrt(phi, lq[:, lag], h.astype(dt), resid, r.astype(dt))
     e[1] = e[1] + (pm - M)
     e = [x.reshape((nc, nb, blk) + x.shape[2:]) for x in e]
     acc = [x[:, :, 0] for x in e]
@@ -275,6 +275,14 @@ def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
     # block k's output, re-expressed relative to block k+1's start
     acc[1] = acc[1].copy()
     acc[1][:, :-1] += M[:, blk - 1:-1:blk] - start_m[:, 1:].astype(dt)
+    return acc
+
+
+def sqrt_scan(blocks, start_m, start_C, cot, dt=np.float32):
+    """Entry states and seeds from square-root block elements: a prefix and
+    a suffix per chain -- what stage 3's kernel does."""
+    acc = [np.asarray(x).astype(dt) for x in blocks]
+    nc, nb, m = acc[1].shape
     blkel = lambda k: [x[:, k] for x in acc]
     pre = [blkel(0)]
     for k in range(1, nb):
@@ -293,8 +301,15 @@ def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
             em[:, k] = start_m[:, k] + pre[k - 1][1]
             eC[:, k] = pre[k - 1][2] @ T(pre[k - 1][2])
         sm[:, k], sC[:, k] = seeds_sqrt(pre[k][1], pre[k][2], suf[k + 1],
-                                        cot.astype(dt))
+                                        np.asarray(cot).astype(dt))
     return em, eC, sm, sC
+
+
+def sqrt_boundary(pt, qt, lag, h, res, r, cot, start_m, start_C, blk,
+                  dt=np.float32, lq=None):
+    """Entry states and seeds: :func:`sqrt_blocks`, then :func:`sqrt_scan`."""
+    blocks = sqrt_blocks(pt, qt, lag, h, res, r, start_m, start_C, blk, dt, lq)
+    return sqrt_scan(blocks, start_m, start_C, cot, dt)
 
 
 # ------------------------------------------------- through the kernel
@@ -303,22 +318,30 @@ def boundary_from(source):
     """Run the kernel's gradient with its boundary quantities replaced.
 
     ``source(inputs, kernel)`` gets the backward's inputs as NumPy arrays
-    (dict: ``pt, qt, lag, h, res, r, r_ref, cot, blk``) and the kernel's own
-    ``(ent_m, ent_C, seed_m, seed_C)``, and returns the four to use; it may
-    also just record them.
+    (dict: ``pt, qt, lag, h, res, r, r_ref, cot, blk``, with ``r`` the
+    per-observation variance including the jitter, and ``mx`` the kernel's
+    own arguments ``(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2)``)
+    and the kernel's ``(ent_m, ent_C, seed_m, seed_C)``, and returns the
+    four to use; it may also just record them.
     """
     orig = am.backward_ckpt
 
     def patched(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                 ent_m, ent_C, seed_m, seed_C, *rest, **kw):
         blk = rest[-1]
-        jv = (np.array(jit2)[:, 0] if jit2.shape[1]
-              else np.zeros(phi_tab.shape[0], np.float32))
+        j2 = np.array(jit2)
         rr = np.array(r_ref)
+        if j2.shape[1] == 0:
+            jv = np.zeros((phi_tab.shape[0], 1), np.float32)
+        elif j2.shape[1] == 1:
+            jv = j2
+        else:
+            jv = j2[:, np.array(inst)]
         inputs = dict(pt=np.array(phi_tab), qt=np.array(q_tab),
                       lag=np.array(lag), h=np.array(hvec),
-                      res=np.array(resid).T, r=rr[None, :] + jv[:, None],
-                      r_ref=rr, cot=np.array(cot), blk=int(blk))
+                      res=np.array(resid).T, r=rr[None, :] + jv,
+                      r_ref=rr, cot=np.array(cot), blk=int(blk),
+                      mx=(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2))
         kernel = tuple(np.array(x) for x in (ent_m, ent_C, seed_m, seed_C))
         new = source(inputs, kernel)
         new = [mx.array(np.asarray(x), dtype=mx.float32) for x in new]

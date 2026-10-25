@@ -52,7 +52,7 @@ import mlx.core as mx
 from .elements import Element
 
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
-           "entry_states", "replay_blocks", "q_factor",
+           "entry_states", "replay_blocks", "q_factor", "sqrt_blocks",
            "backward_ckpt", "block_seeds_kernel",
            "metal_available", "MAX_STATE", "MAX_JITTER",
            "MAX_ADJOINT_BUFFER_BYTES"]
@@ -1662,6 +1662,312 @@ def q_factor(q_tab: mx.array) -> mx.array:
         inputs=[q_tab, int(n_entries)], output_shapes=[q_tab.shape],
         output_dtypes=[mx.float32], grid=(n_entries, 1, 1),
         threadgroup=(min(64, n_entries), 1, 1))[0]
+
+
+#: The square-root boundary's block pass: one thread per (chain, block),
+#: emitting each block's element in the square-root information form,
+#: ``(A, b, U, eta, Z)`` with ``C = U U^T`` and ``J = Z Z^T``, centred on
+#: the filter replayed from the block's own start state.
+#: docs/boundary-plan.md, stage 2; NumPy reference
+#: ``tests/boundary_oracle.py::sqrt_blocks``.
+#:
+#: Why: the dense form's block elements carry ``C`` and ``J`` themselves,
+#: whose conditioning float32 cannot hold on bright, densely sampled data,
+#: and ``b``, ``eta`` relative to a zero state, which ``eta - J b``
+#: cancels.  Factors carry the square root of the condition number;
+#: centring makes ``b``, ``eta`` corrections to a trajectory that is
+#: already nearly right.  Each alone fails (docs/float32.md, section 7).
+#:
+#: Per observation the thread advances the replay (`_FWD_STEP`, giving
+#: the trajectory ``m_t``) and builds the centred leaf from ``L_Q``
+#: (`q_factor`): with ``u = L_Q^T h``, ``S = |u|^2 + r``,
+#:
+#:     residual  y' = y - h Phi m_{t-1}
+#:     A2 = Phi - K h Phi,   K = L_Q u / S
+#:     b2 = K y' + Phi m_{t-1} - m_t
+#:     U2 = L_Q - c2 (L_Q u) u^T,   c2 = 1 / (sqrt S (sqrt S + sqrt r))
+#:     J2 = z z^T, eta2 = g z,   z = (h Phi)^T / sqrt S,  g = y' / sqrt S
+#:
+#: (``U2 U2^T = Q - Q h h^T Q / S``; ``c2`` is the symmetric square root
+#: of ``I - u u^T / S`` written without cancellation.)  The leaf's
+#: information is rank one, so composing it onto the running element
+#: needs no general inverse: with ``p = U^T z``, ``alpha = 1 + |p|^2``,
+#: ``beta = g - z^T b`` and ``a = A^T z``,
+#:
+#:     A <- A2 (A - (U p) a^T / alpha)
+#:     b <- A2 (b + (U p) beta / alpha) + b2
+#:     U <- tria([A2 (U - c (U p) p^T), U2]),   c = 1 / (sqrt alpha (sqrt alpha + 1))
+#:     eta <- eta + a beta / alpha
+#:     Z <- tria([Z, a / sqrt alpha])            (a Givens rank-one update)
+#:
+#: the same scalars as pass 1's dense fold.  ``tria(X)`` is the lower
+#: triangle ``L`` with ``L L^T = X X^T``, by Householder reflections from
+#: the right, diagonal made non-negative.  Finally a block's output is
+#: moved from its own trajectory end to the next block's start state:
+#: ``b += m_end - start_m[k+1]``.
+#:
+#: Positive semi-definite ``Q`` only; a convolved term keeps the dense
+#: boundary (docs/boundary-plan.md, decision 1).
+_SRC_SQRT_BLOCKS = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    uint start = blk_i * (uint)blk_len;
+    if (start >= (uint)npts) return;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint ei = chain * (uint)n_blocks + blk_i;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    JIT_HOIST
+
+    // the replay, from this block's own start state
+    float mean[MDIM], cov[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        mean[i] = start_m[ei * M + i];
+        for (uint j = 0; j < M; ++j) cov[i][j] = start_C[ei * M * M + i * M + j];
+    }
+    // the running element
+    float Am[MDIM][MDIM], Um[MDIM][MDIM], Zm[MDIM][MDIM];
+    float bv[MDIM], ev[MDIM];
+    bool first = true;
+
+    for (uint gi = start; gi < stop; ++gi) {
+        float mprev[MDIM];
+        for (uint i = 0; i < M; ++i) mprev[i] = mean[i];
+        FWD_STEP
+        {
+            JIT_PER_OBS
+            float rv = r_ref[gi] + jit2v;
+            uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
+            float Ph[MDIM][MDIM], LQ[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    Ph[i][j] = phitab[off + i * M + j];
+                    LQ[i][j] = lqtab[off + i * M + j];
+                }
+            float pm[MDIM], hphi[MDIM], uu[MDIM], lu[MDIM];
+            float yv = resid[gi * (uint)n_chains + chain];
+            float su = 0.0f;
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f, c = 0.0f, d = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    a += Ph[i][j] * mprev[j];
+                    c += hv[j] * Ph[j][i];
+                    d += LQ[j][i] * hv[j];
+                }
+                pm[i] = a; hphi[i] = c; uu[i] = d;
+                su += d * d;
+            }
+            for (uint i = 0; i < M; ++i) {
+                yv -= hv[i] * pm[i];
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += LQ[i][j] * uu[j];
+                lu[i] = a;
+            }
+            float sv = su + rv;
+            float rs = metal::precise::sqrt(sv);
+            float inv_rs = 1.0f / rs;
+            float c2 = 1.0f / (rs * (rs + metal::precise::sqrt(rv)));
+            float zz[MDIM], kk[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                zz[i] = hphi[i] * inv_rs;
+                kk[i] = lu[i] / sv;
+            }
+            float gg = yv * inv_rs;
+            float A2[MDIM][MDIM], U2[MDIM][MDIM], b2[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                b2[i] = kk[i] * yv + pm[i] - mean[i];
+                for (uint j = 0; j < M; ++j) {
+                    A2[i][j] = Ph[i][j] - kk[i] * hphi[j];
+                    U2[i][j] = LQ[i][j] - c2 * lu[i] * uu[j];
+                }
+            }
+
+            if (first) {
+                for (uint i = 0; i < M; ++i) {
+                    bv[i] = b2[i];
+                    ev[i] = gg * zz[i];
+                    for (uint j = 0; j < M; ++j) {
+                        Am[i][j] = A2[i][j];
+                        Um[i][j] = U2[i][j];
+                        Zm[i][j] = (j == 0) ? zz[i] : 0.0f;
+                    }
+                }
+                first = false;
+            } else {
+                // p = U^T z ; Up = U p ; a = A^T z
+                float pp[MDIM], up[MDIM], za[MDIM];
+                float sp = 0.0f, zb = 0.0f;
+                for (uint i = 0; i < M; ++i) {
+                    float a = 0.0f, c = 0.0f;
+                    for (uint j = 0; j < M; ++j) {
+                        a += Um[j][i] * zz[j];
+                        c += Am[j][i] * zz[j];
+                    }
+                    pp[i] = a; za[i] = c;
+                    sp += a * a;
+                    zb += zz[i] * bv[i];
+                }
+                for (uint i = 0; i < M; ++i) {
+                    float a = 0.0f;
+                    for (uint j = 0; j < M; ++j) a += Um[i][j] * pp[j];
+                    up[i] = a;
+                }
+                float alpha = 1.0f + sp;
+                float inv_a = 1.0f / alpha;
+                float ra = metal::precise::sqrt(alpha);
+                float cc = 1.0f / (ra * (ra + 1.0f));
+                float bia = (gg - zb) * inv_a;
+
+                // GA = A - Up a^T / alpha ; UR = U - c Up p^T ; v = b + Up beta / alpha
+                float GA[MDIM][MDIM], UR[MDIM][MDIM], vv2[MDIM];
+                for (uint i = 0; i < M; ++i) {
+                    vv2[i] = bv[i] + up[i] * bia;
+                    for (uint j = 0; j < M; ++j) {
+                        GA[i][j] = Am[i][j] - up[i] * za[j] * inv_a;
+                        UR[i][j] = Um[i][j] - cc * up[i] * pp[j];
+                    }
+                }
+                // A <- A2 GA ; b <- A2 v + b2 ; X = [A2 UR, U2]
+                float X[MDIM][2 * MDIM];
+                for (uint i = 0; i < M; ++i) {
+                    float bb = b2[i];
+                    for (uint j = 0; j < M; ++j) bb += A2[i][j] * vv2[j];
+                    bv[i] = bb;
+                    for (uint j = 0; j < M; ++j) {
+                        float a = 0.0f, w = 0.0f;
+                        for (uint k = 0; k < M; ++k) {
+                            a += A2[i][k] * GA[k][j];
+                            w += A2[i][k] * UR[k][j];
+                        }
+                        Am[i][j] = a;
+                        X[i][j] = w;
+                        X[i][M + j] = U2[i][j];
+                    }
+                }
+                TRIA_X
+                for (uint i = 0; i < M; ++i)
+                    for (uint j = 0; j < M; ++j) Um[i][j] = X[i][j];
+
+                // eta <- eta + a beta / alpha ; Z <- tria([Z, a / sqrt alpha])
+                float vz[MDIM];
+                float ira = 1.0f / ra;
+                for (uint i = 0; i < M; ++i) {
+                    ev[i] += za[i] * bia;
+                    vz[i] = za[i] * ira;
+                }
+                for (uint k = 0; k < M; ++k) {
+                    float a = Zm[k][k], bb = vz[k];
+                    float rr = metal::precise::sqrt(a * a + bb * bb);
+                    if (rr == 0.0f) continue;
+                    float cg = a / rr, sg = bb / rr;
+                    Zm[k][k] = rr;
+                    for (uint i = k + 1; i < M; ++i) {
+                        float zi = Zm[i][k], vi = vz[i];
+                        Zm[i][k] = cg * zi + sg * vi;
+                        vz[i] = cg * vi - sg * zi;
+                    }
+                }
+            }
+        }
+    }
+
+    // output relative to the next block's start state
+    if (blk_i + 1 < (uint)n_blocks) {
+        uint en = (chain * (uint)n_blocks + blk_i + 1) * M;
+        for (uint i = 0; i < M; ++i) bv[i] += mean[i] - start_m[en + i];
+    }
+    for (uint i = 0; i < M; ++i) {
+        out_b[ei * M + i] = bv[i];
+        out_eta[ei * M + i] = ev[i];
+        for (uint j = 0; j < M; ++j) {
+            out_A[ei * M * M + i * M + j] = Am[i][j];
+            out_U[ei * M * M + i * M + j] = Um[i][j];
+            out_Z[ei * M * M + i * M + j] = Zm[i][j];
+        }
+    }
+"""
+
+#: ``tria`` in place on ``X[MDIM][2 * MDIM]``: Householder reflections from
+#: the right zero row k beyond column k, leaving ``L = X[:, :M]`` lower
+#: triangular with ``L L^T`` = the original ``X X^T``; then each column is
+#: signed so the diagonal is non-negative.  A row already zero beyond its
+#: diagonal is left alone.
+_TRIA_X = """
+                for (uint k = 0; k < M; ++k) {
+                    float tail = 0.0f;
+                    for (uint j = k + 1; j < 2 * M; ++j) tail += X[k][j] * X[k][j];
+                    if (tail == 0.0f) continue;
+                    float x0 = X[k][k];
+                    float nrm = metal::precise::sqrt(x0 * x0 + tail);
+                    float al = (x0 >= 0.0f) ? -nrm : nrm;
+                    float vk = x0 - al;
+                    float tau = 1.0f / (nrm * (nrm + fabs(x0)));   // 2 / |v|^2
+                    for (uint i = k + 1; i < M; ++i) {
+                        float dt = X[i][k] * vk;
+                        for (uint j = k + 1; j < 2 * M; ++j) dt += X[i][j] * X[k][j];
+                        float f = tau * dt;
+                        X[i][k] -= f * vk;
+                        for (uint j = k + 1; j < 2 * M; ++j) X[i][j] -= f * X[k][j];
+                    }
+                    X[k][k] = al;
+                    for (uint j = k + 1; j < 2 * M; ++j) X[k][j] = 0.0f;
+                }
+                for (uint k = 0; k < M; ++k)
+                    if (X[k][k] < 0.0f)
+                        for (uint i = k; i < M; ++i) X[i][k] = -X[i][k];
+"""
+
+_sqrt_block_kernels: dict = {}
+
+
+def _sqrt_block_kernel(m: int, n_jit: int = 0):
+    key = (m, _jit_key(n_jit))
+    if key not in _sqrt_block_kernels:
+        body = _SRC_SQRT_BLOCKS.replace("FWD_STEP", _fwd_step(False)) \
+                               .replace("TRIA_X", _TRIA_X)
+        body = _formal_src(_jitter_src(body, n_jit), False)
+        _sqrt_block_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_sqrt_blocks_m{m}_j{key[1]}",
+            input_names=["phitab", "qtab", "lqtab", "lag", "inst", "hvec",
+                         "resid", "r_ref", "jit2", "start_m", "start_C",
+                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                         "n_jit"],
+            output_names=["out_A", "out_b", "out_U", "out_eta", "out_Z"],
+            source=body.replace("MDIM", str(m)),
+        )
+    return _sqrt_block_kernels[key]
+
+
+def sqrt_blocks(phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
+                start_m, start_C, blk_len):
+    """``(A, b, U, eta, Z)``, each ``(n_chains, n_blocks, m[, m])``: every
+    block's element in the square-root information form, centred on the
+    filter replayed from ``(start_m, start_C)`` -- approximate entry states,
+    as :func:`entry_states` gives.  ``lq_tab`` is :func:`q_factor` of
+    ``q_tab``; the rest as :func:`scan_blocks`.  See `_SRC_SQRT_BLOCKS`.
+    Not for a convolved term, whose ``Q`` has no real factor.
+    """
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    if m > MAX_STATE:
+        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
+    npts = resid.shape[0]
+    n_blocks = start_m.shape[1]
+    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    shapes = [(n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
+              (n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
+              (n_chains, n_blocks, m, m)]
+    return tuple(_sqrt_block_kernel(m, n_jit)(
+        inputs=[phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
+                start_m, start_C, int(npts), int(n_lags), int(n_blocks),
+                int(n_chains), int(blk_len), int(n_jit)],
+        output_shapes=shapes, output_dtypes=[mx.float32] * 5,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1)))
 
 
 def metal_available() -> bool:
