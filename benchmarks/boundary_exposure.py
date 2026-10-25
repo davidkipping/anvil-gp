@@ -83,7 +83,7 @@ for label, (mk, kp), tb, n, sec, se in ROWS:
     d = len(kp)
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=float(x))
                           for i, x in enumerate(kp)], n_dim=d)
-    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(kappa_max=None))
+    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(metal=False, kappa_max=None))
     V, sd = posterior_draws(ref, d, 16)
     fh = hi(ref, V)
     P = np.repeat(V, 2 * d, axis=0)

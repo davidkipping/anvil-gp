@@ -33,7 +33,7 @@ def worst(label, t, term, kp, yerr, seeds=(1, 2)):
     for seed in seeds:
         y = chol @ np.random.default_rng(seed).standard_normal(len(t))
         ref = GPLogLike(None, t, None, y, yerr, term, pm,
-                        GPPolicy(kappa_max=None))
+                        GPPolicy(metal=False, kappa_max=None))
         hi = float(np.array(ref.hi(mx.zeros((1, 1), dtype=mx.float64,
                                             stream=mx.cpu)))[0])
         kap = max(kap, float(np.array(ref.kappa(mx.zeros((1, 1)))).max()))

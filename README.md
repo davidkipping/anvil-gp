@@ -17,13 +17,13 @@ from anvilgp.anvil import make_target
 
 from anvilgp import GPPolicy
 
-# metal=True turns on the fused kernel: ~17-24x on the forward and ~85-200x
-# on the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
-# is off by default; `gt.loglike.metal_eligible()` says whether it can be honoured
-# (m <= 4, up to 8 jitters), and a request it cannot honour warns rather than
-# falling back in silence.
-gt = make_target(ag.SHOTerm(), t, y, yerr,      # defaults, not homework
-                 policy=GPPolicy(metal=True))
+# The fused Metal kernel is the default wherever it can serve the problem
+# (m <= 4, up to 8 jitters): ~17-24x on the forward and ~85-200x on the
+# gradient, and the more accurate float32 path on bright, densely sampled
+# data.  Otherwise the MLX path runs; either way it says once per process
+# which it chose.  GPPolicy(metal=False) forces the MLX path, metal=True
+# insists on the kernel and warns if it cannot.
+gt = make_target(ag.SHOTerm(), t, y, yerr)      # defaults, not homework
 print(anvil.validate_precision(gt.target, gt.u0(32)))   # trust check first
 
 u0 = gt.u0(256)
@@ -572,7 +572,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `False` | you want the fused kernel: ~17-24x on the forward, ~85-200x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
+| `metal` | `None` (the kernel where eligible: `m <= 4`, up to 8 per-instrument jitters; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
 | `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3 and 256 at m >= 4) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
@@ -624,11 +624,13 @@ marked as an estimate.
   store their log-normaliser for a zero incoming state, ~1e4 numbers that
   every composition cancels; it grows with timescale over cadence, s/e and
   N, and `kappa_max` cannot see it. Clear for GP-detrended transit fits at
-  s/e <~ 10, RV and single Kepler quarters; on the default path, active
+  s/e <~ 10, RV and single Kepler quarters; on the MLX path, active
   stars at s/e >~ 100 and long baselines vary by ~0.4-3.5 log-units across
-  the posterior; a TESS 20-s sector at s/e = 30 by 2.8 on the default path
+  the posterior; a TESS 20-s sector at s/e = 30 by 2.8 on the MLX path
   (1.7 on the kernel before 2026-10-24). **The kernel's value is fixed**
-  (replayed filter, 0.023 on that sector); the default MLX path is not.
+  (replayed filter, 0.023 on that sector), and since 2026-10-25 the kernel
+  is the default wherever it is eligible; the MLX path, still the only one
+  at m > 4, is not fixed (docs/boundary-plan.md, IV).
   **Short blocks on the kernel: fixed 2026-10-25, confirmed by ChEES.**
   At N <~ 6k with m = 4 the automatic block is 256 points, and on densely
   sampled high-s/e data the dense information form's entry states and

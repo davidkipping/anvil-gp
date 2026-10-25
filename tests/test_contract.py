@@ -36,7 +36,7 @@ def test_mean_model_is_subtracted_and_differentiable():
 
     pm = ParamMap(kernel=_const(KP), n_dim=1, mean=slice(0, 1))
     gp = GPLogLike(mean_fn, T, T, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128, hi_block=128))
+                   GPPolicy(metal=False, block=128, hi_block=128))
     v = a64([[slope_ref]])
     got = float(np.array(gp.hi_absolute(v))[0])
     ref = dense_loglike(ag.SHOTerm(), np.array(KP), T, Y - slope_ref * T, YERR)
@@ -65,7 +65,7 @@ def test_x_mean_is_a_separate_abscissa_from_t():
 
     pm = ParamMap(kernel=_const(KP), n_dim=2, mean=slice(0, 2))
     gp = GPLogLike(mean_fn, T, x_mean, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128, hi_block=128))
+                   GPPolicy(metal=False, block=128, hi_block=128))
     v = a64([[0.05, -0.02]])
     resid = Y - (0.05 * x_mean[0] + (-0.02) * x_mean[1])
     ref = dense_loglike(ag.SHOTerm(), np.array(KP), T, resid, YERR)
@@ -84,7 +84,7 @@ def test_per_instrument_jitters_and_offsets():
         offset=[KernelParam(link="const", value=float(o)) for o in off],
         instrument=inst)
     gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128, hi_block=128))
+                   GPPolicy(metal=False, block=128, hi_block=128))
     got = float(np.array(gp.hi_absolute(a64(np.zeros((1, 1)))))[0])
 
     # dense reference with a heteroscedastic diagonal
@@ -103,7 +103,7 @@ def test_multi_instrument_requires_an_instrument_index():
     pm = ParamMap(kernel=_const(KP), n_dim=1,
                   jitter=[KernelParam(link="const", value=0.1),
                           KernelParam(link="const", value=0.2)])
-    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(block=128))
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(metal=False, block=128))
     with pytest.raises(ValueError, match="instrument"):
         gp.hi(a64(np.zeros((1, 1))))
 
@@ -117,7 +117,7 @@ def test_hi_tiles_over_chains_not_data():
     outs = []
     for tile in (1, 4, 16, 64):
         gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                       GPPolicy(hi_block=128, hi_chain_block=tile))
+                       GPPolicy(metal=False, hi_block=128, hi_chain_block=tile))
         outs.append(np.array(gp.hi(v)))
     for o in outs[1:]:
         assert np.max(np.abs(o - outs[0])) < 1e-9 * np.max(np.abs(outs[0]))
@@ -129,7 +129,7 @@ def test_chains_do_not_interact():
     block-diagonal in chains."""
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
                           for i, r in enumerate(KP)], n_dim=3)
-    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(block=128))
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(metal=False, block=128))
     with mx.stream(mx.gpu):
         u = mx.array(_rng.standard_normal((8, 3)).astype(np.float32) * 0.2)
         full = np.array(gp(u))
@@ -143,7 +143,7 @@ def test_is_mx_compile_safe():
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
                           for i, r in enumerate(KP)], n_dim=3)
     gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128, eval_blocks=False))
+                   GPPolicy(metal=False, block=128, eval_blocks=False))
     compiled = mx.compile(gp.__call__)
     with mx.stream(mx.gpu):
         u = mx.array(_rng.standard_normal((16, 3)).astype(np.float32) * 0.2)
@@ -156,7 +156,7 @@ def test_log_norm_const_is_the_only_thing_left_out():
     only the parameter-independent constant is held on the host."""
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
                           for i, r in enumerate(KP)], n_dim=3)
-    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(block=128))
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(metal=False, block=128))
     v = a64([[0.0, 0.0, 0.0], [0.4, -0.3, 0.6]])
     offset = np.array(gp.hi(v))
     absolute = np.array(gp.hi_absolute(v))
@@ -174,7 +174,7 @@ def test_tiny_datasets(n):
     yerr = np.full(n, 0.4)
     pm = ParamMap(kernel=_const(KP), n_dim=1)
     gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                   GPPolicy(block=64, hi_block=64))
+                   GPPolicy(metal=False, block=64, hi_block=64))
     got = float(np.array(gp.hi_absolute(a64(np.zeros((1, 1)))))[0])
     ref = dense_loglike(ag.SHOTerm(), np.array(KP), t, y, yerr)
     assert abs(got - ref) < 1e-9 * max(1.0, abs(ref))
@@ -199,7 +199,7 @@ def test_ragged_final_block_is_padded_not_truncated():
     ref = dense_loglike(ag.SHOTerm(), np.array(KP), t, y, yerr)
     for block in (32, 64, 128, 256, 512):
         gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                       GPPolicy(block=block, hi_block=block))
+                       GPPolicy(metal=False, block=block, hi_block=block))
         got = float(np.array(gp.hi_absolute(a64(np.zeros((1, 1)))))[0])
         assert abs(got - ref) < 1e-9 * abs(ref), block
 
@@ -216,9 +216,9 @@ def test_cadence_reuse_is_exact_and_engages_only_when_it_pays():
     yerr = np.full(n, 0.3)
 
     gp_reg = GPLogLike(None, reg, None, y, yerr, ag.SHOTerm(), pm,
-                       GPPolicy(block=256, hi_block=256))
+                       GPPolicy(metal=False, block=256, hi_block=256))
     gp_rnd = GPLogLike(None, rnd, None, y, yerr, ag.SHOTerm(), pm,
-                       GPPolicy(block=256, hi_block=256))
+                       GPPolicy(metal=False, block=256, hi_block=256))
     # A regular cadence is *one* lag in float32 even though float64
     # representation noise splits it into a dozen -- plus the dt = 0
     # sentinel that stands in for the first point's absent predecessor.
@@ -244,7 +244,7 @@ def test_blocked_leaves_give_the_same_likelihood(blocked):
     kp = [1.2, 3.0, 4.0, 0.6, 1.1, 0.9]
     pm = ParamMap(kernel=_const(kp), n_dim=1)
     gp = GPLogLike(None, T, None, Y, YERR, term, pm,
-                   GPPolicy(block=128, hi_block=128, blocked=blocked))
+                   GPPolicy(metal=False, block=128, hi_block=128, blocked=blocked))
     assert gp.blocked is blocked
     got = float(np.array(gp.hi_absolute(a64(np.zeros((1, 1)))))[0])
     ref = dense_loglike(term, np.array(kp), T, Y, YERR)
@@ -257,16 +257,16 @@ def test_blocked_leaves_give_the_same_likelihood(blocked):
 def test_blocked_default_follows_the_block_structure():
     kp2 = [1.2, 3.0, 4.0]
     pm2 = ParamMap(kernel=_const(kp2), n_dim=1)
-    single = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm2, GPPolicy())
+    single = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm2, GPPolicy(metal=False))
     assert not single.blocked                      # one block, m = 2
 
     two = ag.SHOTerm() + ag.SHOTerm()               # m = 4: dense is faster
     pm4 = ParamMap(kernel=_const([1.0] * 6), n_dim=1)
-    assert not GPLogLike(None, T, None, Y, YERR, two, pm4, GPPolicy()).blocked
+    assert not GPLogLike(None, T, None, Y, YERR, two, pm4, GPPolicy(metal=False)).blocked
 
     four = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()
     pm8 = ParamMap(kernel=_const([1.0] * 12), n_dim=1)
-    assert GPLogLike(None, T, None, Y, YERR, four, pm8, GPPolicy()).blocked
+    assert GPLogLike(None, T, None, Y, YERR, four, pm8, GPPolicy(metal=False)).blocked
 
 
 def test_blocked_gradients_are_finite_and_match_the_dense_path():
@@ -277,7 +277,7 @@ def test_blocked_gradients_are_finite_and_match_the_dense_path():
     grads = []
     for blocked in (False, True):
         gp = GPLogLike(None, T, None, Y, YERR, term, pm,
-                       GPPolicy(block=128, blocked=blocked))
+                       GPPolicy(metal=False, block=128, blocked=blocked))
         with mx.stream(mx.gpu):
             u = mx.zeros((4, len(refs)), dtype=mx.float32)
             _, g = mx.vjp(gp, [u], [mx.ones((4,), dtype=mx.float32)])
@@ -304,7 +304,7 @@ def _gp(**kw):
     args.update(kw)
     return GPLogLike(args["mean_fn"], args["t"], args["x_mean"], args["y"],
                      args["yerr"], args["kernel_spec"], args["param_map"],
-                     GPPolicy(block=64))
+                     GPPolicy(metal=False, block=64))
 
 
 @pytest.mark.parametrize("field", ["t", "y", "yerr"])
@@ -496,7 +496,7 @@ def test_the_pull_ignores_mean_model_columns():
                    ParamMap(kernel=[KernelParam(link="log", index=i + 2)
                                     for i in range(3)],
                             n_dim=5, mean=slice(0, 2)),
-                   GPPolicy())
+                   GPPolicy(metal=False))
     assert np.array(gp._pull_cols).tolist() == [2, 3, 4]
 
 
@@ -550,7 +550,7 @@ def test_kappa_is_finite_and_grows_with_amplitude_for_every_term(term, p):
     n = 200
     t = np.arange(n) * 0.02
     gp = GPLogLike(None, t, None, np.zeros(n), np.full(n, 0.15), term,
-                   ParamMap.log(p), GPPolicy())
+                   ParamMap.log(p), GPPolicy(metal=False))
     amp = np.zeros((6, len(p)), np.float32)
     amp[:, 0] = np.linspace(-4, 10, 6)
     k = np.array(gp.kappa(mx.array(amp)))
@@ -565,7 +565,7 @@ def test_kappa_uses_the_convolved_stationary_covariance():
     t = np.arange(n) * 0.02
     term = TermConvolution(ag.Matern52Term(), 0.01)
     gp = GPLogLike(None, t, None, np.zeros(n), np.full(n, 0.15), term,
-                   ParamMap.log([1.0, 5.0]), GPPolicy())
+                   ParamMap.log([1.0, 5.0]), GPPolicy(metal=False))
     v = mx.zeros((1, 2), dtype=mx.float32)
     kp = gp.param_map.kernel_params(v)
     _, (q,), h = term.matrices_blocks(kp, mx.full((1, 1), 0.02))
@@ -588,7 +588,7 @@ def test_kappa_takes_the_smallest_white_noise_over_instruments():
                   jitter=[KernelParam(link="log", index=3, ref=1.0),
                           KernelParam(link="log", index=4, ref=1.0)])
     gp = GPLogLike(None, t, None, np.zeros(n), yerr, ag.SHOTerm(), pm,
-                   GPPolicy())
+                   GPPolicy(metal=False))
     v = np.array([[0, 0, 0, np.log(0.3), np.log(0.01)],
                   [0, 0, 0, np.log(0.01), np.log(0.01)]], np.float32)
     r = np.array([min(0.1 ** 2 + 0.3 ** 2, 1.0 + 1e-4),
@@ -701,18 +701,18 @@ def test_construction_warns_when_the_data_could_reach_kappa_max():
     with pytest.warns(UserWarning, match="kappa_max"):
         GPLogLike(None, t, None, 3000.0 * rng.standard_normal(n),
                   np.full(n, 1.0), ag.SHOTerm(), ParamMap.log([1, 1, 1]),
-                  GPPolicy())
+                  GPPolicy(metal=False))
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         GPLogLike(None, t, None, 5.0 * rng.standard_normal(n),
                   np.full(n, 1.0), ag.SHOTerm(), ParamMap.log([1, 1, 1]),
-                  GPPolicy())
+                  GPPolicy(metal=False))
         GPLogLike(None, t, None, 3000.0 * rng.standard_normal(n),
                   np.full(n, 1.0), ag.SHOTerm(), ParamMap.log([1, 1, 1]),
-                  GPPolicy(kappa_max=None))
+                  GPPolicy(metal=False, kappa_max=None))
 
 
 def test_kappa_max_must_be_positive():
     with pytest.raises(ValueError, match="kappa_max"):
-        GPPolicy(kappa_max=0.0)
+        GPPolicy(metal=False, kappa_max=0.0)

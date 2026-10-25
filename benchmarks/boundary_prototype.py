@@ -314,7 +314,7 @@ if __name__ == "__main__":
     term = ag.SHOTerm() + ag.SHOTerm(); yerr = np.full(len(t), 1e-3)
     y = sample(term, kp, t, yerr, np.random.default_rng(1)); d = len(kp)
     pm_ = ParamMap(kernel=[KernelParam(link="log", index=i, ref=float(x)) for i, x in enumerate(kp)], n_dim=d)
-    ref = GPLogLike(None, t, None, y, yerr, term, pm_, GPPolicy(kappa_max=None))
+    ref = GPLogLike(None, t, None, y, yerr, term, pm_, GPPolicy(metal=False, kappa_max=None))
     V, sd = posterior_draws(ref, d, 8); V = V[:3]
     G = []
     for v in V:

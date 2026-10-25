@@ -229,8 +229,9 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         ordered members sample a dimensionless *ratio*, so their bounds are
         ratio bounds -- see :func:`~anvilgp.priors.auto_order_groups`.
     policy
-        :class:`~anvilgp.likelihood.GPPolicy`.  ``GPPolicy(metal=True)``
-        turns on the fused kernel, value and gradient alike since M4; the
+        :class:`~anvilgp.likelihood.GPPolicy`.  The default uses the fused
+        kernel wherever it is eligible (since 2026-10-25) and the MLX path
+        otherwise; ``GPPolicy(metal=False)`` forces the MLX path.  The
         returned target declares ``supports_grad=True`` on both paths.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's

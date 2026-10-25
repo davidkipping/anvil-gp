@@ -52,7 +52,7 @@ def _fixed(t, y, yerr, kp, jitter=JIT):
                           for v in kp], n_dim=1,
                   jitter=[KernelParam(link="const", value=float(jitter))])
     return GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                     GPPolicy(block=1024, hi_block=1024))
+                     GPPolicy(metal=False, block=1024, hi_block=1024))
 
 
 @pytest.mark.slow
@@ -530,7 +530,7 @@ def _pit_values(n_sim=48, n_data=300, temper=1.0, seed=4242):
         cov = dense_covariance(ag.SHOTerm(), nat[:3], t, yerr, jitter=nat[3])
         y = np.linalg.cholesky(cov) @ rng.standard_normal(n_data)
         gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                       GPPolicy(block=1024, hi_block=1024))
+                       GPPolicy(metal=False, block=1024, hi_block=1024))
 
         for p, h in enumerate(hypers):
             out[i, p] = _conditional_cdf(gp, v_star, p, h, temper)

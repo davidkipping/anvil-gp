@@ -92,7 +92,7 @@ PROBE_QUIET_MS = 73.3
 rng = np.random.default_rng(0)
 gp0 = GPLogLike(None, gapped(10_000), None, rng.standard_normal(10_000) * 0.9,
                 np.full(10_000, 0.3), ag.SHOTerm(), ParamMap.log([1.0, 4.0, 3.0]),
-                GPPolicy(block=4096))
+                GPPolicy(metal=False, block=4096))
 u0 = mx.array(rng.standard_normal((1024, 3)).astype(np.float32) * 0.01)
 f0 = mx.compile(gp0.__call__)
 with mx.stream(mx.gpu):

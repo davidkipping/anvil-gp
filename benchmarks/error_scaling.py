@@ -84,7 +84,7 @@ def split_error(t, y, yerr, kp, block):
     out = []
     for data in (np.zeros_like(y), y):          # y = 0 isolates the log-det
         gp = GPLogLike(None, t, None, data, yerr, ag.SHOTerm(), pm,
-                       GPPolicy(block=block, hi_block=block))
+                       GPPolicy(metal=False, block=block, hi_block=block))
         with mx.stream(mx.gpu):
             f32 = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
         f64 = float(np.array(gp.hi(a64(np.zeros((1, 1)))))[0])

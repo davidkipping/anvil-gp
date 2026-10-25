@@ -69,7 +69,9 @@ from anvilgp import GPLogLike, GPPolicy, ParamMap
 
 gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
                ParamMap.log([1.2, 5.0, 4.0]),   # reference values
-               GPPolicy(metal=True))            # use the fused kernel
+               GPPolicy(metal=True))            # the kernel (the default
+                                                #   where eligible; True
+                                                #   warns if it cannot)
 v = mx.zeros((1, 3), dtype=mx.float32)          # v = 0 means "at the references"
 with mx.stream(mx.gpu):
     ll = float(np.array(gp.log_prob_absolute(v))[0])   # 733.621570

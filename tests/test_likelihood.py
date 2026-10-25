@@ -38,7 +38,7 @@ def make(term, kp, t=T, y=Y, yerr=YERR, jitter=None, block=64):
     jit = [KernelParam(link="const", value=float(jitter))] if jitter else []
     pm = ParamMap(kernel=kernel, n_dim=1, jitter=jit)
     return GPLogLike(None, t, None, y, yerr, term, pm,
-                     GPPolicy(block=block, hi_block=block))
+                     GPPolicy(metal=False, block=block, hi_block=block))
 
 
 def ours(term, kp, **kw):
@@ -179,7 +179,7 @@ def test_positive_definiteness_failure_is_finite_not_nan():
                           KernelParam(link="log", index=1, ref=1e6),
                           KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
     gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
-                   GPPolicy(block=64))
+                   GPPolicy(metal=False, block=64))
     with mx.stream(mx.gpu):
         u = mx.zeros((4, 3), dtype=mx.float32)
         out = gp(u)
@@ -216,7 +216,7 @@ def test_infeasible_corners_have_finite_gradients(name, point):
                           KernelParam(link="log", index=1, ref=1e6),
                           KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
     gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
-                   GPPolicy(block=64))
+                   GPPolicy(metal=False, block=64))
     u = mx.array(np.array([point], dtype=np.float32))
     with mx.stream(mx.gpu):
         out = gp(u)
@@ -235,7 +235,7 @@ def test_the_gradient_guard_leaves_healthy_lanes_untouched():
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
                           for i, r in enumerate((1.0, 4.0, 3.0))], n_dim=3)
     gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128))
+                   GPPolicy(metal=False, block=128))
     u = mx.array(np.array([[0.2, -0.3, 0.5], [0.0, 0.0, 0.0]],
                           dtype=np.float32))
     with mx.stream(mx.gpu):
@@ -251,7 +251,7 @@ def test_one_failed_chain_does_not_zero_its_neighbours():
                           KernelParam(link="log", index=1, ref=1e6),
                           KernelParam(link="log", index=2, ref=1e3)], n_dim=3)
     gp = GPLogLike(None, T, None, Y, np.full(N, 1e-4), ag.SHOTerm(), pm,
-                   GPPolicy(block=64))
+                   GPPolicy(metal=False, block=64))
     # The healthy lane sits at sigma = 1e-3 (10 x yerr), rho = 1, Q = 3.
     # It used to be u = 0 (sigma/yerr = 1e8, rho = 1e6), which evaluated to
     # something finite but is far past GPPolicy.kappa_max and now refused.
@@ -347,7 +347,7 @@ def test_the_blocked_leaf_path_does_not_make_sub_block_a_precision_knob():
     for blocked in (False, True):
         for sb in (32, 256):
             gp = GPLogLike(None, t, None, y, np.full(n, 0.001), term, pm,
-                           GPPolicy(sub_block=sb, blocked=blocked))
+                           GPPolicy(metal=False, sub_block=sb, blocked=blocked))
             with mx.stream(mx.gpu):
                 vals[blocked, sb] = float(np.array(
                     gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
@@ -385,7 +385,7 @@ def near_duplicate_problem(request):
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
                           for i, x in enumerate(kp)], n_dim=len(kp))
     v0 = np.array([[0.05, -0.03, 0.02, -0.04, 0.03, 0.01]])
-    gp = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy())
+    gp = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(metal=False))
     h = 1e-5
     vs = np.repeat(v0, 1 + 2 * len(kp), 0)
     for i in range(len(kp)):
@@ -403,7 +403,7 @@ def near_duplicate_problem(request):
 
 
 @pytest.mark.parametrize("policy", [
-    GPPolicy(), GPPolicy(sub_block=1), GPPolicy(metal=True)],
+    GPPolicy(metal=False), GPPolicy(metal=False, sub_block=1), GPPolicy(metal=True)],
     ids=["default", "pure-tree", "metal"])
 def test_near_duplicate_timestamps_cost_float32_nothing(
         near_duplicate_problem, policy):
@@ -458,7 +458,7 @@ def test_float64_path_is_float64_accurate_through_a_log_link():
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=ref)
                           for i, ref in enumerate(refs)], n_dim=3)
     gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                   GPPolicy(block=1024, hi_block=1024))
+                   GPPolicy(metal=False, block=1024, hi_block=1024))
     got = float(np.array(gp.hi_absolute(a64(v)))[0])
 
     natural = np.array([ref * np.exp(x) for ref, x in zip(refs, v[0])])
@@ -476,7 +476,7 @@ def test_guard_does_not_re_run_the_forward():
     """
     pm = ParamMap.log([1.0, 4.0, 3.0])
     gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128))
+                   GPPolicy(metal=False, block=128))
     u = mx.array(np.zeros((2, 3), dtype=np.float32))
     with mx.stream(mx.gpu):
         a = np.array(gp(u))
@@ -494,7 +494,7 @@ def test_the_guard_is_an_identity_on_the_value():
     """
     pm = ParamMap.log([1.0, 4.0, 3.0])
     gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128))
+                   GPPolicy(metal=False, block=128))
     u = mx.array(np.zeros((2, 3), dtype=np.float32))
     with mx.stream(mx.gpu):
         a = np.array(gp(u))
@@ -527,7 +527,7 @@ def test_float32_holds_up_at_high_gp_amplitude(sig_over_yerr):
     pm = ParamMap.const([sig_over_yerr, rho, qual])
 
     gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                   GPPolicy(block=4096))
+                   GPPolicy(metal=False, block=4096))
     hi = float(np.array(gp.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
     with mx.stream(mx.gpu):
         lo = float(np.array(gp(mx.zeros((1, 1), dtype=mx.float32)))[0])
@@ -567,7 +567,7 @@ def test_the_joint_high_amplitude_long_correlation_corner():
     pm = ParamMap.const([sig, rho, qual])
 
     ref = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                    GPPolicy(block=4096))
+                    GPPolicy(metal=False, block=4096))
     hi = float(np.array(ref.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
 
     kern = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
@@ -590,11 +590,11 @@ def test_the_variance_floor_is_refused_where_it_could_bind():
     binds -- the innovation variance is at least r_ref since stage 0 -- so
     the policy refuses the range where it would matter.
     """
-    GPPolicy(s_floor_rel=0.0)
-    GPPolicy(s_floor_rel=0.999)
+    GPPolicy(metal=False, s_floor_rel=0.0)
+    GPPolicy(metal=False, s_floor_rel=0.999)
     for bad in (1.0, 10.0, -1e-3):
         with pytest.raises(ValueError, match="s_floor_rel"):
-            GPPolicy(s_floor_rel=bad)
+            GPPolicy(metal=False, s_floor_rel=bad)
 
 
 # ---------------------------------------------------------------------------
@@ -739,10 +739,10 @@ def test_convolution_refuses_a_spacing_below_the_exposure_width(cadence):
     with pytest.raises(ValueError, match="exposure width"):
         GPLogLike(None, t, None, y, yerr,
                   ag.TermConvolution(ag.SHOTerm(), 0.05),
-                  ParamMap.log([1.3, 4.0, 3.0]), GPPolicy())
+                  ParamMap.log([1.3, 4.0, 3.0]), GPPolicy(metal=False))
     # and the same cadence is fine without the convolution
     GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
-              ParamMap.log([1.3, 4.0, 3.0]), GPPolicy())
+              ParamMap.log([1.3, 4.0, 3.0]), GPPolicy(metal=False))
 
 
 @pytest.mark.parametrize("qual", [0.5, 0.4, 0.1])
@@ -1000,11 +1000,11 @@ def test_convolution_refuses_too_wide_an_exposure_for_the_series():
     with pytest.raises(ValueError, match="F delta"):
         GPLogLike(None, t, None, y, yerr,
                   ag.TermConvolution(ag.RealTerm(), 20.0),
-                  ParamMap.log([1.2, 1.0]), GPPolicy())
+                  ParamMap.log([1.2, 1.0]), GPPolicy(metal=False))
     # and just inside the bound is accepted
     GPLogLike(None, t, None, y, yerr,
               ag.TermConvolution(ag.RealTerm(), 20.0),
-              ParamMap.log([1.2, 0.2]), GPPolicy())
+              ParamMap.log([1.2, 0.2]), GPPolicy(metal=False))
     assert _t.MAX_FDELTA == 8.0
 
 

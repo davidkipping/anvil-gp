@@ -143,7 +143,7 @@ def stability():
     t = gapped(10_000)
     y = rng.standard_normal(10_000) * 0.9
     gp = GPLogLike(None, t, None, y, np.full(10_000, 0.3), ag.SHOTerm(),
-                   ParamMap.log([1.0, 4.0, 3.0]), GPPolicy(block=4096))
+                   ParamMap.log([1.0, 4.0, 3.0]), GPPolicy(metal=False, block=4096))
     u = mx.array(rng.standard_normal((1024, 3)).astype(np.float32) * 0.01)
     f = mx.compile(gp.__call__)
     with mx.stream(mx.gpu):

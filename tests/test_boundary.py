@@ -67,7 +67,7 @@ def case(request):
     d = len(KP)
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
                           for i, x in enumerate(KP)], n_dim=d)
-    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(kappa_max=None))
+    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(metal=False, kappa_max=None))
 
     # Laplace posterior from a float64 FD Hessian; widths capped at 0.5 in log
     hs = 1e-3
@@ -593,7 +593,7 @@ def test_the_boundary_setting_is_validated_and_resolved():
                          GPPolicy(metal=True, metal_boundary=mode))
 
     with pytest.raises(ValueError, match="metal_boundary"):
-        GPPolicy(metal_boundary="cholesky")
+        GPPolicy(metal=False, metal_boundary="cholesky")
     assert build(ag.SHOTerm(), None)._metal_boundary == "sqrt"
     assert build(ag.SHOTerm(), "dense")._metal_boundary == "dense"
     conv = ag.TermConvolution(ag.SHOTerm(), 0.01)

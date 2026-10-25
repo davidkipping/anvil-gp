@@ -126,7 +126,7 @@ def run(label, t, term, kp, yerr, seed=1):
     d = len(kp)
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=float(x))
                           for i, x in enumerate(kp)], n_dim=d)
-    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(kappa_max=None))
+    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(metal=False, kappa_max=None))
     V, sd = posterior_draws(ref, d)
     fhi = hi(ref, V)
     kap = float(np.array(ref.kappa(mx.array(V, dtype=mx.float32))).max())

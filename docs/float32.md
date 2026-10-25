@@ -303,7 +303,9 @@ gives 0.63 / 0.06 / 0.004.
 So: transit fits detrended with a GP on quiet or mildly active stars
 (s/e <~ 10), RV, and single Kepler quarters are clear on either path.
 Bright active stars (s/e >~ 100), long baselines and TESS 20-s data are
-not, on the default path. **`GPPolicy(metal=True)` clears every row above
+not, on the MLX path (the default until 2026-10-25). **The fused kernel
+(`GPPolicy(metal=True)`, and the default wherever eligible since
+2026-10-25) clears every row above
 in value, at m <= 4, since the replay (below) landed on 2026-10-24**; before
 it the kernel too was 1.7 (5.9) on a 20-s sector at s/e = 30. An earlier
 version of this section said the kernel stayed within 0.2 everywhere

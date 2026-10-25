@@ -297,7 +297,7 @@ def test_the_kernel_holds_high_amplitude_on_model(sig_over_yerr):
     pm = ParamMap.const([sig_over_yerr, rho, qual])
 
     ref = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
-                    GPPolicy(block=4096))
+                    GPPolicy(metal=False, block=4096))
     hi = float(np.array(ref.hi(mx.zeros((1, 1), dtype=mx.float64)))[0])
     gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(), pm,
                    GPPolicy(block=4096, metal=True))
@@ -330,7 +330,7 @@ def test_the_value_does_not_carry_the_dense_information_floor():
                           for i, x in enumerate(kp)], n_dim=len(kp))
     v = np.random.default_rng(3).normal(0.0, 0.01, (8, len(kp)))
     v[0] = 0.0
-    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(kappa_max=None))
+    ref = GPLogLike(None, t, None, y, yerr, term, pm, GPPolicy(metal=False, kappa_max=None))
     with mx.stream(mx.cpu):
         hi = np.array(ref.hi(mx.array(v).astype(mx.float64)))
     gp = GPLogLike(None, t, None, y, yerr, term, pm,
@@ -1261,7 +1261,7 @@ def test_assigning_metal_block_rebuilds_the_slot_map():
     with pytest.raises(ValueError, match="metal_block"):
         gp.metal_block = 0
     with pytest.raises(ValueError, match="metal_block"):
-        GPPolicy(metal_block=0)
+        GPPolicy(metal=False, metal_block=0)
 
 
 def test_the_launch_refuses_a_map_it_did_not_build():
@@ -1702,3 +1702,78 @@ def test_the_kernel_gradient_survives_many_chains_at_high_state():
         v, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
         mx.eval(v, g)
     assert np.all(np.isfinite(np.array(v))) and np.all(np.isfinite(np.array(g[0])))
+
+
+# ------------------------------- the default: the kernel where eligible
+def _default_build(term, p, policy):
+    n = 800
+    t = np.arange(n) * 0.05
+    y = np.random.default_rng(0).standard_normal(n)
+    return GPLogLike(None, t, None, y, np.full(n, 0.3), term,
+                     ParamMap.log(p), policy)
+
+
+def test_the_default_policy_uses_the_kernel_where_eligible():
+    """`GPPolicy.metal` is None by default since 2026-10-25: the kernel
+    when it can serve the problem, bit for bit what `metal=True` gives;
+    the MLX path otherwise (m > 4), without the warning `metal=True`
+    gives there."""
+    import warnings as _w
+    from anvilgp.likelihood import MetalDefaultNotice
+    assert GPPolicy().metal is None
+    u = mx.array(np.random.default_rng(1).normal(0, 0.1, (3, 3))
+                 .astype(np.float32))
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", MetalDefaultNotice)
+        dflt = _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0], GPPolicy())
+        asked = _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0],
+                               GPPolicy(metal=True))
+        assert dflt._metal_ok and asked._metal_ok
+        with mx.stream(mx.gpu):
+            got = [(np.array(gp(u)),
+                    np.array(mx.grad(lambda u: gp(u).sum())(u)))
+                   for gp in (dflt, asked)]
+        np.testing.assert_array_equal(got[0][0], got[1][0])
+        np.testing.assert_array_equal(got[0][1], got[1][1])
+
+        big = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()     # m = 6
+        _w.simplefilter("error", RuntimeWarning)
+        gp6 = _default_build(big, [1.3, 4.0, 3.0] * 3, GPPolicy())
+        assert not gp6._metal_ok
+    with pytest.warns(RuntimeWarning, match="cannot be honoured"):
+        _default_build(big, [1.3, 4.0, 3.0] * 3, GPPolicy(metal=True))
+
+
+def test_the_default_says_once_per_process_which_path_it_chose(monkeypatch):
+    """The default moved under scripts that never asked for either path,
+    so it says which it took -- once per process and outcome, not per
+    instance -- and says nothing when the path was asked for."""
+    import warnings as _w
+    import anvilgp.likelihood as L
+    monkeypatch.setattr(L, "_METAL_NOTICES", set())
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter("always")
+        for _ in range(3):
+            _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0], GPPolicy())
+        _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0], GPPolicy(metal=False))
+        _default_build(ag.SHOTerm(), [1.3, 4.0, 3.0], GPPolicy(metal=True))
+        for _ in range(2):
+            _default_build(ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm(),
+                           [1.3, 4.0, 3.0] * 3, GPPolicy())
+    notes = [str(r.message) for r in rec
+             if issubclass(r.category, L.MetalDefaultNotice)]
+    assert len(notes) == 2, notes
+    assert "fused Metal kernel" in notes[0] and "MLX path" in notes[1]
+
+
+def test_make_target_gets_the_kernel_by_default():
+    pytest.importorskip("anvil")
+    import warnings as _w
+    from anvilgp.anvil import make_target
+    n = 400
+    t = np.arange(n) * 0.05
+    y = np.random.default_rng(0).standard_normal(n)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        gt = make_target(ag.SHOTerm(), t, y, np.full(n, 0.3))
+    assert gt.loglike._metal_ok

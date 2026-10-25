@@ -604,3 +604,29 @@ Tests: the cap (m = 4 and 6 -> 256), the warning (and its absence at and
 below the caps), and a slow value + gradient at m = 4, N = 1e5, 4096
 chains -- which cannot fail on an idle machine whatever the cap, so the
 cap is what is pinned. With III done, I (the `metal` default) is next.
+
+## I. The `metal` default flipped (2026-10-25)
+
+`GPPolicy.metal` defaults to `None`: the fused kernel wherever
+`metal_eligible()` says it can serve the problem, the MLX path otherwise.
+`True` keeps its meaning (insist, warn if it cannot be honoured) and
+`False` forces the MLX path. A `MetalDefaultNotice` (a `UserWarning`,
+filterable) says once per process and outcome which path the default took
+-- the scripts this changes never asked for either path, and their float32
+numbers and timings move. `make_target` inherits the default, so anvil
+users get the kernel. The slot map is no longer deferred for a default
+instance the kernel could serve (`_may_use_metal`).
+
+Every existing test and benchmark that built a `GPPolicy` without `metal`
+was meant for the MLX path and is now pinned to `metal=False` (64 calls,
+found by parsing the source, not by grep) -- including `verify_readme.py`'s
+stability probe, whose quiet level was measured on the MLX path, and
+`floor_exposure.py`'s MLX column. The `make_target` calls in the
+calibration and prior tests are left on the default: they test the anvil
+integration as a user gets it. New tests: the default picks the kernel
+bit for bit as `metal=True` does, falls back silently (no `RuntimeWarning`)
+at m = 6, notices once per process and outcome and not when a path was
+asked for, and `make_target` gets the kernel.
+
+IV's scope is now m > 4, the only users the MLX path still serves by
+default.

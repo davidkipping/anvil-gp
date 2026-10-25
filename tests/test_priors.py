@@ -110,7 +110,7 @@ def test_defaults_drive_an_end_to_end_likelihood():
     jit = [priors.jitter_hyper(YERR)]
     pm, specs, names = priors.build_param_map(hs, jitters=jit)
     gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
-                   GPPolicy(block=128))
+                   GPPolicy(metal=False, block=128))
     with mx.stream(mx.gpu):
         u = mx.zeros((16, pm.n_dim), dtype=mx.float32)
         out = gp(u)

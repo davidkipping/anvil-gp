@@ -167,7 +167,7 @@ def test_compiled_value_and_grad_now_succeeds_on_every_term():
         pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
                               for i, r in enumerate(refs)], n_dim=len(refs))
         return GPLogLike(None, t, None, y, yerr, term, pm,
-                         GPPolicy(block=256))
+                         GPPolicy(metal=False, block=256))
 
     def grad_compiles(gp, k):
         u = mx.zeros((8, k), dtype=mx.float32)
@@ -216,7 +216,7 @@ def test_the_lag_gather_makes_the_gradient_slightly_non_deterministic():
 
     def spreads(t):
         gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
-                       ParamMap.log([1.0, 4.0, 3.0]), GPPolicy(block=1024))
+                       ParamMap.log([1.0, 4.0, 3.0]), GPPolicy(metal=False, block=1024))
         with mx.stream(mx.gpu):
             runs = []
             for _ in range(3):

@@ -113,11 +113,15 @@ class GPPolicy:
     #: keep leaves in compact block form (None = decide from the term's block
     #: structure).  See :func:`anvilgp.elements.use_blocked_leaves`.
     blocked: bool | None = None
-    #: use the fused Metal scan kernel (:mod:`anvilgp.metal`).
-    #: Differentiable since M4: the kernel carries its own VJP, so a
-    #: gradient sampler can use it too.  Measured 45-74x over the MLX path
-    #: on the forward and ~100x on the gradient, with 20-30x less peak
-    #: memory; see the README.  Limits: m <= 4 and at most
+    #: use the fused Metal scan kernel (:mod:`anvilgp.metal`): ``None``
+    #: (the default since 2026-10-25) uses it wherever it is eligible and
+    #: the MLX path otherwise, saying once per process which it chose;
+    #: ``True`` asks for it and warns if it cannot be honoured; ``False``
+    #: is the MLX path.  The kernel became the default because it is now
+    #: the more accurate path on bright, densely sampled data (value and
+    #: gradient), the only one whose gradient runs at N ~ 1e5, and 17-200x
+    #: faster (docs/boundary-plan.md, I).  Differentiable since M4: the
+    #: kernel carries its own VJP.  Limits: m <= 4 and at most
     #: :data:`anvilgp.metal.MAX_JITTER` per-instrument jitters.  The
     #: gradient's adjoint buffer is one slot per ``(block, lag)`` pair
     #: that *occurs*, so it is bounded by N rather than by N x blocks,
@@ -125,7 +129,7 @@ class GPPolicy:
     #: chains x N = 1e5).  It is **not** unconditional: the buffer scales
     #: with ``m^2``, so the same cadence at m = 4 needs 12.2 GiB and
     #: :data:`anvilgp.metal.MAX_ADJOINT_BUFFER_BYTES` (8 GiB) refuses it.
-    metal: bool = False
+    metal: bool | None = None
     #: observations condensed per kernel thread, or None to pick from N.
     #: Larger means fewer, longer sequential walks and less work left for
     #: the MLX tree above, which is launch-bound and is most of the
@@ -643,7 +647,7 @@ class GPLogLike:
         # showed what a stale map does: a correct value with a gradient
         # wrong by 2.6x, or a read past the end of the block table that
         # hangs the process at 0% CPU.
-        if self.policy.metal and self.policy.metal_block is not None:
+        if self._may_use_metal() and self.policy.metal_block is not None:
             cap = _MAX_METAL_BLOCK.get(kernel_spec.n_state,
                                        _MAX_METAL_BLOCK_HI_M)
             if int(self.policy.metal_block) > max(cap, 256):
@@ -664,7 +668,9 @@ class GPLogLike:
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
         self._metal_ok, self._metal_why = self.metal_eligible()
-        if self.policy.metal and not self._metal_ok:
+        if self.policy.metal is None:
+            _notice_metal_choice(self._metal_ok, self._metal_why)
+        if self.policy.metal is True and not self._metal_ok:
             # Asking for the kernel and silently getting the MLX path is a
             # 40x performance surprise with no signal.  Say so once, here,
             # rather than leaving the user to infer it from the wall clock.
@@ -796,7 +802,7 @@ class GPLogLike:
         `error_scaling.py`-style sweeps build many.  The setter still
         rebuilds on every assignment, so the never-stale property holds.
         """
-        if not self.policy.metal:
+        if not self._may_use_metal():
             # Deferred, not skipped: `_evaluate_metal` rebuilds on first
             # use, so flipping `policy.metal` after construction still
             # works.  `_slot_map_blk` stays unset so the launch guard
@@ -830,10 +836,18 @@ class GPLogLike:
         #: spacing is distinct at 13 blocks.
         self.n_metal_slots = int(slag.size)
 
+    def _may_use_metal(self) -> bool:
+        """Whether this instance can end up on the kernel: asked for, or
+        left to the default with a state dimension the kernel holds."""
+        from .metal import MAX_STATE
+        if self.policy.metal is None:
+            return self.term.n_state <= MAX_STATE
+        return bool(self.policy.metal)
+
     def metal_eligible(self) -> tuple[bool, str]:
         """Whether the fused kernel can serve this problem, and why not."""
         from .metal import MAX_JITTER, MAX_STATE, metal_available
-        if not self.policy.metal:
+        if self.policy.metal is False:
             return False, "GPPolicy.metal is off"
         if self.term.n_state > MAX_STATE:
             return False, (f"m = {self.term.n_state} exceeds the kernel's "
@@ -1596,6 +1610,35 @@ def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     # chains), returning 1 with the estimate 3x over budget (stage R2).
     n = -(-want // _FRONT_END_BUDGET_BYTES)
     return max(1, min(n, n_lags))
+
+
+class MetalDefaultNotice(UserWarning):
+    """Which likelihood path ``GPPolicy(metal=None)`` chose.  Issued once
+    per process and per outcome; filter it to silence it."""
+
+
+_METAL_NOTICES: set = set()
+
+
+def _notice_metal_choice(ok: bool, why: str) -> None:
+    """Say once per process what the default chose.  The default moved
+    from the MLX path to the kernel on 2026-10-25, so float32 numbers and
+    timings changed under scripts that never asked for either; this is
+    the signal that they did."""
+    key = "kernel" if ok else f"mlx: {why}"
+    if key in _METAL_NOTICES:
+        return
+    _METAL_NOTICES.add(key)
+    if ok:
+        msg = ("anvilgp: using the fused Metal kernel, the default since "
+               "2026-10-25 (GPPolicy(metal=None)); GPPolicy(metal=False) "
+               "selects the MLX path.")
+    else:
+        msg = (f"anvilgp: using the MLX path because the fused kernel "
+               f"cannot serve this problem ({why}); on bright, densely "
+               f"sampled data its float32 value varies more across the "
+               f"posterior (docs/float32.md, section 7).")
+    warnings.warn(msg, MetalDefaultNotice, stacklevel=4)
 
 
 def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
