@@ -536,8 +536,13 @@ removes the large numbers instead of storing them more carefully.
    heavier fold; cost not measured. Not yet confirmed by a ChEES run,
    which needs the kernel (the prototype is far too slow to sample with).
    Reference implementation: `benchmarks/boundary_prototype.py`.
-   Being built to `docs/boundary-plan.md`; the oracle and the failing
-   tests are `tests/boundary_oracle.py` and `tests/test_boundary.py`.
+   **Built 2026-10-25 to `docs/boundary-plan.md` and the kernel's default
+   since** (`GPPolicy.metal_boundary`; convolved terms keep the dense
+   form): at 16 posterior draws of the problem above the worst gradient
+   error goes 4.0 -> 0.31 sigma (16 x 256) and 5.0 -> 0.34 (4 x 1024),
+   and the value's spread across them sd 0.066 -> 0.020 and 0.038 ->
+   0.025. ChEES confirmation and cost: stage 5 of the plan. Oracle and
+   tests: `tests/boundary_oracle.py`, `tests/test_boundary.py`.
 
    Ruled out, measured: the term front end (chaining the kernel's per-lag
    adjoints to theta in float64 changes nothing), and the per-lag and `dh`

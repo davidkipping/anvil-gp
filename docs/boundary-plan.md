@@ -1,6 +1,6 @@
 # Plan: the kernel's block boundaries in the square-root information form
 
-Status: agreed 2026-10-25; stages 0-3 done 2026-10-25.
+Status: agreed 2026-10-25; stages 0-4 done 2026-10-25 (the new boundary is the kernel's default).
 
 ## The problem
 
@@ -49,7 +49,7 @@ the backward, unchanged.
 | 1 | Q factor table, a small Metal kernel (Cholesky, pivots clamped at 0, no floor) | 0.5 day, **done** |
 | 2 | Centred square-root block pass, one thread per (chain, block); rank-1 leaf update | 2 days, **done** |
 | 3 | Square-root prefix, suffix and seeds, one thread per chain; 2m x 2m `tria` | 1-1.5 days, **done** |
-| 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day |
+| 4 | Wire into `scan_loglike` forward and VJP, behind the switch; flips stage 0's expected failures | 0.5 day, **done** |
 | 5 | Measure on a quiet machine: README timings, watchdog at m = 4, the exposure matrix (m = 2-4, gapped and 2-s cadences), then ChEES | 1 day + machine time |
 | 6 | Docs and README | 0.5 day |
 
@@ -205,3 +205,33 @@ entry-only variant agrees bit for bit), per-chain independence, and a
 single block. Mutation-checked: five defects in the scan (the prefix's
 `U U^T eta` term, `X11^-T` swapped for `X11^-1`, the seed's `X22 X22^T`,
 the suffix's `(I + J C)^-1`, its `Z` update) each fail 4-6 tests.
+
+## Stage 4: what it found (2026-10-25)
+
+`GPPolicy.metal_boundary`: `None` (default) resolves to `"sqrt"`, or to
+`"dense"` for a convolved term; `"sqrt"` on a convolved term is refused at
+construction. `scan_loglike(boundary=)` runs pass 1, the dense prefix for
+the start states, then `q_factor`, `sqrt_blocks` and `sqrt_scan` -- in the
+forward (entry-only scan) and in the VJP (with seeds); the same kernels on
+the same inputs, so the backward replays from exactly the states the value
+did. A single block skips the square-root pass (both settings give the
+start state and a zero seed, and agree bit for bit).
+
+On the 20-s problem, 16 Laplace draws, dense -> square-root:
+
+| | 16 x 256 | 4 x 1024 |
+|---|---|---|
+| gradient, worst per posterior sigma | 4.0 -> 0.31 | 5.0 -> 0.34 |
+| entry means / covariances / seeds | 5.1e-2 / 2.1e-2 / 1.4e-3 -> 4.6e-4 / 2.8e-5 / 1.8e-4 | 4.5e-2 / 5.5e-3 / 9.1e-3 -> 3.2e-4 / 3.1e-5 / 1.8e-3 |
+| value, sd across the draws | 0.066 -> 0.020 | 0.038 -> 0.025 |
+
+Over all 16 draws the seeds at 4 x 1024 reach 1.8e-3 against the
+2.5e-3 bound (1.0e-3 at the 3 draws stage 3 measured): a thinner margin
+than the other quantities, worth watching in stage 5's wider matrix.
+
+Stage 0's expected failures now pass and have lost their markers; the
+dense boundary's own tests are the strict expected failures now, which
+pins that `"dense"` still is the old boundary. The boundary the default
+path hands its backward is bit-identical to the stage 2-3 pipeline.
+README and docs/float32.md say what changed, and the README's timing
+tables are marked as predating it.

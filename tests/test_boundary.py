@@ -12,8 +12,9 @@ The fix is the square-root information form centred block-locally
 (docs/boundary-plan.md).  Its NumPy reference, `boundary_oracle`, is
 pinned here twice: in float64 it reproduces the sequential filter, and in
 float32 it meets the bounds the kernel must meet, through the kernel's own
-float32 backward.  The kernel's tests are expected failures until stage 4
-wires the new boundary in; `strict` makes that stage remove the markers.
+float32 backward.  Since stage 4 the kernel runs it by default
+(`GPPolicy.metal_boundary`); ``"dense"`` keeps the old boundary for one
+release, and the tests here pin that it still fails on this problem.
 """
 
 import warnings
@@ -41,8 +42,8 @@ ENTRY_MEAN, ENTRY_COV, SEED = 1e-3, 1e-4, 2.5e-3
 #: Oracle 0.33 / 0.24, kernel 4.0 / 5.0 (16 x 256 / 4 x 1024).
 GRAD_SIGMA = 0.5
 
-KERNEL_RED = pytest.mark.xfail(
-    strict=True, reason="dense-form boundary; fixed by docs/boundary-plan.md")
+DENSE_RED = pytest.mark.xfail(
+    strict=True, reason="the dense boundary; replaced by docs/boundary-plan.md")
 
 
 def _hi(gp, V):
@@ -52,8 +53,11 @@ def _hi(gp, V):
 
 @pytest.fixture(scope="module", params=[256, 1024], ids=["16x256", "4x1024"])
 def case(request):
-    """Data, posterior draws, float64 reference gradients, and the kernel's
-    backward inputs with its own and the exact boundary quantities."""
+    """Data, posterior draws, float64 reference values and gradients, the
+    kernel's backward inputs with the exact boundary quantities, and both
+    boundaries: ``kernel``/``g_dense`` from the dense one (whose entry
+    states are also where the square-root pass starts), ``new``/``g_new``
+    from the default, square-root one."""
     blk = request.param
     term = ag.SHOTerm() + ag.SHOTerm()
     rng = np.random.default_rng(2)
@@ -98,24 +102,32 @@ def case(request):
     ff = _hi(ref, P).reshape(N_DRAWS, d, 2)
     G = (ff[..., 0] - ff[..., 1]) / (2 * gh)
 
-    gp = GPLogLike(None, t, None, y, yerr, term, pm,
-                   GPPolicy(metal=True, kappa_max=None, metal_block=blk))
-    got = {}
+    out = dict(blk=blk, V=V, sd=sd, G=G, hi=_hi(ref, V))
+    for name, mode in (("dense", "dense"), ("new", None)):
+        gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                       GPPolicy(metal=True, kappa_max=None, metal_block=blk,
+                                metal_boundary=mode))
+        got = {}
 
-    def record(inputs, kernel):
-        got["inputs"], got["kernel"] = inputs, kernel
-        return kernel
+        def record(inputs, kernel):
+            got["inputs"], got["kernel"] = inputs, kernel
+            return kernel
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        with bo.boundary_from(record), mx.stream(mx.gpu):
-            g = np.array(mx.grad(lambda u: gp(u).sum())(
-                mx.array(V, dtype=mx.float32)))
-    a = got["inputs"]
-    exact = bo.exact_boundary(a["pt"], a["qt"], a["lag"], a["h"], a["res"],
-                              a["r"], a["r_ref"], a["cot"], a["blk"])
-    return dict(blk=blk, gp=gp, V=V, sd=sd, G=G, g_kernel=g,
-                inputs=a, kernel=got["kernel"], exact=exact)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with bo.boundary_from(record), mx.stream(mx.gpu):
+                u = mx.array(V, dtype=mx.float32)
+                g = np.array(mx.grad(lambda u: gp(u).sum())(u))
+                lo = np.array(gp(u))
+        out["g_" + name], out["lo_" + name] = g, lo
+        out["kernel" if name == "dense" else "new"] = got["kernel"]
+        if name == "dense":
+            out["gp"], out["inputs"] = gp, got["inputs"]
+    a = out["inputs"]
+    out["exact"] = bo.exact_boundary(a["pt"], a["qt"], a["lag"], a["h"],
+                                     a["res"], a["r"], a["r_ref"], a["cot"],
+                                     a["blk"])
+    return out
 
 
 def _oracle(case, dt=np.float32):
@@ -164,14 +176,25 @@ def test_the_oracle_boundary_gives_the_kernel_backward_a_good_gradient(case):
     assert e.max() < GRAD_SIGMA, f"per posterior sigma {np.round(e, 3)}"
 
 
-@KERNEL_RED
 def test_the_kernel_boundary_quantities_meet_the_bounds(case):
+    _check_bounds(case["new"], case["exact"])
+
+
+def test_the_kernel_gradient_is_within_half_a_sigma_across_the_posterior(case):
+    e = _grad_sigma(case, case["g_new"])
+    assert e.max() < GRAD_SIGMA, f"per posterior sigma {np.round(e, 3)}"
+
+
+@DENSE_RED
+def test_the_dense_boundary_quantities_meet_the_bounds(case):
+    """Pins that ``metal_boundary="dense"`` really is the old boundary:
+    entry means 5%, covariances 0.6-2% here."""
     _check_bounds(case["kernel"], case["exact"])
 
 
-@KERNEL_RED
-def test_the_kernel_gradient_is_within_half_a_sigma_across_the_posterior(case):
-    e = _grad_sigma(case, case["g_kernel"])
+@DENSE_RED
+def test_the_dense_boundary_gradient_is_within_half_a_sigma(case):
+    e = _grad_sigma(case, case["g_dense"])
     assert e.max() < GRAD_SIGMA, f"per posterior sigma {np.round(e, 3)}"
 
 
@@ -391,7 +414,8 @@ def test_the_block_pass_carries_each_instruments_jitter(n_jit):
         n_dim=3 + n_jit, instrument=inst)
     gp = GPLogLike(None, t, None, rng.standard_normal(n), np.full(n, 0.05),
                    ag.SHOTerm(), pm,
-                   GPPolicy(metal=True, kappa_max=None, metal_block=blk))
+                   GPPolicy(metal=True, kappa_max=None, metal_block=blk,
+                            metal_boundary="dense"))
     a, k = _capture(gp, 3 + n_jit)
     if n_jit == 3:
         assert np.ptp(a["r"][0, :3]) > 0, "jitters must differ by instrument"
@@ -410,7 +434,8 @@ def test_the_block_pass_handles_a_short_last_block():
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
                           for i, x in enumerate(KP)], n_dim=len(KP))
     gp = GPLogLike(None, t, None, y, yerr, term, pm,
-                   GPPolicy(metal=True, kappa_max=None, metal_block=blk))
+                   GPPolicy(metal=True, kappa_max=None, metal_block=blk,
+                            metal_boundary="dense"))
     a, k = _capture(gp, len(KP))
     kb, lq = _kernel_blocks(a, k[0], k[1])
     tail = slice((n // blk) * blk, n)
@@ -507,9 +532,74 @@ def test_one_block_enters_at_its_start_with_a_zero_seed():
     pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=x)
                           for i, x in enumerate(KP)], n_dim=len(KP))
     gp = GPLogLike(None, t, None, y, yerr, term, pm,
-                   GPPolicy(metal=True, kappa_max=None, metal_block=n))
+                   GPPolicy(metal=True, kappa_max=None, metal_block=n,
+                            metal_boundary="dense"))
     a, k = _capture(gp, len(KP))
     got = _gpu_boundary(a, k[0], k[1])
     assert got[0].shape[1] == 1
     assert np.array_equal(got[0], k[0]) and np.array_equal(got[1], k[1])
     assert not np.any(got[2]) and not np.any(got[3])
+
+
+# --------------------------------------------------- stage 4: wired in
+def test_the_wired_boundary_is_the_tested_pipeline(case):
+    """What the default kernel hands its backward is, bit for bit, the GPU
+    pipeline the stage 2-3 tests pin, from the dense entry states."""
+    a, k = case["inputs"], case["kernel"]
+    for got, want in zip(case["new"], _gpu_boundary(a, k[0], k[1])):
+        np.testing.assert_array_equal(got, want)
+
+
+def test_the_value_varies_little_across_the_posterior(case):
+    """The value is replayed from the entry states, so they reach it too.
+    A constant offset is invisible to a sampler; the spread across the
+    posterior is what moves it.  sd over the 16 draws, against float64:
+    0.066 -> 0.020 at 16 x 256, 0.038 -> 0.025 at 4 x 1024 (one block is
+    ~0.023 on this problem)."""
+    e = case["lo_new"] - case["hi"]
+    assert np.std(e) < 0.04, f"sd {np.std(e):.3f}"
+
+
+def test_one_block_gives_the_same_answer_on_either_boundary():
+    """A single block has no boundary: the square-root pass is skipped and
+    both settings are the same computation."""
+    n = 600
+    rng = np.random.default_rng(1)
+    t = np.arange(n) * 0.05
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate((1.3, 4.0, 3.0))], n_dim=3)
+    y = rng.standard_normal(n)
+    u = mx.array(rng.normal(0, 0.1, (3, 3)).astype(np.float32))
+    out = []
+    for mode in ("dense", "sqrt"):
+        gp = GPLogLike(None, t, None, y, np.full(n, 0.3), ag.SHOTerm(), pm,
+                       GPPolicy(metal=True, metal_block=n, metal_boundary=mode))
+        with mx.stream(mx.gpu):
+            v, g = mx.value_and_grad(lambda u: gp(u).sum())(u)
+            out.append((np.array(gp(u)), np.array(g)))
+    np.testing.assert_array_equal(out[0][0], out[1][0])
+    np.testing.assert_array_equal(out[0][1], out[1][1])
+
+
+def test_the_boundary_setting_is_validated_and_resolved():
+    n = 200
+    t = np.arange(n) * 0.05
+    y = np.random.default_rng(0).standard_normal(n)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate((1.3, 4.0, 3.0))], n_dim=3)
+
+    def build(term, mode):
+        return GPLogLike(None, t, None, y, np.full(n, 0.3), term, pm,
+                         GPPolicy(metal=True, metal_boundary=mode))
+
+    with pytest.raises(ValueError, match="metal_boundary"):
+        GPPolicy(metal_boundary="cholesky")
+    assert build(ag.SHOTerm(), None)._metal_boundary == "sqrt"
+    assert build(ag.SHOTerm(), "dense")._metal_boundary == "dense"
+    conv = ag.TermConvolution(ag.SHOTerm(), 0.01)
+    # a convolved term's Q is indefinite: no square root, so dense
+    assert build(conv, None)._metal_boundary == "dense"
+    with pytest.raises(ValueError, match="convolved"):
+        build(conv, "sqrt")
+    with pytest.raises(ValueError, match="formal"):
+        am.scan_loglike(*[None] * 8, 0.0, 8, formal=True, boundary="sqrt")

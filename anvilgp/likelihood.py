@@ -131,6 +131,17 @@ class GPPolicy:
     #: the MLX tree above, which is launch-bound and is most of the
     #: remaining wall time at small N.  See :func:`_auto_metal_block`.
     metal_block: int | None = None
+    #: how the fused kernel forms the state each block starts from and the
+    #: adjoint each block's backward is seeded with: ``"sqrt"``, the
+    #: square-root information form centred on the replayed filter, or
+    #: ``"dense"``, the dense information form it replaced.  ``None`` picks
+    #: ``"sqrt"``, except for a convolved term, whose ``Q`` is indefinite
+    #: and has no square root, which keeps ``"dense"``.  On bright, densely
+    #: sampled data the dense form's float32 boundaries left the gradient
+    #: 4-5 posterior sigma off at the default blocks and ChEES did not
+    #: converge; see docs/boundary-plan.md and docs/float32.md, section 7.
+    #: ``"dense"`` stays for one release, for comparison.
+    metal_boundary: str | None = None
     #: floor on the leaf innovation variance, in units of the reference
     #: variance.  Positive-definiteness failure is a *defined* outcome:
     #: with thousands of chains, warmup will visit float32-infeasible
@@ -173,6 +184,10 @@ class GPPolicy:
                 f"{max(_MAX_METAL_BLOCK.values())}, which the GPU watchdog "
                 f"cannot survive at any state dimension; see "
                 f"_auto_metal_block for the per-m caps")
+        if self.metal_boundary not in (None, "sqrt", "dense"):
+            raise ValueError(
+                f"metal_boundary = {self.metal_boundary!r} must be None, "
+                f"'sqrt' or 'dense'")
         if not 0.0 <= self.s_floor_rel < 1.0:
             raise ValueError(
                 f"s_floor_rel = {self.s_floor_rel!r} must be in [0, 1): the "
@@ -613,6 +628,14 @@ class GPLogLike:
         #: uses a direct inverse instead of a Cholesky factor.  See
         #: `elements.combine`.  Every other term is untouched.
         self._formal = self._has_p_inf
+        if self._formal and self.policy.metal_boundary == "sqrt":
+            raise ValueError(
+                "GPPolicy(metal_boundary='sqrt') cannot serve a convolved "
+                "term: its Q is indefinite, so it has no square root.  Use "
+                "None (which picks 'dense' here) or 'dense'")
+        #: the kernel's block boundary; see GPPolicy.metal_boundary
+        self._metal_boundary = (self.policy.metal_boundary
+                                or ("dense" if self._formal else "sqrt"))
 
         self._lag_np = lag
         # Assigning `metal_block` (a property) builds the kernel's slot map
@@ -982,7 +1005,8 @@ class GPLogLike:
                                   self._metal_slot_start,
                                   self.n_metal_slots,
                                   self._metal_fold_plan),
-                           formal=self._formal)
+                           formal=self._formal,
+                           boundary=self._metal_boundary)
         return out, (q, h)
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):

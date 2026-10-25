@@ -16,6 +16,13 @@ pass was `reduce_blocks`, a fold of the block elements' own log-normalisers,
 which carry the dense information form's floor (`_SRC_REPLAY`); and until
 2026-09-20 that fold was an MLX tree, launch-bound at a flat ~5.1 ms.
 
+Since 2026-10-25 the entry states, and the backward's seeds, are by default
+not the prefix over pass 1's dense elements but a second condensation of
+every block in the square-root information form, centred on the filter
+replayed from those first entry states (`q_factor`, `sqrt_blocks`,
+`sqrt_scan`; `scan_loglike`'s ``boundary``).  The dense ones are float32-
+wrong on bright, densely sampled data; see docs/boundary-plan.md.
+
 What the kernel does *not* do, deliberately
 -------------------------------------------
 It does not evaluate the kernel-term algebra.  ``Phi`` and ``Q`` are handed
@@ -2354,7 +2361,8 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
 
 def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                 s_floor_rel, blk_len, slots=None, formal=False) -> mx.array:
+                 s_floor_rel, blk_len, slots=None, formal=False,
+                 boundary="dense") -> mx.array:
     """``(n_chains,)`` log-likelihood: the kernel's blocks, reduced.
 
     **This, not :func:`scan_blocks`, is where the differentiation boundary
@@ -2375,12 +2383,43 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     dense information form's floor: up to 5.9 log-units on a TESS 20-s
     sector (see `_SRC_REPLAY`).  The fold stays as the element-level
     reduction the tests pin; the value no longer uses it.
+
+    ``boundary`` picks how the entry states and the backward's seeds are
+    formed.  ``"dense"``: the prefix (and suffix) over pass 1's dense
+    information-form elements, as above.  ``"sqrt"``: those entry states
+    are only the start -- :func:`sqrt_blocks` re-condenses every block in
+    the square-root information form, centred on the filter replayed from
+    them, and :func:`sqrt_scan` gives the entry states and seeds the
+    replay and the backward use.  On bright, densely sampled data the
+    dense ones are float32-wrong (entry means 5%, the gradient 4-5
+    posterior sigma off at the worst posterior draws) and the square-root
+    ones are not (docs/boundary-plan.md).  Not for a ``formal`` model, and
+    skipped for a single block, where both give the start state and a zero
+    seed.
     """
+    if boundary not in ("dense", "sqrt"):
+        raise ValueError(f"boundary = {boundary!r} must be 'dense' or 'sqrt'")
+    if boundary == "sqrt" and formal:
+        raise ValueError("the square-root boundary needs a positive "
+                         "semi-definite Q; a formal model has none")
+    use_sqrt = boundary == "sqrt" and -(-resid.shape[0] // blk_len) > 1
+
+    def boundary_states(p_t, q_t, lg, hv, rs, rr, j2, el, cot=None):
+        """Entry states, and seeds if ``cot`` is given, for ``boundary``."""
+        if not use_sqrt:
+            if cot is None:
+                return entry_states(el, formal)
+            return block_seeds_kernel(el, cot, formal)
+        st_m, st_C = entry_states(el, formal)
+        blocks = sqrt_blocks(p_t, q_t, q_factor(q_t), lg, inst, hv, rs, rr,
+                             j2, st_m, st_C, blk_len)
+        return sqrt_scan(blocks, st_m, st_C, cot)
+
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
         el = scan_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
                          blk_len, formal=formal, with_ell=False)
-        ent_m, ent_C = entry_states(el, formal)
+        ent_m, ent_C = boundary_states(phi_t, q_t, lg, hv, rs, rr, j2, el)
         # Partial sums per block, then a sum over a dozen or so: a single
         # float32 accumulator over 1e5 O(1) terms costs ~0.4 on its own.
         return mx.sum(replay_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2,
@@ -2442,7 +2481,10 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
         el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
                          blk_len, formal=formal, with_ell=False)
-        ent_m, ent_C, seed_m, seed_C = block_seeds_kernel(el, cot, formal)
+        # the same entry states the forward replayed from: the same kernels
+        # on the same inputs
+        ent_m, ent_C, seed_m, seed_C = boundary_states(
+            p_t, q_t, lg, hv, rs, rr, j2, el, cot)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
             p_t, q_t, lg, inst, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m,
             seed_C, slot_id, slot_start, n_slots, blk_len, formal=formal)

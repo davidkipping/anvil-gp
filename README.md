@@ -239,6 +239,11 @@ element per *block* reaches memory instead of one per point, and M4's
 checkpointed backward sweep gives it its own VJP. Against the MLX path,
 same problem, same answers:
 
+*The timings in this section predate the square-root block boundary,
+the kernel's default since 2026-10-25, which adds a pass over the data to
+the forward and to the gradient; they are being re-measured
+([docs/boundary-plan.md](docs/boundary-plan.md), stage 5).*
+
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
 | N=1e4, 1024 chains | 73.1 ms | **2.73 ms** | 27x | 1.20 GiB | 0.04 GiB |
@@ -327,7 +332,10 @@ between the two, so that is not a clean speed comparison.)
 Three passes, all with the forward's launch shape because the backward
 blocks are **independent**: the forward kernel emits one element per block;
 one thread per chain folds those into each block's entry state and its
-seed, in closed form; and one thread per (chain, block) replays its block
+seed, in closed form (by default after the blocks are re-condensed in the
+square-root information form; see
+[docs/boundary-plan.md](docs/boundary-plan.md)); and one thread per
+(chain, block) replays its block
 from checkpoints and sweeps back. The seed is the part that removes the
 chain -- see [docs/m4-plan.md](docs/m4-plan.md).
 
@@ -539,6 +547,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 |---|---|---|
 | `metal` | `False` | you want the fused kernel: ~27-38x on the forward, ~90x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
 | `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
+| `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
 | `eval_blocks` | `False` | you are memory-bound and can give up `mx.compile`. The `.hi` path sets it itself. |
@@ -580,7 +589,10 @@ marked as an estimate.
   at 8 and 1.9e-2 at the default's 16, against 0.37 on the MLX path. Every
   other parameter stays under 1.1e-4. Rounding `metal_block` up rather than
   to the nearest power of two would halve the blocks and cost forward
-  speed; not done.
+  speed; not done. (Measured on the dense boundary; the square-root one,
+  default since 2026-10-25, removes that amplification on the cases in
+  [docs/boundary-plan.md](docs/boundary-plan.md) and has not been
+  re-measured at this corner.)
 * **The residual float32 floor on bright, densely sampled data.** Blocks
   store their log-normaliser for a zero incoming state, ~1e4 numbers that
   every composition cancels; it grows with timescale over cadence, s/e and
@@ -590,18 +602,23 @@ marked as an estimate.
   the posterior; a TESS 20-s sector at s/e = 30 by 2.8 on the default path
   (1.7 on the kernel before 2026-10-24). **The kernel's value is fixed**
   (replayed filter, 0.023 on that sector); the default MLX path is not.
-  **Still open on the kernel: short blocks.** At N <~ 6k with m = 4 the
-  automatic block is 256 points, and on densely sampled high-s/e data the
-  prefix's entry states and the backward's seeds break: the gradient is
-  11-18 posterior sigma off at a few points, and ChEES on a 20-s, N = 4096,
-  s/e = 100 SHO + SHO problem had not converged after 2000 warmup (R-hat
-  1.6-1.7, ~10x fewer ESS per gradient) where one block converged in 300.
-  Posteriors stay unbiased. Workaround: `GPPolicy(metal_block=N)` up to
-  8192. Fix prototyped, being built: boundary quantities in the square-root
-  information form, centred on a float32 replay, bring both block sizes to
-  the one-block level (`benchmarks/boundary_prototype.py`). Tables:
-  [docs/float32.md](docs/float32.md), section 7; plan and status:
-  [docs/boundary-plan.md](docs/boundary-plan.md).
+  **Short blocks on the kernel: fixed 2026-10-25, confirmation pending.**
+  At N <~ 6k with m = 4 the automatic block is 256 points, and on densely
+  sampled high-s/e data the dense information form's entry states and
+  backward seeds broke in float32: the gradient was 11-18 posterior sigma
+  off at a few points, and ChEES on a 20-s, N = 4096, s/e = 100 SHO + SHO
+  problem had not converged after 2000 warmup (R-hat 1.6-1.7, ~10x fewer
+  ESS per gradient) where one block converged in 300. The kernel now forms
+  them in the square-root information form, centred on the replayed
+  filter (`GPPolicy.metal_boundary`): at 16 posterior draws of that
+  problem the worst gradient error goes from 4.0 to 0.31 posterior
+  sigma at 16 x 256, and from 5.0 to 0.34 at 4 x 1024, and the value's spread
+  across the posterior from sd 0.066 to 0.020. **Not yet confirmed by a
+  ChEES run, and its cost is not yet measured**; until then
+  `GPPolicy(metal_block=N)` (up to 8192) remains the safe choice for
+  short, densely sampled, high-s/e series. Convolved terms keep the dense
+  boundary. Tables: [docs/float32.md](docs/float32.md), section 7; plan
+  and status: [docs/boundary-plan.md](docs/boundary-plan.md).
 * **The default MLX gradient at N ~ 1e5.** It fails with
   `[metal::malloc] Resource limit (499000) exceeded` (Metal's limit on live
   buffers, not memory): uncompiled at N = 114k for one chain of a single
