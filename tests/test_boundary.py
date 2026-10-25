@@ -596,13 +596,30 @@ def test_the_boundary_setting_is_validated_and_resolved():
         GPPolicy(metal=False, metal_boundary="cholesky")
     assert build(ag.SHOTerm(), None)._metal_boundary == "sqrt"
     assert build(ag.SHOTerm(), "dense")._metal_boundary == "dense"
-    conv = ag.TermConvolution(ag.SHOTerm(), 0.01)
-    # a convolved term's Q is indefinite: no square root, so dense
-    assert build(conv, None)._metal_boundary == "dense"
-    with pytest.raises(ValueError, match="convolved"):
-        build(conv, "sqrt")
-    with pytest.raises(ValueError, match="formal"):
-        am.scan_loglike(*[None] * 8, 0.0, 8, formal=True, boundary="sqrt")
+    # convolved: the square-root boundary (Q clamped) for SHO and rotation
+    # members, measured; dense for anything with a real-type member, whose
+    # exposure correction is negative
+    assert build(ag.TermConvolution(ag.SHOTerm(), 0.01),
+                 None)._metal_boundary == "sqrt"
+    # ... only while Q's negative part is small: ||F delta|| <= 0.5 at the
+    # reference point.  An exposure equal to the spacing against a timescale
+    # of about two spacings is past it.
+    pm_short = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                                for i, r in enumerate((1.3, 0.1, 1.0))],
+                        n_dim=3)
+    wide = GPLogLike(None, t, None, y, np.full(n, 0.3),
+                     ag.TermConvolution(ag.SHOTerm(), 0.05), pm_short,
+                     GPPolicy(metal=True))
+    assert wide._ref_fdelta > 0.5 and wide._metal_boundary == "dense"
+    real = ag.TermConvolution(ag.RealTerm(), 0.01)
+    pm2 = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                           for i, r in enumerate((1.3, 4.0))], n_dim=2)
+    gp_real = GPLogLike(None, t, None, y, np.full(n, 0.3), real, pm2,
+                        GPPolicy(metal=True))
+    assert gp_real._metal_boundary == "dense"
+    with pytest.raises(ValueError, match="real-type"):
+        GPLogLike(None, t, None, y, np.full(n, 0.3), real, pm2,
+                  GPPolicy(metal=True, metal_boundary="sqrt"))
 
 
 # ------------------------------- follow-up: the VJP reuses the forward
@@ -634,3 +651,86 @@ def test_the_gradient_does_not_recompute_the_boundary(monkeypatch, mode):
     assert np.all(np.isfinite(np.array(g)))
     assert calls == {"scan_blocks": 1,
                      "sqrt_blocks": 1 if mode == "sqrt" else 0}, calls
+
+
+# ------------------- convolved terms: float64 front end, sqrt boundary
+def test_a_convolved_terms_lag_table_is_computed_in_float64():
+    """`Q = P - Phi P Phi^T` by subtraction cost a convolved term ~10x the
+    unconvolved term's float32 error on bright data; its lag table is now
+    evaluated in float64 on the host and rounded, value and gradient."""
+    from anvilgp.likelihood import _Float64FrontEnd
+    n = 400
+    t = np.arange(n) * (2 / 1440)
+    y = np.random.default_rng(0).standard_normal(n) * 0.01
+    pm = ParamMap.log([0.01, 3.0, 3.0, 1.0, 0.5])
+    conv = ag.TermConvolution(ag.RotationTerm(), 2 / 1440)
+    gp = GPLogLike(None, t, None, y, np.full(n, 0.01), conv, pm,
+                   GPPolicy(metal=True, kappa_max=None))
+    assert isinstance(gp.term, _Float64FrontEnd) and gp.term._term is conv
+    plain = GPLogLike(None, t, None, y, np.full(n, 0.01), ag.RotationTerm(),
+                      pm, GPPolicy(metal=True, kappa_max=None))
+    assert not isinstance(plain.term, _Float64FrontEnd)
+    # parameters and lags reach the front end as float32; it widens those
+    p = np.array([[0.01, 3.0, 3.0, 1.0, 0.5], [0.02, 2.0, 5.0, 0.5, 0.3]]
+                 ).astype(np.float32).astype(np.float64)
+    lag = np.array([2 / 1440, 1.0]).astype(np.float32).astype(np.float64)
+    with mx.stream(mx.cpu):
+        want = [np.array(x) for x in conv.matrices(
+            mx.array(p, dtype=mx.float64), mx.array(lag, dtype=mx.float64))]
+        w = mx.array(np.random.default_rng(1).standard_normal((2, 2, 4, 4)))
+        g64 = np.array(mx.grad(lambda pp: (conv.matrices(
+            pp, mx.array(lag, dtype=mx.float64))[1] * w.astype(mx.float64))
+            .sum())(mx.array(p, dtype=mx.float64)))
+    with mx.stream(mx.gpu):
+        got = [np.array(x) for x in gp.term.matrices(
+            mx.array(p, dtype=mx.float32), mx.array(lag, dtype=mx.float32))]
+        g32 = np.array(mx.grad(lambda pp: (gp.term.matrices(
+            pp, mx.array(lag, dtype=mx.float32))[1] * w).sum())(
+            mx.array(p, dtype=mx.float32)))
+    for a, b in zip(got, want):
+        assert a.dtype == np.float32
+        np.testing.assert_array_equal(a, b.astype(np.float32))
+    np.testing.assert_allclose(g32, g64, rtol=1e-6, atol=1e-6 * np.abs(g64).max())
+
+
+def test_a_convolved_rotation_on_bright_data_is_accurate():
+    """A TESS 2-min convolved rotation at s/e = 100, N = 4096, 16 Laplace
+    draws: 10.4 posterior sigma off in gradient and sd 0.32 in value across
+    the draws before the float64 front end and the square-root boundary;
+    0.63 and 0.016 after (exact boundaries: 0.33; one block 0.08 / 0.020).
+    docs/boundary-plan.md, VI."""
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parents[1]
+                           / "benchmarks"))
+    from floor_exposure import hi as _hi64, posterior_draws
+    from anvilgp.oracle import dense_covariance
+    n, delta = 4096, 2 / 1440
+    kp = [0.1, 3.0, 3.0, 1.0, 0.5]
+    term = ag.TermConvolution(ag.RotationTerm(), delta)
+    t = np.arange(n) * delta
+    yerr = np.full(n, kp[0] / 100)
+    y = np.linalg.cholesky(dense_covariance(term, np.array(kp), t, yerr)) \
+        @ np.random.default_rng(2).standard_normal(n)
+    d = len(kp)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=float(x))
+                          for i, x in enumerate(kp)], n_dim=d)
+    ref = GPLogLike(None, t, None, y, yerr, term, pm,
+                    GPPolicy(metal=False, kappa_max=None))
+    V, sd = posterior_draws(ref, d, 16)
+    P = np.repeat(V, 2 * d, axis=0)
+    for k in range(len(V)):
+        for i in range(d):
+            P[k * 2 * d + 2 * i, i] += 1e-5
+            P[k * 2 * d + 2 * i + 1, i] -= 1e-5
+    ff = _hi64(ref, P).reshape(len(V), d, 2)
+    G = (ff[..., 0] - ff[..., 1]) / 2e-5
+    gp = GPLogLike(None, t, None, y, yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None))
+    assert gp._metal_boundary == "sqrt" and gp.metal_block == 256
+    with mx.stream(mx.gpu):
+        u = mx.array(V, dtype=mx.float32)
+        g = np.array(mx.grad(lambda u: gp(u).sum())(u))
+        f = np.array(gp(u))
+    e = (np.abs(g - G) * sd).max()
+    assert e < 1.0, f"gradient {e:.2f} posterior sigma"
+    assert np.std(f - _hi64(ref, V)) < 0.04

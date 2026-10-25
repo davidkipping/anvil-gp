@@ -1030,12 +1030,14 @@ def test_the_convolved_diagonal_correction_is_not_dead():
         return float(v[0]), np.array(gr[0], np.float64)[0]
 
     v_on, g_on = val_and_grad(gp)
-    original = type(gp.term).diag_correction
+    # the term itself, not the float64 front end that wraps a convolved one
+    cls = type(getattr(gp.term, "_term", gp.term))
+    original = cls.diag_correction
     try:
-        type(gp.term).diag_correction = lambda self, pp: None
+        cls.diag_correction = lambda self, pp: None
         v_off, g_off = val_and_grad(gp)
     finally:
-        type(gp.term).diag_correction = original
+        cls.diag_correction = original
     assert abs(v_on - v_off) / abs(v_on) > 1e-5, (
         f"the correction does not move the value: {v_on} vs {v_off}")
     assert float(np.max(np.abs(g_on - g_off))
@@ -1098,26 +1100,3 @@ def test_kappa_of_a_convolved_term_counts_its_zero_lag_correction():
         assert np.all(k > 0), k.min()
         small = kappa(ag.TermConvolution(ag.SHOTerm(), 1e-3 * dt), se)
         np.testing.assert_allclose(small, kappa(ag.SHOTerm(), se), rtol=1e-3)
-
-
-def test_a_convolved_term_on_bright_data_warns():
-    """The formal form of a convolved term is ~10x worse in float32 on
-    bright data (docs/boundary-plan.md, VI): say so at construction, above
-    rms / yerr ~ 30; not below it, and never for an unconvolved term."""
-    import warnings
-    n = 600
-    t = np.arange(n) * (2 / 1440)
-    y = np.random.default_rng(0).standard_normal(n)
-    pm = ParamMap.log([1.0, 0.2, 1.0])
-
-    def build(term, yerr):
-        return GPLogLike(None, t, None, y, np.full(n, yerr), term, pm,
-                         GPPolicy(metal=False, kappa_max=None))
-
-    conv = ag.TermConvolution(ag.SHOTerm(), 2 / 1440)
-    with pytest.warns(UserWarning, match="TermConvolution on data"):
-        build(conv, 0.01)                       # rms / yerr ~ 100
-    with warnings.catch_warnings():
-        warnings.filterwarnings("error", message="TermConvolution on data")
-        build(conv, 0.1)                        # ~ 10
-        build(ag.SHOTerm(), 0.01)

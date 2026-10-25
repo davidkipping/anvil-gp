@@ -33,13 +33,16 @@ Known v1 limitations, stated rather than discovered
 ---------------------------------------------------
 * Exposure-time integration (:class:`~anvilgp.terms.TermConvolution`)
   rests on a formal state-space form (indefinite ``P_inf``, process noise by
-  subtraction), so its float32 path is 50-100x less accurate than an
-  unconvolved term's on data far off-model, and on bright data drawn from
-  the model too: at s/e = 100 on a TESS 2-min convolved rotation the value
-  varies by sd 0.19-0.32 across the posterior (unconvolved: 0.018) and the
-  gradient is 1.3-1.6 posterior sigma off even with exact block boundaries
-  (10 at the default blocks).  At s/e = 30 it is 0.02 and 0.1-0.4.  See
-  docs/boundary-plan.md, VI.
+  subtraction).  Its lag table is computed in float64 on the host since
+  2026-10-25 (`_Float64FrontEnd`), which removed a ~10x float32 floor on
+  bright data, and SHO and rotation members use the kernel's square-root
+  block boundary with ``Q``'s negative part clamped while the exposure is
+  short against the timescale (``||F delta|| <= 0.5`` at the reference
+  point): a TESS 2-min convolved rotation at s/e = 100 went from 10
+  posterior sigma and value sd 0.32 to 0.63 and 0.016.  Real-type members,
+  and longer exposures, keep the dense boundary.  The exposure must stay
+  below the validated ``||F delta|| <= 8``.  See docs/boundary-plan.md,
+  VI.
 * No 2D/multiband GPs.
 * ``predict`` / conditional mean is deliberately out of the hot path; see
   :func:`anvilgp.oracle.dense_predict` for the offline float64 utility.
@@ -59,7 +62,7 @@ from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
                        leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from . import terms
-from .terms import Term, _block_diag
+from .terms import RotationTerm, SHOTerm, Term, TermSum, _block_diag
 
 __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
 
@@ -603,6 +606,9 @@ class GPLogLike:
         # Refuse beyond the validated range rather than degrade quietly.
         # `||F delta|| > 8` means the exposure is longer than the fastest
         # correlation time, where the process is nearly white over a frame.
+        #: spectral ||F delta|| at the reference point, for a convolved term
+        #: (`_convolution_takes_sqrt`)
+        self._ref_fdelta = None
         if delta is not None:
             ref = np.zeros((1, param_map.n_dim), dtype=np.float64)
             with mx.stream(mx.cpu):
@@ -610,6 +616,9 @@ class GPLogLike:
                 gens = kernel_spec.term.generator(kp)
                 norms = [float(np.max(np.abs(np.asarray(g)))) * delta
                          for g in gens]
+                self._ref_fdelta = max(
+                    float(np.linalg.norm(np.asarray(g)[0], 2)) * delta
+                    for g in gens)
                 probe = [np.asarray(x) for x in kernel_spec.p_inf_blocks(kp)]
                 corr = kernel_spec.diag_correction(kp)
                 if corr is not None:
@@ -649,31 +658,26 @@ class GPLogLike:
         #: uses a direct inverse instead of a Cholesky factor.  See
         #: `elements.combine`.  Every other term is untouched.
         self._formal = self._has_p_inf
-        if self._formal and self._data_se > _CONVOLVED_SE_WARN:
-            # Not a gate: it does not change the path, it says what the
-            # path is worth here.  The formal state-space form of a
-            # convolved term carries a ~10x float32 floor on bright data
-            # (docs/boundary-plan.md, VI): measured on a TESS 2-min
-            # convolved rotation, clear at s/e = 30 and not at 100.
-            warnings.warn(
-                f"TermConvolution on data whose rms is {self._data_se:.3g} "
-                f"times the median error bar: above "
-                f"~{_CONVOLVED_SE_WARN:g} its float32 "
-                f"form is inaccurate.  Measured at 100 (TESS 2-min convolved "
-                f"rotation, N = 4096): gradients ~10 posterior sigma off at "
-                f"the default blocks and 1.3-1.6 even at one block, and the "
-                f"value varies by sd 0.2-0.3 across the posterior, ~10x the "
-                f"unconvolved term's.  There is no workaround for the "
-                f"gradient yet; a positive-definite realisation is being "
-                f"built (docs/boundary-plan.md, VI).", stacklevel=2)
-        if self._formal and self.policy.metal_boundary == "sqrt":
+        if self._formal:
+            # its lag table in float64: see _Float64FrontEnd
+            self.term = _Float64FrontEnd(self.term)
+        sqrt_ok = (not self._formal
+                   or _convolution_takes_sqrt(self.term._term.term,
+                                              self._ref_fdelta))
+        if self.policy.metal_boundary == "sqrt" and not sqrt_ok:
             raise ValueError(
-                "GPPolicy(metal_boundary='sqrt') cannot serve a convolved "
-                "term: its Q is indefinite, so it has no square root.  Use "
-                "None (which picks 'dense' here) or 'dense'")
+                "GPPolicy(metal_boundary='sqrt') cannot serve this convolved "
+                "term: the square-root boundary clamps its (formally "
+                "indefinite) Q, which is measured safe only for SHOTerm and "
+                "RotationTerm members -- a real-type member's exposure "
+                "correction is negative and drives the leaf variance below "
+                "zero -- and only up to ||F delta|| = "
+                f"{_SQRT_FDELTA:g} at the reference point (here "
+                f"{self._ref_fdelta:.3g}).  Use None (which picks 'dense' "
+                "here) or 'dense'")
         #: the kernel's block boundary; see GPPolicy.metal_boundary
         self._metal_boundary = (self.policy.metal_boundary
-                                or ("dense" if self._formal else "sqrt"))
+                                or ("sqrt" if sqrt_ok else "dense"))
 
         self._lag_np = lag
         # Assigning `metal_block` (a property) builds the kernel's slot map
@@ -1200,9 +1204,6 @@ class GPLogLike:
             r = [float(np.median(self._yerr64 ** 2))]
         self._kappa_r = np.array(r)
         rms2 = float(np.mean((self._y64 - self._y64.mean()) ** 2))
-        se = float(np.sqrt(rms2 / float(np.min(self._kappa_r))))
-        #: data rms over the median error bar (`_CONVOLVED_SE_WARN`)
-        self._data_se = se
         kmax = self.policy.kappa_max
         if kmax is None or self._kappa_dt is None:
             return
@@ -1664,9 +1665,143 @@ def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     return max(1, min(n, n_lags))
 
 
-#: data rms over the median error bar above which a convolved term warns at
-#: construction: s/e = 30 measured clear, 100 not (docs/boundary-plan.md, VI).
-_CONVOLVED_SE_WARN = 30.0
+def _flatten(out):
+    """Arrays out of nested lists / tuples, and how to put them back."""
+    if isinstance(out, (list, tuple)):
+        parts = [_flatten(o) for o in out]
+        flat = [a for f, _ in parts for a in f]
+        kind = type(out)
+        sizes = [len(f) for f, _ in parts]
+        builders = [b for _, b in parts]
+
+        def build(arrs):
+            res, k = [], 0
+            for n, b in zip(sizes, builders):
+                res.append(b(arrs[k:k + n]))
+                k += n
+            return kind(res)
+        return flat, build
+    return [out], lambda arrs: arrs[0]
+
+
+def _float64_bridge(fn):
+    """``fn(p, *rest)`` evaluated in float64 on the host when ``p`` is
+    float32, forward and VJP, then rounded back to float32; outputs may be
+    nested lists of arrays.  ``rest`` (the lags) carries no gradient."""
+    shape = {}
+
+    @mx.custom_function
+    def bridged(p, *rest):
+        with mx.stream(mx.cpu):
+            out = fn(p.astype(mx.float64),
+                     *[x.astype(mx.float64) for x in rest])
+            if out is None:             # e.g. no correction: nothing to carry
+                shape["build"], shape["none"] = (lambda arrs: None), True
+                return (mx.zeros((1,), dtype=mx.float32),)
+            flat, build = _flatten(out)
+            shape["build"], shape["none"] = build, False
+            return tuple(o.astype(mx.float32) for o in flat)
+
+    @bridged.vjp
+    def bridged_vjp(primals, cotangents, outputs):
+        # a single-argument custom_function gets its primal bare, not in a
+        # tuple; normalise both
+        prim = list(primals) if isinstance(primals, (list, tuple)) \
+            else [primals]
+        cots = list(cotangents) if isinstance(cotangents, (list, tuple)) \
+            else [cotangents]
+        p, rest = prim[0], prim[1:]
+        with mx.stream(mx.cpu):
+            r64 = [x.astype(mx.float64) for x in rest]
+
+            if shape["none"]:
+                dp = mx.zeros(p.shape, dtype=mx.float64)
+            else:
+                def f(pp):
+                    return _flatten(fn(pp, *r64))[0]
+                _, (dp,) = mx.vjp(f, [p.astype(mx.float64)],
+                                  [c.astype(mx.float64) for c in cots])
+            return (dp.astype(mx.float32),
+                    *[mx.zeros_like(x) for x in rest])
+
+    def call(p, *rest):
+        flat = bridged(p, *rest)
+        flat = list(flat) if isinstance(flat, (list, tuple)) else [flat]
+        return shape["build"](flat)
+    return call
+
+
+class _Float64FrontEnd:
+    """A convolved term whose lag-table functions run in float64.
+
+    A :class:`~anvilgp.terms.TermConvolution`'s formal state-space form
+    forms ``Q = P_inf - Phi P_inf Phi^T`` by subtraction (float32.md, rule
+    1's documented exception), and in float32 that costs ~10x the
+    unconvolved term's error on bright data: value sd 0.185 against 0.021
+    across a posterior with the same tables computed in float64, and a
+    gradient 1.3 posterior sigma off at one block against 0.07
+    (docs/boundary-plan.md, VI).  So ``matrices`` and ``matrices_blocks``
+    evaluate in float64 on the host when called with float32 parameters --
+    one small table per chain and distinct lag -- and everything else is the
+    wrapped term's.  Only those two: bridging ``p_inf_blocks`` and
+    ``diag_correction`` as well changed nothing measurable (one block,
+    0.08 -> 0.07 sigma) and costs as much again.  Float64 calls (the
+    ``.hi`` path) go straight through.
+    """
+
+    _BRIDGED = ("matrices", "matrices_blocks")
+
+    def __init__(self, term):
+        self._term = term
+        # looked up per call, not bound here, so a method replaced on the
+        # term or its class afterwards is the one that runs
+        self._bridges = {
+            name: _float64_bridge(
+                lambda p, *rest, _n=name: getattr(self._term, _n)(p, *rest))
+            for name in self._BRIDGED}
+
+    def __getattr__(self, name):
+        attr = getattr(self._term, name)
+        if name not in self._BRIDGED:
+            return attr
+
+        def call(p, *rest):
+            if p.dtype != mx.float32:
+                return attr(p, *rest)
+            return self._bridges[name](p, *rest)
+        return call
+
+
+#: largest reference-point spectral ``||F delta||`` at which a convolved
+#: term takes the square-root boundary.  Clamping Q's negative part skews
+#: the entry states the value is replayed from as that part grows: value sd
+#: across a posterior, s/e = 100, against one block's -- 0.002 vs 0.000 at
+#: 0.25, 0.006 vs 0.000 at 0.41, 0.027 vs 0.000 at 0.99, 0.074 vs 0.001 at
+#: 1.98 -- while the dense boundary measured 0.00 sigma / 0.001 at 0.41,
+#: 0.99 and 1.98 (docs/boundary-plan.md, VI).  The dense boundary's own
+#: failure is at small ||F delta|| and high s/e (10 sigma at 0.007).
+_SQRT_FDELTA = 0.5
+
+
+def _convolution_takes_sqrt(inner: Term, ref_fdelta: float | None) -> bool:
+    """Whether a convolved ``inner`` can use the kernel's square-root block
+    boundary.  The boundary needs a factor of ``Q``; a convolved term's is
+    formally indefinite, and `metal.q_factor` clamps the negative part.
+    With the lag table in float64 (`_Float64FrontEnd`) that is measured
+    within 1.2-2x of exact boundaries for SHO and rotation terms -- 0.47
+    against 0.33 posterior sigma on a TESS 2-min convolved rotation at
+    s/e = 100, where the dense boundary is 10 -- and their exposure
+    correction is non-negative everywhere in the validated range.  A
+    real-type member's correction is negative and can push the leaf
+    variance below zero (`RealTerm`: NaN), and Matern-5/2 measured worse
+    than dense, so anything else keeps the dense boundary
+    (docs/boundary-plan.md, VI).  And only while ``Q``'s negative part is
+    small, which it is below ``_SQRT_FDELTA`` at the reference point.  A
+    chain that walks well past it keeps the square-root boundary (the
+    choice is fixed at construction) and its value degrades as above."""
+    members = inner.terms if isinstance(inner, TermSum) else (inner,)
+    return (all(isinstance(t, (SHOTerm, RotationTerm)) for t in members)
+            and ref_fdelta is not None and ref_fdelta <= _SQRT_FDELTA)
 
 
 class MetalDefaultNotice(UserWarning):

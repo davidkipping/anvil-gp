@@ -829,3 +829,59 @@ negative part.
 
 Not measured yet: the float64 host bridge's cost; regimes beyond the
 four cases above; the negative-correction cases.
+
+## VI, built: accurate convolved tables and the square-root boundary (2026-10-25)
+
+Option (a1), agreed after the prototype.
+
+* **`likelihood._Float64FrontEnd`** wraps a convolved term; its `matrices`
+  and `matrices_blocks` evaluate in float64 on the host when called with
+  float32 parameters, forward and VJP (`_float64_bridge`), and round to
+  float32. Only those two: bridging `p_inf_blocks` and `diag_correction`
+  as well changed nothing measurable (one block, 0.08 -> 0.07 sigma) and
+  doubled the cost. Cost, convolved rotation at N = 4096, regular or
+  gapped TESS 2-min: forward unchanged, value + gradient 48.6 -> 57.2 ms
+  at 1024 chains (+18%) and 23.2 -> 31.9 at 256 (+37%); unconvolved terms
+  untouched.
+* **The square-root boundary for convolved terms whose members are all
+  `SHOTerm` or `RotationTerm`, while the spectral `||F delta||` at the
+  reference point is <= 0.5** (`_convolution_takes_sqrt`), `Q`'s negative
+  part clamped by `q_factor`; the replay and the backward stay formal and
+  exact. Their exposure correction is non-negative at every one of ~15k
+  points swept per type inside `||F delta|| <= 8`; `RealTerm`'s is negative
+  everywhere and drives the leaf variance below zero (NaN), and Matern-5/2
+  measured worse than dense (0.43 against 0.00 sigma), so every other
+  member type keeps the dense boundary, and asking for `"sqrt"` there is
+  refused. The fully negative-definite regime (delta / rho >~ 0.5) is
+  outside `||F delta|| <= 8` and already refused.
+* **The warning added the same day is gone**: no convolved case measured
+  is bad any more, and its text (10 sigma) was no longer true.
+
+Measured on the library's default path, N = 4096, 16 Laplace draws:
+
+| s/e 100 | before | **now** | exact boundaries | one block |
+|---|---|---|---|---|
+| TESS 2-min convolved Rotation | 10.4 sigma / value sd 0.32 | **0.63 / 0.016** | 0.33 | 0.08 / 0.020 |
+| TESS 2-min convolved SHO + SHO | 0.66 / 0.013 | **0.08 / 0.002** | 0.03 | 0.03 / 0.003 |
+| Kepler 30-min convolved RealTerm, Matern-5/2 (dense: real-type) | 0.00 | 0.00 | 0.00 | 0.00 |
+
+**Why `||F delta||` too.** The clamp is harmless only while `Q`'s
+negative part is small, and that part grows steeply with the exposure
+over the timescale (1e-8 relative at delta / rho = 0.007, 9e-3 at 0.16).
+On the library's path, convolved SHO at s/e 100, value sd across the
+draws with the square-root boundary against one block's: 0.002 / 0.000
+at `||F delta||` = 0.25, 0.006 / 0.000 at 0.41, **0.027 / 0.000 at 0.99,
+0.074 / 0.001 at 1.98** -- the gradient stays <= 0.05 sigma throughout.
+The dense boundary measured 0.00 sigma / 0.001 at 0.41, 0.99 and 1.98,
+and fails only at small `||F delta||` and high s/e (10 sigma at 0.007).
+So the cut is 0.5 (`_SQRT_FDELTA`), at the reference point: a chain that
+walks well past it keeps the boundary chosen at construction and its
+value degrades as above (0.03 at ~1, 0.07 at ~2).
+
+The rotation's 0.63 is the unconvolved rotation's level on the same kind
+of data (0.57); the gap to 0.33 is the Metal rounding V measured. Pinned
+in `tests/test_boundary.py`: the front end's float32 table equals the
+float64 one rounded and its gradient matches float64; the convolved
+rotation at s/e 100 within 1 posterior sigma and value sd 0.04; the
+boundary's resolution and refusal by member type. The positive-definite
+realisation stays on file for anything this does not reach.

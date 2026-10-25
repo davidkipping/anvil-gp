@@ -575,7 +575,7 @@ float32 accuracy.
 |---|---|---|
 | `metal` | `None` (the kernel where eligible: `m <= 4`, up to 8 per-instrument jitters; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
 | `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3 and 256 at m >= 4) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
-| `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
+| `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term with a real-type member or `\|\|F delta\|\| > 0.5`) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (32 up to m = 6, 64 above) | below N ~ 2000, try 8-16 for speed, at some float32 accuracy (16 is 3.7x less accurate than 32 at sigma/yerr = 30). |
 | `eval_blocks` | `False` | you are memory-bound and can give up `mx.compile`. The `.hi` path sets it itself. |
@@ -645,7 +645,14 @@ marked as an estimate.
   sigma at 16 x 256, and from 5.0 to 0.34 at 4 x 1024, and the value's spread
   across the posterior from sd 0.066 to 0.020, and ChEES converges at
   the default blocks at the one-block rate (0.68-0.81 ESS per 1000
-  gradients against 0.08-0.09). Convolved terms keep the dense boundary.
+  gradients against 0.08-0.09). Convolved terms: since 2026-10-25 their
+  lag table is computed in float64 on the host (its `Q` is formed by
+  subtraction, which cost ~10x in float32 on bright data) and SHO and
+  rotation members use the square-root boundary too while the exposure is
+  short against the timescale (`||F delta|| <= 0.5`) -- a TESS 2-min
+  convolved rotation at s/e = 100 went from 10 posterior sigma and value
+  sd 0.32 to 0.63 and 0.016; value + gradient +18% for convolved terms.
+  Real-type members keep the dense boundary, which measured fine on them.
   **Still open:** at 2-s cadence and s/e 100 (m = 4) the gradient stays
   ~6-9 posterior sigma off, and that is not the boundary -- exact float64
   boundary quantities give 6.4 sigma too. The backward takes the entry

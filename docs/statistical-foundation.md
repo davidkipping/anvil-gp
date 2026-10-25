@@ -195,12 +195,12 @@ Admissible only as a secondary cross-check, never as the likelihood:
 ## Known v1 limitations
 
 * Exposure-time integration (`TermConvolution`) rests on a formal
-  state-space form (indefinite `P_inf`, process noise by subtraction), so
-  its float32 path is 50–100x less accurate than an unconvolved term's on
-  data far off-model, and on bright on-model data too: at s/e = 100 on a
-  TESS 2-min convolved rotation the value varies by sd 0.19–0.32 across the
-  posterior (unconvolved 0.018) and the gradient is 1.3–1.6 posterior sigma
-  off even with exact block boundaries. See
+  state-space form (indefinite `P_inf`, process noise by subtraction). In
+  float32 that cost ~10x on bright data until 2026-10-25, when its lag
+  table moved to float64 on the host and SHO and rotation members moved to
+  the square-root block boundary (a TESS 2-min convolved rotation at
+  s/e = 100: 10 posterior sigma and value sd 0.32 before, 0.63 and 0.016
+  after). See
   [kernels.md](kernels.md#indefinite-and-still-exact) and
   [boundary-plan.md](boundary-plan.md), VI.
 * No 2D / multiband GPs.

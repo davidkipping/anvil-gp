@@ -2409,15 +2409,17 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     replay and the backward use.  On bright, densely sampled data the
     dense ones are float32-wrong (entry means 5%, the gradient 4-5
     posterior sigma off at the worst posterior draws) and the square-root
-    ones are not (docs/boundary-plan.md).  Not for a ``formal`` model, and
-    skipped for a single block, where both give the start state and a zero
-    seed.
+    ones are not (docs/boundary-plan.md).  For a ``formal`` model `q_factor`
+    clamps ``Q``'s negative part, which the caller must have checked is
+    harmless; skipped for a single block, where both give the start state
+    and a zero seed.
     """
     if boundary not in ("dense", "sqrt"):
         raise ValueError(f"boundary = {boundary!r} must be 'dense' or 'sqrt'")
-    if boundary == "sqrt" and formal:
-        raise ValueError("the square-root boundary needs a positive "
-                         "semi-definite Q; a formal model has none")
+    # A formal (convolved) model's Q is indefinite; `q_factor` clamps its
+    # negative part, which the caller has to know is harmless -- only for
+    # SHO and rotation members, measured (likelihood._convolution_takes_sqrt).
+    # The replay and the backward stay formal and exact either way.
     use_sqrt = boundary == "sqrt" and -(-resid.shape[0] // blk_len) > 1
 
     def boundary(p_t, q_t, lg, hv, rs, rr, j2):
