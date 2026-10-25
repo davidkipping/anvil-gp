@@ -13,11 +13,12 @@ exception: `TermConvolution` forms its `Q` this way, because its `P_inf` is
 a matrix function of the generator with no closed-form difference. Measured,
 that costs nothing visible on data drawn from the model at moderate
 signal-to-noise (3e-3 log-units against 3e-4 to 1e-2 for an unconvolved SHO
-at matched kappa, delta/rho >= 0.0025), 50-100x the unconvolved term's
+at matched kappa, delta/rho >= 0.0025), 4-2800x the unconvolved term's
 float32 error on data far off-model, and ~10x on bright on-model data (a
 TESS 2-min convolved rotation at s/e = 100: value sd 0.19-0.32 across the
 posterior against 0.018) -- which is why, since 2026-10-25, that table is
-computed in float64 on the host and rounded (value sd 0.016 there now); see
+computed in float64 on the host and rounded, which brings both to the
+unconvolved term's level (value sd 0.016 there now); see
 docs/kernels.md and docs/boundary-plan.md, VI. Expand it for the SHO at
 `omega_0 dt << 1` and three `O(omega_0 dt)` terms cancel to
 `O((omega_0 dt)^3)`. Measured, at `omega_0 dt = 1e-3` in float32 the

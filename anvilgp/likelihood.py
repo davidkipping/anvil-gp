@@ -35,12 +35,12 @@ Known v1 limitations, stated rather than discovered
   rests on a formal state-space form (indefinite ``P_inf``, process noise by
   subtraction).  Its lag table is computed in float64 on the host since
   2026-10-25 (`_Float64FrontEnd`), which removed a ~10x float32 floor on
-  bright data, and SHO and rotation members use the kernel's square-root
-  block boundary with ``Q``'s negative part clamped while the exposure is
-  short against the timescale (``||F delta|| <= 0.5`` at the reference
-  point): a TESS 2-min convolved rotation at s/e = 100 went from 10
-  posterior sigma and value sd 0.32 to 0.63 and 0.016.  Real-type members,
-  and longer exposures, keep the dense boundary.  The exposure must stay
+  bright data, and SHO, rotation and Matern members use the kernel's
+  square-root block boundary with ``Q``'s negative part clamped while the
+  exposure is short against the timescale (``||F delta|| <= 0.5`` at the
+  reference point): a TESS 2-min convolved rotation at s/e = 100 went from
+  10 posterior sigma and value sd 0.32 to 0.63 and 0.016.  ``RealTerm``
+  members, and longer exposures, keep the dense boundary.  The exposure must stay
   below the validated ``||F delta|| <= 8``.  See docs/boundary-plan.md,
   VI.
 * No 2D/multiband GPs.
@@ -62,7 +62,8 @@ from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
                        leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from . import terms
-from .terms import RotationTerm, SHOTerm, Term, TermSum, _block_diag
+from .terms import (Matern32Term, Matern52Term, RotationTerm, SHOTerm, Term,
+                    TermSum, _block_diag)
 
 __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
 
@@ -668,10 +669,10 @@ class GPLogLike:
             raise ValueError(
                 "GPPolicy(metal_boundary='sqrt') cannot serve this convolved "
                 "term: the square-root boundary clamps its (formally "
-                "indefinite) Q, which is measured safe only for SHOTerm and "
-                "RotationTerm members -- a real-type member's exposure "
-                "correction is negative and drives the leaf variance below "
-                "zero -- and only up to ||F delta|| = "
+                "indefinite) Q, which is measured safe only for SHOTerm, "
+                "RotationTerm, Matern32Term and Matern52Term members -- a "
+                "RealTerm's exposure correction drives the leaf's white "
+                "noise below zero -- and only up to ||F delta|| = "
                 f"{_SQRT_FDELTA:g} at the reference point (here "
                 f"{self._ref_fdelta:.3g}).  Use None (which picks 'dense' "
                 "here) or 'dense'")
@@ -1783,6 +1784,18 @@ class _Float64FrontEnd:
 _SQRT_FDELTA = 0.5
 
 
+#: convolved member types the square-root boundary is measured on.  Inside
+#: the ``_SQRT_FDELTA`` guard their leaf's white-noise part ``r + c`` stays
+#: positive -- ``c >= 0`` for SHO, rotation and Matern-3/2, and Matern-5/2's
+#: negative ``c`` is >= -4.6e-8 k(0), so it would take s/e ~ 5000 -- and the
+#: boundary beat the dense one (SHO + Matern-3/2, s/e 100: 0.05 against 2.06
+#: posterior sigma; Matern-5/2 at rho = 1 d: 0.04 against 1.38).
+#: `RealTerm`'s ``c`` reaches -0.17 k(0), ``r + c`` goes negative and the
+#: leaf has no real square root, so it keeps the dense boundary, which
+#: measured fine on it.
+_SQRT_CONVOLVED = (SHOTerm, RotationTerm, Matern32Term, Matern52Term)
+
+
 def _convolution_takes_sqrt(inner: Term, ref_fdelta: float | None) -> bool:
     """Whether a convolved ``inner`` can use the kernel's square-root block
     boundary.  The boundary needs a factor of ``Q``; a convolved term's is
@@ -1795,12 +1808,13 @@ def _convolution_takes_sqrt(inner: Term, ref_fdelta: float | None) -> bool:
     real-type member's correction is negative and can push the leaf
     variance below zero (`RealTerm`: NaN), and Matern-5/2 measured worse
     than dense, so anything else keeps the dense boundary
-    (docs/boundary-plan.md, VI).  And only while ``Q``'s negative part is
+    (docs/boundary-plan.md, VI; Matern-3/2 and -5/2 added after
+    measuring them inside the guard).  And only while ``Q``'s negative part is
     small, which it is below ``_SQRT_FDELTA`` at the reference point.  A
     chain that walks well past it keeps the square-root boundary (the
     choice is fixed at construction) and its value degrades as above."""
     members = inner.terms if isinstance(inner, TermSum) else (inner,)
-    return (all(isinstance(t, (SHOTerm, RotationTerm)) for t in members)
+    return (all(isinstance(t, _SQRT_CONVOLVED) for t in members)
             and ref_fdelta is not None and ref_fdelta <= _SQRT_FDELTA)
 
 

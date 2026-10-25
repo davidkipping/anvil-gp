@@ -848,9 +848,12 @@ class TermConvolution(Term):
     signal-to-noise.  Checked now against the dense float64 oracle over six
     term shapes, timescales of 1 to 100 exposures and signal-to-noise 3 to
     100: exact everywhere in float64, float32 noise on both float32 paths.
-    One float32 caveat, older than this: ``Q`` is formed as ``P - Phi P
-    Phi^T``, which costs 50-100x the unconvolved term's float32 error on
-    data far off-model (see docs/kernels.md).  ``||F delta||`` above
+    ``Q`` is formed as ``P - Phi P Phi^T``, which in float32 cost ~10x the
+    unconvolved term's error on bright on-model data and 4-2800x off-model;
+    :class:`~anvilgp.likelihood.GPLogLike` therefore evaluates this term's
+    lag table in float64 on the host (``_Float64FrontEnd``), which brings
+    both to the unconvolved term's level (docs/kernels.md,
+    docs/boundary-plan.md, VI).  ``||F delta||`` above
     :data:`MAX_FDELTA` is refused per chain, since the matrix series stop
     converging there.
     """

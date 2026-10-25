@@ -601,6 +601,12 @@ def test_the_boundary_setting_is_validated_and_resolved():
     # exposure correction is negative
     assert build(ag.TermConvolution(ag.SHOTerm(), 0.01),
                  None)._metal_boundary == "sqrt"
+    pm_m = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                            for i, r in enumerate((1.3, 4.0))], n_dim=2)
+    for mat in (ag.Matern32Term(), ag.Matern52Term()):
+        assert GPLogLike(None, t, None, y, np.full(n, 0.3),
+                         ag.TermConvolution(mat, 0.01), pm_m,
+                         GPPolicy(metal=True))._metal_boundary == "sqrt"
     # ... only while Q's negative part is small: ||F delta|| <= 0.5 at the
     # reference point.  An exposure equal to the spacing against a timescale
     # of about two spacings is past it.
@@ -617,7 +623,7 @@ def test_the_boundary_setting_is_validated_and_resolved():
     gp_real = GPLogLike(None, t, None, y, np.full(n, 0.3), real, pm2,
                         GPPolicy(metal=True))
     assert gp_real._metal_boundary == "dense"
-    with pytest.raises(ValueError, match="real-type"):
+    with pytest.raises(ValueError, match="RealTerm"):
         GPLogLike(None, t, None, y, np.full(n, 0.3), real, pm2,
                   GPPolicy(metal=True, metal_boundary="sqrt"))
 

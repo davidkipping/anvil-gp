@@ -197,8 +197,8 @@ Admissible only as a secondary cross-check, never as the likelihood:
 * Exposure-time integration (`TermConvolution`) rests on a formal
   state-space form (indefinite `P_inf`, process noise by subtraction). In
   float32 that cost ~10x on bright data until 2026-10-25, when its lag
-  table moved to float64 on the host and SHO and rotation members moved to
-  the square-root block boundary (a TESS 2-min convolved rotation at
+  table moved to float64 on the host and SHO, rotation and Matern members
+  moved to the square-root block boundary (a TESS 2-min convolved rotation at
   s/e = 100: 10 posterior sigma and value sd 0.32 before, 0.63 and 0.016
   after). See
   [kernels.md](kernels.md#indefinite-and-still-exact) and

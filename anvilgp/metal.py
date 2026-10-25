@@ -1748,7 +1748,12 @@ _SRC_SQRT_BLOCKS = """
         FWD_STEP
         {
             JIT_PER_OBS
-            float rv = r_ref[gi] + jit2v;
+            // The leaf's white noise.  A convolved term's exposure
+            // correction rides in jit2v and can be negative (Matern-5/2:
+            // >= -4.6e-8 k(0) inside the guard); c2 below needs it positive.
+            // Floored at r_ref / 2, which never binds otherwise -- jitter
+            // is a variance -- so every other term is bit-identical.
+            float rv = max(r_ref[gi] + jit2v, 0.5f * r_ref[gi]);
             uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
             float Ph[MDIM][MDIM], LQ[MDIM][MDIM];
             for (uint i = 0; i < M; ++i)

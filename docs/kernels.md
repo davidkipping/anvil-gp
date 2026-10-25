@@ -240,14 +240,18 @@ measurable (float32 error ~1e-4, the same as the unconvolved term, N = 300).
 N = 4096, varied by sd 0.19-0.32 across the posterior against 0.018
 unconvolved, and its gradient was 10 posterior sigma off at the default
 blocks -- **until 2026-10-25, when the lag table moved to float64** (on the
-host, rounded to float32; `likelihood._Float64FrontEnd`) and SHO and
-rotation members moved to the square-root block boundary: 0.63 and 0.016
-now. [boundary-plan.md](boundary-plan.md), VI. The off-model figures below
-were measured with the float32 table and have not been re-measured. **Far off-model** — white noise
-against a long timescale, as during an early burn-in — it is 50 to 100x
-worse than the unconvolved term at the same `kappa` (0.2 log-units at
-`kappa` = 50, 1.1 at 480, N = 300). A cancellation-free `Q` for the
-convolved term is not written yet.
+host, rounded to float32; `likelihood._Float64FrontEnd`) and SHO, rotation and
+Matern members moved to the square-root block boundary: 0.63 and 0.016
+now. [boundary-plan.md](boundary-plan.md), VI. **Far off-model** -- white
+noise against a long timescale, as during an early burn-in -- the float32
+table was 20-2800x the unconvolved term's error at the same `kappa` for an
+SHO (2e-4 at `kappa` ~ 90, 1.3e-3 at ~860, 3.6e-2 at ~9700, N = 300) and
+4-40x for a `RealTerm`; with the float64 table it is the unconvolved term's,
+1e-5 to 1e-4 on both paths at every `kappa` tried (re-measured 2026-10-25;
+the 2026-10-23 figures quoted here before, 0.2 log-units at `kappa` = 50,
+came from a script that was not kept and are not reproduced by this one).
+A cancellation-free `Q` in float32 would remove the host round-trip; it is
+not written.
 
 **One thing is not a kernel.** Below the exposure width the convolution is
 not an exponential sum, and the difference at zero lag is a constant added

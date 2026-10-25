@@ -885,3 +885,39 @@ float64 one rounded and its gradient matches float64; the convolved
 rotation at s/e 100 within 1 posterior sigma and value sd 0.04; the
 boundary's resolution and refusal by member type. The positive-definite
 realisation stays on file for anything this does not reach.
+
+## Follow-on step 1: loose ends of the convolved fix (2026-10-25)
+
+**Matern terms join the square-root boundary.** Matern-5/2 had been left
+on the dense boundary on a measurement at `||F delta||` ~ 2, outside the
+guard that now exists, and Matern-3/2 had not been measured. Inside the
+guard, TESS 2-min, s/e 100, gradient per posterior sigma:
+
+| | dense (was the default) | square-root, `Q` clamped | exact | one block |
+|---|---|---|---|---|
+| SHO (rotation 3 d) + Matern-3/2 (rho 0.2 d) | **2.06** | 0.05 (wired: 0.19) | 0.06 | 0.03 |
+| Matern-5/2, rho 1 d | **1.38** | 0.04 (wired: 0.03) | 0.10 | 0.00 |
+| Matern-3/2, rho 1 d | 0.27 | 0.01 (wired: 0.02) | 0.01 | 0.00 |
+| Matern-5/2, rho 0.2 d | 0.11 | 0.14 (wired: 0.14) | 0.00 | 0.00 |
+| Matern-3/2, rho 0.2 d; Kepler 30-min Matern-3/2, rho 1 d | <= 0.02 | <= 0.00 | 0.00 | 0.00 |
+
+What decides it is the leaf's white-noise part `r + c`, which its
+symmetric root needs positive (the process part `h Q+ h^T + c` is >= 0
+inside the guard for every type, `RealTerm` included, ~13-17k points
+swept each). `c >= 0` for SHO, rotation and Matern-3/2; Matern-5/2's is
+negative but >= -4.6e-8 k(0), so `r + c < 0` would need s/e ~ 5000;
+`RealTerm`'s reaches -0.17 k(0) and stays on the dense boundary, which
+measured fine on it. `sqrt_blocks` now floors the leaf's white noise at
+`r_ref / 2` as a safety net -- it cannot bind for any unconvolved term
+(jitter is a variance; bit-identical, checked) or for SHO / rotation /
+Matern-3/2.
+
+**The off-model figure, re-measured.** kernels.md's "50 to 100x worse
+far off-model" was measured with the float32 table and its script was
+not kept. A reconstruction (white noise against a long timescale,
+N = 300, mean |float32 - float64| over 8 points): with the float32 table
+a convolved SHO was 20-2800x the unconvolved term's error (2e-4 at
+kappa ~ 90 up to 3.6e-2 at ~9700) and a convolved `RealTerm` 4-40x; with
+the float64 table both are at the unconvolved term's level, 1e-5 to 1e-4,
+kernel and MLX paths. The limitation is gone; docs, the `TermConvolution`
+docstring and the oracle test's note corrected.

@@ -860,10 +860,10 @@ def test_a_convolved_term_matches_the_dense_oracle_where_it_used_to_fail(metal):
     The assertion is exactness, not refusal: ``.hi`` within 1e-9 of the
     oracle and the float32 path within float32 noise, at every point.  The
     data are drawn from the model, as a posterior's are.  (Far off-model --
-    white noise against a long timescale -- a convolved term's float32 path
-    is 50-100x less accurate than the plain term's at the same ``kappa``,
-    from the cancellation in ``Q = P - Phi P Phi^T``; that is a separate,
-    older issue, recorded in docs/kernels.md.)
+    white noise against a long timescale -- the cancellation in ``Q = P -
+    Phi P Phi^T`` made a convolved term's float32 path 4-2800x less accurate
+    than the plain term's at the same ``kappa``, until its lag table moved
+    to float64 on the host; docs/kernels.md.)
     """
     n, dl = 300, 0.02
     t = np.arange(n) * dl
