@@ -431,6 +431,49 @@ removes the large numbers instead of storing them more carefully.
    and called the remainder unexplained; those seeds were central
    differences, 3-7e-4 relative off -- as wrong as the kernel's own.
 
+   **The centred elements, prototyped (2026-10-24).** Leaves centred on
+   the float32 replay from the kernel's entry states (residual `y_t - h
+   Phi m_{t-1}`, and `b' = A m_{t-1} + K y_t - m_t`), folded per block,
+   then prefix (entry means = trajectory + correction, entry covariances)
+   and suffix (seeds). Same problem, worst over three draws, the two
+   amplitudes, with each stage of the composition optionally in float64:
+
+   | elements | 16 x 256 | 4 x 1024 |
+   |---|---|---|
+   | plain, all float32 (the kernel's algebra) | 4.1 / 3.2 | 1.3 / 0.95 |
+   | plain, float64 block prefix only | 4.1 / 3.1 | 1.4 / 0.98 |
+   | plain, float32 leaves, float64 fold and prefix | 0.80 / 0.76 | 0.46 / 0.43 |
+   | **centred, all float32** | **0.87 / 0.69** | **0.53 / 0.48** |
+   | centred, float32 leaves, float64 fold and prefix | 0.20 / 0.32 | 0.12 / 0.20 |
+   | all float64 (= exact entries and seeds) | 0.13 / 0.10 | 0.09 / 0.04 |
+
+   What this says:
+
+   * **Centring fixes the means, not the covariances.** It cuts the entry
+     means' error 7-9% -> 0.4-1%, but `C` does not depend on the data, so
+     its composition is untouched (entry covariances 4% off), and a wrong
+     `C` limits the means through every `(I + C J)^-1`. Re-centring a
+     second or third time changes nothing: the correction stalls at a
+     fixed size instead of shrinking.
+   * **The precision is lost inside the block fold, not in the prefix.**
+     A float64 prefix over the block elements changes nothing; a float64
+     fold of float32 leaves recovers most of it.
+   * **Even float32 *leaves* are not enough at s/e = 100.** With them
+     folded in float64, entry covariances are still 1% off: the dense
+     information form is ill-conditioned enough to amplify the leaves'
+     own rounding (the exact entry covariance has eigenvalues 1e-5 to
+     0.9).
+   * So centring alone buys 4x (short blocks) to 20x (long blocks) and
+     leaves 0.5-0.9 sigma at the worst draws; reaching ~0.1-0.3 needs more
+     precision in the fold as well (float-float arithmetic in the kernel's
+     pass 1), or a better-conditioned form (square-root information
+     form), not prototyped.
+
+   Prototype pitfall, for whoever repeats this: `mx.array(x)` of a
+   float64 ndarray is *float32* unless `dtype=` is passed. A first run of
+   the table above silently did its "float64" stages in float32 and
+   showed no effect from any of them.
+
    Ruled out, measured: the term front end (chaining the kernel's per-lag
    adjoints to theta in float64 changes nothing), and the per-lag and `dh`
    accumulators (Kahan compensation changes nothing). Refining the seeds

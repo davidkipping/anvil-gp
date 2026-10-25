@@ -69,7 +69,10 @@ def sample(term, kp, t, yerr, rng):
 
 def hi(gp, V):
     with mx.stream(mx.cpu):
-        return np.array(gp.hi(mx.array(V).astype(mx.float64), refuse=False))
+        # dtype= matters: mx.array of a float64 ndarray is float32, which rounded
+        # V +- 1e-5 before the float64 evaluation (<= 0.005 sigma in the FD
+        # gradients measured at 20-s, N = 4096; values were unaffected)
+        return np.array(gp.hi(mx.array(V, dtype=mx.float64), refuse=False))
 
 
 def lo(gp, V, grad=False):
