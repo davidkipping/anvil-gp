@@ -1098,3 +1098,26 @@ def test_kappa_of_a_convolved_term_counts_its_zero_lag_correction():
         assert np.all(k > 0), k.min()
         small = kappa(ag.TermConvolution(ag.SHOTerm(), 1e-3 * dt), se)
         np.testing.assert_allclose(small, kappa(ag.SHOTerm(), se), rtol=1e-3)
+
+
+def test_a_convolved_term_on_bright_data_warns():
+    """The formal form of a convolved term is ~10x worse in float32 on
+    bright data (docs/boundary-plan.md, VI): say so at construction, above
+    rms / yerr ~ 30; not below it, and never for an unconvolved term."""
+    import warnings
+    n = 600
+    t = np.arange(n) * (2 / 1440)
+    y = np.random.default_rng(0).standard_normal(n)
+    pm = ParamMap.log([1.0, 0.2, 1.0])
+
+    def build(term, yerr):
+        return GPLogLike(None, t, None, y, np.full(n, yerr), term, pm,
+                         GPPolicy(metal=False, kappa_max=None))
+
+    conv = ag.TermConvolution(ag.SHOTerm(), 2 / 1440)
+    with pytest.warns(UserWarning, match="TermConvolution on data"):
+        build(conv, 0.01)                       # rms / yerr ~ 100
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="TermConvolution on data")
+        build(conv, 0.1)                        # ~ 10
+        build(ag.SHOTerm(), 0.01)

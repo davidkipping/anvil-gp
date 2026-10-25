@@ -763,3 +763,69 @@ lag table carries `g`, `s` and `sigma^2`; `Q` is the unconvolved term's
 replay (the observation reads the previous state) and the hand-written
 backward. Estimate: a NumPy float32 prototype first (~1 day) to confirm it
 removes the ~10x floor; the kernel and backward 3-5 days after that.
+
+## VI, prototype: the floor is the front end, not the representation (2026-10-25)
+
+Fable's review of VI asked for a float64-first prototype of the
+positive-definite realisation and a warning in the meantime. The warning
+landed (convolved term, data rms > 30 x the median error bar). The
+prototype changed the diagnosis.
+
+**The positive-definite realisation is right, and not needed for the
+floor.** Built in NumPy (`g`, `s`, `sigma^2` from stationary covariances:
+`g = (1/delta) int Phi^T h` over the window, `s = c - Phi g` with
+`c = (1/delta) int_0^delta Phi h`, `sigma^2 = k_conv(0) - |g|^2 + r`, and
+a filter update written as two covariances, PSD in any precision): in
+float64 it reproduces `.hi` to 7e-10. Value spread across the 16 draws,
+one block, float32 sequential filter, TESS 2-min convolved rotation at
+s/e = 100:
+
+| | value sd |
+|---|---|
+| formal form, float32 tables (today's) | 0.185 (the kernel's one block: 0.19) |
+| positive-definite realisation, float32 filter, float64 tables | 0.035 |
+| **formal form, float32 filter, float64 tables** | **0.021** |
+| unconvolved term (kernel, one block) | 0.029 |
+
+So the ~10x floor is the float32 front end computing the formal tables
+-- `Q = P - Phi P Phi^T` by subtraction, A13 -- not the indefiniteness.
+Through the real kernel, with the convolved term's `matrices`,
+`p_inf_blocks` and `diag_correction` bridged through float64 (forward and
+VJP) and the kernel unchanged:
+
+| TESS 2-min, s/e 100 | float32 tables, dense (today) | float64 tables, dense | float64, exact boundary | **float64, sqrt with Q clamped** | float64, one block |
+|---|---|---|---|---|---|
+| convolved Rotation | 10.4 / 0.32 | 8.2 / 0.12 | 0.40 | **0.48** | 0.07 / 0.027 |
+| convolved SHO + SHO | 0.66 / 0.013 | 1.10 / 0.003 | 0.03 | **0.06** | 0.03 / 0.002 |
+
+(gradient per posterior sigma / value sd.) Accurate tables remove the
+floor; the dense boundary is then the remaining failure, as for
+unconvolved terms; and the square-root boundary with `Q`'s negative part
+clamped -- 10 sigma on SHO + SHO with float32 tables -- is within ~1.2-2x
+of the exact boundary once the tables are accurate. The earlier failure
+was float32 garbage in the small directions, not the genuine 1e-8
+negative part.
+
+**What that makes the fix, and its limits.**
+
+1. *Accurate convolved tables.* Either cancellation-free closed forms
+   for the formal `Q`, `P_inf` and correction, or the lag table evaluated
+   in float64 on the host (cheap on a regular cadence, a handful of rows
+   per chain; costly when every spacing is distinct). Fixes the floor on
+   one block and the value everywhere; the MLX path (1.34 sigma, value sd
+   0.32 on this case) benefits too.
+2. *The square-root boundary for convolved terms*, `Q` clamped by
+   `q_factor`, the replay and backward staying on the exact formal path.
+   Valid only where `Q`'s negative part is tiny (delta / rho <~ 0.03 in
+   the sweep above: TESS 2-min and 20-s, Kepler rotation); at delta / rho
+   >~ 0.5 the formal model is entirely negative definite and clamping
+   cannot work. A real-type component's correction is negative and can
+   exceed the white noise, so the leaf variance `|u|^2 + r + c` could go
+   non-positive: needs a guard or the dense fallback.
+3. *The positive-definite realisation* stays the general answer -- every
+   regime, no clamping, no correction -- at the cost of a correlated-noise
+   replay and backward (estimated 6-9 days with cancellation-free
+   `g`, `s`, `sigma^2`).
+
+Not measured yet: the float64 host bridge's cost; regimes beyond the
+four cases above; the negative-correction cases.

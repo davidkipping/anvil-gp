@@ -649,6 +649,23 @@ class GPLogLike:
         #: uses a direct inverse instead of a Cholesky factor.  See
         #: `elements.combine`.  Every other term is untouched.
         self._formal = self._has_p_inf
+        if self._formal and self._data_se > _CONVOLVED_SE_WARN:
+            # Not a gate: it does not change the path, it says what the
+            # path is worth here.  The formal state-space form of a
+            # convolved term carries a ~10x float32 floor on bright data
+            # (docs/boundary-plan.md, VI): measured on a TESS 2-min
+            # convolved rotation, clear at s/e = 30 and not at 100.
+            warnings.warn(
+                f"TermConvolution on data whose rms is {self._data_se:.3g} "
+                f"times the median error bar: above "
+                f"~{_CONVOLVED_SE_WARN:g} its float32 "
+                f"form is inaccurate.  Measured at 100 (TESS 2-min convolved "
+                f"rotation, N = 4096): gradients ~10 posterior sigma off at "
+                f"the default blocks and 1.3-1.6 even at one block, and the "
+                f"value varies by sd 0.2-0.3 across the posterior, ~10x the "
+                f"unconvolved term's.  There is no workaround for the "
+                f"gradient yet; a positive-definite realisation is being "
+                f"built (docs/boundary-plan.md, VI).", stacklevel=2)
         if self._formal and self.policy.metal_boundary == "sqrt":
             raise ValueError(
                 "GPPolicy(metal_boundary='sqrt') cannot serve a convolved "
@@ -1182,12 +1199,15 @@ class GPLogLike:
         else:
             r = [float(np.median(self._yerr64 ** 2))]
         self._kappa_r = np.array(r)
+        rms2 = float(np.mean((self._y64 - self._y64.mean()) ** 2))
+        se = float(np.sqrt(rms2 / float(np.min(self._kappa_r))))
+        #: data rms over the median error bar (`_CONVOLVED_SE_WARN`)
+        self._data_se = se
         kmax = self.policy.kappa_max
         if kmax is None or self._kappa_dt is None:
             return
         # kappa <= sigma^2 / r for any timescale, and a fitted sigma is about
         # the data's rms, so this ratio bounds the kappa of a posterior.
-        rms2 = float(np.mean((self._y64 - self._y64.mean()) ** 2))
         if rms2 / float(np.min(self._kappa_r)) > kmax:
             warnings.warn(
                 f"the data's rms is {np.sqrt(rms2 / np.min(self._kappa_r)):.3g}"
@@ -1642,6 +1662,11 @@ def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     # chains), returning 1 with the estimate 3x over budget (stage R2).
     n = -(-want // _FRONT_END_BUDGET_BYTES)
     return max(1, min(n, n_lags))
+
+
+#: data rms over the median error bar above which a convolved term warns at
+#: construction: s/e = 30 measured clear, 100 not (docs/boundary-plan.md, VI).
+_CONVOLVED_SE_WARN = 30.0
 
 
 class MetalDefaultNotice(UserWarning):
