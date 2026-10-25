@@ -573,3 +573,34 @@ pins the measured optimum, and decide whether an explicit `metal_block`
 above the cap should warn. The stress test cannot rely on display load
 being present; it will pin the cap and run the m = 4, N = 1e5 case as a
 slow test that fails if killed. Estimate: half a day.
+
+## III. Watchdog guard (2026-10-25)
+
+The 512 cap II proposed was not enough once tested at the extremes (value +
+gradient, m = 4, display in use): killed at 4096 chains at N = 1e5 and at
+N = 3e4. In the hour between II and III the limit had also tightened -- at
+1024-point blocks even the *forward* was killed at N = 1e5 x 1024 chains,
+and value + gradient at N = 3e4 x 1024. 256-point blocks survived every
+case measured:
+
+| m = 4, value + gradient | 1024 | 512 | 256 |
+|---|---|---|---|
+| N = 1e4, 256 chains | 74.6 ms | 48.2 | **40.5** |
+| N = 1e4, 1024 chains | 101 | 115 | 113 |
+| N = 1e4, 4096 chains | killed (forward too) | 374 | 369 |
+| N = 3e4, 4096 chains | -- | killed | 1081 |
+| N = 1e5, 1024 chains | killed (forward too) | 929 | 978 |
+| N = 1e5, 4096 chains | -- | killed | 3557 |
+
+The forward at 256 is within -55% to +12% of 1024 where both ran. The
+block is fixed at construction (the gradient's slot map depends on it)
+while the chain count arrives per call, so the cap has to hold for the
+largest chain counts: **m >= 4 is capped at 256**, the auto rule's floor.
+m = 2 at 8192 and m = 3 at 2048 survived up to 4096 chains at N = 1e5
+under the same load and are unchanged. An explicit `metal_block` above a
+cap is still allowed but warns at construction.
+
+Tests: the cap (m = 4 and 6 -> 256), the warning (and its absence at and
+below the caps), and a slow value + gradient at m = 4, N = 1e5, 4096
+chains -- which cannot fail on an idle machine whatever the cap, so the
+cap is what is pinned. With III done, I (the `metal` default) is next.

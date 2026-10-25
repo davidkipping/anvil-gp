@@ -643,6 +643,19 @@ class GPLogLike:
         # showed what a stale map does: a correct value with a gradient
         # wrong by 2.6x, or a read past the end of the block table that
         # hangs the process at 0% CPU.
+        if self.policy.metal and self.policy.metal_block is not None:
+            cap = _MAX_METAL_BLOCK.get(kernel_spec.n_state,
+                                       _MAX_METAL_BLOCK_HI_M)
+            if int(self.policy.metal_block) > max(cap, 256):
+                # Allowed -- one long block is a real option, e.g. on a
+                # quiet machine -- but it is the GPU watchdog's trigger:
+                # say so once, here, rather than let a long run die.
+                warnings.warn(
+                    f"metal_block = {self.policy.metal_block} exceeds the "
+                    f"automatic cap of {cap} at m = {kernel_spec.n_state}: "
+                    f"threads that long can be killed by the GPU watchdog "
+                    f"('Impacting Interactivity') while the display is in "
+                    f"use.  See likelihood._MAX_METAL_BLOCK.")
         self.metal_block = (self.policy.metal_block
                             if self.policy.metal_block is not None
                             else _auto_metal_block(self.n_data,
@@ -1398,14 +1411,23 @@ def _auto_sub_block(m: int) -> int:
 
 
 #: longest block we will hand one thread, by state dimension.  A thread
-#: walks its whole block sequentially, so block length sets how long a
-#: single command buffer runs, and macOS kills one that runs too long
-#: ("Impacting Interactivity").  Per-observation work grows like m^3, so
-#: the safe length falls as m rises.  Measured at N = 1e5: m = 2 is fine at
-#: 8192 (13 ms); m = 4 at 4096 and 8192 is *killed* at 512 chains, and 2048
-#: sits close enough to the edge that it failed in one run and not another.
+#: walks its whole block sequentially, and macOS kills a command buffer
+#: whose work it cannot preempt for too long ("Impacting Interactivity").
+#: What it responds to is per-thread length, stretched by how many threads
+#: share the GPU -- not total GPU time (459 ms of backward kernels in one
+#: evaluation survive, a whole second at short blocks survives) and not
+#: command-buffer packing.  The limit is stricter while the display is in
+#: use, so the caps are set with the display busy (docs/boundary-plan.md,
+#: II and III).  Per-observation work grows like m^3, so the safe length
+#: falls as m rises.  Measured 2026-10-25 under display load, value +
+#: gradient: m = 2 at 8192 and m = 3 at 2048 survive up to 4096 chains at
+#: N = 1e5; m = 4 at 1024 is killed from ~224 chains at N = 1e5 and at 4096
+#: chains even at N = 1e4, at 512 from 4096 chains, and at 256 survives
+#: every case measured (up to 4096 chains at N = 1e5, 3.6 s).  256 is also
+#: the auto rule's floor.  (The earlier cap of 1024 was set on a quiet
+#: machine.)
 _MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048}
-_MAX_METAL_BLOCK_HI_M = 1024
+_MAX_METAL_BLOCK_HI_M = 256
 
 
 def _slot_map(lag: np.ndarray, blk_len: int):
@@ -1593,14 +1615,18 @@ def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
         3e4      6.7     6.2     4.9     5.7                    2048
         1e5     17.5    17.2    17.2    16.6    13.3    22.2     8192
 
-    and at m = 4 (rotation), where the cap binds:
+    and at m = 4 (SHO + SHO, value + gradient, ms, 2026-10-25, display in
+    use; the cap binds at every N):
 
-        N = 1e4, 1024 chains:  256:110  512:102  1024:65  2048:63  4096:83
-        N = 1e5,  512 chains:  256:173  512:156  1024:187  2048:191
-                               4096: KILLED     8192: KILLED
+        N = 1e4,  256 chains:  256:40.5   512:48.2   1024:74.6
+        N = 1e4, 1024 chains:  256:113    512:115    1024:101
+        N = 1e4, 4096 chains:  256:369    512:374    1024: KILLED
+        N = 1e5, 1024 chains:  256:978    512:929    1024: KILLED
+        N = 1e5, 4096 chains:  256:3557   512: KILLED
 
     The uncapped rule picked 8192 at N = 1e5 for every m, which is a hard
-    failure at m = 4 rather than a slow path.
+    failure at m = 4 rather than a slow path; the cap was 1024 until
+    2026-10-25, set on a quiet machine.
     """
     target = max(1.0, n_data / 12.0)
     p = 1

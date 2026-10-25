@@ -226,7 +226,8 @@ def test_auto_metal_block_matches_the_measured_optimum(n_data, want):
     assert _auto_metal_block(n_data, 2) == want
 
 
-@pytest.mark.parametrize("n_state,cap", [(2, 8192), (3, 2048), (4, 1024)])
+@pytest.mark.parametrize("n_state,cap", [(2, 8192), (3, 2048), (4, 256),
+                                         (6, 256)])
 def test_auto_metal_block_caps_long_blocks_at_high_state_dimension(n_state,
                                                                    cap):
     """A thread walks its whole block, so block length is a time limit.
@@ -235,8 +236,10 @@ def test_auto_metal_block_caps_long_blocks_at_high_state_dimension(n_state,
     that runs too long. At N = 1e5 and 512 chains the uncapped rule chose
     8192 for every m; at m = 4 that is not slow, it is
     "[METAL] Command buffer execution failed: Impacting Interactivity",
-    and 4096 fails too while 2048 failed in one run and not another. The
-    cap keeps every state dimension inside the watchdog with margin.
+    and 4096 fails too while 2048 failed in one run and not another. With
+    the display in use the limit is stricter: m = 4 at 1024 was killed from
+    ~224 chains at N = 1e5 and at 4096 chains at N = 1e4, and 512 at 4096
+    chains, so m >= 4 is capped at 256 (docs/boundary-plan.md, III).
     """
     from anvilgp.likelihood import _auto_metal_block
     assert _auto_metal_block(1_000_000, n_state) == cap
@@ -253,7 +256,7 @@ def test_the_kernel_survives_a_large_high_state_problem():
     refs = [1.0, 7.0, 3.0, 1.0, 0.4]
     gp = GPLogLike(None, t, None, y, np.full(n, 0.3), ag.RotationTerm(),
                    ParamMap.log(refs), GPPolicy(block=4096, metal=True))
-    assert gp.metal_block <= 1024, "m = 4 must not get a long block"
+    assert gp.metal_block <= 256, "m = 4 must not get a long block"
     u = mx.array(rng.standard_normal((n_chains, 5)).astype(np.float32) * 0.01)
     with mx.stream(mx.gpu):
         out = np.array(gp(u))
@@ -1656,3 +1659,46 @@ def test_the_formal_variant_changes_only_the_positivity_assumptions():
             assert c in plain and c not in formal, (name, c)
         for c in only_formal[name]:
             assert c in formal and c not in plain, (name, c)
+
+
+def test_an_explicit_block_above_the_cap_warns():
+    """Allowed, but the GPU watchdog's trigger: say so at construction."""
+    n = 3000
+    t = np.arange(n) * 0.01
+    y = np.random.default_rng(0).standard_normal(n)
+    pm = ParamMap.log([1.0, 4.0, 3.0, 0.3, 0.5, 0.7])
+    term = ag.SHOTerm() + ag.SHOTerm()
+    with pytest.warns(UserWarning, match="GPU watchdog"):
+        GPLogLike(None, t, None, y, np.full(n, 0.3), term, pm,
+                  GPPolicy(metal=True, metal_block=1024))
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.filterwarnings("error", message=".*GPU watchdog.*")
+        GPLogLike(None, t, None, y, np.full(n, 0.3), term, pm,
+                  GPPolicy(metal=True, metal_block=256))
+        GPLogLike(None, t, None, y, np.full(n, 0.3), term, pm,
+                  GPPolicy(metal=True))
+        GPLogLike(None, t, None, y, np.full(n, 0.3), ag.SHOTerm(),
+                  ParamMap.log([1.0, 4.0, 3.0]),
+                  GPPolicy(metal=True, metal_block=2048))
+
+
+@pytest.mark.slow
+def test_the_kernel_gradient_survives_many_chains_at_high_state():
+    """The configuration the 1024 and 512 caps were killed in with the
+    display in use: m = 4, N = 1e5, 4096 chains, value + gradient.  The
+    watchdog's limit depends on display load, so this can pass at a bad
+    cap on an idle machine; the cap itself is pinned above."""
+    n, n_chains = 100_000, 4096
+    rng = np.random.default_rng(0)
+    t = np.arange(n) * (30.0 / n)
+    gp = GPLogLike(None, t, None, rng.standard_normal(n) * 0.9,
+                   np.full(n, 0.3), ag.SHOTerm() + ag.SHOTerm(),
+                   ParamMap.log([1.0, 4.0, 3.0, 0.3, 0.5, 0.7]),
+                   GPPolicy(block=4096, metal=True, kappa_max=None))
+    assert gp.metal_block == 256
+    u = mx.array(rng.standard_normal((n_chains, 6)).astype(np.float32) * 0.01)
+    with mx.stream(mx.gpu):
+        v, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
+        mx.eval(v, g)
+    assert np.all(np.isfinite(np.array(v))) and np.all(np.isfinite(np.array(g[0])))

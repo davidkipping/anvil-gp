@@ -573,7 +573,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 | field | default | change it when |
 |---|---|---|
 | `metal` | `False` | you want the fused kernel: ~17-24x on the forward, ~85-200x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
-| `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
+| `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3 and 256 at m >= 4) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
 | `sub_block` | `None` (16 at m<=4) | below N ~ 2000, try 8. Above m = 6 the default already climbs to 32/64. |
@@ -649,14 +649,19 @@ marked as an estimate.
   covariance and seeds as dense float32 matrices, whose small eigen-
   directions (~12 decades below the large ones there) do not survive the
   rounding; fixing it needs a square-root backward. `metal_block=N` (up
-  to 8192) gives 0.7-0.9 there. Tables: [docs/float32.md](docs/float32.md), section 7; plan
+  to 8192) gives 0.7-0.9 there, at the risk of a GPU watchdog kill while
+  the display is in use (it warns). Tables: [docs/float32.md](docs/float32.md), section 7; plan
   and status: [docs/boundary-plan.md](docs/boundary-plan.md).
-* **The GPU watchdog at m = 4, N = 1e5.** A value + gradient at 256
-  chains ran cleanly in a quiet session and was killed ("Impacting
-  Interactivity") later the same day while the display was in use -- on
-  either boundary. The watchdog is stricter when the window server needs
-  the GPU; run long m = 4 gradients with fewer chains per call, or a
-  smaller `metal_block`, on a machine that is in use.
+* ~~**The GPU watchdog at m = 4.**~~ **Fixed 2026-10-25.** With the
+  display in use, m = 4 gradients at the old 1024-point block cap were
+  killed ("Impacting Interactivity") from ~224 chains at N = 1e5 and at
+  4096 chains at N = 1e4. The watchdog responds to per-thread length,
+  stretched by how many threads share the GPU, not to total GPU time; m >= 4
+  is now capped at 256-point blocks, which survives every case measured
+  (up to 4096 chains at N = 1e5) and is faster at small chain counts (1.8x
+  at 256 chains, N = 1e4) for +12% at N = 1e4 x 1024 chains. An explicit
+  `metal_block` above the cap warns. See
+  [docs/boundary-plan.md](docs/boundary-plan.md), II and III.
 * **The default MLX gradient at N ~ 1e5.** It fails with
   `[metal::malloc] Resource limit (499000) exceeded` (Metal's limit on live
   buffers, not memory): uncompiled at N = 114k for one chain of a single
