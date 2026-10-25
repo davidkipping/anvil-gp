@@ -311,6 +311,17 @@ measured; that was true only at N <= 19k and 2-min cadence. The kernel's
 *gradient* still carries 0.48-0.53 posterior sigma at the two worst rows
 (step 2 below).
 
+**Except on short blocks.** Every row above runs at >= 1024-point blocks.
+At N <~ 6k with m = 4, `_auto_metal_block` picks 256, and on densely
+sampled, high-s/e data the prefix's entry states are then wrong enough to
+reach the replayed value too (step 2). 20-s cadence, N = 4096, SHO + SHO,
+s/e = 100, 128 draws from a converged ChEES posterior, against float64:
+**0.081 (0.77)** at the default 16 x 256, 0.023 (0.13) at one block. The
+pooled posterior still comes out right (measured, step 2), but sampling
+it is ~10x slower per gradient. `tests/test_metal.py::
+test_the_value_does_not_carry_the_dense_information_floor` probes the same
+case within 0.01 of the mode, which is why it did not see this.
+
 ### The fix: replay the filter, do not compose ell
 
 The prefix over the block elements already gives every block its entry
@@ -397,9 +408,11 @@ removes the large numbers instead of storing them more carefully.
    * **the entry states** (the prefix's `b, C`): at 256-point blocks of
      20-s data the kernel's entry means are up to 7% wrong (0.12 against a
      state of 1.6), in directions the observations barely see -- the
-     rotation / granulation split -- which is why the value, replayed from
-     them, is still right. With exact float64 entry states *and* exact
-     seeds the second row is 0.41 / 0.30; with either alone, 1.9 or 4.2.
+     rotation / granulation split. Near the mode the value replayed from
+     them is still right, but not across the posterior: 0.081 (0.77)
+     against 0.023 (0.13) at one block (see "Except on short blocks"
+     above). With exact float64 entry states *and* exact seeds the second
+     row is 0.41 / 0.30; with either alone, 1.9 or 4.2.
 
    Ruled out, measured: the term front end (chaining the kernel's per-lag
    adjoints to theta in float64 changes nothing), and the per-lag and `dh`
@@ -416,6 +429,34 @@ removes the large numbers instead of storing them more carefully.
    suffix -- and is open. Scripts: the scratch prototypes of 2026-10-24
    (`exact_seeds.py`, `refine_exp.py`, `centred_proto.py`) are not in the
    repository.
+
+   **What it costs a sampler, measured 2026-10-24.** The error is heavy-
+   tailed rather than uniformly large: at 256 converged posterior draws of
+   the second row's problem (`make_target` defaults, jitter included) the
+   median gradient error is 0.13-0.18 sigma in the two amplitudes, but the
+   worst points are 11-18 sigma off. ChEES adapts its step size to the
+   harmonic mean of the acceptance, so those few points drag it down, the
+   trajectory-length criterion follows, and the slow directions (jitter)
+   stop mixing. ChEES, 1024 chains, `max_leapfrog = 128`, two seeds each:
+
+   | blocks | warmup | step size | leapfrog / iter | max R-hat | ESS per 1000 gradients | wall |
+   |---|---|---|---|---|---|---|
+   | one (`metal_block = 4096`) | 300 | 0.0225-0.0228 | 35-38 | **1.11** | **0.81-0.86** | 32-34 min |
+   | default, 16 x 256 | 300 | 0.0078-0.0093 | 12 | 2.8-3.3 | -- | 3 min |
+   | default, 16 x 256 | 2000 | **0.0042-0.0043** | 33-41 | **1.57-1.74** | **0.084-0.093** | 52-55 min |
+
+   The step size kept shrinking through warmup as chains reached more of
+   the posterior. The pooled default-block posterior agrees with the
+   one-block one to <= 0.06 sigma in every mean, as it must, but ~10x
+   fewer effective samples per gradient outweighs its 4.5x cheaper
+   gradient (44 against 196 ms at 1024 chains): one block converged in
+   ~60% of the wall time the default blocks spent *not* converging.
+   **Until this is fixed, pass `metal_block` = N (up to the 8192 the
+   policy allows; one 8192-point block at m = 4 runs, 0.4-0.5 s per
+   gradient at 256-4096 chains, no watchdog kill) for short, densely
+   sampled, high-s/e series.** Machine
+   not quiet during these runs; the per-gradient columns do not depend on
+   it, the wall column does. Script: `benchmarks/chees_block_cost.py`.
 3. **Default MLX path** (all m, and the only path for m > 4). The same
    structure at sub-block scale: fold leaves into sub-block elements, a
    prefix over them instead of the reduction, then a 32-step replay batched

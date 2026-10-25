@@ -588,12 +588,16 @@ marked as an estimate.
   s/e <~ 10, RV and single Kepler quarters; on the default path, active
   stars at s/e >~ 100 and long baselines vary by ~0.4-3.5 log-units across
   the posterior; a TESS 20-s sector at s/e = 30 by 2.8 on the default path
-  and **1.7 on the kernel**. Recommended fix, prototyped at 0.06 worst case
-  on all three of the worst rows: read log L from a float32 filter replayed
-  through each block from its prefix entry state, which the backward
-  already does, instead of from the composed `ell`. Expected cost one extra
-  forward sweep, not measured. Table and plan:
-  [docs/float32.md](docs/float32.md), section 7.
+  (1.7 on the kernel before 2026-10-24). **The kernel's value is fixed**
+  (replayed filter, 0.023 on that sector); the default MLX path is not.
+  **Still open on the kernel: short blocks.** At N <~ 6k with m = 4 the
+  automatic block is 256 points, and on densely sampled high-s/e data the
+  prefix's entry states and the backward's seeds break: the gradient is
+  11-18 posterior sigma off at a few points, and ChEES on a 20-s, N = 4096,
+  s/e = 100 SHO + SHO problem had not converged after 2000 warmup (R-hat
+  1.6-1.7, ~10x fewer ESS per gradient) where one block converged in 300.
+  Posteriors stay unbiased. Workaround: `GPPolicy(metal_block=N)` up to
+  8192. Table and plan: [docs/float32.md](docs/float32.md), section 7.
 * **The default MLX gradient at N ~ 1e5.** It fails with
   `[metal::malloc] Resource limit (499000) exceeded` (Metal's limit on live
   buffers, not memory): uncompiled at N = 114k for one chain of a single
