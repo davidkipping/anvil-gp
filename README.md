@@ -17,7 +17,7 @@ from anvilgp.anvil import make_target
 
 from anvilgp import GPPolicy
 
-# metal=True turns on the fused kernel: ~17-24x on the forward and ~65-150x
+# metal=True turns on the fused kernel: ~17-24x on the forward and ~85-200x
 # on the gradient, so it suits the stretch move below and ChEES-HMC alike.  It
 # is off by default; `gt.loglike.metal_eligible()` says whether it can be honoured
 # (m <= 4, up to 8 jitters), and a request it cannot honour warns rather than
@@ -333,13 +333,16 @@ M4 landed: the kernel carries its own VJP, so a gradient sampler can use it.
 
 | config | MLX path | **Metal** | speedup | peak MLX | peak Metal |
 |---|---:|---:|---:|---:|---:|
-| value+grad, N=1e4, 1024 chains | 847 ms | **12.9 ms** | 66x | 6.10 GiB | 0.13 GiB |
-| value+grad, N=1e5, 1024 chains | 15.4 s | **104 ms** | 148x | 34.5 GiB | 1.24 GiB |
+| value+grad, N=1e4, 1024 chains | 847 ms | **9.9 ms** | 86x | 6.10 GiB | 0.13 GiB |
+| value+grad, N=1e5, 1024 chains | 15.4 s | **75.9 ms** | 203x | 34.5 GiB | 1.24 GiB |
 
-(2026-10-25, `bench_reference.py`, square-root boundary; 9.38 and 66.9 ms
-with the dense one, 8.9 and 58 ms before the replayed value. The peaks
-fell because the residuals are now made contiguous once: MLX was handing
-every further kernel that read them its own 0.38 GiB copy at N = 1e5.)
+(2026-10-25, `bench_reference.py`, square-root boundary. The gradient
+reuses the forward's block boundary instead of recomputing it, which took
+these from 12.9 and 104 ms; the dense boundary measures 8.2 and 57 ms that
+way, and was 9.38 and 66.9 ms before it (8.9 and 58 ms before the replayed
+value). The peaks fell because the residuals are now made contiguous once
+in the forward: MLX was handing every further kernel that read them its
+own 0.38 GiB copy at N = 1e5.)
 
 The gradient matches float64 central differences to ~1e-7 on every
 parameter including the jitter, and the two paths agree with each other to
@@ -569,7 +572,7 @@ N ~ 2000, where a smaller `sub_block` shaves a few sequential stages.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `False` | you want the fused kernel: ~17-24x on the forward, ~65-150x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
+| `metal` | `False` | you want the fused kernel: ~17-24x on the forward, ~85-200x on the gradient. `m <= 4`, up to 8 per-instrument jitters. Warns if it cannot be honoured. |
 | `metal_block` | `None` (N/12, 1024-8192) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term) | essentially never: `"dense"` is the float32-fragile boundary it replaced, kept for one release for comparison. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
@@ -648,12 +651,6 @@ marked as an estimate.
   rounding; fixing it needs a square-root backward. `metal_block=N` (up
   to 8192) gives 0.7-0.9 there. Tables: [docs/float32.md](docs/float32.md), section 7; plan
   and status: [docs/boundary-plan.md](docs/boundary-plan.md).
-* **The kernel's gradient recomputes its forward boundary.** The VJP
-  reruns pass 1, the dense prefix and the square-root pass instead of
-  reusing the forward's, as it always reran pass 1; that is most of the
-  square-root boundary's 1.4-1.8x on value + gradient. Reusing them is
-  estimated to bring it near the dense boundary's cost; not done
-  ([docs/boundary-plan.md](docs/boundary-plan.md)).
 * **The GPU watchdog at m = 4, N = 1e5.** A value + gradient at 256
   chains ran cleanly in a quiet session and was killed ("Impacting
   Interactivity") later the same day while the display was in use -- on

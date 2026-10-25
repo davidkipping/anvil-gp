@@ -413,12 +413,51 @@ hazard, recorded in the README.
 
 ### Open, for a later plan
 
-* **Reuse the forward's boundary in the VJP.** The VJP reruns pass 1, the
-  prefix and the square-root pass. From the per-kernel timings, reusing
-  them would take value + gradient to ~71 ms at m = 4, N = 1e4, 256 chains
-  (now 102) and ~9.4 ms at m = 2, N = 1e4 (now 12.9), near the dense
-  boundary's cost today. Needs `custom_function` to carry the boundary out
-  of the forward; estimated a day. Forward-only samplers would not gain.
+* ~~Reuse the forward's boundary in the VJP.~~ Done; see below.
 * **A square-root backward**, for the 2-s, s/e 100 floor that exact
   boundaries do not fix.
 * **Regenerate docs/benchmarks.md** on a quiet CPU and GPU.
+
+## Follow-up: the VJP reuses the forward's boundary (2026-10-25)
+
+`scan_loglike`'s custom function now returns, after the log-likelihood,
+what its forward computed for the boundary -- pass 1's elements (dense)
+or the square-root blocks and their start states -- and the VJP takes
+them from ``outputs`` and runs only the per-chain scan with seeds, instead
+of re-running pass 1, the prefix, `q_factor` and `sqrt_blocks`.
+`scan_loglike` returns the log-likelihood alone, so the extra outputs'
+cotangents are zero and ignored. Values and gradients are bit-identical
+to before on seven configurations (both boundaries, m = 2 and 4, one
+block, a convolved term, three jitters); pinned by a test that counts pass
+1 and the square-root pass at one call each per value + gradient, and the
+custom function's first output is still pinned at one scalar per chain.
+
+The first version gained far less than estimated at N = 1e5, and made the
+dense boundary *slower* (66.8 -> 78.5 ms). Not the reuse: the forward was
+not being recomputed (a forward made ~19 ms heavier left the gradient's
+own evaluation unchanged), and passing the boundary in as a stop-gradient
+input instead of through ``outputs`` measured the same. It was the VJP's
+`mx.contiguous(rs)`, added the same day for memory: with the backward
+kernel now the residuals' only reader in the VJP it copies nothing without
+it, and with it the VJP cost ~21 ms more. Removed there, kept in the
+forward; peaks unchanged.
+
+`benchmarks/boundary_cost.py`, quiet GPU (it now records a watchdog kill
+instead of aborting), value + gradient:
+
+| config | dense (now) | sqrt (now) | sqrt before the reuse | old dense |
+|---|---|---|---|---|
+| m = 2, N = 1e4, 1024 chains | 8.22 ms | **10.02** | 13.13 | 9.33 |
+| m = 2, N = 1e5, 1024 chains | 55.7 | **73.0** | 102.6 | 66.8 |
+| m = 4, N = 1e4, 256 chains | 52.5 | **74.5** | 101.9 | 60.4 |
+| m = 4, N = 4096 (16 x 256), 20 s | 37.4 | **53.5** | 71.5 | 42.0 |
+| m = 4, N = 1e5, 256 chains | killed | killed | 397 | 220 |
+
+Against the dense boundary as it was before this plan, the square-root one
+now costs 1.07-1.09x on value + gradient at m = 2 and 1.23-1.27x at m = 4
+-- inside decision 2's +25% at m = 2, at its edge at m = 4. The forward is
+unchanged (1.7-1.8x at m = 2, 2.5-2.8x at m = 4): forward-only samplers
+gain nothing from this. README timings (`bench_reference.py`): value +
+gradient 9.9 ms at N = 1e4 and 75.9 ms at N = 1e5, 1024 chains. The
+m = 4, N = 1e5 row was killed by the GPU watchdog on both boundaries,
+as in the afternoon before this change, with the display in use.

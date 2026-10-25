@@ -603,3 +603,34 @@ def test_the_boundary_setting_is_validated_and_resolved():
         build(conv, "sqrt")
     with pytest.raises(ValueError, match="formal"):
         am.scan_loglike(*[None] * 8, 0.0, 8, formal=True, boundary="sqrt")
+
+
+# ------------------------------- follow-up: the VJP reuses the forward
+@pytest.mark.parametrize("mode", ["sqrt", "dense"])
+def test_the_gradient_does_not_recompute_the_boundary(monkeypatch, mode):
+    """Value + gradient runs pass 1 and the square-root pass once each: the
+    VJP takes the forward's block elements from its outputs.  Recomputing
+    them was most of the square-root boundary's 1.4-1.8x on value +
+    gradient (docs/boundary-plan.md)."""
+    calls = {"scan_blocks": 0, "sqrt_blocks": 0}
+    for name in calls:
+        real = getattr(am, name)
+
+        def counted(*a, _real=real, _name=name, **k):
+            calls[_name] += 1
+            return _real(*a, **k)
+        monkeypatch.setattr(am, name, counted)
+    n = 2000
+    rng = np.random.default_rng(0)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate((1.3, 4.0, 3.0))], n_dim=3)
+    gp = GPLogLike(None, np.arange(n) * 0.01, None, rng.standard_normal(n),
+                   np.full(n, 0.3), ag.SHOTerm(), pm,
+                   GPPolicy(metal=True, metal_block=256, metal_boundary=mode))
+    u = mx.array(rng.normal(0, 0.1, (4, 3)).astype(np.float32))
+    with mx.stream(mx.gpu):
+        v, g = mx.value_and_grad(lambda u: gp(u).sum())(u)
+        mx.eval(v, g)
+    assert np.all(np.isfinite(np.array(g)))
+    assert calls == {"scan_blocks": 1,
+                     "sqrt_blocks": 1 if mode == "sqrt" else 0}, calls

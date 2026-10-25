@@ -339,7 +339,8 @@ def test_the_value_does_not_carry_the_dense_information_floor():
 
 
 def test_the_differentiation_boundary_encloses_the_reduction():
-    """M4 requirement: the custom_function's OUTPUT is one scalar per chain.
+    """M4 requirement: the custom_function's DIFFERENTIATED output is one
+    scalar per chain.
 
     If it returned the six element fields per block instead, its VJP would
     have to accept cotangents on all six -- not the problem `adjoint.py`
@@ -347,6 +348,13 @@ def test_the_differentiation_boundary_encloses_the_reduction():
     output, which is one scalar per chain whether or not the reduction is
     inside the boundary; it passed with the reduction moved back outside.
     This one captures what the decorated function itself returns.
+
+    Since 2026-10-25 it also returns the block boundary's working arrays,
+    so the VJP can reuse them instead of recomputing pass 1; those are
+    never differentiated (`scan_loglike` returns the first output alone, so
+    their cotangents are zero) and the VJP ignores them.  The first output
+    must still be the per-chain log-likelihood, and `scan_loglike` must
+    return nothing else.
     """
     import anvilgp.metal as metal_mod
 
@@ -367,13 +375,17 @@ def test_the_differentiation_boundary_encloses_the_reduction():
     try:
         gp = _build(ag.SHOTerm(), [1.3, 4.0, 3.0], True)
         with mx.stream(mx.gpu):
-            mx.eval(gp(mx.zeros((n_chains, 1), dtype=mx.float32)))
+            out = gp(mx.zeros((n_chains, 1), dtype=mx.float32))
+            mx.eval(out)
     finally:
         metal_mod.mx.custom_function = real_cf
 
-    assert seen["custom_function_output"] == (n_chains,), (
-        f"the custom_function must return (n_chains,); it returned "
-        f"{seen['custom_function_output']}")
+    got = seen["custom_function_output"]
+    assert isinstance(got, list) and got[0] == (n_chains,), (
+        f"the custom_function's first output must be (n_chains,); it "
+        f"returned {got}")
+    assert all(len(sh) >= 2 and sh[0] == n_chains for sh in got[1:]), got
+    assert out.shape == (n_chains,), out.shape
 
 
 

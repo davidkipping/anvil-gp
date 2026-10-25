@@ -2420,15 +2420,30 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                          "semi-definite Q; a formal model has none")
     use_sqrt = boundary == "sqrt" and -(-resid.shape[0] // blk_len) > 1
 
-    def boundary_states(p_t, q_t, lg, hv, rs, rr, j2, el, cot=None):
-        """Entry states, and seeds if ``cot`` is given, for ``boundary``."""
+    def boundary(p_t, q_t, lg, hv, rs, rr, j2):
+        """Entry states for ``boundary``, and what the seeds need: pass 1's
+        elements (dense), or the square-root blocks and the start states
+        they were centred on."""
+        el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
+                         blk_len, formal=formal, with_ell=False)
         if not use_sqrt:
-            if cot is None:
-                return entry_states(el, formal)
-            return block_seeds_kernel(el, cot, formal)
+            ent_m, ent_C = entry_states(el, formal)
+            return ent_m, ent_C, (el.A, el.b, el.C, el.eta, el.J)
         st_m, st_C = entry_states(el, formal)
         blocks = sqrt_blocks(p_t, q_t, q_factor(q_t), lg, inst, hv, rs, rr,
                              j2, st_m, st_C, blk_len)
+        ent_m, ent_C = sqrt_scan(blocks, st_m, st_C)
+        return ent_m, ent_C, (*blocks, st_m, st_C)
+
+    def seeds(aux, cot):
+        """``(ent_m, ent_C, seed_m, seed_C)`` from `boundary`'s ``aux``.  The
+        entry states are the forward's again: the same kernel source on the
+        same inputs."""
+        if not use_sqrt:
+            A, b, C, eta, J = aux
+            return block_seeds_kernel(Element(A=A, b=b, C=C, eta=eta, J=J,
+                                              ell=None), cot, formal)
+        *blocks, st_m, st_C = aux
         return sqrt_scan(blocks, st_m, st_C, cot)
 
     @mx.custom_function
@@ -2439,13 +2454,17 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         # chains.  Made contiguous once here, no use copies; measured
         # 2026-10-25, the cause inside MLX not pinned down.
         rs = mx.contiguous(rs)
-        el = scan_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len, formal=formal, with_ell=False)
-        ent_m, ent_C = boundary_states(phi_t, q_t, lg, hv, rs, rr, j2, el)
+        ent_m, ent_C, aux = boundary(phi_t, q_t, lg, hv, rs, rr, j2)
         # Partial sums per block, then a sum over a dozen or so: a single
         # float32 accumulator over 1e5 O(1) terms costs ~0.4 on its own.
-        return mx.sum(replay_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2,
-                                    ent_m, ent_C, blk_len, formal), axis=1)
+        ll = mx.sum(replay_blocks(phi_t, q_t, lg, inst, hv, rs, rr, j2,
+                                  ent_m, ent_C, blk_len, formal), axis=1)
+        # ``aux`` goes out too, only so the VJP receives it in ``outputs``
+        # instead of recomputing pass 1 and the square-root pass -- that
+        # was 1.4-1.8x on value + gradient.  `scan_loglike` returns ``ll``
+        # alone, so ``aux`` is never used downstream and its cotangents are
+        # zero; the VJP ignores them.
+        return (ll, *aux)
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
@@ -2458,12 +2477,18 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         # Never reconstruct forward state by running the filter backwards
         # through the propagator: that divides by Phi, which underflowed on
         # the way forward at exactly the lags where it would now overflow,
-        # which is every gap in the data.  Replay forward, always -- which
-        # is why the block elements are recomputed here.
+        # which is every gap in the data.  Replay forward, always.  The
+        # block elements the seeds come from are the forward's own, passed
+        # out of `core` as extra outputs (since 2026-10-25; recomputed
+        # here before).
         p_t, q_t, lg, hv, rs, rr, j2 = primals
-        rs = mx.contiguous(rs)          # see `core`
-        cot = cotangents[0] if isinstance(cotangents, (list, tuple)) \
-            else cotangents
+        # No `mx.contiguous(rs)` here, unlike `core`: the backward kernel is
+        # now the only reader of the residuals in the VJP, so nothing is
+        # copied without it, and with it value + gradient measured 78.5
+        # against 56.9 ms (dense, N = 1e5 x 1024; the copy's cost here not
+        # pinned down).
+        cot = cotangents[0]             # on ``ll``; the rest are on ``aux``
+        aux = tuple(outputs[1:])
 
         n_chains, n_lags, m = p_t.shape[0], p_t.shape[1], p_t.shape[-1]
         npts = rs.shape[0]
@@ -2502,12 +2527,7 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 f"{npts} points.  Bin the timestamps, use fewer chains, or "
                 f"use GPPolicy(metal=False) for the gradient.")
 
-        el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len, formal=formal, with_ell=False)
-        # the same entry states the forward replayed from: the same kernels
-        # on the same inputs
-        ent_m, ent_C, seed_m, seed_C = boundary_states(
-            p_t, q_t, lg, hv, rs, rr, j2, el, cot)
+        ent_m, ent_C, seed_m, seed_C = seeds(aux, cot)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
             p_t, q_t, lg, inst, hv, rs, rr, j2, cot, ent_m, ent_C, seed_m,
             seed_C, slot_id, slot_start, n_slots, blk_len, formal=formal)
@@ -2558,4 +2578,4 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 mx.zeros_like(lg), mx.sum(d_h, axis=1), d_y,
                 mx.zeros_like(rr), d_j2)
 
-    return core(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2)
+    return core(phi_tab, q_tab, lag, hvec, resid, r_ref, jit2)[0]

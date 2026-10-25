@@ -15,7 +15,7 @@ run; neither is produced by that script.
 default since 2026-10-25; [boundary-plan.md](boundary-plan.md)). Wherever
 the series spans more than one kernel block -- above 256 points at the
 default -- every kernel figure here is now 1.6-1.8x slower on the forward
-at m <= 2 and 2.5-2.8x at m = 4, and value + gradient 1.4-1.8x; the
+at m <= 2 and 2.5-2.8x at m = 4, and value + gradient 1.1-1.3x; the
 celerite2 figures and anything under one block are unchanged. Regenerating
 them needs a quiet CPU as well as a quiet GPU (the celerite2 pool), which
 2026-10-25 did not have.

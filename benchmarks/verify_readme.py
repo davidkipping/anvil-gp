@@ -120,7 +120,7 @@ CLAIMS = [
     ("MLX forward, 1e4 x 1024", 73.1, lambda: forward(10_000, 1024, False), "time"),
     ("Metal forward, 1e4 x 1024", 4.4, lambda: forward(10_000, 1024, True), "time"),
     ("MLX value+grad, 1e4 x 1024", 847.0, lambda: gradient(10_000, 1024), "time"),
-    ("Metal value+grad, 1e4 x 1024", 12.9,
+    ("Metal value+grad, 1e4 x 1024", 9.9,
      lambda: gradient(10_000, 1024, True), "time"),
     ("fp32 err, N=25e3, sig/yerr=100 (MLX)", 0.06,
      lambda: fp32_error(25_000, 100.0, False), "acc"),
@@ -131,7 +131,7 @@ if not a.quick:
     CLAIMS += [
         ("MLX forward, 1e5 x 1024", 703.0, lambda: forward(100_000, 1024, False), "time"),
         ("Metal forward, 1e5 x 1024", 37.6, lambda: forward(100_000, 1024, True), "time"),
-        ("Metal value+grad, 1e5 x 1024", 104.0,
+        ("Metal value+grad, 1e5 x 1024", 75.9,
          lambda: gradient(100_000, 1024, True), "time"),
         ("fp32 err, N=1e5, sig/yerr=30 (MLX)", 0.20,
          lambda: fp32_error(100_000, 30.0, False), "acc"),

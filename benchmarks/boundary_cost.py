@@ -110,8 +110,13 @@ for r in range(a.rounds):
             gp, d = make(n, tp, b, cad)
             for kind, fn in (("forward", forward), ("value+grad", gradient)):
                 key = (label, kind, b)
-                got = fn(gp, d, chains)
-                best[key] = min(best.get(key, np.inf), got)
+                try:
+                    got = fn(gp, d, chains)
+                except RuntimeError as e:     # the GPU watchdog, typically
+                    print(f"{label} {kind} {b}: {str(e)[:60]}", flush=True)
+                    got = np.nan
+                best[key] = np.nanmin([best.get(key, np.nan), got]) \
+                    if not np.isnan(got) or key in best else got
             del gp
 print(f"\n{'config':44s} {'':10s} {'dense':>9s} {'sqrt':>9s}  ratio")
 for label, n, tp, chains, cad in ROWS:
