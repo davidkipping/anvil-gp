@@ -319,7 +319,7 @@ says `True`.
 A request the kernel cannot honour **warns and falls back** to the MLX
 reference path. That path is correct in float64 and is what the kernel is
 verified against, but in float32 it is a fallback rather than a plan:
-30–70x slower depending on the kernel (see
+15-26x slower on the forward at m <= 4, ~4x at m = 5-6 (see
 [benchmarks.md](benchmarks.md)), less accurate than the kernel on bright,
 densely sampled data (it carries the dense float32 floor of
 [float32.md](float32.md) section 7, whose fix on this path is deferred),

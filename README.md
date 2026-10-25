@@ -59,14 +59,17 @@ single likelihood and seven orders more accurate in absolute terms;
 anvil-gp is tens of times a 12-core celerite2 pool once you need hundreds
 of *hyperparameter settings* scored at once — an ensemble sampler's walker
 count, not the data size — carries its own gradient, and has Matern-5/2,
-which celerite2 lacks. The exact multiple depends on the cadence: about
-13x on the figures below. It has been cut twice for accuracy: roughly
+which celerite2 lacks. The exact multiple depends on the cadence and
+the state dimension: about 12-13x on the figures below (m = 2), 1.4x at
+m = 4, and at m = 6 (rotation + granulation) the 12-core pool is 2.3x
+faster than the kernel's forward. It has been cut twice for accuracy: roughly
 halved on 2026-10-24, when the kernel's value moved to a replayed filter
 (docs/float32.md, section 7), and cut again by 1.6-1.8x on 2026-10-25,
 when its block boundaries moved to the square-root information form so
 that gradient samplers converge on bright, densely sampled data
 ([docs/boundary-plan.md](docs/boundary-plan.md)). docs/benchmarks.md's
-figures, including its break-even walker counts, predate the second cut.
+figures, break-even walker counts included, were regenerated after both
+cuts on 2026-10-25.
 End to end inside a sampler it is lower again; benchmarks.md says by how
 much and why.
 
@@ -294,22 +297,23 @@ Against celerite2 on the CPU, measured in the same session:
 
 | config | vs 1 core | vs 12 cores |
 |---|---:|---:|
-| N=1e4, 1024 chains | **97x faster** | **13x faster** |
-| N=1e5, 1024 chains | **115x faster** | **13x faster** |
+| N=1e4, 1024 chains | **93x faster** | **12x faster** |
+| N=1e5, 1024 chains | **104x faster** | **13x faster** |
 
-(celerite2 from `benchmarks/bench_docs_tables.py`, 2026-10-24: 426 and
-4327 ms on one core, 59 and 486 ms on twelve; not re-measured on
-2026-10-25, when the CPU was busy. The kernel from the table above,
-2026-10-25. With the dense boundary: 150x / 22x and 185x / 25x; before the
+(celerite2 from `benchmarks/bench_docs_tables.py`, 2026-10-25, probe at
+its quiet level: 408 and 3899 ms on one core, 53 and 488 ms on twelve.
+The kernel from the table above, the same day. m = 2 (SHO); see
+docs/benchmarks.md for other kernels, where the margin narrows to 1.4x at
+m = 4 and reverses at m = 6. With the dense boundary: 150x / 22x and 185x / 25x; before the
 replayed value: 255x / 35x and 376x / 42x.)
 
 **The >=100x gate is not yet cleared.** The brief is explicit that "the honest
 >=100x denominator is the multiprocess one", and against a fully parallelised
-12-core celerite2 we are **13x**, not 100x. The single-core column is
+12-core celerite2 we are **12-13x**, not 100x. The single-core column is
 reported because it is the comparison most users' code actually makes (one
 CPU process, one chain at a time), not because it clears the gate. What the
 kernel did change: the 12-core pool was 2x *ahead* of us before it, and is now
-13x behind (22-25x before the square-root boundary). Closing the remaining factor is future work; see
+12-13x behind (22-25x before the square-root boundary). Closing the remaining factor is future work; see
 "What is left" below.
 
 The brief predicted "~10-50 ms forward at 1024 x 1e5"; the measurement is
@@ -612,13 +616,16 @@ marked as an estimate.
   here, per-parameter Jacobian tables, was measured and retracted.
 * **m > 6, and the cost of m = 5-6.** m = 5 and 6 (rotation + granulation,
   SHO + Matern-5/2) run on the kernel since 2026-10-25, as accurate as the
-  MLX path or more and ~10x faster than it, but they spill registers:
+  MLX path or more and ~10x faster than it on value + gradient (~4x on
+  the forward), but they spill registers:
   value + gradient is ~8x m = 4 (5.4 s at 512 chains, N = 1e5) where the
   arithmetic says 3.4x, and blocks are capped at 128 (m = 5) and 64
   (m = 6) points, half the shortest the GPU watchdog killed. Moving the element to threadgroup memory or
   splitting a chain across lanes would recover it. Above m = 6 the MLX
   path, whose gradient runs out of Metal buffers from N ~ 16384 at m = 6,
-  so in practice from smaller N above it. (Per-instrument jitter was the other
+  so in practice from smaller N above it. On the forward alone a 12-core
+  celerite2 pool is 2.3x faster than the kernel at m = 6 (docs/benchmarks.md).
+  (Per-instrument jitter was the other
   half of this entry until M5 stage 2 put it in the kernel, up to 8.)
 * **Block count as an accuracy knob for one adjoint.** The backward seed
   amplifies block-element error through `eta_s - J_s mu`, which reaches
