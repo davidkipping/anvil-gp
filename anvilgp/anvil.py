@@ -50,7 +50,26 @@ def import_engine():
 
 @dataclass
 class GPTarget:
-    """Everything a sampler needs, plus the pieces needed to report results."""
+    """Everything a sampler needs, plus the pieces needed to report results.
+
+    **As a member of a joint target** (several datasets with some
+    parameters shared, composed by anvil or by the caller), the pieces a
+    composition needs are public here, all in the layout of ``names``:
+
+    * ``model_log_prob(v)`` / ``model_log_prob_hi(v)`` -- the model-space
+      log-density (likelihood plus the explicit Gaussian priors), float32
+      and float64, **without** the transform's Jacobian or its bounded
+      priors.  A composition must sum these and apply one joint transform:
+      summing members' ``target.log_prob(u)`` would count a shared
+      parameter's Jacobian and prior once per member.
+    * ``model_log_norm`` -- the float64 constant kept out of the graph, so
+      ``model_log_prob(v) + model_log_norm`` is the absolute value; a
+      composition sums them.
+    * ``specs`` -- one `anvilgp.priors.SpecHint` per column, the bounds a
+      joint transform is built from; ``u_ref()`` the reference start.
+    * failures come back as anvil's sloped failure value (<= -1e29), which
+      a sum keeps: one failed member fails the joint chain.
+    """
 
     target: object            # anvil.TransformedLogDensity
     transform: object         # anvil.Transform
@@ -60,6 +79,11 @@ class GPTarget:
     param_map: object
     #: the `anvilgp.noise.NoiseModel` whose columns end ``v``, or None
     noise: object = None
+    #: the member protocol: see the class docstring
+    model_log_prob: object = None
+    model_log_prob_hi: object = None
+    model_log_norm: float = 0.0
+    specs: list = None
 
     def u0(self, n_chains: int, seed: int = 0, spread: float = 0.05,
            units: str = "u"):
@@ -319,10 +343,18 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
     # Both paths are differentiable since M4: the fused kernel has its own
     # VJP (the checkpointed backward sweep), so a gradient sampler can take
     # either.
+    # The likelihood keeps -1/2 sum log(2 pi yerr^2) out of its float32
+    # graph; anvil adds `model_log_norm` back wherever an absolute value
+    # matters (evidence, `log_norm_const`).  Until 2026-10-25 it was not
+    # passed, so `anvil.evidence` on a GP target was off by that constant.
     target = engine.TransformedLogDensity(
-        model_log_prob, transform, model_log_prob_hi=model_log_prob_hi)
+        model_log_prob, transform, model_log_prob_hi=model_log_prob_hi,
+        model_log_norm=loglike.log_norm_const)
     return GPTarget(target=target, transform=transform, loglike=loglike,
                     names=([s.name for s in mean_specs] + names
                            + [s.name for s in noise_specs]),
                     hypers=hypers + jitters + offsets, param_map=pm,
-                    noise=noise)
+                    noise=noise, model_log_prob=model_log_prob,
+                    model_log_prob_hi=model_log_prob_hi,
+                    model_log_norm=loglike.log_norm_const,
+                    specs=mean_specs + specs + noise_specs)

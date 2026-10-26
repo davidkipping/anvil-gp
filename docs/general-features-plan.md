@@ -157,3 +157,31 @@ m > 6), IV (deferred), the seed-3 margin, the >= 100x gate.
   per-instrument noise; the refusals; kappa; `make_target`; the per-block
   slicing; and the WASP reply's check as a general test -- an irregular
   non-time input with a quarter of the spacings tied, both paths.
+
+## Item 2, member side done (2026-10-25)
+
+The note went to anvil (`docs/anvil-joint-target-note.md`); the
+composition itself waits on its answer. anvil-gp's side, done now:
+
+- `GPTarget` exposes the member protocol: `model_log_prob` /
+  `model_log_prob_hi` (model space, no Jacobian), `model_log_norm`,
+  `specs` (one `SpecHint` per column, in `names` order), alongside the
+  existing `u_ref()` and `natural()`. The class docstring says how to
+  compose: sum the model-space functions and apply one joint transform.
+- **Bug fixed:** `make_target` never passed the likelihood's constant
+  (`-1/2 sum log(2 pi yerr^2)`, kept out of the float32 graph) to anvil as
+  `model_log_norm`, so `anvil.evidence` and `target.log_norm_const` on a
+  GP target were off by it. Relative evidences on the same data were
+  unaffected (the constant depends only on the error bars).
+- `tests/test_members.py`: two members with a shared mean parameter,
+  composed by hand as anvil or a fallback would -- one transform from the
+  members' specs, the model-space sum; the naive sum of members'
+  `log_prob(u)` differs by exactly the shared column's Jacobian (the trap
+  the note describes); the shared column's gradient is the members' sum;
+  `log_prob_hi` and `validate_precision` work on the composition; a
+  refused chain in one member fails the joint chain; the constant
+  reproduces the dense oracle's absolute value to 1e-8.
+
+Next: item 3 (`apply_inverse` / `gram`, then marginalisation), which does
+not depend on anvil. The composition (anvil's or our fallback) is picked
+up when anvil answers.
