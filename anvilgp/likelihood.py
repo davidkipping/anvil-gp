@@ -1618,6 +1618,72 @@ class GPLogLike:
         gram = mx.stack([mx.stack(row, axis=-1) for row in g], axis=-2)
         return ell0, gram, mx.min(ell, axis=1)
 
+    def gram(self, v: mx.array, Y) -> mx.array:
+        """``Y^T K^-1 Y`` for each chain: ``(n_chains, k, k)``, differentiable
+        in ``v`` and in ``Y``.
+
+        ``K`` is the data's full covariance at ``v`` -- the GP plus the
+        per-datum noise the likelihood uses (``yerr``, jitter or
+        ``noise_fn``).  ``Y`` is ``(N,)``, ``(N, k)`` or ``(n_chains, N, k)``,
+        in ``v``'s dtype.  float32 ``v`` runs where the likelihood runs: on
+        the fused kernel by one filter carrying all ``k`` columns
+        (`metal.scan_gram`, forward and backward), on the MLX path by
+        polarisation of the likelihood (``1 + k(k+1)/2`` evaluations, whose
+        off-diagonal entries are differences and so lose digits in float32
+        when the columns are large or nearly parallel).  float64 ``v`` runs
+        on the CPU stream, by polarisation of the float64 path.  A chain the
+        likelihood refuses (``kappa_max``, a convolution's series range)
+        gets NaN.  This is the primitive the linear marginalisation
+        (``linear_basis``) is built on.
+        """
+        self._check_v(v)
+        n, N = v.shape[0], self.n_data
+        Y = Y if isinstance(Y, mx.array) else mx.array(np.asarray(Y),
+                                                        dtype=v.dtype)
+        Y = Y.astype(v.dtype)
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        if Y.ndim == 2:
+            Y = mx.broadcast_to(Y, (n,) + tuple(Y.shape))
+        if Y.ndim != 3 or tuple(Y.shape[:2]) != (n, N):
+            raise ValueError(f"Y must be ({N},), ({N}, k) or ({n}, {N}, k); "
+                             f"got {tuple(Y.shape)}")
+        cols = mx.swapaxes(Y, 1, 2)                         # (n, k, N)
+        if v.dtype == mx.float64:
+            dt, y = a64(self._dt64), a64(self._y64)
+            r_ref = a64(self._yerr64 ** 2)
+            xm = None if self._x_mean64 is None else a64(self._x_mean64)
+            blk = _pow2(self.policy.hi_block)
+
+            def ev(vv, resid):
+                return self._evaluate(vv, dt, y, r_ref, xm, self._inst32, blk,
+                                      True, uniq=self._uniq64, resid=resid)
+            with mx.stream(mx.cpu):             # tiled over chains, as `hi`
+                blk_c = self.policy.hi_chain_block
+                parts = [self._gram_polarised(v[c:c + blk_c], ev,
+                                              cols[c:c + blk_c])
+                         for c in range(0, n, blk_c)]
+                g = mx.concatenate([q[1] for q in parts])
+                worst = mx.concatenate([q[2] for q in parts])
+                bad = mx.logical_not(mx.isfinite(worst))
+        else:
+            _, g, worst = (self._gram_metal(v, cols) if self._metal_ok
+                           else self._gram_polarised(v, self._raw_resid, cols))
+            bad = worst <= _FAILED
+        return mx.where(bad[:, None, None],
+                        mx.array(float("nan"), dtype=g.dtype), g)
+
+    def apply_inverse(self, v, Y):
+        """``K^-1 Y`` in float64 NumPy for model-space rows ``v``: ``K`` as
+        in :meth:`gram`; ``Y`` ``(N,)`` gives ``(n_chains, N)``, ``(N, k)``
+        or ``(n_chains, N, k)`` gives ``(n_chains, N, k)``.  O(N k), from
+        the state-space smoother that :meth:`predict` uses, and value only:
+        for a differentiable quadratic form use :meth:`gram`.  See
+        `anvilgp.predict.apply_inverse`.
+        """
+        from .predict import apply_inverse
+        return apply_inverse(self, v, Y)
+
     def predict(self, v, t_pred, return_var: bool = True):
         """The GP component's posterior at new inputs: ``(mean, var)``, each
         float64 NumPy ``(n_chains, len(t_pred))``, for model-space rows
@@ -1643,11 +1709,15 @@ class GPLogLike:
         ``C^-1 Phi^T K^-1 r`` and ``C^-1``; under a Gaussian prior
         ``N(mu, S)``, ``(C + S^-1)^-1 (C b + S^-1 mu)`` and ``(C + S^-1)^-1``.
         Draws of beta for reporting are one Gaussian draw per posterior
-        sample of ``v``.
+        sample of ``v``.  Tiled over chains by ``policy.hi_chain_block``, as
+        :meth:`hi` is: in one batch the float64 evaluation held ~6 MB per
+        draw at N = 2000, so a whole posterior (7.7e4 draws) asked for
+        ~440 GiB.
         """
         if self.linear_basis is None:
             raise ValueError("no linear_basis: nothing is marginalised")
         self._check_v(v)
+        n_chains = v.shape[0]
         with mx.stream(mx.cpu):
             v64 = v.astype(mx.float64)
 
@@ -1658,12 +1728,17 @@ class GPLogLike:
                     None if self._x_mean64 is None else a64(self._x_mean64),
                     self._inst32, _pow2(self.policy.hi_block), True,
                     uniq=self._uniq64, resid=resid)
-            _, beta, cov = self._marginal(
-                v64, ev, a64(self._y64),
-                None if self._x_mean64 is None else a64(self._x_mean64),
-                mx.array(self._noise_x64, dtype=mx.float64),
-                a64(self._yerr64 ** 2))
-            beta, cov = np.array(beta), np.array(cov)
+            parts = []
+            for c in range(0, n_chains, self.policy.hi_chain_block):
+                _, b, cv = self._marginal(
+                    v64[c:c + self.policy.hi_chain_block], ev, a64(self._y64),
+                    None if self._x_mean64 is None else a64(self._x_mean64),
+                    mx.array(self._noise_x64, dtype=mx.float64),
+                    a64(self._yerr64 ** 2))
+                mx.eval(b, cv)
+                parts.append((np.array(b), np.array(cv)))
+            beta = np.concatenate([b for b, _ in parts])
+            cov = np.concatenate([cv for _, cv in parts])
         if self._linear_prior is None:
             return beta, cov
         mu, sig = self._linear_prior

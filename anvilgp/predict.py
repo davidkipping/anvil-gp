@@ -41,7 +41,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-__all__ = ["predict"]
+__all__ = ["predict", "apply_inverse"]
 
 #: Rough cap on the per-chunk working set of stored filter steps, bytes.
 _CHUNK_BYTES = 512 * 2 ** 20
@@ -59,18 +59,79 @@ def predict(gp, v, t_pred, return_var: bool = True):
     exposure width: every prediction point must be that far from every
     data point and from every other prediction point.
     """
+    v = _check(gp, v)
+    t_pred = np.asarray(t_pred, dtype=np.float64).ravel()
+    if not np.all(np.isfinite(t_pred)):
+        raise ValueError("t_pred must be finite")
+    grid = _grid(gp, t_pred)
+    n_chains = v.shape[0]
+    k = 1 if gp.linear_basis is None else 1 + _n_basis(gp, v[:1])
+    mean = np.empty((n_chains, t_pred.size))
+    var = np.empty((n_chains, t_pred.size)) if return_var else None
+    for c, vc in _chunks(gp, v, grid, k):
+        out = _smooth(gp, vc, grid, return_var=return_var)
+        mu, va = out["mean"][:, 0], out.get("var")
+        if k > 1:
+            beta, c_beta = gp.linear_posterior(mx.array(vc, dtype=mx.float64))
+            s_phi = out["mean"][:, 1:]                          # (n, p, M)
+            mu = mu - np.einsum("np,npm->nm", beta, s_phi)
+            if return_var:
+                va = va + np.einsum("npm,npq,nqm->nm", s_phi, c_beta, s_phi)
+        mean[c:c + vc.shape[0]] = mu
+        if return_var:
+            var[c:c + vc.shape[0]] = va
+    return mean, var
+
+
+def apply_inverse(gp, v, Y):
+    """``K^-1 Y`` in float64 for each row of ``v``: ``K`` the data's full
+    covariance (GP plus the per-datum noise the likelihood uses), ``Y``
+    ``(N,)``, ``(N, k)`` or ``(n_chains, N, k)``; the result is
+    ``(n_chains, N)`` for a 1-D ``Y``, else ``(n_chains, N, k)``.
+
+    From the same filter and smoother as :func:`predict`: the log-density
+    ``l(y)`` of columns ``y`` has ``-dl/dy = K^-1 y``, and at observation
+    ``t`` that is ``v_t / S_t - K_t^T lambda_t`` -- the innovation over its
+    variance, less the gain against the smoother's adjoint of the filtered
+    state.  No ``y - E[f | y]`` subtraction, so nothing cancels.  O(N k),
+    value only (no gradient: see `GPLogLike.gram` for a differentiable
+    quadratic form).
+    """
+    v = _check(gp, v)
+    n_chains, N = v.shape[0], gp.n_data
+    Y = np.asarray(Y, dtype=np.float64)
+    flat = Y.ndim == 1
+    if flat:
+        Y = Y[:, None]
+    if Y.ndim == 2:
+        Y = np.broadcast_to(Y, (n_chains,) + Y.shape)
+    if Y.ndim != 3 or Y.shape[:2] != (n_chains, N):
+        raise ValueError(f"Y must be ({N},), ({N}, k) or ({n_chains}, {N}, "
+                         f"k); got {np.shape(Y)}")
+    grid = _grid(gp, np.zeros(0))
+    out = np.empty(Y.shape)
+    for c, vc in _chunks(gp, v, grid, Y.shape[-1]):
+        cols = np.swapaxes(Y[c:c + vc.shape[0]], 1, 2)      # (n, k, N)
+        out[c:c + vc.shape[0]] = _smooth(gp, vc, grid, return_var=False,
+                                         cols=cols, alpha=True)["alpha"]
+    return out[..., 0] if flat else out
+
+
+def _check(gp, v):
     v = np.asarray(v, dtype=np.float64)
     if v.ndim != 2 or v.shape[1] != gp.param_map.n_dim:
         raise ValueError(f"v must be (n_chains, {gp.param_map.n_dim}), "
                          f"got {v.shape}")
-    t_pred = np.asarray(t_pred, dtype=np.float64).ravel()
-    if not np.all(np.isfinite(t_pred)):
-        raise ValueError("t_pred must be finite")
+    return v
+
+
+def _grid(gp, t_pred):
+    """The merged grid of data and prediction points: ``(is_obs, data_pos,
+    pred_slot, lag_u, lag_idx)``."""
     t_data = gp._t64
     n_data, n_pred = t_data.size, t_pred.size
-
-    # the merged grid; a stable sort puts a data point before a prediction
-    # point at the same time, so the prediction sees it through dt = 0
+    # a stable sort puts a data point before a prediction point at the
+    # same time, so the prediction sees it through dt = 0
     t_all = np.concatenate([t_data, t_pred])
     order = np.argsort(t_all, kind="stable")
     t_all = t_all[order]
@@ -92,21 +153,17 @@ def predict(gp, v, t_pred, return_var: bool = True):
                 f"and from the other prediction points, where the "
                 f"state-space form of the convolved kernel holds")
     lag_u, lag_idx = np.unique(dt[1:], return_inverse=True)
+    return is_obs, data_pos, pred_slot, lag_u, lag_idx
 
-    n_chains = v.shape[0]
-    m = gp.term.n_state
-    k = 1 if gp.linear_basis is None else 1 + _n_basis(gp, v[:1])
-    per_chain = 8 * (n_data + n_pred) * (k * m + m * m + 2 * m + k + 2)
-    step = max(1, min(n_chains, _CHUNK_BYTES // max(per_chain, 1)))
-    mean = np.empty((n_chains, n_pred))
-    var = np.empty((n_chains, n_pred)) if return_var else None
-    for c in range(0, n_chains, step):
-        mu, va = _predict_chunk(gp, v[c:c + step], t_pred, is_obs, data_pos,
-                                pred_slot, lag_u, lag_idx, return_var)
-        mean[c:c + step] = mu
-        if return_var:
-            var[c:c + step] = va
-    return mean, var
+
+def _chunks(gp, v, grid, k):
+    """``(start, rows)`` over chains, each chunk's stored steps within
+    `_CHUNK_BYTES`."""
+    m, T = gp.term.n_state, grid[0].size
+    per_chain = 8 * T * (k * m + m * m + 2 * m + k + 2)
+    step = max(1, min(v.shape[0], _CHUNK_BYTES // max(per_chain, 1)))
+    for c in range(0, v.shape[0], step):
+        yield c, v[c:c + step]
 
 
 def _n_basis(gp, v1):
@@ -140,20 +197,30 @@ def _columns(gp, v64):
     return mx.concatenate(cols, axis=1), r_var
 
 
-def _predict_chunk(gp, v, t_pred, is_obs, data_pos, pred_slot, lag_u,
-                   lag_idx, return_var):
+def _smooth(gp, v, grid, return_var, cols=None, alpha=False):
+    """The filter and smoother over ``grid`` for one chunk of chains.
+
+    Returns ``{"mean": (n, k, M)}`` -- each column's smoothed GP component
+    at the prediction points -- plus ``"var"`` ``(n, M)`` with
+    ``return_var``, and ``"alpha"`` ``(n, N, k)``, ``K^-1`` of the columns,
+    with ``alpha``.  ``cols`` ``(n, k, N)`` replaces the likelihood's own
+    (the residual, then any basis).
+    """
+    is_obs, data_pos, pred_slot, lag_u, lag_idx = grid
     pm = gp.param_map
     n = v.shape[0]
     with mx.stream(mx.cpu):
         v64 = mx.array(v, dtype=mx.float64)
-        cols, r_var = _columns(gp, v64)
+        own, r_var = _columns(gp, v64)
+        if cols is None:
+            cols = own
         kp = pm.kernel_params(v64)
         phi_u, q_u, h = gp.term.matrices(kp, mx.array(lag_u,
                                                       dtype=mx.float64))
         pin = gp._p_inf(kp, mx.float64, dense=True) if gp._has_p_inf else None
         corr = gp.term.diag_correction(kp)
         mx.eval(cols, r_var, phi_u, q_u, h)
-        cols, r_var = np.array(cols), np.array(r_var)
+        cols, r_var = np.asarray(cols, dtype=np.float64), np.array(r_var)
         phi_u, q_u, h = np.array(phi_u), np.array(q_u), np.array(h)
         p_inf = (np.broadcast_to(np.eye(h.shape[-1]), (n,) + (h.shape[-1],) * 2)
                  if pin is None else np.array(pin))
@@ -213,9 +280,18 @@ def _predict_chunk(gp, v, t_pred, is_obs, data_pos, pred_slot, lag_u,
     f_mean = np.empty((n, k, pred_slot.size))
     f_var = np.empty((n, pred_slot.size)) if return_var else None
     hh = hc @ hr
+    alpha_out = np.empty((n, cols.shape[2], k)) if alpha else None
+    obs_i = cols.shape[2]
     for i in range(T - 1, -1, -1):
         if is_obs[i]:
             gain, sv = gain_s[i], sv_s[i]
+            if alpha:
+                # -d log L / d y_t: the innovation over S, less the gain
+                # against lambda, which here is still the adjoint of the
+                # filtered state at t
+                obs_i -= 1
+                alpha_out[:, data_pos[obs_i]] = (
+                    inn_s[i] / sv - np.swapaxes(gain, 1, 2) @ lam)[:, 0, :]
             at = eye - hc @ np.swapaxes(gain, 1, 2)      # (I - K h^T)^T
             lam = hc @ (inn_s[i] / sv) + at @ lam
             Lam = hh / sv + at @ Lam @ np.swapaxes(at, 1, 2)
@@ -230,16 +306,12 @@ def _predict_chunk(gp, v, t_pred, is_obs, data_pos, pred_slot, lag_u,
             lam = phi_ut[:, li] @ lam
             Lam = phi_ut[:, li] @ Lam @ phi_u[:, li]
 
-    mu = f_mean[:, 0]
-    va = None
+    out = {"mean": f_mean}
     if return_var:
         va = np.maximum(f_var, 0.0)
         if corr is not None:              # the convolution's zero-lag excess
             va = va + corr[:, None]
-    if k > 1:
-        beta, c_beta = gp.linear_posterior(mx.array(v, dtype=mx.float64))
-        s_phi = f_mean[:, 1:]                               # (n, p, M)
-        mu = mu - np.einsum("np,npm->nm", beta, s_phi)
-        if return_var:
-            va = va + np.einsum("npm,npq,nqm->nm", s_phi, c_beta, s_phi)
-    return mu, va
+        out["var"] = va
+    if alpha:
+        out["alpha"] = alpha_out
+    return out

@@ -417,3 +417,36 @@ so only the caller can evaluate `mean_fn` at new points.
 - Found on the way: `GPTarget.linear_posterior` passed `mx.array` of a
   float64 array, which MLX makes float32, so the "float64" posterior was
   computed from float32-rounded draws. Fixed (`dtype=mx.float64`).
+
+## Item 3's primitive, public: `gram` and `apply_inverse` (2026-10-26)
+
+The plan put marginalisation and `predict` on a public `apply_inverse` /
+`gram` primitive (and the WASP-103 update said so). What was built first
+was narrower: the Gram matrix internally (kernel multi-column filter,
+polarisation elsewhere) and `predict` on the smoother, with no public
+primitive and no `apply_inverse` at all. Now:
+
+- `GPLogLike.gram(v, Y)` -> `(n_chains, k, k)` = `Y^T K^-1 Y`,
+  differentiable in `v` and `Y`, `Y` `(N,)` / `(N, k)` / `(n_chains, N,
+  k)`. float32 on the kernel by `scan_gram` (forward and backward), on the
+  MLX path by polarisation; float64 `v` by polarisation of the float64
+  path on the CPU. Refused chains get NaN. Measured against dense float64
+  solves: 5-7e-8 (kernel), 2-3e-7 (MLX; polarisation degrades for large
+  or nearly parallel columns), 5-7e-15 (float64); gradients in `v` against
+  float64 finite differences and in `Y` against `K^-1 Y (W + W^T)`.
+- `GPLogLike.apply_inverse(v, Y)` -> `K^-1 Y`, float64, value only, from
+  `predict`'s smoother (now shared, `predict._smooth`): `-d l/d y_t =
+  v_t / S_t - K_t^T lambda_t` -- no `y - E[f|y]` subtraction. 7e-14
+  against `np.linalg.solve`, sums of terms, exact ties and a convolved
+  term included; `Y^T apply_inverse(Y)` equals the float64 `gram` to
+  1e-10. `GPTarget.apply_inverse` passes through.
+- **Not built: a differentiable `apply_inverse`** (gradients of `K^-1 Y`
+  in the hyperparameters). It needs second derivatives through the filter,
+  which neither the kernel's VJP nor the MLX path provides, and no feature
+  here needs it. Built on request.
+- Found on the way (writing the tutorial): `linear_posterior` evaluated
+  every draw in one float64 batch, ~6 MB per draw at N = 2000, so a whole
+  posterior (7.7e4 draws) asked for ~440 GiB and pushed the machine's free
+  memory to 24% before it was stopped. Now tiled by `hi_chain_block`, as
+  `hi` is: flat 0.40 GiB from 64 to 4096 draws, ~3.3 ms a draw. The
+  float64 `gram` is tiled the same way.

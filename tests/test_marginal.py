@@ -559,3 +559,16 @@ def test_the_multi_column_gradient_in_the_hard_regime():
                                 refuse=False))
         G[:, i] = (hp - hm) / 2e-5
     assert np.abs(g - G).max() < 2e-5 * np.abs(G).max()
+
+
+def test_linear_posterior_is_tiled_over_chains():
+    """Tiled by ``hi_chain_block`` (in one batch a whole posterior asked for
+    ~440 GiB at N = 2000): tiles of 2 give the same answer as one tile."""
+    gp, _ = _gp(False)
+    rows = np.tile(ROWS, (3, 1))
+    gp.policy.hi_chain_block = 64
+    whole = gp.linear_posterior(mx.array(rows, dtype=mx.float64))
+    gp.policy.hi_chain_block = 2
+    tiled = gp.linear_posterior(mx.array(rows, dtype=mx.float64))
+    for a, b in zip(whole, tiled):
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=0)

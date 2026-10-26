@@ -178,6 +178,10 @@ class GPTarget:
         return self.loglike.linear_posterior(
             mx.array(np.asarray(v_model, dtype=np.float64), dtype=mx.float64))
 
+    def apply_inverse(self, v_model: np.ndarray, Y):
+        """``K^-1 Y`` at model-space draws: see `GPLogLike.apply_inverse`."""
+        return self.loglike.apply_inverse(v_model, Y)
+
     def predict(self, v_model: np.ndarray, t_pred, return_var: bool = True):
         """The GP component's posterior mean and variance at ``t_pred`` for
         model-space draws: see `GPLogLike.predict`."""
