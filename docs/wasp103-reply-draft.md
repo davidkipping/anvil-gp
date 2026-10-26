@@ -1,8 +1,7 @@
 # Reply to WASP103b_CHEOPS: dense multi-input GP, noise scale, marginalisation
 
-**Draft, 2026-10-25 -- not sent.** Goes to
-`WASP103b_CHEOPS/docs/upstream/anvil-gp_reply.md` on sign-off. Answers
-their brief of 2026-10-24 (`anvil-gp_prompt.md`).
+**Sent 2026-10-25** as `WASP103b_CHEOPS/docs/upstream/anvil-gp_reply.md`.
+Answers their brief of 2026-10-24 (`anvil-gp_prompt.md`).
 
 ## Summary
 
