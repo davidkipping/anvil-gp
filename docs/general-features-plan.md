@@ -185,3 +185,61 @@ composition itself waits on its answer. anvil-gp's side, done now:
 Next: item 3 (`apply_inverse` / `gram`, then marginalisation), which does
 not depend on anvil. The composition (anvil's or our fallback) is picked
 up when anvil answers.
+
+## Item 3, first half done: marginalisation by polarisation (2026-10-25)
+
+Decision C (agreed): polarisation now, on every path, as the general
+implementation and the test oracle; the multi-column kernel next.
+
+- **Measured first.** Prototype (no library change): float64 exact;
+  float32 kernel marginal error 1e-3 (s/e 10) to 2e-2 (s/e 100) at first.
+  That was cancellation in the marginal *formula*, not in polarisation: a
+  200-sigma baseline left in r made r^T K^-1 r and its projection agree to
+  ~1e-6. Centring r on a white-noise least-squares beta0 first (exact:
+  the marginal is invariant to r -> r - Phi beta0) took it to 7e-5, about
+  twice the plain likelihood's error on the same residual.
+- **Built.** `GPLogLike(linear_basis=, linear_prior=)`,
+  `linear_basis(v_mean, x, m0) -> Phi (n, N, p)`; flat prior (restricted
+  likelihood, -1/2 ln|C| kept) or Gaussian `(mu, cov)`;
+  `linear_posterior(v)` (float64); `make_target(linear_basis=,
+  linear_prior=)` and `GPTarget.linear_posterior`. Internally
+  `_marginal`: centre, scale the columns, evaluate the existing
+  likelihood once on all `1 + k(k+1)/2` combinations as extra chains
+  (`_raw_resid`, a residual supplied in place of y - mean on every path),
+  polarise into the Gram matrix, small solves by `linalg.inv_logdet`. A
+  refused chain or a singular basis gets the failure value.
+- **Accuracy.** float64: the brute-force quadrature over beta of the plain
+  likelihood (the acceptance test asked for) to 1e-8 relative; the
+  Gaussian prior against the dense marginal; `linear_posterior` against
+  dense GLS to 1e-7. float32: value within 5e-3 of float64 at s/e 10,
+  gradients (mean parameter included, which moves the basis through m0)
+  to 1e-4 relative on the kernel, 1e-3 on the MLX path. The float32 floor
+  is set by forming the residual on the device: the plain likelihood with
+  the same device-side mean is 3e-4 off here, the marginal ~4x that.
+- **Calibration** (slow test): ensemble sampler on the marginalised and
+  the beta-sampled targets, posterior means of depth, GP amplitude, rho
+  and jitter agree to 0.02-0.05 posterior sd.
+- **Cost** (kernel, value / value + gradient, against the plain
+  likelihood): p = 1 1.6-2.3x at 256 chains, 3.3-4.8x at 1024; p = 2
+  3.1-5.5x at 256, 7.0-11.8x at 1024 (N = 1e4 and 1e5). Under-filled GPUs
+  hide part of it; at 1024 chains it is the full 7 evaluations and more.
+  This is what the multi-column kernel is for.
+
+## Item 2, composition: anvil built it (2026-10-25)
+
+anvil answered the note by building it: 0.12.0 (in anvil's working
+tree, not yet committed when read) adds `anvil.joint(members, shared)` ->
+`JointLogDensity` -- shared columns first, then `"<member>.<name>"`, one
+Jacobian and one set of declared priors, `model_log_norm` summed, a
+float64 path when every member has one, failures kept -- makes
+`TransformedLogDensity.model_log_prob` / `model_log_prob_hi` public (our
+one request), and makes `Transform` reject duplicate names, which broke
+the hand-composed tests of the member side (they concatenated two
+members' specs under the same names). No fallback is needed.
+
+anvil-gp's remaining piece: `anvilgp.anvil.joint_u0(jt, members,
+n_chains)`, a joint start from each member's `u_ref()` placed by
+`jt.member_columns`. `tests/test_members.py` now runs against
+`anvil.joint` (skipped before anvil 0.12.0). Caveat, documented on
+`joint_u0`: sharing a GP *hyperparameter* across members needs equal
+specs, which `make_target`'s data-derived bounds do not give.

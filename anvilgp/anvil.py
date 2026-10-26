@@ -170,6 +170,13 @@ class GPTarget:
         u[self.transform.dim - n_noise:] = 0.0
         return np.clip(u, -self.U_REF_MAX, self.U_REF_MAX)
 
+    def linear_posterior(self, v_model: np.ndarray):
+        """The marginalised linear parameters' conditional posterior at
+        model-space draws: ``(mean, cov)``, see
+        `GPLogLike.linear_posterior`."""
+        return self.loglike.linear_posterior(
+            mx.array(np.asarray(v_model, dtype=np.float64)))
+
     def _n_noise(self) -> int:
         return 0 if self.noise is None else len(self.noise.specs)
 
@@ -236,7 +243,8 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
                 instrument: np.ndarray | None = None,
                 order_groups: list[list[int]] | None = None,
                 policy: GPPolicy | None = None,
-                seed_period: bool = False, noise=None) -> GPTarget:
+                seed_period: bool = False, noise=None, linear_basis=None,
+                linear_prior=None) -> GPTarget:
     """Build a ready-to-sample GP target with shipped defaults.
 
     Parameters
@@ -282,6 +290,14 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         whole per-datum noise variance in place of ``yerr^2 + jitter^2``.
         Its parameters end the model vector, raw values within its specs'
         bounds; ``u0`` starts them at the centre of each box.
+    linear_basis, linear_prior
+        Linear mean parameters to integrate out rather than sample:
+        ``linear_basis(v_mean, x, m0) -> (n_chains, n_data, p)``, the
+        columns the mean is linear in (``m0`` is ``mean_fn``'s output, zeros
+        without one; ``x`` is ``x_mean``, else ``t``).  ``linear_prior``
+        None for a flat prior on them (the restricted likelihood), or
+        ``(mu, cov)``.  :meth:`GPTarget.linear_posterior` reports them.
+        Costs ``1 + (p+1)(p+2)/2`` likelihood evaluations (7 at p = 2).
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic
@@ -320,7 +336,8 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
 
     loglike = GPLogLike(mean_fn, t, x_mean, y, yerr, term, pm,
                         policy or GPPolicy(),
-                        noise_fn=None if noise is None else noise.fn)
+                        noise_fn=None if noise is None else noise.fn,
+                        linear_basis=linear_basis, linear_prior=linear_prior)
     log_prior = make_log_prior(hypers, jitters, offsets,
                                n_mean=len(mean_specs))
 
@@ -358,3 +375,33 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
                     model_log_prob_hi=model_log_prob_hi,
                     model_log_norm=loglike.log_norm_const,
                     specs=mean_specs + specs + noise_specs)
+
+
+def joint_u0(jt, members: dict, n_chains: int, seed: int = 0,
+             spread: float = 0.05) -> mx.array:
+    """Initial states for an ``anvil.joint`` target built from GPTargets.
+
+    Each member's :meth:`GPTarget.u_ref` goes to the joint columns it reads
+    (``jt.member_columns(name)``); a shared column takes the mean of its
+    members' values (they agree for a shared mean-model parameter, which
+    starts at ``u = 0``), then a Gaussian ball of ``spread`` in ``u``.
+    ``members`` maps the names given to ``anvil.joint`` to the GPTargets
+    whose ``.target`` went in.
+
+    Sharing a GP *hyperparameter* across members needs equal specs, which
+    ``make_target``'s data-derived bounds will not give: build those
+    members' specs to agree, or share only mean-model parameters.
+    """
+    dim = jt.transform.dim
+    acc, cnt = np.zeros(dim), np.zeros(dim)
+    for name, gt in members.items():
+        cols = jt.member_columns(name)
+        acc[cols] += gt.u_ref()
+        cnt[cols] += 1.0
+    if np.any(cnt == 0):
+        raise ValueError("members do not cover every joint column; pass "
+                         "every member given to anvil.joint")
+    u = acc / cnt
+    rng = np.random.default_rng(seed)
+    return mx.array((u + spread * rng.standard_normal((n_chains, dim)))
+                    .astype(np.float32))

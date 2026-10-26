@@ -50,6 +50,7 @@ Known v1 limitations, stated rather than discovered
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass, field
 
@@ -445,9 +446,17 @@ class GPLogLike:
 
     def __init__(self, mean_fn, t, x_mean, y, yerr, kernel_spec: Term,
                  param_map: ParamMap, policy: GPPolicy | None = None,
-                 noise_fn=None):
+                 noise_fn=None, linear_basis=None, linear_prior=None):
         self.mean_fn = mean_fn
         self.noise_fn = noise_fn
+        #: ``linear_basis(v_mean, x, m0) -> Phi (n_chains, m, p)``: linear
+        #: mean parameters integrated out of the likelihood rather than
+        #: sampled (`_marginal`); ``linear_prior`` None for a flat prior on
+        #: them, or ``(mu, cov)`` for a Gaussian one.
+        self.linear_basis = linear_basis
+        self._linear_prior = (None if linear_prior is None else
+                              (np.asarray(linear_prior[0], np.float64),
+                               np.asarray(linear_prior[1], np.float64)))
         if param_map.noise is not None and noise_fn is None:
             raise ValueError(
                 "`param_map.noise` is set but `noise_fn` is None: the noise "
@@ -801,7 +810,8 @@ class GPLogLike:
         return lambda s, e: (mx.take(phi_u, inv[s:e], axis=1),
                              mx.take(q_u, inv[s:e], axis=1), h)
 
-    def leaf_inputs(self, v, dt, y, r_ref, x_mean, idx, s, e, get_mat=None):
+    def leaf_inputs(self, v, dt, y, r_ref, x_mean, idx, s, e, get_mat=None,
+                    resid=None):
         """``(phi, q, h, residual, r_var, r_ref, s_floor)`` for one data block.
 
         Exactly the argument list of :func:`~anvilgp.elements.leaf_elements`
@@ -826,12 +836,15 @@ class GPLogLike:
                    if self._has_p_inf else None)
             phi, q = first_point(phi, q, dtype, pin)
 
-        r = mx.broadcast_to(y[s:e], (n, e - s))
-        if self.mean_fn is not None and pm.mean is not None:
-            r = r - self.mean_fn(v[:, pm.mean], x_mean[..., s:e])
-        off = pm.offsets(v, sub)
-        if off is not None:
-            r = r - off
+        if resid is not None:          # `_marginal`'s combinations
+            r = resid[:, s:e]
+        else:
+            r = mx.broadcast_to(y[s:e], (n, e - s))
+            if self.mean_fn is not None and pm.mean is not None:
+                r = r - self.mean_fn(v[:, pm.mean], x_mean[..., s:e])
+            off = pm.offsets(v, sub)
+            if off is not None:
+                r = r - off
 
         r_ref = r_ref[s:e]
         jit2 = (self._noise_extra(v, r_ref, s, e) if self.noise_fn is not None
@@ -1048,7 +1061,7 @@ class GPLogLike:
         self._metal_matrices_fn = ((v.shape[0], n_chunk), core)
         return core(v)
 
-    def _evaluate_metal(self, v: mx.array):
+    def _evaluate_metal(self, v: mx.array, resid: mx.array | None = None):
         """Design C: one kernel condenses the blocks, a second folds them.
 
         The whole thing sits behind :func:`anvilgp.metal.scan_loglike`'s
@@ -1086,13 +1099,16 @@ class GPLogLike:
         # chains-fastest grid: adjacent threads then read adjacent floats.
         # Constructed transposed rather than transposed afterwards, which
         # would be a full copy of the residual every call.
-        r = mx.broadcast_to(self._y32[:, None], (self.n_data, n))
-        if self.mean_fn is not None and pm.mean is not None:
-            r = r - mx.swapaxes(self.mean_fn(v[:, pm.mean], self._x_mean32),
-                                0, 1)
-        off = pm.offsets(v, self._inst32)
-        if off is not None:
-            r = r - mx.swapaxes(off, 0, 1)
+        if resid is not None:          # `_marginal`'s combinations
+            r = mx.swapaxes(resid, 0, 1)
+        else:
+            r = mx.broadcast_to(self._y32[:, None], (self.n_data, n))
+            if self.mean_fn is not None and pm.mean is not None:
+                r = r - mx.swapaxes(
+                    self.mean_fn(v[:, pm.mean], self._x_mean32), 0, 1)
+            off = pm.offsets(v, self._inst32)
+            if off is not None:
+                r = r - mx.swapaxes(off, 0, 1)
         # Same correction as the reference path.  It is per chain and
         # applies to every observation, so it is added to the jitter
         # wherever it is; with no jitter declared it becomes the one
@@ -1138,7 +1154,8 @@ class GPLogLike:
                            boundary=self._metal_boundary)
         return out, (q, h)
 
-    def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None):
+    def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None,
+                  resid=None):
         """Blocked chunked-scan reduction over the whole series -> (n_chains,).
 
         The per-block roots are composed by a *pairwise tree*, not folded
@@ -1155,7 +1172,8 @@ class GPLogLike:
         roots: list[Element] = []
         for s in range(0, self.n_data, block):
             e = min(s + block, self.n_data)
-            args = self.leaf_inputs(v, dt, y, r_ref, x_mean, idx, s, e, get_mat)
+            args = self.leaf_inputs(v, dt, y, r_ref, x_mean, idx, s, e, get_mat,
+                                    resid=resid)
             fm = self._formal
             if self.blocked:
                 root = chunked_reduce_blocked(leaf_parts(*args, formal=fm),
@@ -1402,17 +1420,181 @@ class GPLogLike:
 
     def _raw_call(self, v: mx.array) -> mx.array:
         """The float32 likelihood itself, sanitised but not gradient-guarded."""
+        if self.linear_basis is not None:
+            return self._marginal(v, self._raw_resid, self._y32,
+                                  self._x_mean32, self._noise_x32,
+                                  self._r_ref32)[0]
+        return self._raw_resid(v, None)
+
+    def _raw_resid(self, v: mx.array, resid: mx.array | None) -> mx.array:
+        """`_raw_call` for the data's residual, or for ``resid``
+        ``(n_chains, n_data)`` in its place."""
         pull = self._infeasible_pull(v)
         tables = None
         if self._metal_ok:
-            out, tables = self._evaluate_metal(v)
+            out, tables = self._evaluate_metal(v, resid)
         else:
             out = self._evaluate(
                 v, self._dt32, self._y32, self._r_ref32, self._x_mean32,
                 self._inst32, _pow2(self.policy.block),
-                self.policy.eval_blocks, uniq=self._uniq32)
+                self.policy.eval_blocks, uniq=self._uniq32, resid=resid)
         out = self._refuse_outside_series(v, out)
         return _sanitize(self._refuse_ill_conditioned(v, out, tables), pull)
+
+    def _marginal(self, v, ev, y, x_mean, x_lin, r_ref):
+        """The likelihood with the linear mean parameters integrated out.
+
+        With ``r = y - m0 - offsets``, ``Phi = linear_basis(v_mean, x, m0)``
+        and ``C = Phi^T K^-1 Phi``, a flat prior on beta gives the
+        restricted (REML) form
+
+            log L = -1/2 r^T P r - 1/2 log|K| - 1/2 log|C| - (N - p)/2 log 2 pi,
+            P = K^-1 - K^-1 Phi C^-1 Phi^T K^-1,
+
+        and a Gaussian prior N(mu, S) on beta adds
+        ``-1/2 (b - mu)^T (C^-1 + S)^-1 (b - mu) - 1/2 log|C^-1 + S|`` and
+        drops the ``p/2 log 2 pi``, with ``b = C^-1 Phi^T K^-1 r`` the
+        generalised least-squares estimate.
+
+        Everything needed is the Gram matrix ``[r Phi]^T K^-1 [r Phi]`` and
+        ``log|K|``, which come from the existing likelihood by polarisation:
+        ``q(z) = z^T K^-1 z = -2 (ell(z) - ell(0))`` and ``2 a^T K^-1 b =
+        q(a + b) - q(a) - q(b)``, all combinations evaluated at once as extra
+        chains (``ev``, the plain likelihood of a supplied residual).  So
+        every path and every gradient works as it is -- at ``1 + k(k+1)/2``
+        evaluations for ``k = p + 1`` columns (7 at p = 2); a multi-column
+        filter on the kernel is the planned speed-up
+        (docs/general-features-plan.md, item 3).  The log-determinant is
+        bit-identical across combinations, so it cancels exactly.
+
+        Two steps keep float32 honest.  ``r`` is first centred on a
+        white-noise least-squares fit of the basis, ``beta0`` -- the marginal
+        is invariant to ``r -> r - Phi beta0``, so this is exact, but it
+        removes the part of ``r`` the projection would otherwise cancel (a
+        baseline of 200 sigma made ``r^T K^-1 r`` and its projection agree
+        to ~1e-6 relative; measured 2.3e-2 log-units of error without, 7e-5
+        with, against 3e-5 for the plain likelihood on the same data).  And
+        the basis columns are scaled to the residual's size, which only
+        moves ``log|C|`` by a constant.  ``beta0`` and the scales are under
+        ``stop_gradient``: any value is exact, so the gradient is too.
+
+        Returns ``(log L, b, C^-1)`` -- the last two for
+        :meth:`linear_posterior`.
+        """
+        from .linalg import inv_logdet
+        pm = self.param_map
+        n, N, dtype = v.shape[0], self.n_data, v.dtype
+        vm = v[:, pm.mean] if pm.mean is not None else v[:, :0]
+        if self.mean_fn is not None and pm.mean is not None:
+            m0 = self.mean_fn(vm, x_mean)
+        else:
+            m0 = mx.zeros((n, N), dtype=dtype)
+        r = mx.broadcast_to(y, (n, N)) - m0
+        off = pm.offsets(v, self._inst32)
+        if off is not None:
+            r = r - off
+        phi = self.linear_basis(vm, x_lin, m0).astype(dtype)
+        phi = mx.broadcast_to(phi, (n, N, phi.shape[-1]))
+        p = phi.shape[-1]
+        k = p + 1
+
+        w = (1.0 / r_ref)[None, :, None]
+        a_w = mx.swapaxes(phi * w, 1, 2)                        # (n, p, N)
+        a_inv, _ = inv_logdet(a_w @ phi)
+        beta0 = mx.stop_gradient((a_inv @ (a_w @ r[..., None]))[..., 0])
+        rc = r - (phi @ beta0[..., None])[..., 0]
+        size = mx.maximum(mx.sum(rc * rc * w[..., 0], -1, keepdims=True),
+                          float(N))
+        c = mx.stop_gradient(mx.sqrt(size / mx.maximum(
+            mx.sum(phi * phi * w, 1), 1e-30)))                   # (n, p)
+
+        cols = mx.concatenate([rc[:, None, :],
+                               mx.swapaxes(phi * c[:, None, :], 1, 2)], 1)
+        pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
+        combos = ([mx.zeros((n, 1, N), dtype=dtype)]
+                  + [cols[:, i:i + 1] for i in range(k)]
+                  + [cols[:, i:i + 1] + cols[:, j:j + 1] for i, j in pairs])
+        R = mx.concatenate(combos, axis=1)                       # (n, M, N)
+        M = R.shape[1]
+        ell = ev(mx.repeat(v, M, axis=0), R.reshape(n * M, N)).reshape(n, M)
+        ell0 = ell[:, 0]
+        q = -2.0 * (ell - ell0[:, None])
+        g = [[None] * k for _ in range(k)]
+        for i in range(k):
+            g[i][i] = q[:, 1 + i]
+        for t_, (i, j) in enumerate(pairs):
+            g[i][j] = g[j][i] = 0.5 * (q[:, 1 + k + t_] - g[i][i] - g[j][j])
+        gram = mx.stack([mx.stack(row, axis=-1) for row in g], axis=-2)
+
+        a, b, cs = gram[:, 0, 0], gram[:, 0, 1:], gram[:, 1:, 1:]
+        cs_inv, logdet_cs = inv_logdet(cs)
+        cs_b = (cs_inv @ b[..., None])[..., 0]
+        rpr = a - mx.sum(b * cs_b, -1)
+        log_c = mx.sum(mx.log(c), -1)
+        logdet_c = logdet_cs - 2.0 * log_c
+        beta = beta0 + c * cs_b                       # C^-1 Phi^T K^-1 r
+        cov = c[:, :, None] * cs_inv * c[:, None, :]  # C^-1
+        if self._linear_prior is None:
+            out = (ell0 - 0.5 * rpr - 0.5 * logdet_c
+                   + 0.5 * p * math.log(2.0 * math.pi))
+        else:
+            mu = mx.array(self._linear_prior[0], dtype=dtype)
+            sig = mx.array(self._linear_prior[1], dtype=dtype)
+            if mu.shape != (p,) or sig.shape != (p, p):
+                raise ValueError(
+                    f"linear_prior is (mu {tuple(mu.shape)}, cov "
+                    f"{tuple(sig.shape)}) but the basis has p = {p} columns")
+            d = (beta - mu) / c
+            s2_inv, logdet_s2 = inv_logdet(
+                cs_inv + sig / (c[:, :, None] * c[:, None, :]))
+            quad = mx.sum(d * (s2_inv @ d[..., None])[..., 0], -1)
+            out = (ell0 - 0.5 * rpr - 0.5 * quad - 0.5 * logdet_c
+                   - 0.5 * (logdet_s2 + 2.0 * log_c))
+        # Every combination shares the chain's hyperparameters, so a refused
+        # chain is refused in all of them; a singular basis (collinear
+        # columns) makes the value non-finite.  Both get the failure value.
+        failed = mx.any(ell <= _FAILED, axis=1)
+        out = mx.where(failed, mx.min(ell, axis=1), out)
+        return _sanitize(out, self._infeasible_pull(v)), beta, cov
+
+    def linear_posterior(self, v: mx.array):
+        """The linear mean parameters' conditional posterior given ``v``:
+        ``(mean (n_chains, p), cov (n_chains, p, p))``, float64 NumPy.
+
+        Under a flat prior the generalised least-squares estimate
+        ``C^-1 Phi^T K^-1 r`` and ``C^-1``; under a Gaussian prior
+        ``N(mu, S)``, ``(C + S^-1)^-1 (C b + S^-1 mu)`` and ``(C + S^-1)^-1``.
+        Draws of beta for reporting are one Gaussian draw per posterior
+        sample of ``v``.
+        """
+        if self.linear_basis is None:
+            raise ValueError("no linear_basis: nothing is marginalised")
+        self._check_v(v)
+        with mx.stream(mx.cpu):
+            v64 = v.astype(mx.float64)
+
+            def ev(vv, resid):
+                return self._evaluate(
+                    vv, a64(self._dt64), a64(self._y64),
+                    a64(self._yerr64 ** 2),
+                    None if self._x_mean64 is None else a64(self._x_mean64),
+                    self._inst32, _pow2(self.policy.hi_block), True,
+                    uniq=self._uniq64, resid=resid)
+            _, beta, cov = self._marginal(
+                v64, ev, a64(self._y64),
+                None if self._x_mean64 is None else a64(self._x_mean64),
+                mx.array(self._noise_x64, dtype=mx.float64),
+                a64(self._yerr64 ** 2))
+            beta, cov = np.array(beta), np.array(cov)
+        if self._linear_prior is None:
+            return beta, cov
+        mu, sig = self._linear_prior
+        prec = np.linalg.inv(cov) + np.linalg.inv(sig)
+        post_cov = np.linalg.inv(prec)
+        post_mean = np.einsum("cij,cj->ci", post_cov,
+                              np.einsum("cij,cj->ci", np.linalg.inv(cov), beta)
+                              + np.linalg.solve(sig, mu))
+        return post_mean, post_cov
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`.
@@ -1486,12 +1668,22 @@ class GPLogLike:
             v64 = v.astype(mx.float64)
             for c in range(0, n_chains, pol.hi_chain_block):
                 vb = v64[c:c + pol.hi_chain_block]
-                acc = self._evaluate(vb, dt, y, r_ref, xm, self._inst32,
-                                     blk, True, uniq=self._uniq64)
-                if refuse:
-                    acc = _sanitize(self._refuse_ill_conditioned(
-                        vb, self._refuse_outside_series(vb, acc)),
-                        self._infeasible_pull(vb))
+
+                def ev(vv, resid):
+                    a_ = self._evaluate(vv, dt, y, r_ref, xm, self._inst32,
+                                        blk, True, uniq=self._uniq64,
+                                        resid=resid)
+                    if refuse:
+                        a_ = _sanitize(self._refuse_ill_conditioned(
+                            vv, self._refuse_outside_series(vv, a_)),
+                            self._infeasible_pull(vv))
+                    return a_
+                if self.linear_basis is not None:
+                    acc = self._marginal(
+                        vb, ev, y, xm, mx.array(self._noise_x64,
+                                                dtype=mx.float64), r_ref)[0]
+                else:
+                    acc = ev(vb, None)
                 mx.eval(acc)
                 out[c:c + vb.shape[0]] = np.array(acc, dtype=np.float64)
         return a64(out)

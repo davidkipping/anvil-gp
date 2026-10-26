@@ -19,7 +19,7 @@ from anvilgp.oracle import dense_loglike, sample_ssm
 from anvilgp.priors import SpecHint
 
 anvil = pytest.importorskip("anvil")
-from anvilgp.anvil import make_target  # noqa: E402
+from anvilgp.anvil import joint_u0, make_target  # noqa: E402
 
 KP = [1.3, 4.0, 3.0]
 
@@ -50,29 +50,13 @@ def pair():
 
 
 def _joint(pair):
-    """[mu | A's own | B's own]: one transform from the members' specs,
-    the sum of their model-space log-densities."""
+    """[mu | a.* | b.*] through anvil.joint, the composition the note to
+    anvil proposed and anvil 0.12.0 built."""
+    if not hasattr(anvil, "joint"):
+        pytest.skip("anvil.joint needs anvil >= 0.12.0")
     (a, _), (b, _) = pair
-    na, nb = len(a.specs), len(b.specs)
-    ia = np.arange(na)                               # mu then A's own
-    ib = np.concatenate([[0], na + np.arange(nb - 1)])   # mu then B's own
-    specs = a.specs + b.specs[1:]
-    transform = anvil.Transform([s.to_anvil() for s in specs])
-    ia_m, ib_m = mx.array(ia.astype(np.int32)), mx.array(ib.astype(np.int32))
-
-    def lp(v):
-        return (a.model_log_prob(mx.take(v, ia_m, axis=1))
-                + b.model_log_prob(mx.take(v, ib_m, axis=1)))
-
-    def lp_hi(v):
-        return (a.model_log_prob_hi(mx.take(v, ia_m, axis=1))
-                + b.model_log_prob_hi(mx.take(v, ib_m, axis=1)))
-
-    target = anvil.TransformedLogDensity(
-        lp, transform, model_log_prob_hi=lp_hi,
-        model_log_norm=a.model_log_norm + b.model_log_norm)
-    u0 = np.concatenate([a.u_ref(), b.u_ref()[1:]])
-    return target, transform, ia, ib, u0
+    jt = anvil.joint({"a": a.target, "b": b.target}, shared={"mu": ["a", "b"]})
+    return jt, jt.member_columns("a"), jt.member_columns("b")
 
 
 def test_the_member_protocol_is_public(pair):
@@ -109,26 +93,24 @@ def test_a_joint_target_composes_in_model_space(pair):
     """The joint value is the members' model-space sum plus ONE Jacobian;
     summing the members' own `log_prob(u)` instead counts the shared
     column's Jacobian twice, and the difference is exactly that."""
-    target, transform, ia, ib, u0 = _joint(pair)
+    jt, ia, ib = _joint(pair)
     (a, _), (b, _) = pair
-    rng = np.random.default_rng(0)
-    u = mx.array((u0 + 0.05 * rng.standard_normal((4, u0.size)))
-                 .astype(np.float32))
-    joint = np.array(target.log_prob(u))
-    naive = (np.array(a.target.log_prob(u[:, mx.array(ia.astype(np.int32))]))
-             + np.array(b.target.log_prob(u[:, mx.array(ib.astype(np.int32))])))
+    u = joint_u0(jt, {"a": a, "b": b}, 4, seed=0)
+    joint = np.array(jt.log_prob(u))
+    ua, ub = u[:, mx.array(ia.astype(np.int32))], u[:, mx.array(ib.astype(np.int32))]
+    naive = np.array(a.target.log_prob(ua)) + np.array(b.target.log_prob(ub))
     jac_mu = np.array(anvil.Transform([a.specs[0].to_anvil()])
                       .log_det_jac(u[:, :1]))
     np.testing.assert_allclose(naive - joint, jac_mu, rtol=0, atol=1e-3)
+    assert jt.names[0] == "mu" and jt.names[1].startswith("a.")
 
 
 def test_a_shared_column_gets_the_sum_of_the_members_gradients(pair):
-    target, transform, ia, ib, u0 = _joint(pair)
+    jt, ia, ib = _joint(pair)
     (a, _), (b, _) = pair
-    v = np.array(transform.to_model(mx.array(u0[None].astype(np.float32))))
-    vm = mx.array(np.repeat(v, 3, axis=0) + np.array([[0.0], [0.1], [-0.1]])
-                  * np.eye(1, v.shape[1]))
-    g = np.array(mx.grad(lambda v: target._fn(v).sum())(vm))
+    u = joint_u0(jt, {"a": a, "b": b}, 3, seed=1)
+    vm = jt.transform.to_model(u)
+    g = np.array(mx.grad(lambda v: jt.model_log_prob(v).sum())(vm))
     ga = np.array(mx.grad(lambda w: a.model_log_prob(w).sum())(
         vm[:, mx.array(ia.astype(np.int32))]))
     gb = np.array(mx.grad(lambda w: b.model_log_prob(w).sum())(
@@ -138,33 +120,42 @@ def test_a_shared_column_gets_the_sum_of_the_members_gradients(pair):
     np.testing.assert_allclose(g[:, ib[1:]], gb[:, 1:], rtol=1e-6)
 
 
-def test_the_joint_float64_path_and_precision_check(pair):
+def test_the_joint_float64_path_and_constant(pair):
     """anvil's own tools run on the composed target: `log_prob_hi` exists
-    because every member has one, and `validate_precision` passes."""
-    target, transform, ia, ib, u0 = _joint(pair)
-    rng = np.random.default_rng(1)
-    u = mx.array((u0 + 0.05 * rng.standard_normal((8, u0.size)))
-                 .astype(np.float32))
-    lo = np.array(target.log_prob(u))
+    because every member has one, `validate_precision` runs, and the
+    constant is the members' sum."""
+    jt, ia, ib = _joint(pair)
+    (a, _), (b, _) = pair
+    u = joint_u0(jt, {"a": a, "b": b}, 8, seed=2)
+    lo = np.array(jt.log_prob(u))
     with mx.stream(mx.cpu):
-        hi = np.array(target.log_prob_hi(u))
+        hi = np.array(jt.log_prob_hi(u))
     assert np.abs(lo - hi).max() < 5e-3
-    rep = anvil.validate_precision(target, u)
-    assert "ok" in str(rep).lower() or getattr(rep, "ok", True)
+    anvil.validate_precision(jt, u)
+    assert jt.model_log_norm == pytest.approx(a.model_log_norm
+                                              + b.model_log_norm)
 
 
 def test_one_failed_member_fails_the_joint_chain(pair):
-    """A member refusing a chain (here: amplitude and correlation length
-    both far out, so the conditioning number kappa -- bounded by the
-    amplitude-to-noise ratio -- is past `kappa_max`) returns the failure
-    value; the sum stays below the floor anvil's samplers treat as
-    failed."""
-    target, transform, ia, ib, u0 = _joint(pair)
-    v = np.array(transform.to_model(mx.array(u0[None].astype(np.float32))))
-    v = np.repeat(v, 2, axis=0)
-    names = pair[0][0].names
+    """A member refusing a chain (amplitude and correlation length both far
+    out, so kappa -- bounded by the amplitude-to-noise ratio -- is past
+    `kappa_max`) returns the failure value, and the sum keeps it."""
+    jt, ia, ib = _joint(pair)
+    (a, _), (b, _) = pair
+    v = np.array(jt.transform.to_model(joint_u0(jt, {"a": a, "b": b}, 2)))
+    names = a.names
     v[1, ia[names.index("log_gp_sigma")]] = 20.0
     v[1, ia[names.index("log_gp_rho")]] = 30.0
-    out = np.array(target._fn(mx.array(v.astype(np.float32))))
+    out = np.array(jt.model_log_prob(mx.array(v.astype(np.float32))))
     assert np.isfinite(out[0]) and out[0] > -1e20
     assert out[1] <= -1e29
+
+
+def test_joint_u0_places_each_members_reference(pair):
+    jt, ia, ib = _joint(pair)
+    (a, _), (b, _) = pair
+    u = np.array(joint_u0(jt, {"a": a, "b": b}, 1, spread=0.0))[0]
+    np.testing.assert_allclose(u[ia], a.u_ref(), atol=1e-6)
+    np.testing.assert_allclose(u[ib[1:]], b.u_ref()[1:], atol=1e-6)
+    with pytest.raises(ValueError, match="cover"):
+        joint_u0(jt, {"a": a}, 1)
