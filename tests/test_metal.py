@@ -1568,21 +1568,23 @@ def test_each_instruments_jitter_gets_its_own_gradient():
         f"instrument index, and it did not move: {gke[0][3:]}")
 
 
-def test_more_jitters_than_the_kernel_holds_is_refused_not_wrong():
-    """`MAX_JITTER` sizes a per-thread register array, so it is a real
-    budget.  Above it the MLX path is correct and eligibility says so."""
+def test_more_jitters_than_the_old_cap_run_on_the_kernel():
+    """Until 2026-10-25 the kernel kept one jitter adjoint per instrument
+    in registers and refused more than eight (`MAX_JITTER`).  Several
+    jitters now go per datum (`metal._jitter_src`), so there is no cap:
+    twelve run on the kernel and match the MLX path, value and gradient."""
     import warnings
-    from anvilgp.metal import MAX_JITTER
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        gp = _jitter_gp(MAX_JITTER + 1, True)
+        gp = _jitter_gp(12, True)
     ok, why = gp.metal_eligible()
-    assert not ok and "exceeds the kernel" in why, why
-    # and the user is told, rather than silently getting the slow path
-    assert [w for w in caught if "cannot be honoured" in str(w.message)]
-    # and it still computes, on the reference path
-    v, g = _vg(gp, 3 + MAX_JITTER + 1)
-    assert np.all(np.isfinite(v)) and np.all(np.isfinite(g))
+    assert ok and gp._metal_ok, why
+    assert not [w for w in caught if "cannot be honoured" in str(w.message)]
+    vk, gk = _vg(gp, 3 + 12)
+    vm, gm = _vg(_jitter_gp(12, False), 3 + 12)
+    assert np.max(np.abs(vk - vm)) < 1e-2
+    rel = np.max(np.abs(gk - gm)) / np.max(np.abs(gm))
+    assert rel < 1e-5, f"gradient rel {rel:.2e}"
 
 
 def test_per_instrument_jitter_needs_instrument_labels():

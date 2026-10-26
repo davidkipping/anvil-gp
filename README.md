@@ -18,7 +18,7 @@ from anvilgp.anvil import make_target
 from anvilgp import GPPolicy
 
 # The fused Metal kernel is the default wherever it can serve the problem
-# (m <= 6, up to 8 jitters): ~17-24x on the forward and ~85-200x on the
+# (m <= 6): ~17-24x on the forward and ~85-200x on the
 # gradient, and the more accurate float32 path on bright, densely sampled
 # data.  Otherwise the MLX path runs; either way it says once per process
 # which it chose.  GPPolicy(metal=False) forces the MLX path, metal=True
@@ -389,9 +389,9 @@ since a block is up to 4096 sequential adds with no tree to spread the error.
 Limits, stated: m <= 6 (the running element is `3m^2+2m+1` floats per
 thread — 17 at m = 2, 57 at m = 4, 121 at m = 6; m = 5 and 6 spill
 registers, cost ~6-8x m = 4, and take 128- and 64-point blocks for the
-GPU watchdog);
-up to 8 per-instrument jitters (`metal.MAX_JITTER`, a register budget);
-and an all-distinct-lag cadence degenerates
+GPU watchdog); any number of per-instrument jitters, and any `noise_fn`
+(both read per observation since 2026-10-25); and an all-distinct-lag
+cadence degenerates
 the table to one row per point, which is correct but gives up the traffic
 saving — the value costs 13.2 GiB at 1024 chains x N = 1e5 where a regular
 cadence costs 0.4. The gradient handles it: its adjoint buffer holds one
@@ -580,7 +580,7 @@ float32 accuracy.
 
 | field | default | change it when |
 |---|---|---|
-| `metal` | `None` (the kernel where eligible: `m <= 6`, up to 8 per-instrument jitters; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
+| `metal` | `None` (the kernel where eligible: `m <= 6`; the MLX path otherwise) | you want the MLX path anyway (`False`), or want a warning if the kernel cannot serve the problem (`True`). The default was `False` until 2026-10-25. |
 | `metal_block` | `None` (N/12, 256-8192; at most 2048 at m = 3, 256 at m = 4, 128 at m = 5 and 64 at m = 6) | essentially never: the rule picks the measured best at N = 1e4, 3e4 and 1e5, capped where the GPU watchdog kills long threads. Above the cap it warns. |
 | `metal_boundary` | `None` (`"sqrt"`; `"dense"` for a convolved term with a `RealTerm` member or `\|\|F delta\|\| > 0.5`) | `"dense"` only for a sampler that uses the value alone (stretch move, nested sampling) at m <= 3: the forward is 1.6-1.7x faster and the value measured within sd 0.012 of float64 across the posterior at every m <= 3 row tried. Never with a gradient sampler (its gradient is 1.6-1.8 posterior sigma off at m = 2, s/e 300), and not at m >= 4, where on bright, densely sampled data its value is 2-4x worse than the default's at m = 4 (sd 0.05-0.09) and up to 15x at m = 6. |
 | `block` | `1024` | raise to 4096 for speed (3.2x on the gradient path); lower it if the gradient's peak memory does not fit. Accuracy no longer depends on it. |
@@ -626,7 +626,8 @@ marked as an estimate.
   so in practice from smaller N above it. On the forward alone a 12-core
   celerite2 pool is 2.3x faster than the kernel at m = 6 (docs/benchmarks.md).
   (Per-instrument jitter was the other
-  half of this entry until M5 stage 2 put it in the kernel, up to 8.)
+  half of this entry until M5 stage 2 put it in the kernel; uncapped since
+  2026-10-25.)
 * **Block count as an accuracy knob for one adjoint.** The backward seed
   amplifies block-element error through `eta_s - J_s mu`, which reaches
   only `dh` (the amplitude gradient). At the joint corner (`sigma/yerr =

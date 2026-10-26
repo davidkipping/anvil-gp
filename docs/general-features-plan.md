@@ -120,3 +120,40 @@ anvil's answer.
 The boundary plan's open items: the square-root backward (rotation at
 TESS 20-s, the 2-s floor), the kernel thread layout (m = 5-6 speed,
 m > 6), IV (deferred), the seed-3 margin, the >= 100x gate.
+
+## Item 1 done: `noise_fn` (2026-10-25)
+
+- **API.** `GPLogLike(..., noise_fn=)` with `noise_fn(v_noise, d)` -> the
+  total per-datum variance, `d` an `anvilgp.noise.NoiseData` (`yerr`,
+  `x` = `x_mean` or `t`, `inst`) sliced alike, since the reference path
+  evaluates per block; `ParamMap.noise` for its columns (raw model-space
+  values, last in `v`). `anvilgp.noise`: `NoiseModel` (fn + specs +
+  `natural`), `error_scale`, `scale_and_jitter`, each per instrument;
+  `make_target(noise=)`, with `n_jitter` defaulting to 0 then. Combining
+  `noise_fn` with `param_map.jitter` raises. The plan's `scale_hyper`
+  became the noise models' own bounded log-uniform specs.
+- **Kernel.** A third `_jitter_src` variant: a per-datum extra variance
+  `(npts, n_chains, 1)` in the residual's layout, read per observation,
+  with the backward writing each observation's variance adjoint. Checked
+  bit-identical in value and to 1e-7 in gradient against the compact
+  variant at m = 2, 4, 6. Cost at 1024 chains, with the array built and
+  laid out each call: m = 2 forward 1.04-1.10x, value + gradient
+  1.05-1.06x; m = 4 1.00x. So the default single jitter keeps its hoisted
+  read (bit-identical, no cost), and **several per-instrument jitters now
+  go per datum too: the compact variant and `MAX_JITTER` (eight) are
+  retired**; twelve jitters run on the kernel and match the MLX path.
+- **Floor.** `sqrt_blocks` floored the leaf variance at `r_ref / 2`, which
+  an error scale below 0.71 would hit; now `1e-6 r_ref`, the innovation
+  floor's default. Unchanged for every variance >= that.
+- **Found on the way.** MLX's float64 `exp` and `sin` are float32-accurate
+  (known; `special.exp_acc` / `sincos` exist for it), so a hand-written
+  `noise_fn` or `mean_fn` using `mx.exp` puts a float32 floor under `.hi`
+  (1e-5 in log L, and float64 finite differences off by 2%). The noise
+  models use `exp_acc`; the docs say so.
+- **Tests** (`tests/test_noise.py`): every path against the dense float64
+  oracle for m = 2, 4, 6 (float64 to 1e-8, float32 gradient to 1e-4 of
+  float64 differences); the error scale as an exact reparametrisation;
+  s = 0.3 over several kernel blocks; a convolved term's correction;
+  per-instrument noise; the refusals; kappa; `make_target`; the per-block
+  slicing; and the WASP reply's check as a general test -- an irregular
+  non-time input with a quarter of the spacings tied, both paths.

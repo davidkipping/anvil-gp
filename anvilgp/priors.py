@@ -263,12 +263,14 @@ def build_param_map(hypers: list[Hyper], n_mean: int = 0,
                     jitters: list[Hyper] | None = None,
                     offsets: list[Hyper] | None = None,
                     instrument: np.ndarray | None = None,
-                    order_groups: list[list[int]] | None = None):
+                    order_groups: list[list[int]] | None = None,
+                    n_noise: int = 0):
     """Assemble a :class:`~anvilgp.likelihood.ParamMap` and its spec hints.
 
-    Layout of ``v``: ``[mean block | kernel | jitters | offsets]``.  Returns
-    ``(param_map, spec_hints, names)``; the mean block's own specs are the
-    caller's business (they belong to the mean model, not to the GP).
+    Layout of ``v``: ``[mean block | kernel | jitters | offsets | noise]``.
+    Returns ``(param_map, spec_hints, names)``; the mean block's and the
+    noise block's own specs are the caller's business (they belong to the
+    mean model and the noise model, not to the GP's hyperparameters).
     """
     jitters = jitters or []
     offsets = offsets or []
@@ -290,9 +292,10 @@ def build_param_map(hypers: list[Hyper], n_mean: int = 0,
     emit(jitters, jit_params)
     emit(offsets, off_params)
 
-    pm = ParamMap(kernel=kernel, n_dim=idx, jitter=jit_params,
+    pm = ParamMap(kernel=kernel, n_dim=idx + n_noise, jitter=jit_params,
                   offset=off_params, instrument=instrument,
                   mean=slice(0, n_mean) if n_mean else None,
+                  noise=slice(idx, idx + n_noise) if n_noise else None,
                   order_groups=order_groups)
     return pm, specs, names
 

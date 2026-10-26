@@ -264,8 +264,8 @@ For example, `RotationTerm() + RotationTerm()` has `m = 8` and reports
 It returns `False` first of all when `GPPolicy(metal=False)` turned the
 kernel off — `(False, 'GPPolicy.metal is off')` means "you turned it off",
 not "unsupported"; the default, `metal=None`, takes the kernel wherever
-this says `True`. It also returns `False` for `m > 6`, for more than eight per-instrument jitters
-(`metal.MAX_JITTER`), and when `mx.fast.metal_kernel` is unavailable. A request that cannot be honoured
+this says `True`. It also returns `False` for `m > 6`, and when
+`mx.fast.metal_kernel` is unavailable. A request that cannot be honoured
 **warns and falls back** to the MLX path, which is correct but far
 slower — it does not fail silently. See [kernels.md](kernels.md) for the
 state dimension of each kernel and what combinations stay under the

@@ -61,7 +61,7 @@ from .elements import Element
 __all__ = ["scan_blocks", "scan_loglike", "reduce_blocks",
            "entry_states", "replay_blocks", "q_factor", "sqrt_blocks", "sqrt_scan",
            "backward_ckpt", "block_seeds_kernel",
-           "metal_available", "MAX_STATE", "MAX_JITTER",
+           "metal_available", "MAX_STATE",
            "MAX_ADJOINT_BUFFER_BYTES"]
 
 #: Largest adjoint buffer the kernel gradient will allocate.  The backward
@@ -109,13 +109,6 @@ MAX_ADJOINT_BUFFER_BYTES = _default_adjoint_budget()
 #: (docs/boundary-plan.md, follow-on step 2).  Above 6 the MLX path, until
 #: the element is moved to threadgroup memory.
 MAX_STATE = 6
-
-#: Largest number of jitter parameters the kernel accepts.  The backward
-#: holds one ``r_var`` adjoint accumulator per jitter in registers, so this
-#: is a register budget like :data:`MAX_STATE`, not an arbitrary limit.
-#: Eight covers every multi-instrument radial-velocity dataset I know of;
-#: above it the MLX path is correct and `metal_eligible` says so.
-MAX_JITTER = 8
 
 _SRC = """
     // Flat grid, chains fastest.  Two reasons.  Adjacent lanes then hold
@@ -329,24 +322,49 @@ def _jitter_src(src: str, n_jit: int) -> str:
 
     Two variants, on purpose.  With at most one jitter the variance is the
     same for every observation, so it is read **once per thread** -- which
-    is what the kernel has always done, and the single-jitter path must not
-    start paying a global read per observation for a feature it does not
-    use.  With several, the read moves inside the loop and is indexed by
-    the observation's instrument.
+    is what the kernel has always done, and the single-jitter path must
+    not start paying a global read per observation for a feature it does
+    not use.  ``n_jit < 0`` is a **per-datum** extra variance,
+    ``(npts, n_chains)`` in the residual's layout -- a general noise model
+    (`GPLogLike`'s ``noise_fn``), or several per-instrument jitters
+    expanded by label: read per observation, and the backward writes each
+    observation's variance adjoint.  Until 2026-10-25 several jitters had
+    their own variant, indexed by instrument with one adjoint accumulator
+    per jitter in registers, which capped them at eight (``MAX_JITTER``);
+    the per-datum one measured within 0-10% of it and has no cap.
     """
-    if n_jit <= 1:
+    if n_jit > 1:
+        raise ValueError(
+            f"{n_jit} compact jitters: pass several per-instrument jitters "
+            f"per datum, as jit2 of shape (npts, n_chains, 1)")
+    drv_acc = "drv_acc[JIT_IDX] += s_bar;"
+    drv_out = ("for (uint j = 0; j < NJIT; ++j)\n"
+               "        out_drv[ei * NJIT + j] = drv_acc[j];")
+    if n_jit < 0:
+        hoist = ""
+        per_obs = "float jit2v = jit2[GI * (uint)n_chains + chain];"
+        drv_acc = "out_drv[gi * (uint)n_chains + chain] = s_bar;"
+        drv_out = ""
+    else:
         hoist = ("float jit2v = (n_jit > 0) ? jit2[chain * (uint)n_jit] "
                  ": 0.0f;")
         per_obs = ""
-    else:
-        hoist = ""
-        per_obs = "float jit2v = jit2[chain * (uint)n_jit + (uint)inst[GI]];"
-    jit_idx = "0" if n_jit <= 1 else "(uint)inst[gi]"
-    return (src.replace("JIT_HOIST", hoist)
+    jit_idx = "0"
+    return (src.replace("DRV_ACC", drv_acc)
+               .replace("DRV_OUT", drv_out)
+               .replace("JIT_HOIST", hoist)
                .replace("JIT_PER_OBS_T", per_obs.replace("GI", "t"))
                .replace("JIT_PER_OBS", per_obs.replace("GI", "gi"))
                .replace("JIT_IDX", jit_idx)
                .replace("NJIT", str(max(1, n_jit))))
+
+
+def _n_jit_of(jit2: mx.array) -> int:
+    """The jitter variant ``jit2``'s shape asks for: ``(n_chains, n_jit)``
+    per instrument, ``(npts, n_chains, 1)`` per datum (-1), else none."""
+    if jit2.ndim == 3:
+        return -1
+    return jit2.shape[1] if jit2.ndim == 2 else 0
 
 
 def _ell_src(src: str, with_ell: bool) -> str:
@@ -368,17 +386,14 @@ def _ell_src(src: str, with_ell: bool) -> str:
 
 
 def _jit_key(n_jit: int) -> int:
-    """Cache key for the jitter variant.
-
-    0 and 1 share: both use the hoisted read, whose ternary handles the
-    no-jitter case, and both substitute ``NJIT = 1``.  Above that each count
-    needs its **own** kernel, because ``NJIT`` sizes the backward's
-    accumulator and strides its output -- collapsing 2 and 3 into one
-    variant made a 3-jitter problem reuse the 2-jitter kernel, write
-    ``drv_acc[2]`` out of bounds and stride ``out_drv`` wrongly, for a 0.44
-    relative error in the jitter gradients with the *value* still right.
+    """Cache key for the jitter variant: 0 for none or one jitter (both use
+    the hoisted read, whose ternary handles the no-jitter case), ``"d"``
+    per datum.  (When several compact jitters had a variant, each count
+    needed its own key: ``NJIT`` sized the backward's accumulator, and
+    sharing one kernel between 2 and 3 wrote out of bounds, for a 0.44
+    relative error in the jitter gradients with the value still right.)
     """
-    return 0 if n_jit <= 1 else n_jit
+    return "d" if n_jit < 0 else 0
 
 
 def _formal_src(src: str, formal: bool) -> str:
@@ -1007,7 +1022,7 @@ _SRC_BWD_CKPT = """
                 ch_bar[i] += kg_bar[i] / sv;
                 s_bar -= kg_bar[i] * kg[i] / sv;
             }
-            drv_acc[JIT_IDX] += s_bar;
+            DRV_ACC
             float hch_bar = clamped ? 0.0f : s_bar;
             for (uint i = 0; i < M; ++i) {
                 h_bar[i] += hch_bar * ch[i];
@@ -1087,8 +1102,7 @@ _SRC_BWD_CKPT = """
             }
     }
     for (uint i = 0; i < M; ++i) out_dh[ei * M + i] = h_bar[i];
-    for (uint j = 0; j < NJIT; ++j)
-        out_drv[ei * NJIT + j] = drv_acc[j];
+    DRV_OUT
 """
 
 
@@ -1159,12 +1173,13 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
     slen = _SUB_LEN.get(m, 8) if sub_len is None else int(sub_len)
     n_blocks = (npts + blk_len - 1) // blk_len
     n_ckpt = (blk_len + slen - 1) // slen
-    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    n_jit = _n_jit_of(jit2)
     n_slots = int(n_slots)
     shapes = [(n_chains, n_slots, m, m),
               (n_chains, n_slots, m, m),
               (n_chains, n_blocks, m), (npts, n_chains),
-              (n_chains, n_blocks, max(1, n_jit)),
+              ((npts, n_chains, 1) if n_jit < 0
+               else (n_chains, n_blocks, max(1, n_jit))),
               (n_chains, n_blocks, n_ckpt, m + m * m)]
     outs = _bwd_ckpt_kernel(m, slen, n_jit, formal)(
         inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
@@ -1605,7 +1620,7 @@ def replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     npts = resid.shape[0]
     n_blocks = ent_m.shape[1]
-    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    n_jit = _n_jit_of(jit2)
     outs = _replay_kernel(m, n_jit, formal)(
         inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
@@ -1757,9 +1772,12 @@ _SRC_SQRT_BLOCKS = """
             // The leaf's white noise.  A convolved term's exposure
             // correction rides in jit2v and can be negative (Matern-5/2:
             // >= -4.6e-8 k(0) inside the guard); c2 below needs it positive.
-            // Floored at r_ref / 2, which never binds otherwise -- jitter
-            // is a variance -- so every other term is bit-identical.
-            float rv = max(r_ref[gi] + jit2v, 0.5f * r_ref[gi]);
+            // Floored at 1e-6 r_ref, the innovation floor's default
+            // (GPPolicy.s_floor_rel): a `noise_fn` may legitimately go
+            // below r_ref (an error scale s < 1), so the floor that was
+            // r_ref / 2 until 2026-10-25 would have bound there.  It never
+            // binds for a variance >= 1e-6 r_ref, so those are unchanged.
+            float rv = max(r_ref[gi] + jit2v, 1.0e-6f * r_ref[gi]);
             uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
             float Ph[MDIM][MDIM], LQ[MDIM][MDIM];
             for (uint i = 0; i < M; ++i)
@@ -1998,7 +2016,7 @@ def sqrt_blocks(phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
         raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
     npts = resid.shape[0]
     n_blocks = start_m.shape[1]
-    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    n_jit = _n_jit_of(jit2)
     shapes = [(n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m)]
@@ -2370,7 +2388,7 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
     if n_blocks is None:
         n_blocks = (npts + blk_len - 1) // blk_len
-    n_jit = jit2.shape[1] if jit2.ndim == 2 else 0
+    n_jit = _n_jit_of(jit2)
 
     shapes = [(n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
@@ -2555,8 +2573,10 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         # d_rv is (n_chains, n_blocks, n_jit): the kernel split the r_var
         # adjoint by the observation's instrument, so summing over blocks
         # gives each jitter parameter its own gradient.
-        n_jit = j2.shape[1] if j2.ndim == 2 else 0
-        d_j2 = (mx.zeros_like(j2) if n_jit == 0
+        # Per datum (`noise_fn`) the kernel wrote each observation's own
+        # adjoint, already in ``j2``'s (npts, n_chains, 1) shape.
+        n_jit = _n_jit_of(j2)
+        d_j2 = (d_rv if n_jit < 0 else mx.zeros_like(j2) if n_jit == 0
                 else mx.sum(d_rv, axis=1)[:, :n_jit])
         # Slots -> the per-lag table the term front end differentiates.
         # Distinct blocks own disjoint slots, so the blocks are already

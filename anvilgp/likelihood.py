@@ -132,8 +132,8 @@ class GPPolicy:
     #: the more accurate path on bright, densely sampled data (value and
     #: gradient), the only one whose gradient runs at N ~ 1e5, and 17-200x
     #: faster (docs/boundary-plan.md, I).  Differentiable since M4: the
-    #: kernel carries its own VJP.  Limits: m <= 6 and at most
-    #: :data:`anvilgp.metal.MAX_JITTER` per-instrument jitters.  The
+    #: kernel carries its own VJP.  Limits: m <= 6 (any number of
+    #: per-instrument jitters, and any `noise_fn`, since 2026-10-25).  The
     #: gradient's adjoint buffer is one slot per ``(block, lag)`` pair
     #: that *occurs*, so it is bounded by N rather than by N x blocks,
     #: and an irregular cadence is affordable at m = 2 (3.05 GiB at 1024
@@ -300,6 +300,9 @@ class ParamMap:
     kernel: list[KernelParam]
     n_dim: int
     mean: slice | None = None
+    #: the columns `GPLogLike`'s ``noise_fn`` reads, raw model-space values
+    #: like the mean block's (their ``0`` is not a reference)
+    noise: slice | None = None
     jitter: list[KernelParam] = field(default_factory=list)
     offset: list[KernelParam] = field(default_factory=list)
     instrument: np.ndarray | None = None
@@ -424,11 +427,36 @@ class GPLogLike:
     Sorted input is required (unsorted raises).  Duplicate timestamps are
     legal: celerite2 accepts them, and ``dt = 0`` gives ``Phi = I``,
     ``Q = 0`` exactly here, with no NaN.
+
+    ``noise_fn(v_noise, d)`` is the general noise model, celerite2's
+    ``diag``: the **total** per-datum noise variance ``(n_chains, m)``,
+    from the noise columns of ``v`` (``param_map.noise``, raw model-space
+    values) and ``d``, an `anvilgp.noise.NoiseData` of per-datum arrays
+    sliced alike (``yerr``, the abscissa ``x`` -- ``x_mean`` if given,
+    else ``t`` -- and the instrument labels).  It must act pointwise along
+    the data axis: the reference path evaluates it per block.  ``None``
+    keeps ``yerr^2 + jitter^2`` from ``param_map.jitter``; the two cannot
+    be combined (write the jitter into ``noise_fn``).  `anvilgp.noise` has
+    the common forms, and says why a hand-written one should use
+    `special.exp_acc` rather than ``mx.exp``.  The variance must stay above
+    ``s_floor_rel * yerr^2`` (1e-6 by default), where the innovation floor
+    starts to bind.
     """
 
     def __init__(self, mean_fn, t, x_mean, y, yerr, kernel_spec: Term,
-                 param_map: ParamMap, policy: GPPolicy | None = None):
+                 param_map: ParamMap, policy: GPPolicy | None = None,
+                 noise_fn=None):
         self.mean_fn = mean_fn
+        self.noise_fn = noise_fn
+        if param_map.noise is not None and noise_fn is None:
+            raise ValueError(
+                "`param_map.noise` is set but `noise_fn` is None: the noise "
+                "columns would be sampled but inert.")
+        if noise_fn is not None and param_map.jitter:
+            raise ValueError(
+                "`noise_fn` gives the whole noise variance, so it cannot be "
+                "combined with `param_map.jitter`; write the jitter into "
+                "`noise_fn` (see `anvilgp.noise.scale_and_jitter`).")
         self.term = kernel_spec
         self.param_map = param_map
         #: The columns of ``v`` whose reference point is ``v = 0`` by
@@ -549,6 +577,10 @@ class GPLogLike:
         self._r_ref32 = mx.array((self._yerr64 ** 2).astype(np.float32))
         self._x_mean32 = (None if self._x_mean64 is None
                           else mx.array(self._x_mean64.astype(np.float32)))
+        # `noise_fn`'s abscissa: the mean model's own if there is one.
+        self._noise_x64 = (self._t64 if self._x_mean64 is None
+                           else self._x_mean64)
+        self._noise_x32 = mx.array(self._noise_x64.astype(np.float32))
         inst = param_map.instrument
         if inst is not None:
             # `mx.take` is silent on an out-of-range label -- it clamps or
@@ -802,7 +834,8 @@ class GPLogLike:
             r = r - off
 
         r_ref = r_ref[s:e]
-        jit2 = pm.jitter_var(v, sub)
+        jit2 = (self._noise_extra(v, r_ref, s, e) if self.noise_fn is not None
+                else pm.jitter_var(v, sub))
         # A convolved term is not a sum of exponentials below its exposure
         # width, and the difference at zero lag is a constant on the
         # diagonal.  It is a function of the sampled parameters, so it goes
@@ -814,6 +847,20 @@ class GPLogLike:
         r_var = mx.broadcast_to(r_var, r.shape)
         s_floor = self.policy.s_floor_rel * r_ref
         return phi, q, h, r, r_var, r_ref, s_floor
+
+    def _noise_extra(self, v: mx.array, r_ref: mx.array, s: int,
+                     e: int) -> mx.array:
+        """``noise_fn``'s variance minus ``r_ref`` over data ``[s, e)``,
+        ``(n_chains, e - s)``: the part the likelihood adds to the
+        reference variance, as it adds a jitter."""
+        from .noise import NoiseData
+        pm = self.param_map
+        vn = v[:, pm.noise] if pm.noise is not None else v[:, :0]
+        x = (self._noise_x32 if v.dtype == mx.float32
+             else mx.array(self._noise_x64, dtype=v.dtype))
+        inst = None if self._inst32 is None else self._inst32[s:e]
+        var = self.noise_fn(vn, NoiseData(mx.sqrt(r_ref), x[..., s:e], inst))
+        return mx.broadcast_to(var, (v.shape[0], e - s)) - r_ref
 
     @property
     def metal_block(self) -> int:
@@ -892,16 +939,12 @@ class GPLogLike:
 
     def metal_eligible(self) -> tuple[bool, str]:
         """Whether the fused kernel can serve this problem, and why not."""
-        from .metal import MAX_JITTER, MAX_STATE, metal_available
+        from .metal import MAX_STATE, metal_available
         if self.policy.metal is False:
             return False, "GPPolicy.metal is off"
         if self.term.n_state > MAX_STATE:
             return False, (f"m = {self.term.n_state} exceeds the kernel's "
                            f"register budget (max {MAX_STATE})")
-        if len(self.param_map.jitter) > MAX_JITTER:
-            return False, (f"{len(self.param_map.jitter)} jitter parameters "
-                           f"exceeds the kernel's per-thread accumulator "
-                           f"(max {MAX_JITTER})")
         if len(self.param_map.jitter) > 1 and self.param_map.instrument is None:
             return False, ("per-instrument jitter needs "
                            "param_map.instrument to say which datum is which")
@@ -1050,22 +1093,35 @@ class GPLogLike:
         off = pm.offsets(v, self._inst32)
         if off is not None:
             r = r - mx.swapaxes(off, 0, 1)
-        # The compact per-instrument form: the kernel indexes it per
-        # observation with `_inst32`.  `jitter_var` would expand it to one
-        # column per datum, which is what the MLX path wants and the
-        # kernel does not.
-        jit = pm.jitter_var_per_instrument(v)
         # Same correction as the reference path.  It is per chain and
-        # applies to every observation, so it is added to *every* jitter
-        # column; with no jitter declared it becomes the one column, which
-        # is why stage 2's slot had to be additive rather than "the
-        # jitter".
+        # applies to every observation, so it is added to the jitter
+        # wherever it is; with no jitter declared it becomes the one
+        # column, which is why stage 2's slot had to be additive rather
+        # than "the jitter".
         corr = self.term.diag_correction(pm.kernel_params(v))
-        if corr is not None:
-            jit = corr if jit is None else jit + corr
-        n_col = max(len(pm.jitter), 1) if corr is not None else len(pm.jitter)
-        jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
-                else mx.broadcast_to(jit, (n, n_col)))
+        if self.noise_fn is not None or len(pm.jitter) > 1:
+            # Per datum, (npts, n_chains, 1) in the residual's layout: the
+            # kernel reads it per observation and writes its adjoint per
+            # observation (`metal._jitter_src`).  Several per-instrument
+            # jitters go this way too since 2026-10-25 -- measured within
+            # 0-10% of the old compact per-instrument variant, which kept
+            # one adjoint accumulator per jitter in registers and capped
+            # them at eight.
+            if self.noise_fn is not None:
+                extra = self._noise_extra(v, self._r_ref32, 0, self.n_data)
+            else:
+                extra = mx.take(pm.jitter_var_per_instrument(v),
+                                self._metal_inst, axis=1)
+            if corr is not None:
+                extra = extra + corr
+            jit2 = mx.swapaxes(extra, 0, 1)[:, :, None]
+        else:
+            # One jitter or none: one value per chain, read once per thread.
+            jit = pm.jitter_var_per_instrument(v)
+            if corr is not None:
+                jit = corr if jit is None else jit + corr
+            jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
+                    else mx.broadcast_to(jit, (n, 1)))
 
         # scan_loglike, not scan_blocks + tree_reduce here: the
         # differentiation boundary has to enclose the reduction so the
@@ -1252,9 +1308,19 @@ class GPLogLike:
         n = v.shape[0]
         if self._kappa_dt is None:
             return mx.zeros((n,), dtype=v.dtype)
-        r = mx.array(self._kappa_r, dtype=v.dtype)
-        jit = self.param_map.jitter_var_per_instrument(v)
-        w = mx.broadcast_to(r if jit is None else r + jit, (n, r.shape[0]))
+        if self.noise_fn is not None:
+            # A per-datum variance: its geometric mean over the data, the
+            # analogue of the median error bar the jitter form uses.
+            rr = (self._r_ref32 if v.dtype == mx.float32
+                  else mx.array(self._yerr64 ** 2, dtype=v.dtype))
+            var = self._noise_extra(v, rr, 0, self.n_data) + rr
+            w = mx.exp(mx.mean(mx.log(mx.maximum(var, 1e-38)), axis=-1,
+                               keepdims=True))
+        else:
+            r = mx.array(self._kappa_r, dtype=v.dtype)
+            jit = self.param_map.jitter_var_per_instrument(v)
+            w = mx.broadcast_to(r if jit is None else r + jit,
+                                (n, r.shape[0]))
         if (tables is not None and self._kappa_row is not None
                 and not self._has_p_inf):
             q, h = (mx.stop_gradient(x) for x in tables)

@@ -383,15 +383,32 @@ tool, at `O(N^3)`.
 
 ## Other limits worth knowing
 
-**Per-instrument jitter, up to eight instruments.** The kernel used to
-accept one jitter only; since 2026-09-27 it indexes the jitter per
-observation from `param_map.instrument`, and the backward gives each
-instrument its own gradient. The cap is `metal.MAX_JITTER = 8`, a register
-budget like `m <= 6` rather than an arbitrary limit; above it
-`metal_eligible()` refuses and the MLX path is correct. Several jitters
-require `param_map.instrument`, whose labels are range-checked at
-construction — an out-of-range label used to pass silently through
-`mx.take`. Per-instrument *offsets* were already supported on both paths.
+**Noise models.** The observation variance defaults to `yerr^2 +
+jitter^2`, with one jitter or one per instrument (any number since
+2026-10-25; until then the kernel kept their gradients in registers and
+capped them at eight). For anything else, pass `noise_fn` -- celerite2's
+`diag` -- giving the **total** per-datum variance from your own
+parameters, the error bars, the abscissa and the instrument labels;
+gradients come from autodiff, on the fused kernel too (it reads the
+variance per observation and writes its adjoint per observation, within
+0-10% of the single-jitter cost). `anvilgp.noise` has the common forms,
+for `make_target(noise=...)`:
+
+```python
+noise.error_scale()                 # (s yerr)^2: error bars right up to a factor
+noise.scale_and_jitter(yerr)        # (s yerr)^2 + j^2
+noise.error_scale(n_instruments=3)  # one s per instrument (pass instrument=)
+```
+
+A hand-written `noise_fn` must act pointwise along the data, and should
+use `anvilgp.special.exp_acc` rather than `mx.exp`: MLX's float64 `exp`
+is only float32-accurate, which would put a float32 floor under the
+float64 `.hi` path. Keep the variance above `1e-6 yerr^2`, where the
+innovation floor (`GPPolicy.s_floor_rel`) binds. Several jitters or
+per-instrument noise require `param_map.instrument`, whose labels are
+range-checked at construction — an out-of-range label used to pass
+silently through `mx.take`. Per-instrument *offsets* are supported on both
+paths.
 
 **Mean models** are supported on both paths: pass `mean_fn` and
 `mean_specs` to `make_target`, or `mean_fn` to `GPLogLike`.

@@ -331,7 +331,9 @@ def boundary_from(source):
         blk = rest[-1]
         j2 = np.array(jit2)
         rr = np.array(r_ref)
-        if j2.shape[1] == 0:
+        if j2.ndim == 3:            # per datum, (npts, n_chains, 1)
+            jv = j2[:, :, 0].T
+        elif j2.shape[1] == 0:
             jv = np.zeros((phi_tab.shape[0], 1), np.float32)
         elif j2.shape[1] == 1:
             jv = j2

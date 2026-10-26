@@ -58,6 +58,8 @@ class GPTarget:
     names: list[str]
     hypers: list
     param_map: object
+    #: the `anvilgp.noise.NoiseModel` whose columns end ``v``, or None
+    noise: object = None
 
     def u0(self, n_chains: int, seed: int = 0, spread: float = 0.05,
            units: str = "u"):
@@ -135,16 +137,26 @@ class GPTarget:
         (a periodogram peak at the edge of its grid) would map to infinity,
         so the result is clipped to ``|u| <= U_REF_MAX``.
         """
-        n_mean = self.transform.dim - len(self.hypers)
+        n_mean, n_noise = self._n_mean(), self._n_noise()
         u = self.transform.from_model_np(np.zeros(self.transform.dim))
         u[:n_mean] = 0.0
+        # The noise model's columns are raw values like the mean model's:
+        # its box's centre (u = 0) is the start, e.g. s = 1 for a scale
+        # log-uniform on [0.1, 10].
+        u[self.transform.dim - n_noise:] = 0.0
         return np.clip(u, -self.U_REF_MAX, self.U_REF_MAX)
+
+    def _n_noise(self) -> int:
+        return 0 if self.noise is None else len(self.noise.specs)
+
+    def _n_mean(self) -> int:
+        return self.transform.dim - len(self.hypers) - self._n_noise()
 
     def _prior_sd_in_u(self) -> np.ndarray:
         """Each column's prior standard deviation, mapped to ``u`` at
         :meth:`u_ref`; 1.0 where there is no prior width to use."""
         specs = self.transform.specs
-        n_mean = len(specs) - len(self.hypers)
+        n_mean = self._n_mean()
         jac = self.transform.jacobian_np(self.u_ref())
         out = np.ones(len(specs))
         for j, h in enumerate(self.hypers):
@@ -184,16 +196,23 @@ class GPTarget:
                 if key.startswith(p):
                     key = key[len(p):]
             out[key] = allc[..., i]
+        if self.noise is not None:
+            vn = np.asarray(v_model, dtype=np.float64)[..., pm.noise]
+            if self.noise.natural is not None:
+                out.update(self.noise.natural(vn))
+            else:
+                out.update({s.name: vn[..., i]
+                            for i, s in enumerate(self.noise.specs)})
         return out
 
 
 def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
                 mean_specs: list[SpecHint] | None = None,
-                n_jitter: int = 1, n_offset: int = 0,
+                n_jitter: int | None = None, n_offset: int = 0,
                 instrument: np.ndarray | None = None,
                 order_groups: list[list[int]] | None = None,
                 policy: GPPolicy | None = None,
-                seed_period: bool = False) -> GPTarget:
+                seed_period: bool = False, noise=None) -> GPTarget:
     """Build a ready-to-sample GP target with shipped defaults.
 
     Parameters
@@ -218,7 +237,8 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         columns of the model vector; the GP's own parameters follow.
     n_jitter, n_offset
         How many per-instrument jitters and mean offsets to sample.  With
-        more than one of either, pass ``instrument``.
+        more than one of either, pass ``instrument``.  ``n_jitter``
+        defaults to 1, or 0 with a ``noise`` model.
     instrument
         ``(n_data,)`` integers assigning each datum to an instrument.
     order_groups
@@ -233,6 +253,11 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         kernel wherever it is eligible (since 2026-10-25) and the MLX path
         otherwise; ``GPPolicy(metal=False)`` forces the MLX path.  The
         returned target declares ``supports_grad=True`` on both paths.
+    noise
+        An `anvilgp.noise.NoiseModel` (e.g. ``noise.error_scale()``), the
+        whole per-datum noise variance in place of ``yerr^2 + jitter^2``.
+        Its parameters end the model vector, raw values within its specs'
+        bounds; ``u0`` starts them at the centre of each box.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic
@@ -245,6 +270,14 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         ``.loglike``, ``.names``, ``.hypers`` and ``.param_map``.
     """
     engine = import_engine()
+    if n_jitter is None:
+        n_jitter = 0 if noise is not None else 1
+    if noise is not None and n_jitter:
+        raise ValueError(
+            "`noise` gives the whole noise variance, so it cannot be "
+            "combined with `n_jitter` > 0; use a noise model that includes "
+            "a jitter (`anvilgp.noise.scale_and_jitter`).")
+    noise_specs = [] if noise is None else list(noise.specs)
 
     period_ref = periodogram_period(t, y) if seed_period else None
     hypers = default_hypers(term, t, y, yerr, period_ref=period_ref)
@@ -258,14 +291,17 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         order_groups = auto_order_groups(term)
     pm, specs, names = build_param_map(
         hypers, n_mean=len(mean_specs), jitters=jitters, offsets=offsets,
-        instrument=instrument, order_groups=order_groups or None)
+        instrument=instrument, order_groups=order_groups or None,
+        n_noise=len(noise_specs))
 
     loglike = GPLogLike(mean_fn, t, x_mean, y, yerr, term, pm,
-                        policy or GPPolicy())
+                        policy or GPPolicy(),
+                        noise_fn=None if noise is None else noise.fn)
     log_prior = make_log_prior(hypers, jitters, offsets,
                                n_mean=len(mean_specs))
 
-    transform = engine.Transform([s.to_anvil() for s in mean_specs + specs])
+    transform = engine.Transform([s.to_anvil()
+                                  for s in mean_specs + specs + noise_specs])
 
     def model_log_prob(v):
         return loglike(v) + log_prior(v)
@@ -286,5 +322,7 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
     target = engine.TransformedLogDensity(
         model_log_prob, transform, model_log_prob_hi=model_log_prob_hi)
     return GPTarget(target=target, transform=transform, loglike=loglike,
-                    names=[s.name for s in mean_specs] + names,
-                    hypers=hypers + jitters + offsets, param_map=pm)
+                    names=([s.name for s in mean_specs] + names
+                           + [s.name for s in noise_specs]),
+                    hypers=hypers + jitters + offsets, param_map=pm,
+                    noise=noise)
