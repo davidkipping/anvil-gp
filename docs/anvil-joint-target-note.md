@@ -1,6 +1,6 @@
 # Note for anvil: a joint target over several log-densities with shared parameters
 
-**Draft, 2026-10-25 -- not sent.** From anvil-gp. Read against anvil
+**2026-10-25.** From anvil-gp. Read against anvil
 0.11.0 (`231d41f`): `transforms.py`, `logdensity.py`, `precision.py`,
 `engine.py`, `diagnostics.py`, `priors.py`. Where something below is
 inferred rather than read, it says so.

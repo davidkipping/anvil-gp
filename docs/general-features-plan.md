@@ -2,7 +2,7 @@
 
 Agreed 2026-10-25. Prompted by the WASP103b_CHEOPS brief
 (`WASP103b_CHEOPS/docs/upstream/anvil-gp_prompt.md`; reply sent as
-`anvil-gp_reply.md` beside it, our copy `docs/wasp103-reply-draft.md`),
+`anvil-gp_reply.md` beside it, our copy `docs/wasp103-reply.md`),
 but scoped as general library features: anvil-gp is a general-purpose,
 celerite2-like O(N) GP library for MLX, and nothing here is specific to
 one science case.

@@ -53,6 +53,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/anvil-chees-production-reply.md](docs/anvil-chees-production-reply.md) | anvil's reply to the production note: agrees with `kappa_max`, no trimmed statistic, `warmup_report` climbing-chain fix in 0.7.1 |
 | [docs/anvil-0.10.2-fused-kernel-test-note.md](docs/anvil-0.10.2-fused-kernel-test-note.md) | anvil's note: on 0.10.2 the fused-kernel ChEES test's width check fails, inflated by a few lost chains |
 | [docs/anvil-0.10.2-fused-kernel-test-reply.md](docs/anvil-0.10.2-fused-kernel-test-reply.md) | Our reply: the lost chains are still climbing back (not trapped, not at the float32 boundary); the test now takes the median per-chain width |
+| [docs/anvil-joint-target-note.md](docs/anvil-joint-target-note.md) | Note to anvil proposing a joint target over several log-densities with shared parameters, composed in model space; one API request (expose `model_log_prob` / `model_log_prob_hi`) |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
