@@ -129,12 +129,18 @@ def test_gram_gradients(path):
         assert np.abs(gy[c] - want_y).max() < tol * np.abs(want_y).max()
 
 
-def test_gram_refuses_what_the_likelihood_refuses():
-    gp, _ = _gp(True)
+@pytest.mark.parametrize("path", ["kernel", "mlx", "float64"])
+def test_gram_refuses_what_the_likelihood_refuses(path):
+    """Every path, float64 included: until 2026-10-26 the float64 route
+    skipped the refusals `hi` applies and returned a finite Gram for a
+    chain at kappa 5.5e18."""
+    gp, _ = _gp(path == "kernel")
     gp.policy.kappa_max = 1e6
-    v = mx.array([[0.0, 0.0, 0.0], [20.0, 30.0, 0.0]])   # 2nd: kappa >> max
-    with mx.stream(mx.gpu):
-        G = np.array(gp.gram(v, _Y(n=2)))
+    rows = [[0.0, 0.0, 0.0], [20.0, 30.0, 0.0]]          # 2nd: kappa >> max
+    dtype = mx.float64 if path == "float64" else mx.float32
+    with mx.stream(mx.cpu if path == "float64" else mx.gpu):
+        G = np.array(gp.gram(mx.array(rows, dtype=dtype),
+                             mx.array(_Y(n=2), dtype=dtype)))
     assert np.all(np.isfinite(G[0])) and np.all(np.isnan(G[1]))
 
 

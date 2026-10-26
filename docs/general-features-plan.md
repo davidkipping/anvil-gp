@@ -240,7 +240,10 @@ implementation and the test oracle; the multi-column kernel next.
   likelihood once on all `1 + k(k+1)/2` combinations as extra chains
   (`_raw_resid`, a residual supplied in place of y - mean on every path),
   polarise into the Gram matrix, small solves by `linalg.inv_logdet`. A
-  refused chain or a singular basis gets the failure value.
+  refused chain or a singular basis gets the failure value. (Revised
+  2026-10-26 after review: a Gaussian prior makes a singular basis
+  proper, and it was getting a wrong value; see docs/review-2026-10-26.md,
+  "A2 as fixed".)
 - **Accuracy.** float64: the brute-force quadrature over beta of the plain
   likelihood (the acceptance test asked for) to 1e-8 relative; the
   Gaussian prior against the dense marginal; `linear_posterior` against

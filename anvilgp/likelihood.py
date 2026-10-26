@@ -71,6 +71,16 @@ __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
 _LARGE_NEGATIVE = -1e30
 #: anything at or below this is a sanitised failure, not a real value.
 _FAILED = 0.5 * _LARGE_NEGATIVE
+#: Ridge on the linear marginal's unit-diagonal centring fit (`_marginal`):
+#: the marginal is exactly invariant to the centre, so this only keeps a
+#: singular basis finite.
+_RIDGE = (1e-7, 1e-15)                                  # float32, float64
+#: ``log|R|`` of the basis's unit-diagonal white-noise normal equations
+#: below which it counts as rank-deficient (`_marginal`), float32 and
+#: float64; well above the ridge.  For two columns ``|R| = 1 - rho^2``:
+#: 1e-5 is a white-noise correlation of 0.999995, where the float32
+#: marginal was already off by 1e-2 to 52 log-units (review 2026-10-26, A3).
+_COLLINEAR_LOG_R = (math.log(1e-5), math.log(1e-12))
 #: |v| beyond which the infeasible-region pull stops growing: keeps v**2
 #: (<= 1e30) and so the sentinel (>= -7e31) finite in float32.
 _PULL_CLIP = 1e15
@@ -457,6 +467,21 @@ class GPLogLike:
         self._linear_prior = (None if linear_prior is None else
                               (np.asarray(linear_prior[0], np.float64),
                                np.asarray(linear_prior[1], np.float64)))
+        if self._linear_prior is not None:
+            mu_, s_ = self._linear_prior
+            if (mu_.ndim != 1 or s_.shape != (mu_.size, mu_.size)
+                    or not np.allclose(s_, s_.T)):
+                raise ValueError(
+                    "linear_prior must be (mu (p,), cov (p, p)) with cov "
+                    f"symmetric; got {mu_.shape} and {s_.shape}")
+            try:
+                ch = np.linalg.cholesky(s_)
+            except np.linalg.LinAlgError:
+                raise ValueError("linear_prior's covariance is not positive "
+                                 "definite") from None
+            #: ``S^-1`` and ``log|S|``, once in float64 (`_marginal`).
+            self._prior_prec = np.linalg.inv(s_)
+            self._prior_logdet = float(2.0 * np.sum(np.log(np.diag(ch))))
         if param_map.noise is not None and noise_fn is None:
             raise ValueError(
                 "`param_map.noise` is set but `noise_fn` is None: the noise "
@@ -1486,10 +1511,29 @@ class GPLogLike:
             log L = -1/2 r^T P r - 1/2 log|K| - 1/2 log|C| - (N - p)/2 log 2 pi,
             P = K^-1 - K^-1 Phi C^-1 Phi^T K^-1,
 
-        and a Gaussian prior N(mu, S) on beta adds
-        ``-1/2 (b - mu)^T (C^-1 + S)^-1 (b - mu) - 1/2 log|C^-1 + S|`` and
-        drops the ``p/2 log 2 pi``, with ``b = C^-1 Phi^T K^-1 r`` the
-        generalised least-squares estimate.
+        and a Gaussian prior N(mu, S) on beta gives the marginal density of
+        ``r`` under covariance ``K + Phi S Phi^T`` about ``Phi mu``.  That is
+        formed in the precision form, ``M = C + S^-1``,
+
+            e^T (K + Phi S Phi^T)^-1 e = e^T K^-1 e - h^T M^-1 h,
+            log|K + Phi S Phi^T| = log|K| + log|S| + log|M|,
+
+        with ``e = r - Phi mu`` and ``h = Phi^T K^-1 e``, which never inverts
+        ``C``: a basis that is rank-deficient (an all-zero column, a global
+        level beside one offset per instrument) is a well-defined model
+        under a proper prior, which an earlier ``(C^-1 + S)`` form gave the
+        failure value or, for collinear columns, a finite wrong one (240
+        log-units on the kernel).  Exactly collinear columns are still
+        refused in float32, which cannot resolve their degenerate direction
+        (see the refusal below); float64 evaluates them.  It is expanded about the centring fit below
+        (``rc = r - Phi beta0``, ``m = mu - beta0``) as
+
+            quad = a - b^T M^-1 b - 2 b^T w + w^T C m,   w = M^-1 S^-1 m,
+
+        with ``a = rc^T K^-1 rc`` and ``b = Phi^T K^-1 rc``, so that no term
+        is a difference of large numbers whether the prior is broad or
+        tight (the plain ``m^T S^-1 m - ...`` form cancels ``S^-1`` against
+        itself when the prior is much tighter than the data).
 
         Everything needed is the Gram matrix ``[r Phi]^T K^-1 [r Phi]`` and
         ``log|K|``, which come from the existing likelihood by polarisation:
@@ -1514,8 +1558,10 @@ class GPLogLike:
         moves ``log|C|`` by a constant.  ``beta0`` and the scales are under
         ``stop_gradient``: any value is exact, so the gradient is too.
 
-        Returns ``(log L, b, C^-1)`` -- the last two for
-        :meth:`linear_posterior`.
+        Returns ``(log L, mean, cov)``, the linear parameters' conditional
+        posterior for :meth:`linear_posterior`: ``b = C^-1 Phi^T K^-1 r``
+        and ``C^-1`` under the flat prior, ``beta0 + M^-1 (Phi^T K^-1 rc +
+        S^-1 m)`` and ``M^-1`` under the Gaussian one.
         """
         from .linalg import inv_logdet_fast as inv_logdet
         from .metal import (MAX_NORMAL_EQ_COLS, metal_available,
@@ -1546,18 +1592,30 @@ class GPLogLike:
             a_mat, a_r = normal_equations(
                 mx.stop_gradient(mx.swapaxes(phi_own, 1, 2)),
                 mx.stop_gradient(r), 1.0 / r_ref)
-            a_inv, _ = inv_logdet(a_mat)
-            beta0 = mx.stop_gradient((a_inv @ a_r[..., None])[..., 0])
-            phi_w2 = mx.diagonal(a_mat, axis1=1, axis2=2)
         else:
-            a_w = mx.swapaxes(phi * w, 1, 2)                    # (n, p, N)
-            a_inv, _ = inv_logdet(a_w @ phi)
-            beta0 = mx.stop_gradient((a_inv @ (a_w @ r[..., None]))[..., 0])
-            phi_w2 = mx.sum(phi * phi * w, 1)
+            a_w = mx.stop_gradient(mx.swapaxes(phi * w, 1, 2))  # (n, p, N)
+            a_mat = a_w @ mx.stop_gradient(phi)
+            a_r = (a_w @ mx.stop_gradient(r)[..., None])[..., 0]
+        # Any beta0 is exact, so the fit is ridged on the unit-diagonal
+        # normal equations: a singular basis (a zero column, collinear
+        # columns -- well defined under a Gaussian prior) still gets a
+        # finite, sensible centre.  A zero column is centred at 0 and keeps
+        # scale 1, and is no evidence of collinearity (`log_ra` below).
+        phi_w2 = mx.diagonal(a_mat, axis1=1, axis2=2)
+        live = phi_w2 > 0
+        dn = mx.where(live, mx.sqrt(mx.maximum(phi_w2, 1e-30)), 1.0)
+        f64 = dtype == mx.float64
+        a_inv, log_ra = inv_logdet(
+            a_mat / (dn[:, :, None] * dn[:, None, :])
+            + (_RIDGE[f64] + mx.where(live, 0.0, 1.0))[:, None, :]
+            * mx.eye(p, dtype=dtype))
+        beta0 = mx.stop_gradient(
+            (a_inv @ (a_r / dn)[..., None])[..., 0] / dn)
         rc = r - (phi @ beta0[..., None])[..., 0]
         size = mx.maximum(mx.sum(rc * rc * w[..., 0], -1, keepdims=True),
                           float(N))
-        c = mx.stop_gradient(mx.sqrt(size / mx.maximum(phi_w2, 1e-30)))
+        c = mx.stop_gradient(mx.where(
+            live, mx.sqrt(size / mx.maximum(phi_w2, 1e-30)), 1.0))
 
         cols = mx.concatenate([rc[:, None, :],
                                mx.swapaxes(phi * c[:, None, :], 1, 2)], 1)
@@ -1565,32 +1623,61 @@ class GPLogLike:
                              if gram_fn is None else gram_fn(v, cols))
 
         a, b, cs = gram[:, 0, 0], gram[:, 0, 1:], gram[:, 1:, 1:]
-        cs_inv, logdet_cs = inv_logdet(cs)
-        cs_b = (cs_inv @ b[..., None])[..., 0]
-        rpr = a - mx.sum(b * cs_b, -1)
         log_c = mx.sum(mx.log(c), -1)
-        logdet_c = logdet_cs - 2.0 * log_c
-        beta = beta0 + c * cs_b                       # C^-1 Phi^T K^-1 r
-        cov = c[:, :, None] * cs_inv * c[:, None, :]  # C^-1
+
+        def mv(m_, x_):
+            return (m_ @ x_[..., None])[..., 0]
         if self._linear_prior is None:
-            out = (ell0 - 0.5 * rpr - 0.5 * logdet_c
+            cs_inv, logdet_cs = inv_logdet(cs)
+            cs_b = mv(cs_inv, b)
+            rpr = a - mx.sum(b * cs_b, -1)
+            beta = beta0 + c * cs_b                       # C^-1 Phi^T K^-1 r
+            cov = c[:, :, None] * cs_inv * c[:, None, :]  # C^-1
+            out = (ell0 - 0.5 * rpr - 0.5 * (logdet_cs - 2.0 * log_c)
                    + 0.5 * p * math.log(2.0 * math.pi))
         else:
-            mu = mx.array(self._linear_prior[0], dtype=dtype)
-            sig = mx.array(self._linear_prior[1], dtype=dtype)
-            if mu.shape != (p,) or sig.shape != (p, p):
+            if self._linear_prior[0].shape != (p,):
                 raise ValueError(
-                    f"linear_prior is (mu {tuple(mu.shape)}, cov "
-                    f"{tuple(sig.shape)}) but the basis has p = {p} columns")
-            d = (beta - mu) / c
-            s2_inv, logdet_s2 = inv_logdet(
-                cs_inv + sig / (c[:, :, None] * c[:, None, :]))
-            quad = mx.sum(d * (s2_inv @ d[..., None])[..., 0], -1)
-            out = (ell0 - 0.5 * rpr - 0.5 * quad - 0.5 * logdet_c
-                   - 0.5 * (logdet_s2 + 2.0 * log_c))
+                    f"linear_prior has {self._linear_prior[0].size} "
+                    f"parameters but the basis has p = {p} columns")
+            # In the scaled columns (beta = beta0 + c * gamma): the prior on
+            # gamma has mean ms = (mu - beta0) / c and precision
+            # ps = c c^T * S^-1.
+            mu = mx.array(self._linear_prior[0], dtype=dtype)
+            ps = (c[:, :, None] * mx.array(self._prior_prec, dtype=dtype)
+                  * c[:, None, :])
+            ms = (mu - beta0) / c
+            m_inv, logdet_m = inv_logdet(cs + ps)
+            w = mv(m_inv, mv(ps, ms))
+            m_b = mv(m_inv, b)
+            quad = (a - mx.sum(b * m_b, -1) - 2.0 * mx.sum(b * w, -1)
+                    + mx.sum(w * mv(cs, ms), -1))
+            beta = beta0 + c * (m_b + w)                  # posterior mean
+            cov = c[:, :, None] * m_inv * c[:, None, :]   # posterior cov
+            out = (ell0 - 0.5 * quad
+                   - 0.5 * (self._prior_logdet - 2.0 * log_c + logdet_m))
+        # A rank-deficient basis -- exactly collinear columns; a zero column
+        # is excluded above -- is improper under the flat prior.  In
+        # rounding its Gram can still invert to a finite, meaningless value
+        # (exactly parallel columns: smallest unit-diagonal eigenvalue
+        # 2.8e-4 by float32 polarisation), so it is refused by its own
+        # structure, the white-noise normal equations' unit-diagonal
+        # log-determinant, rather than by the K-weighted system (which a GP
+        # makes ill-conditioned for perfectly good bases).  Under a Gaussian
+        # prior the model is proper and float64 is exact, but float32
+        # resolves the degenerate direction only to the Gram's rounding:
+        # a global level beside per-instrument offsets was off by 4.6
+        # log-units on the kernel, with the p x p system's own determinant
+        # unable to tell.  So float32 refuses it under either prior.
+        # (The centring fit used to fail on such a basis and make the old
+        # code refuse it by accident.)
+        if self._linear_prior is None or not f64:
+            out = mx.where(log_ra < _COLLINEAR_LOG_R[f64],
+                           mx.array(float("nan"), dtype), out)
         # Every combination shares the chain's hyperparameters, so a refused
-        # chain is refused in all of them; a singular basis (collinear
-        # columns) makes the value non-finite.  Both get the failure value.
+        # chain is refused in all of them; under the flat prior a singular
+        # basis (collinear columns) makes the value non-finite.  Both get
+        # the failure value.  (Under a Gaussian prior it is finite.)
         out = mx.where(worst <= _FAILED, worst, out)
         return _sanitize(out, self._infeasible_pull(v)), beta, cov
 
@@ -1655,9 +1742,12 @@ class GPLogLike:
             xm = None if self._x_mean64 is None else a64(self._x_mean64)
             blk = _pow2(self.policy.hi_block)
 
-            def ev(vv, resid):
-                return self._evaluate(vv, dt, y, r_ref, xm, self._inst32, blk,
-                                      True, uniq=self._uniq64, resid=resid)
+            def ev(vv, resid):                  # refused as `hi` refuses
+                a_ = self._evaluate(vv, dt, y, r_ref, xm, self._inst32, blk,
+                                    True, uniq=self._uniq64, resid=resid)
+                return _sanitize(self._refuse_ill_conditioned(
+                    vv, self._refuse_outside_series(vv, a_)),
+                    self._infeasible_pull(vv))
             with mx.stream(mx.cpu):             # tiled over chains, as `hi`
                 blk_c = self.policy.hi_chain_block
                 parts = [self._gram_polarised(v[c:c + blk_c], ev,
@@ -1665,7 +1755,8 @@ class GPLogLike:
                          for c in range(0, n, blk_c)]
                 g = mx.concatenate([q[1] for q in parts])
                 worst = mx.concatenate([q[2] for q in parts])
-                bad = mx.logical_not(mx.isfinite(worst))
+                bad = mx.logical_or(mx.logical_not(mx.isfinite(worst)),
+                                    worst <= _FAILED)
         else:
             _, g, worst = (self._gram_metal(v, cols) if self._metal_ok
                            else self._gram_polarised(v, self._raw_resid, cols))
@@ -1707,7 +1798,8 @@ class GPLogLike:
 
         Under a flat prior the generalised least-squares estimate
         ``C^-1 Phi^T K^-1 r`` and ``C^-1``; under a Gaussian prior
-        ``N(mu, S)``, ``(C + S^-1)^-1 (C b + S^-1 mu)`` and ``(C + S^-1)^-1``.
+        ``N(mu, S)``, ``(C + S^-1)^-1 (Phi^T K^-1 r + S^-1 mu)`` and
+        ``(C + S^-1)^-1``, which exist even when ``C`` is singular.
         Draws of beta for reporting are one Gaussian draw per posterior
         sample of ``v``.  Tiled over chains by ``policy.hi_chain_block``, as
         :meth:`hi` is: in one batch the float64 evaluation held ~6 MB per
@@ -1739,15 +1831,7 @@ class GPLogLike:
                 parts.append((np.array(b), np.array(cv)))
             beta = np.concatenate([b for b, _ in parts])
             cov = np.concatenate([cv for _, cv in parts])
-        if self._linear_prior is None:
-            return beta, cov
-        mu, sig = self._linear_prior
-        prec = np.linalg.inv(cov) + np.linalg.inv(sig)
-        post_cov = np.linalg.inv(prec)
-        post_mean = np.einsum("cij,cj->ci", post_cov,
-                              np.einsum("cij,cj->ci", np.linalg.inv(cov), beta)
-                              + np.linalg.solve(sig, mu))
-        return post_mean, post_cov
+        return beta, cov
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`.

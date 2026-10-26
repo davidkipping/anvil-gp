@@ -178,7 +178,10 @@ def test_float32_value_and_gradient(metal):
     assert np.abs(g - G).max() / np.abs(G).max() < tol
 
 
-def test_a_collinear_basis_and_a_refused_chain_fail_cleanly():
+@pytest.mark.parametrize("metal", [False, True], ids=["mlx", "kernel"])
+def test_a_collinear_basis_and_a_refused_chain_fail_cleanly(metal):
+    """Under the flat prior a rank-deficient basis is an improper model:
+    the failure value, on both routes and in float64."""
     t, tc, y, yerr, shape = _setup()
     pm = ParamMap.log(KP)
 
@@ -186,10 +189,11 @@ def test_a_collinear_basis_and_a_refused_chain_fail_cleanly():
         col = mx.ones_like(m0)
         return mx.stack([col, 2.0 * col], axis=-1)     # rank 1
     gp = GPLogLike(None, t, None, y, yerr, TERM, pm,
-                   GPPolicy(metal=False, kappa_max=None), linear_basis=twice)
+                   GPPolicy(metal=metal, kappa_max=None), linear_basis=twice)
     with mx.stream(mx.gpu):
         out = np.array(gp(mx.zeros((1, 3))))
     assert out[0] <= -1e29
+    assert np.array(_hi(gp, np.zeros((1, 3))))[0] <= -1e29
 
     def ok(vm, x, m0):
         return mx.stack([mx.ones_like(m0),
@@ -202,6 +206,96 @@ def test_a_collinear_basis_and_a_refused_chain_fail_cleanly():
         g = np.array(mx.grad(lambda u: gp(u).sum())(v))
     assert np.isfinite(out[0]) and out[0] > -1e20 and out[1] <= -1e29
     assert np.all(np.isfinite(g))
+
+
+def _singular_basis(kind, t, tc):
+    """Rank-deficient bases that a proper prior makes well defined."""
+    inst = (np.arange(t.size) % 3 == 0).astype(np.float64)
+    if kind == "zero-column":
+        cols = np.stack([np.ones_like(t), np.zeros_like(t), t - tc], 1)
+    else:                       # a global level beside one offset each
+        cols = np.stack([np.ones_like(t), inst, 1.0 - inst], 1)
+    return cols
+
+
+@pytest.mark.parametrize("kind", ["zero-column", "level+offsets"])
+def test_a_gaussian_prior_makes_a_singular_basis_well_defined(kind):
+    """``C = Phi^T K^-1 Phi`` singular, the prior proper: the marginal is
+    the dense ``N(Phi mu, K + Phi S Phi^T)`` on every path, the posterior
+    the dense one, and the float32 gradient that of float64.  Until
+    2026-10-26 the Gaussian prior was formed through ``C^-1``: the zero
+    column got the failure value, and the level + offsets case a finite
+    WRONG value (240 log-units on the kernel, 3.7 in float64).  A zero
+    column is exactly zero in float32 too, so float32 resolves it; exact
+    collinearity it does not, and refuses (`_COLLINEAR_LOG_R`)."""
+    rng = np.random.default_rng(11)
+    t = np.arange(N) * CAD
+    tc, yerr, shape = float(t.mean()), np.full(N, 1e-4), None
+    cols = _singular_basis(kind, t, tc)
+    y = (cols @ np.array([0.01, 0.003, -0.002])
+         + sample_ssm(TERM, KP, CAD, N, rng) + yerr * rng.standard_normal(N))
+    mu, S = np.array([0.0, 0.0, 0.0]), np.diag([0.02, 0.01, 0.01]) ** 2
+
+    def basis(vm, x, m0):
+        return mx.array(cols, dtype=m0.dtype)
+    ref = []
+    for row in ROWS[:, 1:]:
+        K = dense_covariance(TERM, np.asarray(KP) * np.exp(row), t, yerr)
+        cov = K + cols @ S @ cols.T
+        d = y - cols @ mu
+        ref.append(-0.5 * (d @ np.linalg.solve(cov, d)
+                           + np.linalg.slogdet(cov)[1]
+                           + N * math.log(2 * math.pi)))
+    ref = np.array(ref)
+    for metal in (False, True):
+        gp = GPLogLike(None, t, None, y, yerr, TERM, ParamMap.log(KP),
+                       GPPolicy(metal=metal, kappa_max=None),
+                       linear_basis=basis, linear_prior=(mu, S))
+        with mx.stream(mx.gpu):
+            u = mx.array(ROWS[:, 1:], dtype=mx.float32)
+            lo = np.array(gp(u)).astype(np.float64) + gp.log_norm_const
+            g = np.array(mx.grad(lambda u: gp(u).sum())(u))
+        hi = _hi(gp, ROWS[:, 1:])
+        np.testing.assert_allclose(hi, ref, rtol=1e-10)
+        if kind == "level+offsets":
+            # Exactly collinear: float32 resolves the degenerate direction
+            # only to the Gram's rounding (4.6 log-units off on the kernel
+            # before it was refused), so float32 refuses it under either
+            # prior; float64, above, is exact.
+            assert np.all(lo <= -1e29), (metal, lo)
+            continue
+        assert np.abs(lo - ref).max() < 2e-3, (metal, np.abs(lo - ref))
+        G = np.zeros_like(ROWS[:, 1:])
+        for i in range(3):
+            dp = np.zeros(3)
+            dp[i] = 1e-6
+            G[:, i] = (_hi(gp, ROWS[:, 1:] + dp)
+                       - _hi(gp, ROWS[:, 1:] - dp)) / 2e-6
+        assert np.abs(g - G).max() / np.abs(G).max() < 1e-3, metal
+    mean, pcov = gp.linear_posterior(mx.array(ROWS[:, 1:]))
+    for c, row in enumerate(ROWS[:, 1:]):
+        K = dense_covariance(TERM, np.asarray(KP) * np.exp(row), t, yerr)
+        C = cols.T @ np.linalg.solve(K, cols)
+        want_c = np.linalg.inv(C + np.linalg.inv(S))
+        want_m = want_c @ (cols.T @ np.linalg.solve(K, y)
+                           + np.linalg.solve(S, mu))
+        np.testing.assert_allclose(mean[c], want_m, rtol=1e-8, atol=1e-12)
+        np.testing.assert_allclose(pcov[c], want_c, rtol=1e-8, atol=1e-16)
+
+
+def test_a_bad_linear_prior_is_refused():
+    t, tc, y, yerr, shape = _setup()
+
+    def basis(vm, x, m0):
+        return mx.ones_like(m0)[..., None]
+    for prior, match in [((np.zeros(1), -np.eye(1)), "positive definite"),
+                         ((np.zeros(2), np.eye(3)), "linear_prior must"),
+                         ((np.zeros(2), np.eye(2)), "p = 1")]:
+        with pytest.raises(ValueError, match=match):
+            gp = GPLogLike(None, t, None, y, yerr, TERM, ParamMap.log(KP),
+                           GPPolicy(metal=False), linear_basis=basis,
+                           linear_prior=prior)
+            _hi(gp, np.zeros((1, 3)))
 
 
 def test_make_target_marginalises():
