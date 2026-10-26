@@ -313,3 +313,52 @@ forward, and polarisation is already the gradient oracle.
 
 Next: Stage C, the multi-column backward, which removes the polarised
 gradient (and its +6-15%).
+
+## Item 3, Stage C: the multi-column backward (2026-10-26)
+
+`scan_gram` is differentiable on its own now, and `GPLogLike._gram_metal`
+no longer polarises for the gradient.
+
+- **Seeds.** The single column's closed form (docs/m4-plan.md), `m_bar =
+  cot r`, `P_bar = (cot/2)(r r^T - Jt)`, generalises to the cotangent
+  `c_ld` on the log-determinant half and `gs` (symmetrised) on the Gram
+  matrix as `seed_m[a] = -2 (gs R)_a`, `seed_C = -1/2 c_ld Jt - R gs
+  R^T`; one column, `c_ld = cot`, `gs = -cot/2`, is the original exactly.
+  `-1/2 c_ld Jt` is the existing seed of the zero residual at cotangent
+  `c_ld` (so the forward's one boundary now runs on zeros, not column 0).
+  `R` (one `r_c` per column at every block exit) does not come from the
+  suffix element's `eta_s - J_s mu` -- the cancellation the M4 plan
+  measured amplifying float32 error ~1e3 -- but from a linear suffix of
+  the actual innovations: the mean adjoint's recursion does not involve
+  the covariance adjoint, so each block's contribution `g_b = sum_t
+  (h^T Phi_t T_{t-1})^T v_t / S_t` comes from one pass from the true entry
+  means (`_SRC_RSENS`) and `r(b) = g(b+1) + T(b+1)^T r(b+1)`
+  (`_SRC_R_SUFFIX`).
+- **The kernel.** `backward_ckpt_mc` is `_SRC_BWD_CKPT` with nine
+  asserted replacements (`_BWD_MC_EDITS`): per-column means, checkpoints,
+  adjoints and `dy`; the covariance adjoint -- most of the kernel -- is
+  the single-column source. Step terms `v_bar = 2 (gs v)/S`, `s_bar =
+  -c_ld/(2S) - v^T gs v / S^2`. All 78 existing kernel sources hash
+  identically before and after (the single-column VJP's fold, budget and
+  seed code moved into shared helpers, comments with them).
+- **Accuracy.** Against the same functional built by polarisation through
+  `scan_loglike`'s backward, random cotangents: 1e-8-8e-7 relative in the
+  parameter and the column gradients, m = 2, 4, 6 and a convolved SHO,
+  no / one / per-datum noise, one block and many, both boundaries. In the
+  hard regime (sigma/yerr 100, rho/dt 1000, 16 blocks) the marginal's
+  gradient is within 2.1e-6 of float64 finite differences (polarisation
+  3.7e-6); 1.0e-6 / 5.8e-7 at 32 / 64 blocks.
+- **Cost, value + gradient** (N = 1e4, SHO, quiet machine), against the
+  plain likelihood:
+
+  | p (k) | 1024 chains: polarised | multi-column | 256: polarised | multi-column |
+  |---|---|---|---|---|
+  | 1 (2) | 3.2x | 1.7x | | |
+  | 2 (3) | 5.3x | 2.0x | 2.4x | 1.5x |
+  | 5 (6) | 14.9x | 3.1x | 5.8x | 2.1x |
+  | 10 (11) | 44.6x | 7.5x | | |
+
+  Forward: 1.8x, 2.0x, 2.6x, 6.3x at 1024 chains. At m = 4 and 6 the
+  covariance adjoint dominates and three columns cost the backward kernel
+  +8-9% over one. The backward's sub-block is 16, measured (sizing it to
+  the single-column register budget gave 4 at k = 11, 12% slower).

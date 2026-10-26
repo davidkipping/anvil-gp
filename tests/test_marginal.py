@@ -362,10 +362,9 @@ def test_the_kernel_gram_is_the_polarised_marginal(name, blk):
     """The marginal on the kernel, by one multi-column filter, against the
     float64 path and against the polarisation it replaces: as close to
     float64 as polarisation is, or closer, for m = 2, 4 and 6 and every
-    noise variant.  And the gradient is polarisation's own -- the VJP
-    differentiates it until the multi-column backward exists -- up to the
-    cotangent, which the algebra downstream evaluates at the kernel's Gram
-    matrix rather than polarisation's (~1e-5 relative)."""
+    noise variant.  And the gradient (`scan_gram`'s own VJP) matches
+    polarisation's to float32 rounding, the algebra downstream evaluated at
+    each route's own Gram matrix."""
     gp, rows = _gp_case(name, blk)
     hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64), refuse=False))
     with mx.stream(mx.gpu):
@@ -442,3 +441,121 @@ def test_the_small_inverse_and_its_vjp(p):
     np.testing.assert_allclose(g, g_ref, rtol=1e-3,
                                atol=1e-4 * np.abs(g_ref).max())
     assert not np.all(np.isfinite(np.array(sing[0])))
+
+
+_VJP_CASES = [
+    # (term, kernel refs, noise, metal_block, boundary)
+    ("sho", "none", None, None),
+    ("sho", "jitter", 64, "sqrt"),
+    ("sho", "noise_fn", 64, "dense"),
+    ("sho2", "noise_fn", 64, "sqrt"),
+    ("rot+sho", "jitter", 64, "sqrt"),
+    ("conv", "none", None, None),
+    ("conv", "jitter", 64, "dense"),
+]
+_VJP_TERMS = {
+    "sho": (TERM, [1.0, 2.0, 3.0]),
+    "sho2": (TERM + ag.SHOTerm(), [1.0, 2.0, 3.0, 0.5, 0.7, 1.5]),
+    "rot+sho": (ag.RotationTerm() + ag.SHOTerm(),
+                [1.0, 4.0, 3.0, 1.0, 0.4, 0.3, 0.5, 0.7]),
+    "conv": (ag.TermConvolution(TERM, 0.01), [1.0, 2.0, 3.0]),
+}
+
+
+@pytest.mark.parametrize("name,noise,blk,boundary", _VJP_CASES,
+                         ids=["-".join(map(str, c)) for c in _VJP_CASES])
+def test_the_multi_column_vjp_is_the_polarised_one(name, noise, blk,
+                                                    boundary):
+    """`scan_gram`'s VJP -- the multi-column backward from generalised block
+    seeds -- against the same functional, ``c_ld * ld + sum W * G`` with
+    random cotangents, built by polarisation through `scan_loglike`'s
+    verified backward: gradients with respect to the parameters and to the
+    columns, for m = 2, 4, 6 and a convolved term, every noise variant, one
+    block and many through either boundary.  Measured 1e-8-8e-7 relative;
+    gated at 1e-5."""
+    from anvilgp.metal import scan_gram
+    term, kp = _VJP_TERMS[name]
+    rng = np.random.default_rng(0)
+    n, N, k = 3, 600, 3
+    t = (np.arange(N) * 0.02 if name == "conv"
+         else np.sort(rng.uniform(0, 20, N)))
+    yerr = rng.uniform(0.2, 0.4, N)
+    nk = len(kp)
+    pm = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
+                          for i, r in enumerate(kp)],
+                  n_dim=nk + {"jitter": 1, "noise_fn": 2}.get(noise, 0),
+                  jitter=([KernelParam(link="log", index=nk, ref=0.05)]
+                          if noise == "jitter" else []),
+                  noise=slice(nk, nk + 2) if noise == "noise_fn" else None)
+    gp = GPLogLike(None, t, None, rng.standard_normal(N), yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None),
+                   noise_fn=_scale_jitter if noise == "noise_fn" else None)
+    if blk is not None:
+        gp.metal_block = blk
+    if boundary is not None:
+        gp._metal_boundary = boundary
+    v = 0.1 * rng.standard_normal((n, pm.n_dim))
+    if noise == "noise_fn":
+        v[:, nk:] = [0.0, -3.0]
+    v = mx.array(v.astype(np.float32))
+    cols = mx.array(rng.standard_normal((n, k, N)).astype(np.float32))
+    W = mx.array(rng.standard_normal((n, k, k)).astype(np.float32))
+    cl = mx.array(rng.standard_normal(n).astype(np.float32))
+    slots = (gp._metal_slot_id, gp._metal_slot_start, gp.n_metal_slots,
+             gp._metal_fold_plan)
+
+    def via_gram(v, cols):
+        pt, qt, h, r, j2, _ = gp._metal_inputs(v, cols)
+        ld, G = scan_gram(pt, qt, gp._metal_lag, gp._metal_inst, h, r,
+                          gp._r_ref32, j2, gp.policy.s_floor_rel,
+                          gp.metal_block, slots=slots, formal=gp._formal,
+                          boundary=gp._metal_boundary)
+        return mx.sum(cl * ld) + mx.sum(W * G)
+
+    def via_polar(v, cols):
+        ell0, G, _ = gp._gram_polarised(
+            v, lambda vv, rr: gp._evaluate_metal(vv, rr)[0], cols)
+        return mx.sum(cl * ell0) + mx.sum(W * G)
+    with mx.stream(mx.gpu):
+        got = mx.grad(via_gram, argnums=(0, 1))(v, cols)
+        want = mx.grad(via_polar, argnums=(0, 1))(v, cols)
+    for a, b in zip(got, want):
+        a, b = np.array(a), np.array(b)
+        assert np.abs(a - b).max() < 1e-5 * np.abs(b).max()
+
+
+def test_the_multi_column_gradient_in_the_hard_regime():
+    """Bright, long-timescale data over 16 blocks -- where the single
+    column's closed-form seed loses most to float32 (docs/m4-plan.md) --
+    the marginal's kernel gradient against float64 finite differences.
+    The multi-column seeds take ``r`` from a linear suffix of the actual
+    innovations, not ``eta_s - J_s mu``.  Measured 2.1e-6 relative
+    (polarisation 3.7e-6)."""
+    from anvilgp.oracle import sample_ssm as ssm
+    N, kp = 8192, [100.0, 1000.0, 3.0]
+    rng = np.random.default_rng(0)
+    t = np.arange(N, dtype=float)
+    y = ssm(TERM, kp, 1.0, N, rng) + rng.standard_normal(N) + 5.0 + 1e-3 * t
+    tt = mx.array((t - t.mean()) / t.std())
+
+    def basis(vm, x, m0):
+        b = mx.stack([mx.ones_like(tt), tt], -1).astype(m0.dtype)
+        return mx.broadcast_to(b, (m0.shape[0], N, 2))
+    gp = GPLogLike(None, t, None, y, np.ones(N), TERM, ParamMap.log(kp),
+                   GPPolicy(metal=True, kappa_max=None), linear_basis=basis)
+    gp.metal_block = 512
+    rows = np.array([[0.0, 0.0, 0.0], [0.05, -0.1, 0.1]])
+    with mx.stream(mx.gpu):
+        g = np.array(mx.grad(lambda u: gp(u).sum())(
+            mx.array(rows, dtype=mx.float32)))
+    G = np.zeros_like(rows)
+    for i in range(3):
+        d = np.zeros(3)
+        d[i] = 1e-5
+        with mx.stream(mx.cpu):
+            hp = np.array(gp.hi(mx.array(rows + d, dtype=mx.float64),
+                                refuse=False))
+            hm = np.array(gp.hi(mx.array(rows - d, dtype=mx.float64),
+                                refuse=False))
+        G[:, i] = (hp - hm) / 2e-5
+    assert np.abs(g - G).max() < 2e-5 * np.abs(G).max()

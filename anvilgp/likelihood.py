@@ -1440,43 +1440,25 @@ class GPLogLike:
     def _gram_metal(self, v: mx.array, cols: mx.array):
         """`_gram_polarised` on the kernel by one multi-column filter
         (:func:`anvilgp.metal.scan_gram`): ``1`` filter carrying ``k``
-        means instead of ``1 + k(k+1)/2`` filters.
-
-        The value only, for now: the VJP differentiates `_gram_polarised`,
-        whose value this is to float32 rounding.  So the gradient costs
-        polarisation's plus this forward (measured +6-15% on value +
-        gradient, p = 2-10) until the multi-column backward exists
-        (docs/general-features-plan.md, item 3).  Above `MAX_GRAM_COLS`
-        columns `_marginal` polarises instead.
+        means instead of ``1 + k(k+1)/2`` filters, forward and backward.
+        Above `MAX_GRAM_COLS` columns `_marginal` polarises instead.
         """
         from .metal import scan_gram
         if cols.shape[1] > MAX_GRAM_COLS:
             return self._gram_polarised(v, self._raw_resid, cols)
-
-        @mx.custom_function
-        def gram(v, cols):
-            pull = self._infeasible_pull(v)
-            pt, qt, h, r, jit2, q = self._metal_inputs(v, cols)
-            ld, g = scan_gram(pt, qt, self._metal_lag, self._metal_inst, h,
-                              r, self._r_ref32, jit2,
-                              self.policy.s_floor_rel, self.metal_block,
-                              formal=self._formal,
-                              boundary=self._metal_boundary)
-            # `ld` is the plain likelihood of a zero residual, refused and
-            # sanitised exactly as `_raw_resid` does it.
-            ld = self._refuse_outside_series(v, ld)
-            ld = _sanitize(self._refuse_ill_conditioned(v, ld, (q, h)), pull)
-            return ld, g
-
-        @gram.vjp
-        def _gram_vjp(primals, cotangents, outputs):
-            _, vjps = mx.vjp(
-                lambda a, b: list(self._gram_polarised(
-                    a, self._raw_resid, b)[:2]),
-                list(primals), list(cotangents))
-            return tuple(vjps)
-
-        ld, g = gram(v, cols)
+        pull = self._infeasible_pull(v)
+        pt, qt, h, r, jit2, q = self._metal_inputs(v, cols)
+        ld, g = scan_gram(pt, qt, self._metal_lag, self._metal_inst, h, r,
+                          self._r_ref32, jit2, self.policy.s_floor_rel,
+                          self.metal_block,
+                          slots=(self._metal_slot_id, self._metal_slot_start,
+                                 self.n_metal_slots, self._metal_fold_plan),
+                          formal=self._formal,
+                          boundary=self._metal_boundary)
+        # `ld` is the plain likelihood of a zero residual, refused and
+        # sanitised exactly as `_raw_resid` does it.
+        ld = self._refuse_outside_series(v, ld)
+        ld = _sanitize(self._refuse_ill_conditioned(v, ld, (q, h)), pull)
         return ld, g, ld
 
     def _raw_resid(self, v: mx.array, resid: mx.array | None) -> mx.array:

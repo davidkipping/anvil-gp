@@ -933,19 +933,40 @@ _FWD_AFFINE_T = """
             }"""
 
 
+#: `_FWD_AFFINE_T` plus the r-sensitivity: ``g[c] += (h^T Phi T)^T v_c /
+#: S``, with ``T`` (before its update) the map from the block's entry mean
+#: to the previous filtered mean, so ``-h^T Phi T`` is ``d v / d m_entry``
+#: and ``g[c]`` is ``-1/2 d(sum v_c^2 / S) / d m_entry`` from the actual
+#: innovations.
+_FWD_AFFINE_TG = _FWD_AFFINE_T.replace(
+    """                for (uint i = 0; i < M; ++i)
+                    for (uint j = 0; j < M; ++j)
+                        tm[i][j] = pt[i][j] - kg[i] * hpt[j];""",
+    """                float isv = 1.0f / sv;
+                for (uint c = 0; c < KCOL; ++c) {
+                    float w = vv[c] * isv;
+                    for (uint j = 0; j < M; ++j) gacc[c][j] += hpt[j] * w;
+                }
+                for (uint i = 0; i < M; ++i)
+                    for (uint j = 0; j < M; ++j)
+                        tm[i][j] = pt[i][j] - kg[i] * hpt[j];""")
+assert _FWD_AFFINE_TG != _FWD_AFFINE_T
+
+
 def _fwd_step(with_ell: bool = False, multi: bool = False,
-              affine: bool = False) -> str:
+              affine: bool = False, sens: bool = False) -> str:
     """`_FWD_STEP`, accumulating the log-likelihood or not.  The backward's
     replays take it without, so their source is what it always was.
-    ``multi`` is the ``KCOL``-column step of `_FWD_MC` (which always
-    accumulates its log-determinant and Gram matrix); ``affine`` the
+    ``multi`` is the ``KCOL``-column step of `_FWD_MC` (``with_ell``: its
+    log-determinant and Gram matrix accumulated); ``affine`` the
     ``KCOL``-column step of the affine pass, which accumulates nothing and
     carries the mean map ``tm`` (`_FWD_AFFINE_T`)."""
-    if affine:
+    if affine or sens:
         parts = dict(_FWD_MC, FWD_ELL="")
-        parts["MEAN_UPDATE"] = _FWD_MC["MEAN_UPDATE"] + _FWD_AFFINE_T
+        parts["MEAN_UPDATE"] = (_FWD_MC["MEAN_UPDATE"]
+                                + (_FWD_AFFINE_TG if sens else _FWD_AFFINE_T))
     elif multi:
-        parts = dict(_FWD_MC)
+        parts = dict(_FWD_MC, FWD_ELL=_FWD_MC["FWD_ELL"] if with_ell else "")
     else:
         parts = dict(_FWD_1, FWD_ELL=_FWD_ELL if with_ell else "")
     src = _FWD_STEP
@@ -1298,6 +1319,275 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
     return outs[:5]
 
+
+
+
+#: The multi-column backward: `_SRC_BWD_CKPT` for ``KCOL`` columns sharing
+#: one covariance, differentiating ``c_ld * ld + sum_ab gs_ab G_ab`` (the
+#: log-determinant half and the Gram matrix of `scan_gram`; ``gs`` the
+#: symmetrised cotangent on ``G``).  Derived from the single-column source
+#: by the replacements below, each asserted to apply exactly once, so the
+#: covariance adjoint -- most of the kernel -- stays one source.  What
+#: changes is per column: the means, their checkpoints and adjoints
+#: ``m_bar[c]``, the innovations, ``dy``.  The step's own terms are
+#:
+#:     v_bar[a] = 2 (gs v)_a / S,   s_bar = -c_ld / (2 S) - v^T gs v / S^2
+#:
+#: -- with ``c_ld = cot`` and ``gs = -cot / 2`` (one column) exactly the
+#: single-column ``-cot v / S`` and ``cot (v^2 - S) / (2 S^2)``.
+_BWD_MC_EDITS = [
+    ("""    float cotv = cot[chain];
+""", """    float cld = cot[chain];
+    float gs[KCOL][KCOL];
+    for (uint a = 0; a < KCOL; ++a)
+        for (uint b = 0; b < KCOL; ++b)
+            gs[a][b] = gbar[(chain * KCOL + a) * KCOL + b];
+"""),
+    ("""    float mean[MDIM], cov[MDIM][MDIM];
+    for (uint i = 0; i < M; ++i) {
+        mean[i] = ent_m[ei * M + i];
+        for (uint j = 0; j < M; ++j) cov[i][j] = ent_C[ei * M * M + i * M + j];
+    }
+    const uint CK = M + M * M;
+""", """    float mean[KCOL][MDIM], cov[MDIM][MDIM];
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i) mean[c][i] = ent_m[(ei * KCOL + c) * M + i];
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) cov[i][j] = ent_C[ei * M * M + i * M + j];
+    const uint CK = KCOL * M + M * M;
+"""),
+    ("""            for (uint i = 0; i < M; ++i) {
+                ckpt[cb + i] = mean[i];
+                for (uint j = 0; j < M; ++j) ckpt[cb + M + i * M + j] = cov[i][j];
+            }
+""", """            for (uint c = 0; c < KCOL; ++c)
+                for (uint i = 0; i < M; ++i) ckpt[cb + c * M + i] = mean[c][i];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j)
+                    ckpt[cb + KCOL * M + i * M + j] = cov[i][j];
+"""),
+    ("""    float m_bar[MDIM], p_bar[MDIM][MDIM], h_bar[MDIM];
+    for (uint i = 0; i < M; ++i) {
+        m_bar[i] = seed_m[ei * M + i];
+        h_bar[i] = 0.0f;
+""", """    float m_bar[KCOL][MDIM], p_bar[MDIM][MDIM], h_bar[MDIM];
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i)
+            m_bar[c][i] = seed_m[(ei * KCOL + c) * M + i];
+    for (uint i = 0; i < M; ++i) {
+        h_bar[i] = 0.0f;
+"""),
+    ("""        for (uint i = 0; i < M; ++i) {
+            mean[i] = ckpt[cb + i];
+            for (uint j = 0; j < M; ++j) cov[i][j] = ckpt[cb + M + i * M + j];
+        }
+        float smean[SLEN][MDIM], scov[SLEN][MDIM][MDIM];
+        for (uint t = t0; t < t1; ++t) {
+            uint li = t - t0;
+            for (uint i = 0; i < M; ++i) {
+                smean[li][i] = mean[i];
+                for (uint j = 0; j < M; ++j) scov[li][i][j] = cov[i][j];
+            }
+""", """        for (uint c = 0; c < KCOL; ++c)
+            for (uint i = 0; i < M; ++i) mean[c][i] = ckpt[cb + c * M + i];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j)
+                cov[i][j] = ckpt[cb + KCOL * M + i * M + j];
+        float smean[SLEN][KCOL][MDIM], scov[SLEN][MDIM][MDIM];
+        for (uint t = t0; t < t1; ++t) {
+            uint li = t - t0;
+            for (uint c = 0; c < KCOL; ++c)
+                for (uint i = 0; i < M; ++i) smean[li][c][i] = mean[c][i];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) scov[li][i][j] = cov[i][j];
+"""),
+    ("""            float mp[MDIM], cp[MDIM][MDIM], ch[MDIM], kg[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += Ph[i][j] * smean[li][j];
+                mp[i] = a;
+            }
+""", """            float mp[KCOL][MDIM], cp[MDIM][MDIM], ch[MDIM], kg[MDIM];
+            for (uint c = 0; c < KCOL; ++c)
+                for (uint i = 0; i < M; ++i) {
+                    float a = 0.0f;
+                    for (uint j = 0; j < M; ++j)
+                        a += Ph[i][j] * smean[li][c][j];
+                    mp[c][i] = a;
+                }
+"""),
+    ("""            float vv = resid[gi * (uint)n_chains + chain];
+            for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+            for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
+
+            float v_bar = -cotv * vv / sv;
+            float s_bar = cotv * (vv * vv - sv) / (2.0f * sv * sv);
+
+            float kg_bar[MDIM], ch_bar[MDIM], mp_bar[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f, b = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    a += p_bar[i][j] * ch[j];
+                    b += p_bar[j][i] * kg[j];
+                }
+                kg_bar[i] = -a + m_bar[i] * vv;
+                ch_bar[i] = -b;
+                mp_bar[i] = m_bar[i];
+            }
+            for (uint i = 0; i < M; ++i) v_bar += kg[i] * m_bar[i];
+
+            out_dy[gi * (uint)n_chains + chain] = v_bar;
+            for (uint i = 0; i < M; ++i) {
+                h_bar[i] -= v_bar * mp[i];
+                mp_bar[i] -= v_bar * hv[i];
+            }
+""", """            float vv[KCOL];
+            for (uint c = 0; c < KCOL; ++c) {
+                float a = resid[(gi * (uint)n_chains + chain) * KCOL + c];
+                for (uint i = 0; i < M; ++i) a -= hv[i] * mp[c][i];
+                vv[c] = a;
+            }
+            for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
+
+            float isv = 1.0f / sv;
+            float v_bar[KCOL], vgv = 0.0f;
+            for (uint a = 0; a < KCOL; ++a) {
+                float g = 0.0f;
+                for (uint b = 0; b < KCOL; ++b) g += gs[a][b] * vv[b];
+                vgv += vv[a] * g;
+                v_bar[a] = 2.0f * g * isv;
+            }
+            float s_bar = -0.5f * cld * isv - vgv * isv * isv;
+
+            float kg_bar[MDIM], ch_bar[MDIM], mp_bar[KCOL][MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f, b = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    a += p_bar[i][j] * ch[j];
+                    b += p_bar[j][i] * kg[j];
+                }
+                float mv = 0.0f;
+                for (uint c = 0; c < KCOL; ++c) mv += m_bar[c][i] * vv[c];
+                kg_bar[i] = -a + mv;
+                ch_bar[i] = -b;
+            }
+            for (uint c = 0; c < KCOL; ++c) {
+                float a = 0.0f;
+                for (uint i = 0; i < M; ++i) {
+                    a += kg[i] * m_bar[c][i];
+                    mp_bar[c][i] = m_bar[c][i];
+                }
+                v_bar[c] += a;
+                out_dy[(gi * (uint)n_chains + chain) * KCOL + c] = v_bar[c];
+                for (uint i = 0; i < M; ++i) {
+                    h_bar[i] -= v_bar[c] * mp[c][i];
+                    mp_bar[c][i] -= v_bar[c] * hv[i];
+                }
+            }
+"""),
+    ("""                    acc_p[i][j] += a + mp_bar[i] * smean[li][j];
+""", """                    float mm = 0.0f;
+                    for (uint c = 0; c < KCOL; ++c)
+                        mm += mp_bar[c][i] * smean[li][c][j];
+                    acc_p[i][j] += a + mm;
+"""),
+    ("""            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) {
+                    p_bar[i][j] = 0.5f * (nb[i][j] + nb[j][i]);
+                    a += Ph[j][i] * mp_bar[j];
+                }
+                m_bar[i] = a;
+            }
+""", """            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j)
+                    p_bar[i][j] = 0.5f * (nb[i][j] + nb[j][i]);
+            for (uint c = 0; c < KCOL; ++c)
+                for (uint i = 0; i < M; ++i) {
+                    float a = 0.0f;
+                    for (uint j = 0; j < M; ++j) a += Ph[j][i] * mp_bar[c][j];
+                    m_bar[c][i] = a;
+                }
+"""),
+]
+
+
+def _bwd_mc_src() -> str:
+    src = _SRC_BWD_CKPT
+    for old, new in _BWD_MC_EDITS:
+        if src.count(old) != 1:
+            raise RuntimeError(
+                "the multi-column backward no longer derives from "
+                "_SRC_BWD_CKPT: an edit's anchor matched "
+                f"{src.count(old)} times:\n{old}")
+        src = src.replace(old, new)
+    return src.replace("FWD_STEP", _fwd_step(multi=True))
+
+
+_bwd_mc_kernels: dict = {}
+
+
+def _sub_len_mc(m: int, k: int) -> int:
+    """The multi-column sweep's sub-block.  Measured, not derived: 16 was
+    the fastest of 1-32, or within 2%, at every (m, k) tried -- m = 2 with
+    k = 3, 6, 11, m = 4 and 6 with k = 1 and 3 (N = 1e4 x 1024 chains,
+    2026-10-26) -- where sizing it to the single-column sweep's register
+    budget gave 4 at k = 11 and ran 12% slower."""
+    return 16
+
+
+def _bwd_mc_kernel(m: int, k: int, slen: int, n_jit: int = 0,
+                   formal: bool = False):
+    key = (m, k, slen, _jit_key(n_jit), bool(formal))
+    if key not in _bwd_mc_kernels:
+        body = _formal_src(_jitter_src(_bwd_mc_src(), n_jit), formal)
+        _bwd_mc_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_bwd_mc_m{m}_k{k}_s{slen}_j{key[3]}"
+                 + ("_formal" if formal else ""),
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref", "jit2", "cot", "gbar", "ent_m", "ent_C",
+                         "seed_m", "seed_C", "slot_id", "slot_start",
+                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                         "n_jit", "n_ckpt", "n_slots"],
+            output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
+                          "out_drv", "ckpt"],
+            source=body.replace("KCOL", str(k)).replace("MDIM", str(m))
+                       .replace("SLEN", str(slen)),
+        )
+    return _bwd_mc_kernels[key]
+
+
+def backward_ckpt_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+                     c_ld, gs, ent_m, ent_C, seed_m, seed_C, slot_id,
+                     slot_start, n_slots, blk_len, formal=False):
+    """:func:`backward_ckpt` for :func:`scan_gram`: the cotangent is
+    ``c_ld`` ``(n_chains,)`` on the log-determinant half and the symmetric
+    ``gs`` ``(n_chains, k, k)`` on the Gram matrix; ``cols``, ``ent_m``,
+    ``seed_m`` and the returned ``dy`` carry a column axis
+    (``(npts, n_chains, k)``, ``(n_chains, n_blocks, k, m)``)."""
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts, k = cols.shape[0], cols.shape[-1]
+    slen = _sub_len_mc(m, k)
+    n_blocks = (npts + blk_len - 1) // blk_len
+    n_ckpt = (blk_len + slen - 1) // slen
+    n_jit = _n_jit_of(jit2)
+    n_slots = int(n_slots)
+    shapes = [(n_chains, n_slots, m, m), (n_chains, n_slots, m, m),
+              (n_chains, n_blocks, m), (npts, n_chains, k),
+              ((npts, n_chains, 1) if n_jit < 0
+               else (n_chains, n_blocks, max(1, n_jit))),
+              (n_chains, n_blocks, n_ckpt, k * m + m * m)]
+    outs = _bwd_mc_kernel(m, k, slen, n_jit, formal)(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+                c_ld.astype(mx.float32), mx.contiguous(gs.astype(mx.float32)),
+                ent_m, ent_C, mx.contiguous(seed_m), mx.contiguous(seed_C),
+                slot_id, slot_start,
+                int(npts), int(n_lags), int(n_blocks), int(n_chains),
+                int(blk_len), int(n_jit), int(n_ckpt), int(n_slots)],
+        output_shapes=shapes, output_dtypes=[mx.float32] * 6,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    return outs[:5]
 
 
 #: The `combine` core shared by the prefix, the suffix step and the seed:
@@ -1786,7 +2076,8 @@ def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False):
     key = (m, k, _jit_key(n_jit), bool(formal))
     if key not in _replay_mc_kernels:
         body = _formal_src(_jitter_src(
-            _SRC_REPLAY_MC.replace("FWD_STEP", _fwd_step(multi=True)), n_jit),
+            _SRC_REPLAY_MC.replace("FWD_STEP", _fwd_step(True, multi=True)),
+            n_jit),
             formal)
         _replay_mc_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_replay_mc_m{m}_k{k}_j{key[2]}"
@@ -1946,49 +2237,307 @@ def column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
         threadgroup=(min(64, n_chains * k), 1, 1))[0]
 
 
+#: The gradient's r-sensitivity pass: `_SRC_AFFINE` from each column's
+#: actual entry mean, accumulating ``g[c]`` (`_FWD_AFFINE_TG`) beside the
+#: block's mean map ``T``.  `_SRC_R_SUFFIX` turns them into ``r_c`` at every
+#: block exit -- what `scan_gram`'s VJP builds the block seeds from.
+_SRC_RSENS = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    uint start = blk_i * (uint)blk_len;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint ei = chain * (uint)n_blocks + blk_i;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    JIT_HOIST
+
+    float mean[KCOL][MDIM], cov[MDIM][MDIM], tm[MDIM][MDIM], gacc[KCOL][MDIM];
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i) {
+            mean[c][i] = ent_m[(ei * KCOL + c) * M + i];
+            gacc[c][i] = 0.0f;
+        }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            cov[i][j] = ent_C[ei * M * M + i * M + j];
+            tm[i][j] = (i == j) ? 1.0f : 0.0f;
+        }
+    for (uint gi = start; gi < stop; ++gi) {
+        FWD_STEP
+    }
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i)
+            out_g[(ei * KCOL + c) * M + i] = gacc[c][i];
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) out_T[ei * M * M + i * M + j] = tm[i][j];
+"""
+
+#: ``r_c`` at each block's exit from the later blocks' ``(g, T)``: zero at
+#: the last block, ``r(b) = g(b + 1) + T(b + 1)^T r(b + 1)``.  A linear
+#: suffix of the actual gradient contributions -- no ``eta_s - J_s mu``
+#: cancellation, which `block_seeds_kernel`'s closed form has.  One thread
+#: per (chain, column).
+_SRC_R_SUFFIX = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_chains * KCOL) return;
+    uint chain = gid / KCOL;
+    uint c = gid % KCOL;
+    const uint M = MDIM;
+    float r[MDIM];
+    for (uint i = 0; i < M; ++i) r[i] = 0.0f;
+    for (int bi = (int)n_blocks - 1; bi >= 0; --bi) {
+        uint ei = chain * (uint)n_blocks + (uint)bi;
+        for (uint i = 0; i < M; ++i) out_r[(ei * KCOL + c) * M + i] = r[i];
+        float nr[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = in_g[(ei * KCOL + c) * M + i];
+            for (uint j = 0; j < M; ++j) a += in_T[ei * M * M + j * M + i] * r[j];
+            nr[i] = a;
+        }
+        for (uint i = 0; i < M; ++i) r[i] = nr[i];
+    }
+"""
+
+_rsens_kernels: dict = {}
+_r_suffix_kernels: dict = {}
+
+
+def column_exit_sensitivities(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
+                              jit2, ent_m, ent_C, blk_len, formal=False):
+    """``(n_chains, n_blocks, k, m)``: ``r_c`` at every block's exit, ``-1/2``
+    the derivative of the later blocks' ``sum v_c^2 / S`` with respect to
+    the exit mean (`_SRC_RSENS`, `_SRC_R_SUFFIX`).  Zero at the last
+    block."""
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts, k = cols.shape[0], cols.shape[-1]
+    n_blocks = ent_C.shape[1]
+    n_jit = _n_jit_of(jit2)
+    key = (m, k, _jit_key(n_jit), bool(formal))
+    if key not in _rsens_kernels:
+        body = _formal_src(_jitter_src(
+            _SRC_RSENS.replace("FWD_STEP", _fwd_step(sens=True)), n_jit),
+            formal)
+        _rsens_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_rsens_m{m}_k{k}_j{key[2]}"
+                 + ("_formal" if formal else ""),
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref", "jit2", "ent_m", "ent_C", "npts", "n_lags",
+                         "n_blocks", "n_chains", "blk_len", "n_jit"],
+            output_names=["out_g", "out_T"],
+            source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
+        )
+    g, T = _rsens_kernels[key](
+        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2, ent_m,
+                ent_C, int(npts), int(n_lags), int(n_blocks), int(n_chains),
+                int(blk_len), int(n_jit)],
+        output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
+        output_dtypes=[mx.float32] * 2,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    if (m, k) not in _r_suffix_kernels:
+        _r_suffix_kernels[(m, k)] = mx.fast.metal_kernel(
+            name=f"anvilgp_r_suffix_m{m}_k{k}",
+            input_names=["in_g", "in_T", "n_blocks", "n_chains"],
+            output_names=["out_r"],
+            source=_SRC_R_SUFFIX.replace("KCOL", str(k))
+                                .replace("MDIM", str(m)))
+    return _r_suffix_kernels[(m, k)](
+        inputs=[g, T, int(n_blocks), int(n_chains)],
+        output_shapes=[(n_chains, n_blocks, k, m)],
+        output_dtypes=[mx.float32],
+        grid=(n_chains * k, 1, 1),
+        threadgroup=(min(64, n_chains * k), 1, 1))[0]
+
+
+def _boundary_seeds(aux, cot, formal, use_sqrt):
+    """``(ent_m, ent_C, seed_m, seed_C)`` from `_boundary_states`' ``aux``.
+    The entry states are the forward's again: the same kernel source on the
+    same inputs."""
+    if not use_sqrt:
+        A, b, C, eta, J = aux
+        return block_seeds_kernel(Element(A=A, b=b, C=C, eta=eta, J=J,
+                                          ell=None), cot, formal)
+    *blocks, st_m, st_C = aux
+    return sqrt_scan(blocks, st_m, st_C, cot)
+
+
+def _check_adjoint_budget(n_chains, n_slots, n_lags, npts, m, fold_plan):
+    """The kernel gradient's buffer fence.
+
+    The adjoint buffer is one slot per (block, lag) pair that occurs.  It
+    is bounded by N however irregular the cadence, so this fence is a
+    sanity check rather than the wall it was when the buffer had a slot per
+    pair that *could* occur (40 GiB at 1024 chains x N = 1e5, where the
+    slots are 3 GiB).  The dense fold gathers (n_chains, n_lags, max_rank,
+    m, m) on top of the buffer, and `_lag_fold_plan` only bounds that table
+    at 4x the slots -- so a configuration comfortably inside the fence
+    could still OOM in the fold.  The gather is charged to the same
+    budget.  (The groups branch has no such intermediate.)
+    """
+    slab = 2 * n_chains * n_slots * m * m * 4
+    kind, plan = fold_plan
+    if kind == "dense":
+        slab += 2 * n_chains * int(plan.shape[0]) * int(plan.shape[1]) \
+            * m * m * 4
+    if slab > MAX_ADJOINT_BUFFER_BYTES:
+        raise ValueError(
+            f"the kernel gradient's adjoint buffer would be "
+            f"{slab / 2**30:.1f} GiB ({n_chains} chains x {n_slots} "
+            f"(block, lag) slots x m^2 = {m * m}, plus the fold's "
+            f"gather), over MAX_ADJOINT_BUFFER_BYTES = "
+            f"{MAX_ADJOINT_BUFFER_BYTES / 2**30:.1f} GiB. "
+            f"Every distinct float32 spacing in the timestamps is a "
+            f"lag, and this cadence has {n_lags - 1} of them over "
+            f"{npts} points.  Bin the timestamps, use fewer chains, or "
+            f"use GPPolicy(metal=False) for the gradient.")
+
+
+def _fold_slots(d_phi, d_q, fold_plan, n_chains, n_lags, m):
+    """Slot adjoints -> the per-lag tables the term front end
+    differentiates.
+
+    Distinct blocks own disjoint slots, so the blocks are already summed
+    and this only regroups.  Applied one fold group at a time: each group's
+    lags are distinct, which is what keeps the scatter reproducible -- see
+    `likelihood._lag_fold_plan`.  The all-distinct cadence this work is for
+    has exactly one group.  The dense plan is one gather through a
+    (n_lags, max_rank) table of slot indices padded with a zero row, then
+    one `mx.sum` -- which is reproducible where a repeated-index scatter is
+    not.
+    """
+    kind, plan = fold_plan
+    if kind == "dense":
+        pad = mx.zeros((n_chains, 1, m, m), dtype=d_phi.dtype)
+        return (mx.sum(mx.take(mx.concatenate([d_phi, pad], axis=1), plan,
+                               axis=1), axis=2),
+                mx.sum(mx.take(mx.concatenate([d_q, pad], axis=1), plan,
+                               axis=1), axis=2))
+    d_phi_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_phi.dtype)
+    # a separate zero, not an alias: `.at[].add` is functional so sharing
+    # one would be correct today, but an empty plan would then return the
+    # same array as two independent cotangents.
+    d_q_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_q.dtype)
+    for sel, lags_of in plan:
+        d_phi_tab = d_phi_tab.at[:, lags_of].add(mx.take(d_phi, sel, axis=1))
+        d_q_tab = d_q_tab.at[:, lags_of].add(mx.take(d_q, sel, axis=1))
+    return d_phi_tab, d_q_tab
+
+
+def _d_jit2(d_rv, j2):
+    """``jit2``'s cotangent.  ``S = max(h Cp h^T, 0) + r_ref + jit2``, so
+    d/d(jit2) is the sum of the r_var cotangents, which the kernel
+    accumulates per block: ``d_rv`` is (n_chains, n_blocks, n_jit), split
+    by the observation's instrument, so summing over blocks gives each
+    jitter parameter its own gradient.  Per datum (`noise_fn`) the kernel
+    wrote each observation's own adjoint, already in ``j2``'s (npts,
+    n_chains, 1) shape."""
+    n_jit = _n_jit_of(j2)
+    return (d_rv if n_jit < 0 else mx.zeros_like(j2) if n_jit == 0
+            else mx.sum(d_rv, axis=1)[:, :n_jit])
+
+
 def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
-              s_floor_rel, blk_len, formal=False, boundary="dense"):
+              s_floor_rel, blk_len, slots=None, formal=False,
+              boundary="dense"):
     """``(ld (n_chains,), gram (n_chains, k, k))``: the log-determinant half
     ``-1/2 sum log(S / r_ref)`` and ``Z^T K^-1 Z`` for the columns ``Z`` =
     ``cols`` ``(npts, n_chains, k)``, by one filter carrying ``k`` means.
 
     ``ld + -1/2 gram[c, c]`` is :func:`scan_loglike` of column ``c``.  The
-    entry covariances come from `scan_loglike`'s own boundary, run once (on
-    column 0: they are not a function of the data), and every column's
-    entry means from :func:`column_entry_means`.  Running the boundary
-    with the columns as ``k`` virtual chains instead measured k-fold: 8.7
-    and 16.1 ms at k = 3 and 6 against 3.0 for one (N = 1e4 x 1024
-    chains, SHO), and the boundary was then most of the cost.  **Value
-    only**: there is no VJP here (the caller supplies one; `GPLogLike`
-    differentiates the polarisation it replaces).
+    entry covariances come from `scan_loglike`'s own boundary, run once, on
+    a zero residual (they are not a function of the data), and every
+    column's entry means from :func:`column_entry_means`.  Running the
+    boundary with the columns as ``k`` virtual chains instead measured
+    k-fold: 8.7 and 16.1 ms at k = 3 and 6 against 3.0 for one (N = 1e4 x
+    1024 chains, SHO), and the boundary was then most of the cost.
+
+    Differentiable, like `scan_loglike` (``slots`` as there).  The VJP is
+    `backward_ckpt_mc` from per-block seeds that generalise the single
+    column's closed form (docs/m4-plan.md): for ``c_ld * ld + sum_ab
+    gs_ab G_ab``,
+
+        seed_m[a] = -2 (gs R)_a,   seed_C = -1/2 c_ld Jt - R gs R^T,
+
+    with ``r_c`` (the columns of ``R``) from
+    :func:`column_exit_sensitivities` and ``-1/2 c_ld Jt`` the existing
+    seed of the zero residual at cotangent ``c_ld``.  One column, ``c_ld =
+    cot`` and ``gs = -cot / 2``, is the single-column seed exactly.
     """
-    n_chains, m = phi_tab.shape[0], phi_tab.shape[-1]
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     npts, k = cols.shape[0], cols.shape[-1]
     if m > MAX_STATE:
         raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
     n_blocks = -(-npts // blk_len)
-    cols = mx.contiguous(cols)
-    if n_blocks == 1:
-        # Block 0 enters at zero (its first lag is row 0, Phi = 0), as in
-        # `_SRC_PREFIX`; no boundary to run.
-        ent_m = mx.zeros((n_chains, 1, k, m), dtype=mx.float32)
-        ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
-    else:
-        _, ent_C, _ = _boundary_states(
-            phi_tab, q_tab, lag, inst, hvec, mx.contiguous(cols[..., 0]),
-            r_ref, jit2, s_floor_rel, blk_len, formal, boundary == "sqrt")
-        ent_m = column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols,
-                                   r_ref, jit2, ent_C, blk_len, formal)
-    ld, g = replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
-                             jit2, mx.contiguous(ent_m),
-                             mx.contiguous(ent_C), blk_len, formal)
-    ld, g = mx.sum(ld, axis=1), mx.sum(g, axis=1)
+    use_sqrt = boundary == "sqrt" and n_blocks > 1
     rows, cs = np.tril_indices(k)
-    full = mx.zeros((n_chains, k * k), dtype=g.dtype)
-    full = full.at[:, mx.array(rows * k + cs)].add(g)
-    full = full.at[:, mx.array(cs * k + rows)].add(
-        mx.where(mx.array(rows != cs), g, 0.0))
-    return ld, full.reshape(n_chains, k, k)
+    lower, upper = mx.array(rows * k + cs), mx.array(cs * k + rows)
+    off_diag = mx.array(rows != cs)
+
+    @mx.custom_function
+    def core(p_t, q_t, hv, cz, j2):
+        cz = mx.contiguous(cz)
+        if n_blocks == 1:
+            # Block 0 enters at zero (its first lag is row 0, Phi = 0), as
+            # in `_SRC_PREFIX`; no boundary to run.
+            ent_m = mx.zeros((n_chains, 1, k, m), dtype=mx.float32)
+            ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+            aux = ()
+        else:
+            zero = mx.zeros((npts, n_chains), dtype=mx.float32)
+            _, ent_C, aux = _boundary_states(
+                p_t, q_t, lag, inst, hv, zero, r_ref, j2, s_floor_rel,
+                blk_len, formal, use_sqrt)
+            ent_m = column_entry_means(p_t, q_t, lag, inst, hv, cz, r_ref,
+                                       j2, ent_C, blk_len, formal)
+        ent_m, ent_C = mx.contiguous(ent_m), mx.contiguous(ent_C)
+        ld, g = replay_blocks_mc(p_t, q_t, lag, inst, hv, cz, r_ref, j2,
+                                 ent_m, ent_C, blk_len, formal)
+        ld, g = mx.sum(ld, axis=1), mx.sum(g, axis=1)
+        full = mx.zeros((n_chains, k * k), dtype=g.dtype)
+        full = full.at[:, lower].add(g)
+        full = full.at[:, upper].add(mx.where(off_diag, g, 0.0))
+        # entry states and the boundary's aux go out only for the VJP
+        return (ld, full.reshape(n_chains, k, k), ent_m, ent_C, *aux)
+
+    @core.vjp
+    def _core_vjp(primals, cotangents, outputs):
+        p_t, q_t, hv, cz, j2 = primals
+        c_ld = cotangents[0]
+        gs = 0.5 * (cotangents[1] + mx.swapaxes(cotangents[1], 1, 2))
+        ent_m, ent_C, aux = outputs[2], outputs[3], tuple(outputs[4:])
+        if slots is None:
+            raise ValueError(
+                "the kernel gradient needs the (block, lag) slot map; "
+                "`scan_gram` was called without `slots`")
+        slot_id, slot_start, n_slots, fold_plan = slots
+        _check_adjoint_budget(n_chains, n_slots, n_lags, npts, m, fold_plan)
+        if n_blocks == 1:
+            seed_m = mx.zeros((n_chains, 1, k, m), dtype=mx.float32)
+            seed_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+        else:
+            *_, seed_ld = _boundary_seeds(aux, c_ld, formal, use_sqrt)
+            R = column_exit_sensitivities(p_t, q_t, lag, inst, hv,
+                                          mx.contiguous(cz), r_ref, j2,
+                                          ent_m, ent_C, blk_len, formal)
+            seed_m = -2.0 * mx.einsum("cab,cnbi->cnai", gs, R)
+            seed_C = seed_ld - mx.einsum("cnai,cab,cnbj->cnij", R, gs, R)
+        d_phi, d_q, d_h, d_y, d_rv = backward_ckpt_mc(
+            p_t, q_t, lag, inst, hv, mx.contiguous(cz), r_ref, j2, c_ld, gs,
+            ent_m, ent_C, seed_m, seed_C, slot_id, slot_start, n_slots,
+            blk_len, formal)
+        d_phi_tab, d_q_tab = _fold_slots(d_phi, d_q, fold_plan, n_chains,
+                                         n_lags, m)
+        return (d_phi_tab, d_q_tab, mx.sum(d_h, axis=1), d_y,
+                _d_jit2(d_rv, j2))
+
+    out = core(phi_tab, q_tab, hvec, cols, jit2)
+    return out[0], out[1]
+
 
 
 
@@ -2997,15 +3546,7 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                                 s_floor_rel, blk_len, formal, use_sqrt)
 
     def seeds(aux, cot):
-        """``(ent_m, ent_C, seed_m, seed_C)`` from `boundary`'s ``aux``.  The
-        entry states are the forward's again: the same kernel source on the
-        same inputs."""
-        if not use_sqrt:
-            A, b, C, eta, J = aux
-            return block_seeds_kernel(Element(A=A, b=b, C=C, eta=eta, J=J,
-                                              ell=None), cot, formal)
-        *blocks, st_m, st_C = aux
-        return sqrt_scan(blocks, st_m, st_C, cot)
+        return _boundary_seeds(aux, cot, formal, use_sqrt)
 
     @mx.custom_function
     def core(phi_t, q_t, lg, hv, rs, rr, j2):
@@ -3061,32 +3602,7 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
         # would force a device sync on every gradient call.
         slot_id, slot_start, n_slots, fold_plan = slots
 
-        # The adjoint buffer is one slot per (block, lag) pair that occurs.
-        # It is bounded by N however irregular the cadence, so this fence
-        # is a sanity check rather than the wall it was when the buffer had
-        # a slot per pair that *could* occur (40 GiB at 1024 chains x
-        # N = 1e5, where the slots are 3 GiB).
-        slab = 2 * n_chains * n_slots * m * m * 4
-        # The dense fold gathers (n_chains, n_lags, max_rank, m, m) on top
-        # of the buffer, and `_lag_fold_plan` only bounds that table at 4x
-        # the slots -- so a configuration comfortably inside the fence
-        # could still OOM in the fold.  Charge the gather to the same
-        # budget.  (The groups branch has no such intermediate.)
-        kind, plan = slots[3]
-        if kind == "dense":
-            slab += 2 * n_chains * int(plan.shape[0]) * int(plan.shape[1]) \
-                * m * m * 4
-        if slab > MAX_ADJOINT_BUFFER_BYTES:
-            raise ValueError(
-                f"the kernel gradient's adjoint buffer would be "
-                f"{slab / 2**30:.1f} GiB ({n_chains} chains x {n_slots} "
-                f"(block, lag) slots x m^2 = {m * m}, plus the fold's "
-                f"gather), over MAX_ADJOINT_BUFFER_BYTES = "
-                f"{MAX_ADJOINT_BUFFER_BYTES / 2**30:.1f} GiB. "
-                f"Every distinct float32 spacing in the timestamps is a "
-                f"lag, and this cadence has {n_lags - 1} of them over "
-                f"{npts} points.  Bin the timestamps, use fewer chains, or "
-                f"use GPPolicy(metal=False) for the gradient.")
+        _check_adjoint_budget(n_chains, n_slots, n_lags, npts, m, fold_plan)
 
         ent_m, ent_C, seed_m, seed_C = seeds(aux, cot)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
@@ -3095,48 +3611,10 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
         # `lag` is an integer index and `r_ref` is the data's own yerr^2 --
         # neither is ever a function of the sampled parameters, so neither
-        # needs a cotangent.  `jit2` does: S = max(h Cp h^T, 0) + r_ref +
-        # jit2, so d/d(jit2) is the sum of the r_var cotangents, which is
-        # exactly what the kernel accumulates per block.
-        # Since 2026-09-27 the kernel splits this by instrument, so the
-        # per-block sum is already per jitter parameter.
-        # d_rv is (n_chains, n_blocks, n_jit): the kernel split the r_var
-        # adjoint by the observation's instrument, so summing over blocks
-        # gives each jitter parameter its own gradient.
-        # Per datum (`noise_fn`) the kernel wrote each observation's own
-        # adjoint, already in ``j2``'s (npts, n_chains, 1) shape.
-        n_jit = _n_jit_of(j2)
-        d_j2 = (d_rv if n_jit < 0 else mx.zeros_like(j2) if n_jit == 0
-                else mx.sum(d_rv, axis=1)[:, :n_jit])
-        # Slots -> the per-lag table the term front end differentiates.
-        # Distinct blocks own disjoint slots, so the blocks are already
-        # summed and this only regroups.  Applied one fold group at a
-        # time: each group's lags are distinct, which is what keeps the
-        # scatter reproducible -- see `likelihood._lag_fold_plan`.  The
-        # all-distinct cadence this work is for has exactly one group.
-        kind, plan = fold_plan
-        if kind == "dense":
-            # One gather through a (n_lags, max_rank) table of slot indices
-            # padded with a zero row, then one `mx.sum` -- which is
-            # reproducible where a repeated-index scatter is not.
-            pad = mx.zeros((n_chains, 1, m, m), dtype=d_phi.dtype)
-            d_phi_tab = mx.sum(
-                mx.take(mx.concatenate([d_phi, pad], axis=1), plan, axis=1),
-                axis=2)
-            d_q_tab = mx.sum(
-                mx.take(mx.concatenate([d_q, pad], axis=1), plan, axis=1),
-                axis=2)
-        else:
-            d_phi_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_phi.dtype)
-            # a separate zero, not an alias: `.at[].add` is functional so
-            # sharing one would be correct today, but an empty plan would
-            # then return the same array as two independent cotangents.
-            d_q_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_q.dtype)
-            for sel, lags_of in plan:
-                d_phi_tab = d_phi_tab.at[:, lags_of].add(
-                    mx.take(d_phi, sel, axis=1))
-                d_q_tab = d_q_tab.at[:, lags_of].add(
-                    mx.take(d_q, sel, axis=1))
+        # needs a cotangent.  `jit2` does: see `_d_jit2`.
+        d_phi_tab, d_q_tab = _fold_slots(d_phi, d_q, fold_plan, n_chains,
+                                         n_lags, m)
+        d_j2 = _d_jit2(d_rv, j2)
         return (d_phi_tab, d_q_tab,
                 mx.zeros_like(lg), mx.sum(d_h, axis=1), d_y,
                 mx.zeros_like(rr), d_j2)
