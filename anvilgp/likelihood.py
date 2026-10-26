@@ -1778,7 +1778,8 @@ class GPLogLike:
         in :meth:`gram`; ``Y`` ``(N,)`` gives ``(n_chains, N)``, ``(N, k)``
         or ``(n_chains, N, k)`` gives ``(n_chains, N, k)``.  O(N k), from
         the state-space smoother that :meth:`predict` uses, and value only:
-        for a differentiable quadratic form use :meth:`gram`.  See
+        for a differentiable quadratic form use :meth:`gram`.  As in
+        :meth:`predict`, no chain is refused.  See
         `anvilgp.predict.apply_inverse`.
         """
         from .predict import apply_inverse
@@ -1787,7 +1788,7 @@ class GPLogLike:
     def predict(self, v, t_pred, return_var: bool = True):
         """The GP component's posterior at new inputs: ``(mean, var)``, each
         float64 NumPy ``(n_chains, len(t_pred))``, for model-space rows
-        ``v``.
+        ``v``; ``var`` is None with ``return_var=False``.
 
         ``t_pred`` is in the data's coordinate ``t``, in any order.  The
         mean model and the noise are not included -- evaluate ``mean_fn``
@@ -1795,7 +1796,9 @@ class GPLogLike:
         variance for an observation-level band.  With a ``linear_basis``
         the linear parameters are integrated over their posterior.  O(N +
         M) by the state-space smoother, in float64 on the host, and
-        separate from the likelihood: see :mod:`anvilgp.predict`.
+        separate from the likelihood: see :mod:`anvilgp.predict`.  No
+        chain is refused: a chain the likelihood refuses (``kappa_max``)
+        still gets its exact float64 answer, unlike :meth:`gram`'s NaN.
         """
         from .predict import predict
         v = np.asarray(v, dtype=np.float64)

@@ -204,5 +204,7 @@ Admissible only as a secondary cross-check, never as the likelihood:
   [kernels.md](kernels.md#indefinite-and-still-exact) and
   [boundary-plan.md](boundary-plan.md), VI.
 * No 2D / multiband GPs.
-* `predict` / conditional mean is an offline float64 utility
-  (`oracle.dense_predict`), deliberately outside the hot path.
+* `predict` (the GP's conditional mean and variance at new inputs) is an
+  O(N + M) float64 state-space smoother on the host (`anvilgp.predict`),
+  deliberately outside the hot path; `oracle.dense_predict` is its dense
+  test oracle.

@@ -184,7 +184,8 @@ class GPTarget:
 
     def predict(self, v_model: np.ndarray, t_pred, return_var: bool = True):
         """The GP component's posterior mean and variance at ``t_pred`` for
-        model-space draws: see `GPLogLike.predict`."""
+        model-space draws (``var`` None with ``return_var=False``): see
+        `GPLogLike.predict`."""
         return self.loglike.predict(v_model, t_pred, return_var=return_var)
 
     def _n_noise(self) -> int:
@@ -217,9 +218,10 @@ class GPTarget:
     def natural(self, v_model: np.ndarray) -> dict:
         """Model-space draws -> natural units, for reporting.
 
-        Covers the kernel block, the jitters and the offsets; the mean
-        model's own parameters stay the caller's business, since only it
-        knows what they mean.
+        Covers the kernel block, the jitters, the offsets and a noise
+        model's parameters (through its ``natural``); the mean model's own
+        parameters stay the caller's business, since only it knows what
+        they mean.
         """
         pm = self.param_map
         v = mx.array(np.asarray(v_model, dtype=np.float32))
@@ -307,7 +309,14 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         without one; ``x`` is ``x_mean``, else ``t``).  ``linear_prior``
         None for a flat prior on them (the restricted likelihood), or
         ``(mu, cov)``.  :meth:`GPTarget.linear_posterior` reports them.
-        Costs ``1 + (p+1)(p+2)/2`` likelihood evaluations (7 at p = 2).
+        On the fused kernel all ``p + 1`` columns ride one filter: value +
+        gradient 1.7x the plain likelihood at p = 1, 2.0x at 2, 7.5x at 10
+        (N = 1e4 x 1024 chains).  The MLX path, and the kernel above 31
+        basis columns, polarise instead, at ``1 + (p+1)(p+2)/2`` likelihood
+        evaluations (7 at p = 2).  Centre and scale the columns (``x -
+        x.mean()``, not raw ``x``); exactly collinear columns (a global
+        level beside one offset per instrument) are refused in float32 --
+        drop the redundant one.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic
@@ -317,7 +326,11 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
     -------
     GPTarget
         With ``.target`` (hand to ``anvil.run``), ``.transform``,
-        ``.loglike``, ``.names``, ``.hypers`` and ``.param_map``.
+        ``.loglike``, ``.names``, ``.hypers``, ``.param_map``, ``.noise``
+        (the noise model or None), and the joint-member protocol
+        (``.model_log_prob``, ``.model_log_prob_hi``, ``.model_log_norm``,
+        ``.specs``, ``.u_ref()``; see `GPTarget`).  Methods: ``u0``,
+        ``natural``, ``predict``, ``apply_inverse``, ``linear_posterior``.
     """
     engine = import_engine()
     if n_jitter is None:

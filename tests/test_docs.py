@@ -39,7 +39,7 @@ def _tutorial_data():
 
 
 def test_the_tutorials_headline_agreement_with_celerite2():
-    """docs/tutorial.md: "The two agree to 1.1e-3 on a log-likelihood of 734."
+    """docs/tutorial.md: "The two agree to 4e-5 on a log-likelihood of 734."
 
     The tutorial's whole claim to a celerite2 user is that this is the same
     likelihood.  If the gap grows past ~1e-2 the claim is no longer
@@ -58,7 +58,7 @@ def test_the_tutorials_headline_agreement_with_celerite2():
             mx.zeros((1, 3), dtype=mx.float32)))[0])
 
     assert abs(ll_c2 - 733.62) < 0.5, f"tutorial prints 733.62, got {ll_c2}"
-    assert abs(ll - ll_c2) < 1e-2, f"tutorial claims 1.1e-3, got {abs(ll-ll_c2):.2e}"
+    assert abs(ll - ll_c2) < 1e-3, f"tutorial claims 4e-5, got {abs(ll-ll_c2):.2e}"
 
 
 def test_the_batched_call_returns_one_value_per_vector():

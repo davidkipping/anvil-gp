@@ -140,6 +140,11 @@ The boundary plan's open items: the square-root backward (rotation at
 TESS 20-s, the 2-s floor), the kernel thread layout (m = 5-6 speed,
 m > 6), IV (deferred), the seed-3 margin, the >= 100x gate.
 
+From item 3: **a gradient for `apply_inverse`.** `K^-1 Y` is value-only;
+its derivative in the GP parameters needs second derivatives through the
+filter, which neither gradient route provides. Nothing built on it needs
+one (marginalisation differentiates `gram`); built on request.
+
 From item 4: **parallel-in-time `predict`.** Today's smoother is one
 host-side step per merged point, bound by NumPy's per-call overhead (~20
 us a point: 2.0 s at N = 1e5 for one chain, 7.3 s for 64). Proposed:

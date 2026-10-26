@@ -439,6 +439,14 @@ paths.
 **Mean models** are supported on both paths: pass `mean_fn` and
 `mean_specs` to `make_target`, or `mean_fn` to `GPLogLike`.
 
+**Linear parameters** (`linear_basis`, integrated out rather than
+sampled) run on both paths, with up to 31 columns through one filter on
+the kernel. Centre and scale the columns: nearly parallel ones cost the
+float32 algebra digits, and **exactly** collinear ones (a global level
+beside one offset per instrument) are refused in float32 under either
+prior. Under a Gaussian `linear_prior` the float64 paths evaluate them
+exactly. See the tutorial, "Linear parameters, marginalised".
+
 **Cadence.** Any cadence works, including duplicate timestamps and large
 gaps. A cadence where every spacing is distinct makes the internal lag
 table one row per observation, which costs memory in the *value* (13.2 GiB

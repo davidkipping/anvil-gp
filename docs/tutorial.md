@@ -75,14 +75,15 @@ gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
                                                 #   warns if it cannot)
 v = mx.zeros((1, 3), dtype=mx.float32)          # v = 0 means "at the references"
 with mx.stream(mx.gpu):
-    ll = float(np.array(gp.log_prob_absolute(v))[0])   # 733.621570
+    ll = float(np.array(gp.log_prob_absolute(v))[0])   # 733.620472
 ```
 
-The two agree to **1.1e-3** on a log-likelihood of 734. That gap is
+The two agree to **4e-5** on a log-likelihood of 734. That gap is
 float32 against float64 and is discussed under
 [accuracy](benchmarks.md#accuracy-against-a-float64-dense-cholesky); it is
-three orders below the ~1-unit scale at which a Metropolis accept/reject
-decision changes.
+four orders below the ~1-unit scale at which a Metropolis accept/reject
+decision changes. (It was 1.1e-3 until 2026-10-24, when the kernel's
+value moved to a replayed filter; the MLX path gives 733.623401, 3e-3.)
 
 ### Three things that look different
 
@@ -279,8 +280,14 @@ The parity tests do this over every kernel, cadence and corner
 itself approximate. To spot-check your own problem:
 
 ```python
-assert abs(gp.log_prob_absolute(v)[0] - ll_c2) < 1e-2 * max(1, abs(ll_c2))
+with mx.stream(mx.gpu):
+    ll = float(np.array(gp.log_prob_absolute(v))[0])
+assert abs(ll - ll_c2) < 1e-2 * max(1, abs(ll_c2))
 ```
+
+(`log_prob_absolute` returns float64, which lives on the CPU stream:
+convert it with `np.array` as here rather than indexing it on the GPU,
+which raises "float64 is not supported on the GPU".)
 
 There is also a float64 path, `gp.hi(...)`, which runs the same algebra
 in double precision on the CPU and agrees with a dense Cholesky to ~1e-11.
@@ -344,7 +351,17 @@ draws = beta + np.einsum("cij,cj->ci", np.linalg.cholesky(cov),
 ```
 
 The basis is rebuilt at every evaluation, so it may depend on the mean
-model (through `m0`), on any covariate and on sampled parameters.
+model (through `m0`), on any covariate and on sampled parameters. Centre
+and scale its columns (`x - tc` above, not raw `x`): the marginal's small
+p x p algebra runs in float32 on the GPU, and nearly parallel columns
+cost it digits: `[1, 1 + 1e-3 (t - tc)]` (correlation 0.99998) is off by
+1e-3 log-units on the kernel and by 41 on the MLX path, whose Gram comes
+from differences of likelihoods. **Exactly** collinear columns
+(a global level beside one offset per instrument) are refused in float32
+under either prior, because float32 cannot resolve the redundant
+direction; drop one column. Under a flat prior they are improper anyway;
+under a Gaussian `linear_prior` the float64 paths (`gp.hi`,
+`linear_posterior`, `predict`) evaluate them exactly.
 `draws` are posterior draws of β: one per draw of the rest, from its
 exact conditional. Here they give a level of 2.97 (16-84%: 2.88-3.09)
 and a slope of 0.061 (0.051-0.071) against 3.0 and 0.05.
@@ -390,8 +407,8 @@ X = gt.apply_inverse(vs[:4], Y)                             # (4, N, 2)
 the marginalisation above is built on it, and the fused kernel carries all
 k columns through one filter (up to 32). `apply_inverse` is float64 and
 value-only -- no gradient in `v`. `Y` may be shared, `(N,)` or `(N, k)`,
-or per chain, `(n_chains, N, k)`. Here `Y^T X` agrees with `G` to 3e-6,
-float32 against float64.
+or per chain, `(n_chains, N, k)`. Here `Y^T X` agrees with `G` to 3e-6
+of its largest entry, float32 against float64.
 
 ### Several datasets at once
 

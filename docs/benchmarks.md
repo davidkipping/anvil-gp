@@ -352,7 +352,9 @@ p x p solves run on small Metal kernels of their own, because MLX's
 batched matmul and inverse were slower than the likelihood at these
 shapes. The one-filter route beat polarisation at every k measured (up to
 26), and polarising 26 columns at m = 6 tripped the GPU watchdog. Reproduce with
-`benchmarks/marginal_cost.py` (add `--grad`).
+`benchmarks/marginal_cost.py --chains 1024 --p 1 2 5 10` (add `--grad` for
+value + gradient; the defaults, 256 chains and p = 2, 5, 10, give the
+256-chain column).
 
 **Prediction** (`predict`) is float64 on the CPU, off the likelihood
 path: a Kalman filter and smoother over data and prediction points

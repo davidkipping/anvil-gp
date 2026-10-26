@@ -139,7 +139,7 @@ approximate one.
 |---|---|
 | `special.py` | cancellation-free scalar functions; true float64 `exp`/`sincos` |
 | `terms.py` | kernel terms as SSMs — propagator, stationary covariance, process noise |
-| `linalg.py` | tiny batched Cholesky / triangular solve, unrolled and differentiable |
+| `linalg.py` | tiny batched Cholesky / triangular solve and small inverses (`inv_logdet_fast`), unrolled and differentiable |
 | `elements.py` | affine-Gaussian scan-element algebra; chunked-scan **reduction** |
 | `kalman.py` | sequential prediction-error filter — an independent oracle |
 | `likelihood.py` | `GPLogLike`: the anvil engine contract |
@@ -147,7 +147,7 @@ approximate one.
 | `noise.py` | noise models for `noise_fn`: error scale, scale + jitter, per instrument |
 | `predict.py` | float64 Kalman smoother: `predict` and `apply_inverse` |
 | `oracle.py` | dense float64 Cholesky oracle, `dense_predict`, celerite2 wrapper |
-| `metal.py` | fused Metal scan kernel and its checkpointed backward — M3 and M4 |
+| `metal.py` | fused Metal scan kernel and its checkpointed backward — M3 and M4; the multi-column filter (`scan_gram`) and the marginal's small kernels |
 | `adjoint.py` | hand-derived backward recursion — M4's specification |
 | `anvil.py` | engine integration (lazy import; core stays mlx + numpy only) |
 
@@ -774,6 +774,13 @@ marked as an estimate.
 * **Symmetric storage for C and J.** 15 numbers instead of 17 at m = 2, 45
   instead of 57 at m = 4. Marginal in MLX, and immaterial in the kernel
   (block outputs are 0.05 GiB) — kept here only so nobody re-derives it.
+* **The square-root boundary's margin on one draw.** Its acceptance
+  bounds were set on one posterior draw; on another (seed 3) the default
+  m = 4, 256-point blocks give a worst gradient error of 0.51 posterior
+  sigma against a 0.5 bound (dense boundary: 1.1), split between the
+  float32 algebra and the Metal implementation's rounding. Candidates: a
+  compensated accumulation in `sqrt_blocks`' fold products, or a second
+  centring round. See [docs/boundary-plan.md](docs/boundary-plan.md), V.
 * **Parallel-in-time `predict`.** The smoother is one host-side step per
   merged point, bound by NumPy's per-call overhead (~20 us a point: 2.0 s
   at N = 1e5 for one chain, 7.3 s for 64). Splitting the grid into
@@ -1016,9 +1023,11 @@ Three more are worked around and pinned as regression tests
   chain for prefix, suffix and seeds; one thread per (chain, block) that
   replays its block from checkpoints and sweeps it back.
 
-  Two practical limits to know before relying on it. A gradient at the
-  brief's realistic kernel (rotation + granulation, m = 6) is off the kernel
-  and costs seconds per call at 256 chains and N = 1e4. And a ChEES chain
+  A practical limit to know before relying on it. (A second one stood here
+  until 2026-10-25: a gradient at the brief's realistic kernel, rotation +
+  granulation, m = 6, ran off the kernel at seconds per call. m = 5-6 run
+  on the kernel since, at the register-spill cost under "What is left".)
+  A ChEES chain
   started deep in a bounded parameter's prior tail never moves again — not
   because of anything here (the GP likelihood and its gradient stay finite
   well past the point where anvil's own transform returns `-inf`) but
