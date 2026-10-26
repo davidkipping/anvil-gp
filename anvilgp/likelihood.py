@@ -1144,11 +1144,16 @@ class GPLogLike:
         # Built time-major, (npts, n_chains), to match the kernel's flat
         # chains-fastest grid: adjacent threads then read adjacent floats.
         # Constructed transposed rather than transposed afterwards, which
-        # would be a full copy of the residual every call.
+        # would be a full copy of the residual every call.  A supplied
+        # residual is transposed, and is then made contiguous ONCE: a
+        # `metal_kernel` copies a non-contiguous input on every use, and
+        # the columns are read by up to five kernels (boundary, affine,
+        # replay; r-sensitivities and the backward in the VJP) -- 1.2 GB
+        # a copy at N = 1e5 x 1024 chains x 3 columns.
         if resid is not None and resid.ndim == 3:     # `_marginal`'s columns
-            r = mx.transpose(resid, (2, 0, 1))
+            r = mx.contiguous(mx.transpose(resid, (2, 0, 1)))
         elif resid is not None:        # `_marginal`'s combinations
-            r = mx.swapaxes(resid, 0, 1)
+            r = mx.contiguous(mx.swapaxes(resid, 0, 1))
         else:
             r = mx.broadcast_to(self._y32[:, None], (self.n_data, n))
             if self.mean_fn is not None and pm.mean is not None:
@@ -1178,7 +1183,11 @@ class GPLogLike:
                                 self._metal_inst, axis=1)
             if corr is not None:
                 extra = extra + corr
-            jit2 = mx.swapaxes(extra, 0, 1)[:, :, None]
+            # Contiguous once, as the residual: every kernel reading it
+            # (four on the value, seven with the gradient) would otherwise
+            # copy the transposed view -- 1957 against 1176 MB peak on the
+            # value at N = 1e5 x 1024 chains.
+            jit2 = mx.contiguous(mx.swapaxes(extra, 0, 1)[:, :, None])
         else:
             # One jitter or none: one value per chain, read once per thread.
             jit = pm.jitter_var_per_instrument(v)

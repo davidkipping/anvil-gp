@@ -2480,7 +2480,6 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
 
     @mx.custom_function
     def core(p_t, q_t, hv, cz, j2):
-        cz = mx.contiguous(cz)
         if n_blocks == 1:
             # Block 0 enters at zero (its first lag is row 0, Phi = 0), as
             # in `_SRC_PREFIX`; no boundary to run.
@@ -2521,13 +2520,13 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
             seed_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
         else:
             *_, seed_ld = _boundary_seeds(aux, c_ld, formal, use_sqrt)
-            R = column_exit_sensitivities(p_t, q_t, lag, inst, hv,
-                                          mx.contiguous(cz), r_ref, j2,
-                                          ent_m, ent_C, blk_len, formal)
+            R = column_exit_sensitivities(p_t, q_t, lag, inst, hv, cz,
+                                          r_ref, j2, ent_m, ent_C, blk_len,
+                                          formal)
             seed_m = -2.0 * mx.einsum("cab,cnbi->cnai", gs, R)
             seed_C = seed_ld - mx.einsum("cnai,cab,cnbj->cnij", R, gs, R)
         d_phi, d_q, d_h, d_y, d_rv = backward_ckpt_mc(
-            p_t, q_t, lag, inst, hv, mx.contiguous(cz), r_ref, j2, c_ld, gs,
+            p_t, q_t, lag, inst, hv, cz, r_ref, j2, c_ld, gs,
             ent_m, ent_C, seed_m, seed_C, slot_id, slot_start, n_slots,
             blk_len, formal)
         d_phi_tab, d_q_tab = _fold_slots(d_phi, d_q, fold_plan, n_chains,
@@ -2535,7 +2534,12 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
         return (d_phi_tab, d_q_tab, mx.sum(d_h, axis=1), d_y,
                 _d_jit2(d_rv, j2))
 
-    out = core(phi_tab, q_tab, hvec, cols, jit2)
+    # Contiguous before the custom function, not inside it: a
+    # `metal_kernel` copies a non-contiguous input on every use, and the VJP
+    # receives the primal as passed, so a copy made inside `core` was made
+    # again for each of the VJP's two readers.  A no-op when the caller
+    # already passes contiguous columns (`GPLogLike._metal_inputs` does).
+    out = core(phi_tab, q_tab, hvec, mx.contiguous(cols), mx.contiguous(jit2))
     return out[0], out[1]
 
 
