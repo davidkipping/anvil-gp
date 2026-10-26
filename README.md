@@ -54,6 +54,8 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/anvil-0.10.2-fused-kernel-test-note.md](docs/anvil-0.10.2-fused-kernel-test-note.md) | anvil's note: on 0.10.2 the fused-kernel ChEES test's width check fails, inflated by a few lost chains |
 | [docs/anvil-0.10.2-fused-kernel-test-reply.md](docs/anvil-0.10.2-fused-kernel-test-reply.md) | Our reply: the lost chains are still climbing back (not trapped, not at the float32 boundary); the test now takes the median per-chain width |
 | [docs/anvil-joint-target-note.md](docs/anvil-joint-target-note.md) | Note to anvil proposing a joint target over several log-densities with shared parameters, composed in model space; one API request (expose `model_log_prob` / `model_log_prob_hi`) |
+| [docs/general-features-plan.md](docs/general-features-plan.md) | The general-features plan, landed: noise models, joint-target members, `gram` / `apply_inverse` and marginalised linear parameters, `predict` -- design, measurements and what is parked |
+| [docs/wasp103-reply.md](docs/wasp103-reply.md) | Our reply to the WASP-103b CHEOPS brief that prompted it: what was declined (multi-input kernels) and why, and what shipped |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
@@ -73,6 +75,43 @@ figures, break-even walker counts included, were regenerated after both
 cuts on 2026-10-25.
 End to end inside a sampler it is lower again; benchmarks.md says by how
 much and why.
+
+## Beyond the plain likelihood
+
+All general and all `O(N)`; the first two and `gram` run on the fused
+kernel, gradient included. The tutorial has a runnable example of each
+([docs/tutorial.md](docs/tutorial.md#beyond-the-plain-likelihood)).
+
+* **Noise models.** `make_target(noise=noise.scale_and_jitter(yerr))`, or
+  `noise.error_scale()`, per instrument if wanted; or any
+  `noise_fn(v_noise, d)` of your own giving the total per-datum variance
+  (celerite2's `diag`). Gradients by autodiff, on the kernel too, at
+  1.00-1.10x the plain cost.
+* **Marginalised linear parameters.** `linear_basis=f(v_mean, x, m0) ->
+  (n_chains, N, p)`, rebuilt every evaluation so it may depend on the mean
+  model; the coefficients are integrated out analytically (the restricted
+  likelihood, with `-1/2 ln|Phi^T K^-1 Phi|`), flat or under
+  `linear_prior=(mu, S)`, and `gt.linear_posterior(v)` gives their
+  Gaussian conditional per draw. Value + gradient at N = 1e4 x 1024
+  chains: 1.7x the plain likelihood at p = 1, 2.0x at 2, 3.1x at 5, 7.5x
+  at 10 ([docs/benchmarks.md](docs/benchmarks.md#what-the-general-features-cost)).
+* **Prediction.** `gt.predict(v, t_pred)`: the GP component's posterior
+  mean and variance at any points, per draw, float64, with marginalised
+  coefficients integrated over; to ~1e-14 of the dense conditional. A
+  host-side smoother: ~0.2 s for one draw at N = 1e4, 2 s at N = 1e5,
+  vectorised over draws (64 draws at N = 1e5: 7.3 s).
+* **The primitives.** `gp.gram(v, Y)` = `Y^T K^-1 Y` for any columns,
+  batched and differentiable in `v` and `Y` (the kernel carries up to 32
+  columns through one filter); `gt.apply_inverse(v, Y)` = `K^-1 Y`,
+  float64, value only.
+* **Several datasets.** `anvil.joint(members, shared)` (anvil >= 0.12.0)
+  composes anvil-gp targets, and any other anvil log-density, with some
+  parameters in common; `anvilgp.anvil.joint_u0` starts it.
+
+**Not supported, deliberately:** kernels of more than one input. They have
+no `O(N)` form, and this library ships only kernels it can evaluate in
+`O(N)`; [docs/kernels.md](docs/kernels.md#one-input-and-why) says why and
+what to use instead.
 
 ## Why a state-space model rather than celerite's Cholesky
 
@@ -105,7 +144,9 @@ approximate one.
 | `kalman.py` | sequential prediction-error filter — an independent oracle |
 | `likelihood.py` | `GPLogLike`: the anvil engine contract |
 | `priors.py` | parametrisation, default priors, periodogram initialiser |
-| `oracle.py` | dense float64 Cholesky oracle, `predict`, celerite2 wrapper |
+| `noise.py` | noise models for `noise_fn`: error scale, scale + jitter, per instrument |
+| `predict.py` | float64 Kalman smoother: `predict` and `apply_inverse` |
+| `oracle.py` | dense float64 Cholesky oracle, `dense_predict`, celerite2 wrapper |
 | `metal.py` | fused Metal scan kernel and its checkpointed backward — M3 and M4 |
 | `adjoint.py` | hand-derived backward recursion — M4's specification |
 | `anvil.py` | engine integration (lazy import; core stays mlx + numpy only) |
@@ -114,7 +155,8 @@ Kernel set: `RealTerm`, `SHOTerm`, `ComplexTerm`, `Matern32Term`,
 `Matern52Term`, `RotationTerm` (two SHOs at P and P/2, the
 celerite2/exoplanet convention), sums of terms, exposure-time integration
 (`TermConvolution`, around **any** of them -- including Matern-5/2, which
-celerite2 cannot convolve), per-instrument jitters and mean offsets.
+celerite2 cannot convolve), per-instrument jitters and mean offsets,
+`noise_fn` noise models and marginalised linear parameters.
 
 ## The likelihood is a reduction, not a scan
 
@@ -732,6 +774,18 @@ marked as an estimate.
 * **Symmetric storage for C and J.** 15 numbers instead of 17 at m = 2, 45
   instead of 57 at m = 4. Marginal in MLX, and immaterial in the kernel
   (block outputs are 0.05 GiB) — kept here only so nobody re-derives it.
+* **Parallel-in-time `predict`.** The smoother is one host-side step per
+  merged point, bound by NumPy's per-call overhead (~20 us a point: 2.0 s
+  at N = 1e5 for one chain, 7.3 s for 64). Splitting the grid into
+  ~sqrt(N + M) blocks -- block elements, a prefix over blocks, then the
+  within-block filter and smoother vectorised over chains x blocks -- is
+  estimated at ~10x at N = 1e5. Not started; see
+  [docs/general-features-plan.md](docs/general-features-plan.md), "Parked
+  behind this".
+* **A gradient for `apply_inverse`.** `K^-1 Y` is value-only: its
+  derivative in the GP parameters needs second derivatives through the
+  filter, which neither gradient route provides. Nothing built on it needs
+  one (marginalisation differentiates `gram`); built on request.
 * **Not worth doing:** `metal::fast` intrinsics buy nothing once the layout
   above is fixed (1.35 -> 1.19 ms) and cost up to 6e-2 log-units. A
   whole-series fold with a grouped tree measured *slower* (114–122 vs

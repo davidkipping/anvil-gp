@@ -115,6 +115,25 @@ targets. Benchmarks: noise_fn cost, marginalisation cost, predict cost.
 (measured first), item 3's stage 3 cost, and item 2's dependence on
 anvil's answer.
 
+## Item 5 done: docs and benchmarks (2026-10-26)
+
+- `kernels.md`: "One input, and why" -- the O(N)-only rule, and what a
+  second input maps to instead (mean / `linear_basis`, `noise_fn`, a dense
+  joint member).
+- README: "Beyond the plain likelihood" (each feature, its cost, the
+  refusal); `noise.py` and `predict.py` in the layout; two open items
+  (parallel-in-time `predict`, a gradient for `apply_inverse`); this plan
+  and the WASP reply in the documentation table.
+- `tutorial.md`: "Beyond the plain likelihood", five runnable sections on
+  the tutorial's data (noise model, marginalised level + slope with
+  `linear_posterior`, `predict`, `gram` / `apply_inverse`, a two-member
+  joint target), figures from one run; `tests/test_docs.py` pins the
+  names, shapes and the `gram` agreement.
+- `benchmarks.md`: "What the general features cost", hand-written from
+  the measurements above; the stale prediction paragraph replaced.
+
+The plan is complete.
+
 ## Parked behind this
 
 The boundary plan's open items: the square-root backward (rotation at

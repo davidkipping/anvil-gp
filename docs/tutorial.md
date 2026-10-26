@@ -3,8 +3,9 @@
 This walks through the same fit twice, once in celerite2 and once in
 anvil-gp, so the differences are concrete. The numbers quoted are the ones
 these blocks actually produce. `tests/test_docs.py` re-runs the load-bearing
-ones — the celerite2 agreement, the batched shapes, the kernel/`m` table
-and the Matern-3/2 comparison — with tolerances loose enough to survive
+ones — the celerite2 agreement, the batched shapes, the kernel/`m` table,
+the Matern-3/2 comparison, and the feature sections' parameter lists,
+shapes and `gram` agreement — with tolerances loose enough to survive
 float32 noise. **The timings and the posterior table below are not
 pinned**: they move with machine load and sampler seed, so treat them as
 illustrative rather than as a contract.
@@ -288,12 +289,150 @@ It refuses the same chains the float32 path does (it is the float64 value
 of the same target, and anvil's `reanchor_every` writes it into the chain
 state); `gp.hi(v, refuse=False)` gives the raw float64 number everywhere.
 
+## Beyond the plain likelihood
+
+The sections below use the same `t`, `y`, `yerr`, `rng` and the imports
+above. Each feature is general (it knows nothing about transits or
+instruments) and each keeps the likelihood `O(N)`.
+
+### Noise models
+
+The default observation variance is `yerr^2 + jitter^2`. If you do not
+trust the error bars, say so in the model:
+
+```python
+from anvilgp import noise
+
+gt = make_target(ag.SHOTerm(), t, y, yerr, noise=noise.scale_and_jitter(yerr))
+gt.names   # ['log_gp_sigma', 'log_gp_rho', 'log_gp_Q',
+           #  'log_noise_scale', 'log_noise_jitter']
+```
+
+That is `(s yerr)^2 + j^2`; `noise.error_scale()` is `(s yerr)^2` alone,
+with one `s` per instrument if you ask. Anything else -- flux- or
+time-dependent noise -- is a `noise_fn` of your own, celerite2's `diag`;
+the two rules it must follow are in
+[kernels.md](kernels.md#other-limits-worth-knowing). It runs on the fused
+kernel, gradient included, within 0-10% of the plain jitter's cost.
+
+### Linear parameters, marginalised
+
+A baseline that is linear in its coefficients -- a level and a slope here,
+`(1 + m0)(a + b t)` around a transit -- need not be sampled. Give
+`make_target` the basis and the coefficients are integrated out
+analytically:
+
+```python
+tc = float(t.mean())
+
+def baseline(v_mean, x, m0):             # -> (n_chains, N, p), linear in beta
+    one = mx.ones_like(m0)               # m0 is the mean model, (n_chains, N)
+    return mx.stack([one, mx.broadcast_to(x - tc, m0.shape)], axis=-1)
+
+y_lin = y + 3.0 + 0.05 * (t - tc)        # an offset and a trend to remove
+gt = make_target(ag.SHOTerm(), t, y_lin, yerr, linear_basis=baseline)
+gt.names   # ['log_gp_sigma', 'log_gp_rho', 'log_gp_Q', 'log_jitter']: no beta
+
+res = anvil.run(EnsembleKernel(gt.target, seed=2), gt.target,
+                gt.u0(256, seed=1), n_warmup=1000, n_samples=300,
+                seed=3, progress=False)
+v = gt.transform.model_np(res.get_chain(flat=True).astype(np.float64))
+vs = v[::200]                            # 384 of the 76,800 draws
+beta, cov = gt.linear_posterior(vs)      # beta | v is Gaussian, in float64
+draws = beta + np.einsum("cij,cj->ci", np.linalg.cholesky(cov),
+                         rng.standard_normal(beta.shape))
+```
+
+The basis is rebuilt at every evaluation, so it may depend on the mean
+model (through `m0`), on any covariate and on sampled parameters.
+`draws` are posterior draws of β: one per draw of the rest, from its
+exact conditional. Here they give a level of 2.97 (16-84%: 2.88-3.09)
+and a slope of 0.061 (0.051-0.071) against 3.0 and 0.05.
+
+The likelihood is the restricted one: it keeps `-1/2 ln|Phi^T K^-1 Phi|`,
+which is what makes the marginal posterior of the other parameters match a
+fit that samples β under a flat prior. `linear_prior=(mu, S)` gives a
+Gaussian prior on β instead. It costs, on the kernel at N = 1e4 x 1024
+chains, 1.7x the plain likelihood for p = 1 and 2.0x for p = 2 on value +
+gradient, rising to 7.5x at p = 10 ([benchmarks.md](benchmarks.md#what-the-general-features-cost)).
+
+### Predicting the GP
+
+The GP component's posterior at any times, for each draw, in float64:
+
+```python
+t_new = np.linspace(-2.0, 42.0, 500)
+mean, var = gt.predict(vs, t_new)        # each (384, 500)
+```
+
+That is `E[f(t_new) | y]` and its variance under each draw's
+hyperparameters -- not including the mean model or the observation noise,
+and with β integrated over its posterior when it is marginalised. It
+matches the dense conditional to ~1e-14. It runs on the CPU, as a Kalman
+filter and smoother over data and prediction points together, vectorised
+over draws: 1.9 s for these 384 draws, and for a single draw about 0.2 s
+at N = 1e4 and 2 s at N = 1e5. Thin the chain first. A parallel version is on the open list in the README.
+
+### The primitives underneath
+
+The quadratic form `Y^T K^-1 Y` and the solve `K^-1 Y`, for any columns
+`Y`, are public:
+
+```python
+gp = gt.loglike
+Y = np.stack([np.ones(n), t - tc], 1)                       # (N, k)
+with mx.stream(mx.gpu):
+    G = gp.gram(mx.array(vs[:4], dtype=mx.float32), Y)      # (4, 2, 2)
+X = gt.apply_inverse(vs[:4], Y)                             # (4, N, 2)
+```
+
+`gram` is batched and differentiable, in `v` and in `Y`, on every path:
+the marginalisation above is built on it, and the fused kernel carries all
+k columns through one filter (up to 32). `apply_inverse` is float64 and
+value-only -- no gradient in `v`. `Y` may be shared, `(N,)` or `(N, k)`,
+or per chain, `(n_chains, N, k)`. Here `Y^T X` agrees with `G` to 3e-6,
+float32 against float64.
+
+### Several datasets at once
+
+Datasets with some parameters in common are one target, composed by
+anvil. Two halves of the light curve here, sharing a mean level `mu`:
+
+```python
+from anvilgp.anvil import joint_u0
+from anvilgp.priors import SpecHint
+
+def level(v_mean, x):
+    return mx.broadcast_to(v_mean[:, :1], (v_mean.shape[0], x.shape[-1]))
+
+h, mu = n // 2, [SpecHint("mu", lo=-2.0, hi=2.0)]
+a = make_target(ag.SHOTerm(), t[:h], y[:h] + 0.5, yerr[:h],
+                mean_fn=level, x_mean=t[:h], mean_specs=mu)
+b = make_target(ag.SHOTerm(), t[h:], y[h:] + 0.5, yerr[h:],
+                mean_fn=level, x_mean=t[h:], mean_specs=mu)
+jt = anvil.joint({"a": a.target, "b": b.target}, shared={"mu": ["a", "b"]})
+jt.names   # ['mu', 'a.log_gp_sigma', ..., 'b.log_jitter']
+res = anvil.run(EnsembleKernel(jt, seed=2), jt,
+                joint_u0(jt, {"a": a, "b": b}, 256),
+                n_warmup=1000, n_samples=300, seed=3, progress=False)
+```
+
+Each half keeps its own GP and jitter; `mu` comes out at 0.40
+(0.29-0.51). `anvil.joint` needs anvil 0.12.0 or later; it composes the
+members in model space, so the shared column's prior and Jacobian count
+once, and the float64 path and `anvil.validate_precision` work on the
+result. `joint_u0` starts each member's columns at its own reference. A
+member can be any anvil log-density, so a likelihood that is not a GP, or a
+GP anvil-gp does not support, sits beside these. A shared GP
+hyperparameter needs the same spec on every member.
+
 ## Where to go next
 
 * [kernels.md](kernels.md) — every supported kernel, how to set it up,
   and the common ones that are not supported.
 * [benchmarks.md](benchmarks.md) — speed and accuracy against celerite2
-  across scales and kernels, including where celerite2 wins.
+  across scales and kernels, including where celerite2 wins, and what
+  the features above cost.
 * [float32.md](float32.md) — the precision discipline and its measured
   error budget.
 * [statistical-foundation.md](statistical-foundation.md) — why the

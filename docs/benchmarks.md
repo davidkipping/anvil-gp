@@ -318,6 +318,53 @@ path is off by 1.5 log-units where either axis alone stays under 0.2,
 while the fused kernel holds 0.002 (0.02 before its value moved to a
 replayed filter, 2026-10-24). `benchmarks/error_scaling.py` maps it.
 
+## What the general features cost
+
+Measured by hand on a quiet machine (2026-10-25/26) rather than by
+`bench_docs_tables.py`, against the plain likelihood on the fused kernel.
+Each is recorded in more detail in
+[general-features-plan.md](general-features-plan.md).
+
+**A noise model** (`noise_fn`, or several per-instrument jitters) costs
+almost nothing: the kernel reads one extra variance per observation and
+writes one adjoint. At 1024 chains, m = 2: forward 1.04-1.10x, value +
+gradient 1.05-1.06x; at m = 4, 1.00x. A single jitter keeps its cheaper
+path and is bit-identical.
+
+**Marginalised linear parameters** (`linear_basis`, p columns) need the
+Gram matrix of the residual and the p basis columns, k = p + 1 in all.
+The kernel carries all k through one filter (one covariance recursion, k
+means); the MLX path, and the kernel above 32 columns, polarise instead,
+one likelihood per pair. Value + gradient, N = 1e4, SHO, against the plain
+likelihood:
+
+| p (k) | 1024 chains: one filter | polarised | 256 chains: one filter | polarised |
+|---|---:|---:|---:|---:|
+| 1 (2) | 1.7x | 3.2x | | |
+| 2 (3) | 2.0x | 5.3x | 1.5x | 2.4x |
+| 5 (6) | 3.1x | 14.9x | 2.1x | 5.8x |
+| 10 (11) | 7.5x | 44.6x | | |
+
+The forward alone: 1.8x, 2.0x, 2.6x and 6.3x at 1024 chains. At k = 3
+about a third of the forward's overhead is not the filter but building
+and transposing the columns (~3 ms); the white-noise centring fit and the
+p x p solves run on small Metal kernels of their own, because MLX's
+batched matmul and inverse were slower than the likelihood at these
+shapes. The one-filter route beat polarisation at every k measured (up to
+26), and polarising 26 columns at m = 6 tripped the GPU watchdog. Reproduce with
+`benchmarks/marginal_cost.py` (add `--grad`).
+
+**Prediction** (`predict`) is float64 on the CPU, off the likelihood
+path: a Kalman filter and smoother over data and prediction points
+together, vectorised over chains. SHO, 1000 prediction points: 0.21 s at
+N = 1e4 and 2.0 s at N = 1e5 for one chain; 0.55 s and 7.3 s for 64
+chains; 2.9 s for 512 at N = 1e4. It is bound by NumPy's per-call
+overhead (~20 us per merged point), not arithmetic; a parallel-in-time
+version, estimated ~10x at N = 1e5, is on the README's open list.
+`apply_inverse` runs the same smoother (not timed separately). `linear_posterior`
+is ~3.3 ms a draw in float64 at flat memory (0.40 GiB from 64 to 4096
+draws).
+
 ## What is not benchmarked here
 
 **tinygp** is not installed in this environment (it needs JAX, which is
@@ -332,10 +379,10 @@ not provide them. anvil-gp's value and gradient cost about 2.3x the value
 alone (10.1 ms at 1024 chains and N = 1e4) and matches float64 central differences to ~1e-7.
 The honest comparison would be against tinygp or a JAX-wrapped celerite2.
 
-**Prediction / conditioning.** celerite2 has a mature `predict` API.
-anvil-gp has `oracle.dense_predict` for float64 reference use, but
-prediction is not the batched, GPU-resident path the library is built
-around.
+**Prediction against celerite2.** Both have a `predict`; the two have
+not been timed against each other. anvil-gp's (above) is float64 on the
+CPU, not the batched, GPU-resident path the library is built around, and
+matches the dense conditional to ~1e-14.
 
 ## Choosing between them
 

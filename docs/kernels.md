@@ -381,6 +381,32 @@ anvil-gp supports them, and no `O(N)` method of this family will:
 For those, a dense GP library (george, tinygp, GPyTorch) is the right
 tool, at `O(N^3)`.
 
+### One input, and why
+
+Every kernel here is a function of one sorted coordinate, and that is a
+rule, not a gap. The `O(N)` cost comes from the state-space form: the
+covariance is a Markov process along the ordering, so each point needs
+only the state at the one before it. A kernel in two inputs -- time and
+roll angle, time and wavelength, a product of a time term with a
+covariate term -- has no single ordering along which it is Markov, and
+evaluating it exactly is a dense `O(N^3)` solve. anvil-gp is a
+general-purpose library whose point is speed, so it ships only kernels
+it can evaluate in `O(N)`; requests for a multi-input or dense kernel are
+declined for that reason, however useful the science case.
+
+What it does instead covers most of what a second input is used for:
+
+* **In the mean.** A covariate that enters linearly (a roll-angle
+  harmonic series, a centroid decorrelation) is a `linear_basis`, with
+  its coefficients marginalised analytically; anything else is part of
+  `mean_fn`, sampled. See the tutorial, "Linear parameters, marginalised".
+* **In the noise.** Error bars that depend on a covariate or on the flux
+  are a `noise_fn` ("Other limits worth knowing", below).
+* **Beside it.** Data that genuinely need a dense multi-input GP can be
+  one member of a joint target (`anvil.joint`) whose other members are
+  anvil-gp likelihoods; the dense member is your own code, at its own
+  cost, and the shared parameters are sampled once.
+
 ## Other limits worth knowing
 
 **Noise models.** The observation variance defaults to `yerr^2 +

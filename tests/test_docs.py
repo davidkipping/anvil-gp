@@ -255,3 +255,41 @@ def test_the_tutorials_exposure_time_table():
              / float(np.asarray(ag.SHOTerm().value_np(np.array(p),
                                                       np.array([0.0])))[0]))
     assert abs(ratio - 0.8781) < 1e-4, ratio
+
+
+def test_the_tutorials_feature_sections():
+    """docs/tutorial.md, "Beyond the plain likelihood": the parameter lists
+    it prints, the shapes, and "``Y^T X`` agrees with ``G`` to 3e-6".  The
+    sampled figures (beta, mu) are not pinned; the draws here are
+    reference-centred rather than posterior ones."""
+    pytest.importorskip("anvil")
+    from anvilgp import noise
+    from anvilgp.anvil import make_target
+    t, y, yerr = _tutorial_data()
+    n, tc = t.size, float(t.mean())
+
+    def baseline(v_mean, x, m0):
+        one = mx.ones_like(m0)
+        return mx.stack([one, mx.broadcast_to(x - tc, m0.shape)], axis=-1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gn = make_target(ag.SHOTerm(), t, y, yerr,
+                         noise=noise.scale_and_jitter(yerr))
+        gt = make_target(ag.SHOTerm(), t, y + 3.0 + 0.05 * (t - tc), yerr,
+                         linear_basis=baseline)
+    assert gn.names == ['log_gp_sigma', 'log_gp_rho', 'log_gp_Q',
+                        'log_noise_scale', 'log_noise_jitter']
+    assert gt.names == ['log_gp_sigma', 'log_gp_rho', 'log_gp_Q',
+                        'log_jitter']
+    vs = np.array(gt.transform.to_model(gt.u0(4, seed=1))).astype(np.float64)
+    beta, cov = gt.linear_posterior(vs)
+    assert beta.shape == (4, 2) and cov.shape == (4, 2, 2)
+    mean, var = gt.predict(vs, np.linspace(-2.0, 42.0, 500))
+    assert mean.shape == var.shape == (4, 500)
+    Y = np.stack([np.ones(n), t - tc], 1)
+    with mx.stream(mx.gpu):
+        G = np.array(gt.loglike.gram(mx.array(vs, dtype=mx.float32), Y))
+    X = gt.apply_inverse(vs, Y)
+    assert G.shape == (4, 2, 2) and X.shape == (4, n, 2)
+    err = np.abs(np.einsum("nk,cnl->ckl", Y, X) - G).max() / np.abs(G).max()
+    assert err < 3e-5, f"tutorial says 3e-6, got {err:.1e}"
