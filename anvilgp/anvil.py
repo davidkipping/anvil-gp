@@ -174,8 +174,14 @@ class GPTarget:
         """The marginalised linear parameters' conditional posterior at
         model-space draws: ``(mean, cov)``, see
         `GPLogLike.linear_posterior`."""
+        # dtype explicit: `mx.array` of a float64 NumPy array is float32
         return self.loglike.linear_posterior(
-            mx.array(np.asarray(v_model, dtype=np.float64)))
+            mx.array(np.asarray(v_model, dtype=np.float64), dtype=mx.float64))
+
+    def predict(self, v_model: np.ndarray, t_pred, return_var: bool = True):
+        """The GP component's posterior mean and variance at ``t_pred`` for
+        model-space draws: see `GPLogLike.predict`."""
+        return self.loglike.predict(v_model, t_pred, return_var=return_var)
 
     def _n_noise(self) -> int:
         return 0 if self.noise is None else len(self.noise.specs)

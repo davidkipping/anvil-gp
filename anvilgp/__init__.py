@@ -26,7 +26,7 @@ Layers:
 
 from __future__ import annotations
 
-from . import noise, oracle, priors
+from . import noise, oracle, predict, priors
 from .likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap, a64
 from .terms import (
     ComplexTerm,
@@ -45,7 +45,7 @@ __version__ = "0.1.0.dev0"
 
 __all__ = [
     "GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64",
-    "priors", "oracle", "noise",
+    "priors", "oracle", "noise", "predict",
     "Term", "TermSum", "RealTerm", "SHOTerm", "ComplexTerm", "TermConvolution",
     "Matern32Term", "Matern52Term", "RotationTerm",
     "from_celerite_coefficients",

@@ -1618,6 +1618,23 @@ class GPLogLike:
         gram = mx.stack([mx.stack(row, axis=-1) for row in g], axis=-2)
         return ell0, gram, mx.min(ell, axis=1)
 
+    def predict(self, v, t_pred, return_var: bool = True):
+        """The GP component's posterior at new inputs: ``(mean, var)``, each
+        float64 NumPy ``(n_chains, len(t_pred))``, for model-space rows
+        ``v``.
+
+        ``t_pred`` is in the data's coordinate ``t``, in any order.  The
+        mean model and the noise are not included -- evaluate ``mean_fn``
+        on the covariates that go with ``t_pred``, and add the noise
+        variance for an observation-level band.  With a ``linear_basis``
+        the linear parameters are integrated over their posterior.  O(N +
+        M) by the state-space smoother, in float64 on the host, and
+        separate from the likelihood: see :mod:`anvilgp.predict`.
+        """
+        from .predict import predict
+        v = np.asarray(v, dtype=np.float64)
+        return predict(self, v, t_pred, return_var=return_var)
+
     def linear_posterior(self, v: mx.array):
         """The linear mean parameters' conditional posterior given ``v``:
         ``(mean (n_chains, p), cov (n_chains, p, p))``, float64 NumPy.

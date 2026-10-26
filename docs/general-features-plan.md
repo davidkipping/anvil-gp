@@ -121,6 +121,20 @@ The boundary plan's open items: the square-root backward (rotation at
 TESS 20-s, the 2-s floor), the kernel thread layout (m = 5-6 speed,
 m > 6), IV (deferred), the seed-3 margin, the >= 100x gate.
 
+From item 4: **parallel-in-time `predict`.** Today's smoother is one
+host-side step per merged point, bound by NumPy's per-call overhead (~20
+us a point: 2.0 s at N = 1e5 for one chain, 7.3 s for 64). Proposed:
+split the merged grid into ~sqrt(N + M) blocks; form each block's
+filtering element in float64 (vectorised over blocks), a prefix over the
+blocks for their entry states, then the within-block filter vectorised
+over chains x blocks; backward, each block's exit adjoints from the
+suffix in closed form (`r = G^T (eta_s - J_s mu)`, `Jt`, harmless in
+float64), then the within-block smoother vectorised the same way.
+Sequential steps fall from 2(N + M) to ~3L + 2B (L, B the block length
+and count): ~1700 instead of 2e5 at N = 1e5, estimated ~10x. Same
+answers to float64 rounding; the dense tests in `tests/test_predict.py`
+are the gate.
+
 ## Item 1 done: `noise_fn` (2026-10-25)
 
 - **API.** `GPLogLike(..., noise_fn=)` with `noise_fn(v_noise, d)` -> the
@@ -362,3 +376,44 @@ no longer polarises for the gradient.
   covariance adjoint dominates and three columns cost the backward kernel
   +8-9% over one. The backward's sub-block is 16, measured (sizing it to
   the single-column register budget gave 4 at k = 11, 12% slower).
+
+## Item 4 done: `predict` (2026-10-26)
+
+`GPLogLike.predict(v, t_pred, return_var=True)` (and `GPTarget.predict`)
+-> `(mean, var)`, float64 `(n_chains, M)`: the GP component's posterior
+at `t_pred` given the data. The mean model and the noise are not included
+(celerite2's `include_mean=False`): `x_mean` can be any covariate array,
+so only the caller can evaluate `mean_fn` at new points.
+
+- **Method** (`anvilgp/predict.py`): a Kalman filter then the modified
+  Bryson-Frazier smoother over the merged, sorted grid of data and
+  prediction points, prediction points being steps without an
+  observation. The MBF form is the adjoint `(lambda, Lambda)` -- `E[x|y]
+  = m_pred + P_pred lambda`, `Cov = P_pred - P_pred Lambda P_pred` -- and
+  needs no inverse of a predicted covariance, which the RTS form does and
+  which is singular at duplicate timestamps. O(N + M), float64 on the
+  host, vectorised over chains (chunked to ~512 MB), and entirely off the
+  likelihood path.
+- **General by construction**: the residual and per-datum noise variance
+  come from `leaf_inputs`, the likelihood's own, so `mean_fn`, offsets,
+  jitter and `noise_fn` are what the likelihood uses. A `linear_basis`
+  is smoothed as extra means beside the residual (one covariance) and the
+  linear parameters integrated over `linear_posterior`: mean `s_r - s_Phi
+  b`, variance `+ s_Phi C_beta s_Phi^T`. A TermConvolution predicts the
+  exposure-averaged process (variance includes its zero-lag excess) and
+  refuses prediction points within the exposure width of anything, where
+  the state-space form does not hold.
+- **Accuracy**: against the dense float64 conditional to 1e-14-1e-15 on
+  m = 1, 2, 3, 6 terms, inside, outside and on the data, duplicate
+  timestamps, mean model + offsets + `noise_fn`, flat and Gaussian
+  marginalised bases, and a convolved SHO (tests at 1e-10 / 1e-9).
+- **Cost** (SHO, M = 1000): 0.21 s at N = 1e4 and 2.0 s at N = 1e5 for
+  one chain; 0.55 / 7.3 s for 64 chains; 2.9 s for 512 at N = 1e4. The
+  loop is bound by NumPy's per-call overhead (~20 us per merged point).
+  Not optimised further: the next step would be parallel-in-time blocks
+  (block elements, a prefix over blocks, then the within-block filter and
+  smoother vectorised over blocks), estimated ~10x at N = 1e5, if
+  prediction cost turns out to matter.
+- Found on the way: `GPTarget.linear_posterior` passed `mx.array` of a
+  float64 array, which MLX makes float32, so the "float64" posterior was
+  computed from float32-rounded draws. Fixed (`dtype=mx.float64`).
