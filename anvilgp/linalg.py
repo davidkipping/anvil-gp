@@ -204,6 +204,34 @@ def inv_logdet(x: mx.array) -> tuple[mx.array, mx.array]:
     return inv_x, logdet
 
 
+def inv_logdet_fast(x: mx.array) -> tuple[mx.array, mx.array]:
+    """:func:`inv_logdet` with an analytic VJP, and one Metal thread per
+    matrix for float32 on the GPU (`metal.small_inv_logdet`).
+
+    Differentiating the unrolled elimination is ``p^3`` more launches: 74
+    ms for the gradient of 1024 10 x 10 inverses, measured 2026-10-26.  The
+    VJP here is ``d log|x| = x^-T`` and ``d x^-1 = -x^-T (.) x^-T``, two
+    batched products.  For the linear marginalisation's small Gram
+    matrices (`GPLogLike._marginal`).
+    """
+    @mx.custom_function
+    def f(x):
+        from .metal import MAX_SMALL_INV, metal_available, small_inv_logdet
+        if (x.dtype == mx.float32 and mx.default_device() == mx.gpu
+                and x.shape[-1] <= MAX_SMALL_INV and metal_available()):
+            return small_inv_logdet(x)
+        return inv_logdet(x)
+
+    @f.vjp
+    def f_vjp(primals, cotangents, outputs):
+        xit = mx.swapaxes(outputs[0], -1, -2)
+        g_inv, g_ld = cotangents
+        return (g_ld[..., None, None] * xit - xit @ g_inv @ xit,)
+
+    inv, ld = f(x)
+    return inv, ld
+
+
 def tri_solve_right(lo: mx.array, b: mx.array) -> mx.array:
     """Solve ``x @ lo.T == b`` for x, with ``lo`` (..., m, m) lower triangular.
 

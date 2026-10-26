@@ -54,6 +54,7 @@ with no tree to spread the error.
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 
 
 from .elements import Element
@@ -759,12 +760,8 @@ def reduce_blocks(el: Element, formal: bool = False) -> mx.array:
 _FWD_STEP = """
         {
             uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
-            float mp[MDIM], cp[MDIM][MDIM], ch[MDIM];
-            for (uint i = 0; i < M; ++i) {
-                float a = 0.0f;
-                for (uint j = 0; j < M; ++j) a += phitab[off + i * M + j] * mean[j];
-                mp[i] = a;
-            }
+MEAN_PREDICT
+            float cp[MDIM][MDIM], ch[MDIM];
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
                     float a = 0.0f;
@@ -788,12 +785,11 @@ _FWD_STEP = """
             }
             JIT_PER_OBS
             float sv = HCH_CLAMPED + r_ref[gi] + jit2v;
-            float vv = resid[gi * (uint)n_chains + chain];
-            for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];
+INNOVATION
 FWD_ELL
             float kg[MDIM];
             for (uint i = 0; i < M; ++i) kg[i] = ch[i] / sv;
-            for (uint i = 0; i < M; ++i) mean[i] = mp[i] + kg[i] * vv;
+MEAN_UPDATE
             // Joseph form, cov = (I - K h) cp (I - K h)^T + rk K K^T, with
             // rk = sv - h cp h^T formed without cancellation.  Equal to the
             // spec's cp - K ch^T in exact arithmetic for every sv (clamped
@@ -842,10 +838,121 @@ _FWD_ELL = """            {
             }"""
 
 
-def _fwd_step(with_ell: bool = False) -> str:
+#: The data-dependent lines of `_FWD_STEP`, one column: the predicted
+#: mean, the innovation ``vv`` and the mean update.  Everything else in the
+#: step -- the covariance recursion, ``sv``, the gain -- is the same for
+#: every residual the filter is run on, which is what the multi-column
+#: replay (`_FWD_MC`) uses.
+_FWD_1 = {
+    "MEAN_PREDICT": """            float mp[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float a = 0.0f;
+                for (uint j = 0; j < M; ++j) a += phitab[off + i * M + j] * mean[j];
+                mp[i] = a;
+            }""",
+    "INNOVATION": """            float vv = resid[gi * (uint)n_chains + chain];
+            for (uint i = 0; i < M; ++i) vv -= hv[i] * mp[i];""",
+    "MEAN_UPDATE": """            for (uint i = 0; i < M; ++i) mean[i] = mp[i] + kg[i] * vv;""",
+}
+
+#: The same lines for ``KCOL`` residual columns sharing one covariance:
+#: ``mean[c]``, ``vv[c]``, the residual read from ``(npts, n_chains,
+#: KCOL)``.  The log-likelihood is replaced by the log-determinant half
+#: ``-1/2 sum log(S / r_ref)`` and the packed lower triangle of the
+#: innovation Gram matrix ``sum vv_a vv_b / S``, each Kahan-summed as
+#: `_FWD_ELL` is: for columns ``z_a`` that is ``z_a^T K^-1 z_b`` exactly,
+#: since the innovations whitened by ``sqrt(S)`` are ``L^-1 z``.
+_FWD_MC = {
+    "MEAN_PREDICT": """            float mp[KCOL][MDIM];
+            for (uint c = 0; c < KCOL; ++c)
+                for (uint i = 0; i < M; ++i) {
+                    float a = 0.0f;
+                    for (uint j = 0; j < M; ++j)
+                        a += phitab[off + i * M + j] * mean[c][j];
+                    mp[c][i] = a;
+                }""",
+    "INNOVATION": """            float vv[KCOL];
+            for (uint c = 0; c < KCOL; ++c) {
+                float a = resid[(gi * (uint)n_chains + chain) * KCOL + c];
+                for (uint i = 0; i < M; ++i) a -= hv[i] * mp[c][i];
+                vv[c] = a;
+            }""",
+    "MEAN_UPDATE": """            for (uint c = 0; c < KCOL; ++c)
+                for (uint i = 0; i < M; ++i) mean[c][i] = mp[c][i] + kg[i] * vv[c];""",
+    "FWD_ELL": """            {
+                float add = -0.5f * metal::precise::log(sv / r_ref[gi]);
+                float yk = add - ell_c;
+                float tk = ell + yk;
+                ell_c = (tk - ell) - yk;
+                ell = tk;
+            }
+            // The loop shape is measured, not tidy: the outer loop rolled,
+            // the inner unrolled to a constant bound, 1/S hoisted.  Full
+            // unrolling had a cliff at KCOL = 7-8 (10-15x slower than either
+            // side of it, N = 4096 x 128 chains, m = 2) and a running index
+            // was several x slower everywhere; this is the fastest of the
+            // four tried at every KCOL from 3 to 16.
+            float isv = 1.0f / sv;
+            for (uint a = 0; a < KCOL; ++a) {
+                float va = vv[a] * isv;
+                #pragma unroll
+                for (uint b = 0; b < KCOL; ++b)
+                    if (b <= a) {
+                        uint t = a * (a + 1) / 2 + b;
+                        float add = va * vv[b];
+                        float yk = add - gram_c[t];
+                        float tk = gram[t] + yk;
+                        gram_c[t] = (tk - gram[t]) - yk;
+                        gram[t] = tk;
+                    }
+            }""",
+}
+
+
+#: The affine pass's addition to the multi-column mean update: the block's
+#: mean map ``T <- (I - K h) Phi T``, so that the exit mean from an entry
+#: mean ``m`` is ``T m + d`` with ``d`` the exit mean from zero.
+_FWD_AFFINE_T = """
+            {
+                float pt[MDIM][MDIM], hpt[MDIM];
+                for (uint i = 0; i < M; ++i)
+                    for (uint j = 0; j < M; ++j) {
+                        float a = 0.0f;
+                        for (uint u = 0; u < M; ++u)
+                            a += phitab[off + i * M + u] * tm[u][j];
+                        pt[i][j] = a;
+                    }
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint i = 0; i < M; ++i) a += hv[i] * pt[i][j];
+                    hpt[j] = a;
+                }
+                for (uint i = 0; i < M; ++i)
+                    for (uint j = 0; j < M; ++j)
+                        tm[i][j] = pt[i][j] - kg[i] * hpt[j];
+            }"""
+
+
+def _fwd_step(with_ell: bool = False, multi: bool = False,
+              affine: bool = False) -> str:
     """`_FWD_STEP`, accumulating the log-likelihood or not.  The backward's
-    replays take it without, so their source is what it always was."""
-    return _FWD_STEP.replace("FWD_ELL\n", _FWD_ELL + "\n" if with_ell else "")
+    replays take it without, so their source is what it always was.
+    ``multi`` is the ``KCOL``-column step of `_FWD_MC` (which always
+    accumulates its log-determinant and Gram matrix); ``affine`` the
+    ``KCOL``-column step of the affine pass, which accumulates nothing and
+    carries the mean map ``tm`` (`_FWD_AFFINE_T`)."""
+    if affine:
+        parts = dict(_FWD_MC, FWD_ELL="")
+        parts["MEAN_UPDATE"] = _FWD_MC["MEAN_UPDATE"] + _FWD_AFFINE_T
+    elif multi:
+        parts = dict(_FWD_MC)
+    else:
+        parts = dict(_FWD_1, FWD_ELL=_FWD_ELL if with_ell else "")
+    src = _FWD_STEP
+    for tok in ("MEAN_PREDICT", "INNOVATION", "MEAN_UPDATE"):
+        src = src.replace(tok + "\n", parts[tok] + "\n")
+    return src.replace("FWD_ELL\n", parts["FWD_ELL"] + "\n"
+                       if parts["FWD_ELL"] else "")
 
 
 #: Stage F: the checkpointed reverse sweep, one thread per (chain, block).
@@ -1631,6 +1738,423 @@ def replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     return outs[0]
 
 
+
+#: The multi-column replay: `_SRC_REPLAY` for ``KCOL`` residual columns at
+#: once, one thread per (chain, block).  The covariance recursion is the
+#: same for every column, so it runs once and only the means are per
+#: column; the thread emits the block's log-determinant half and the packed
+#: lower triangle of its innovation Gram matrix (`_FWD_MC`).  Summed over
+#: blocks these are ``-1/2 log|K|`` (relative to ``r_ref``) and ``Z^T K^-1
+#: Z`` for the columns ``Z`` -- what a linear marginalisation needs, for
+#: the cost of one filter plus ``KCOL`` mean recursions instead of the
+#: ``1 + k(k+1)/2`` filters of polarisation.
+_SRC_REPLAY_MC = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    uint start = blk_i * (uint)blk_len;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint ei = chain * (uint)n_blocks + blk_i;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    JIT_HOIST
+
+    float mean[KCOL][MDIM], cov[MDIM][MDIM];
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i)
+            mean[c][i] = ent_m[(ei * KCOL + c) * M + i];
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) cov[i][j] = ent_C[ei * M * M + i * M + j];
+    float ell = 0.0f, ell_c = 0.0f;          // Kahan accumulators
+    float gram[KTRI], gram_c[KTRI];
+    for (uint t = 0; t < KTRI; ++t) { gram[t] = 0.0f; gram_c[t] = 0.0f; }
+    for (uint gi = start; gi < stop; ++gi) {
+        FWD_STEP
+    }
+    out_ld[ei] = ell;
+    for (uint t = 0; t < KTRI; ++t) out_g[ei * KTRI + t] = gram[t];
+"""
+
+_replay_mc_kernels: dict = {}
+
+
+def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False):
+    key = (m, k, _jit_key(n_jit), bool(formal))
+    if key not in _replay_mc_kernels:
+        body = _formal_src(_jitter_src(
+            _SRC_REPLAY_MC.replace("FWD_STEP", _fwd_step(multi=True)), n_jit),
+            formal)
+        _replay_mc_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_replay_mc_m{m}_k{k}_j{key[2]}"
+                 + ("_formal" if formal else ""),
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref", "jit2", "ent_m", "ent_C",
+                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                         "n_jit"],
+            output_names=["out_ld", "out_g"],
+            source=body.replace("KTRI", str(k * (k + 1) // 2))
+                       .replace("KCOL", str(k)).replace("MDIM", str(m)),
+        )
+    return _replay_mc_kernels[key]
+
+
+def replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+                     ent_m, ent_C, blk_len, formal=False):
+    """``(ld, gram)``, each per (chain, block): the log-determinant half and
+    the packed lower-triangular innovation Gram matrix of ``cols``
+    ``(npts, n_chains, k)``, replayed from per-column entry means ``ent_m``
+    ``(n_chains, n_blocks, k, m)`` and the shared entry covariance
+    ``ent_C`` ``(n_chains, n_blocks, m, m)``.  Inputs otherwise as
+    :func:`replay_blocks`."""
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts, k = cols.shape[0], cols.shape[-1]
+    n_blocks = ent_m.shape[1]
+    n_jit = _n_jit_of(jit2)
+    ktri = k * (k + 1) // 2
+    outs = _replay_mc_kernel(m, k, n_jit, formal)(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+                ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
+                int(n_chains), int(blk_len), int(n_jit)],
+        output_shapes=[(n_chains, n_blocks), (n_chains, n_blocks, ktri)],
+        output_dtypes=[mx.float32] * 2,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    return outs[0], outs[1]
+
+
+#: The multi-column boundary's middle pass: each block's mean map from its
+#: shared entry covariance, one thread per (chain, block).  The block's
+#: exit mean for column ``c`` entering at ``m`` is ``T m + d[c]``, and both
+#: come from the replay's own step (`_FWD_STEP`, gains and all) started at
+#: zero mean, so `_SRC_MEAN_PREFIX` composes them into every column's entry
+#: mean with no inverse anywhere -- the means are linear in the data, and
+#: their covariance is not a function of it.
+_SRC_AFFINE = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_blocks * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint blk_i = gid / (uint)n_chains;
+
+    const uint M = MDIM;
+    uint start = blk_i * (uint)blk_len;
+    uint stop = min(start + (uint)blk_len, (uint)npts);
+    uint ei = chain * (uint)n_blocks + blk_i;
+
+    float hv[MDIM];
+    for (uint i = 0; i < M; ++i) hv[i] = hvec[chain * M + i];
+    JIT_HOIST
+
+    float mean[KCOL][MDIM], cov[MDIM][MDIM], tm[MDIM][MDIM];
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i) mean[c][i] = 0.0f;
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            cov[i][j] = ent_C[ei * M * M + i * M + j];
+            tm[i][j] = (i == j) ? 1.0f : 0.0f;
+        }
+    for (uint gi = start; gi < stop; ++gi) {
+        FWD_STEP
+    }
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i)
+            out_d[(ei * KCOL + c) * M + i] = mean[c][i];
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) out_T[ei * M * M + i * M + j] = tm[i][j];
+"""
+
+#: Every column's entry mean from the blocks' mean maps: block 0 enters at
+#: zero, block b + 1 at ``T_b m_b + d_b``.  One thread per (chain, column),
+#: sequential over the blocks.
+_SRC_MEAN_PREFIX = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_chains * KCOL) return;
+    uint chain = gid / KCOL;
+    uint c = gid % KCOL;
+    const uint M = MDIM;
+    float m[MDIM];
+    for (uint i = 0; i < M; ++i) m[i] = 0.0f;
+    for (uint b = 0; b < (uint)n_blocks; ++b) {
+        uint ei = chain * (uint)n_blocks + b;
+        for (uint i = 0; i < M; ++i) ent_m[(ei * KCOL + c) * M + i] = m[i];
+        float nm[MDIM];
+        for (uint i = 0; i < M; ++i) {
+            float a = in_d[(ei * KCOL + c) * M + i];
+            for (uint j = 0; j < M; ++j) a += in_T[ei * M * M + i * M + j] * m[j];
+            nm[i] = a;
+        }
+        for (uint i = 0; i < M; ++i) m[i] = nm[i];
+    }
+"""
+
+_affine_kernels: dict = {}
+_mean_prefix_kernels: dict = {}
+
+
+def _affine_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False):
+    key = (m, k, _jit_key(n_jit), bool(formal))
+    if key not in _affine_kernels:
+        body = _formal_src(_jitter_src(
+            _SRC_AFFINE.replace("FWD_STEP", _fwd_step(affine=True)), n_jit),
+            formal)
+        _affine_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_affine_m{m}_k{k}_j{key[2]}"
+                 + ("_formal" if formal else ""),
+            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                         "r_ref", "jit2", "ent_C", "npts", "n_lags",
+                         "n_blocks", "n_chains", "blk_len", "n_jit"],
+            output_names=["out_d", "out_T"],
+            source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
+        )
+    return _affine_kernels[key]
+
+
+def column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+                       ent_C, blk_len, formal=False):
+    """``(n_chains, n_blocks, k, m)``: every column's entry mean, given the
+    blocks' shared entry covariances ``ent_C`` -- the affine pass
+    (`_SRC_AFFINE`) and the prefix over its maps (`_SRC_MEAN_PREFIX`)."""
+    n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
+    npts, k = cols.shape[0], cols.shape[-1]
+    n_blocks = ent_C.shape[1]
+    n_jit = _n_jit_of(jit2)
+    d, T = _affine_kernel(m, k, n_jit, formal)(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2, ent_C,
+                int(npts), int(n_lags), int(n_blocks), int(n_chains),
+                int(blk_len), int(n_jit)],
+        output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
+        output_dtypes=[mx.float32] * 2,
+        grid=(n_blocks * n_chains, 1, 1),
+        threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    key = (m, k)
+    if key not in _mean_prefix_kernels:
+        _mean_prefix_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_mean_prefix_m{m}_k{k}",
+            input_names=["in_d", "in_T", "n_blocks", "n_chains"],
+            output_names=["ent_m"],
+            source=_SRC_MEAN_PREFIX.replace("KCOL", str(k))
+                                   .replace("MDIM", str(m)),
+        )
+    return _mean_prefix_kernels[key](
+        inputs=[d, T, int(n_blocks), int(n_chains)],
+        output_shapes=[(n_chains, n_blocks, k, m)],
+        output_dtypes=[mx.float32],
+        grid=(n_chains * k, 1, 1),
+        threadgroup=(min(64, n_chains * k), 1, 1))[0]
+
+
+def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+              s_floor_rel, blk_len, formal=False, boundary="dense"):
+    """``(ld (n_chains,), gram (n_chains, k, k))``: the log-determinant half
+    ``-1/2 sum log(S / r_ref)`` and ``Z^T K^-1 Z`` for the columns ``Z`` =
+    ``cols`` ``(npts, n_chains, k)``, by one filter carrying ``k`` means.
+
+    ``ld + -1/2 gram[c, c]`` is :func:`scan_loglike` of column ``c``.  The
+    entry covariances come from `scan_loglike`'s own boundary, run once (on
+    column 0: they are not a function of the data), and every column's
+    entry means from :func:`column_entry_means`.  Running the boundary
+    with the columns as ``k`` virtual chains instead measured k-fold: 8.7
+    and 16.1 ms at k = 3 and 6 against 3.0 for one (N = 1e4 x 1024
+    chains, SHO), and the boundary was then most of the cost.  **Value
+    only**: there is no VJP here (the caller supplies one; `GPLogLike`
+    differentiates the polarisation it replaces).
+    """
+    n_chains, m = phi_tab.shape[0], phi_tab.shape[-1]
+    npts, k = cols.shape[0], cols.shape[-1]
+    if m > MAX_STATE:
+        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
+    n_blocks = -(-npts // blk_len)
+    cols = mx.contiguous(cols)
+    if n_blocks == 1:
+        # Block 0 enters at zero (its first lag is row 0, Phi = 0), as in
+        # `_SRC_PREFIX`; no boundary to run.
+        ent_m = mx.zeros((n_chains, 1, k, m), dtype=mx.float32)
+        ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+    else:
+        _, ent_C, _ = _boundary_states(
+            phi_tab, q_tab, lag, inst, hvec, mx.contiguous(cols[..., 0]),
+            r_ref, jit2, s_floor_rel, blk_len, formal, boundary == "sqrt")
+        ent_m = column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols,
+                                   r_ref, jit2, ent_C, blk_len, formal)
+    ld, g = replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
+                             jit2, mx.contiguous(ent_m),
+                             mx.contiguous(ent_C), blk_len, formal)
+    ld, g = mx.sum(ld, axis=1), mx.sum(g, axis=1)
+    rows, cs = np.tril_indices(k)
+    full = mx.zeros((n_chains, k * k), dtype=g.dtype)
+    full = full.at[:, mx.array(rows * k + cs)].add(g)
+    full = full.at[:, mx.array(cs * k + rows)].add(
+        mx.where(mx.array(rows != cs), g, 0.0))
+    return ld, full.reshape(n_chains, k, k)
+
+
+
+#: Weighted normal equations ``A = Phi^T W Phi`` (packed lower triangle)
+#: and ``b = Phi^T W r`` per chain, one threadgroup per chain striding over
+#: the data, reduced across SIMD groups in threadgroup memory.  For the
+#: marginalisation's white-noise centring fit: MLX's batched matmul for
+#: this shape (a p x p result over a long N) ran at ~5 GB/s, 3.9 ms at
+#: N = 1e4 x 256 chains and 38 ms at 1e5 -- more than the likelihood.
+#: The basis is read as ``(chain, column, datum)``, so adjacent threads read
+#: adjacent floats; ``(chain, datum, column)`` measured 6x slower at p = 10.
+#: ``phi_stride`` is 0 for a basis shared by every chain.
+_SRC_NORMAL_EQ = """
+    uint chain = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    const uint P = PCOL;
+    float acc[NACC];
+    for (uint i = 0; i < NACC; ++i) acc[i] = 0.0f;
+    uint pb = chain * (uint)phi_stride;
+    uint rb = chain * (uint)npts;
+    for (uint t = tid; t < (uint)npts; t += NTHR) {
+        float wt = w[t];
+        float ph[PCOL];
+        for (uint a = 0; a < P; ++a) ph[a] = phi[pb + a * (uint)npts + t];
+        float rt = r[rb + t] * wt;
+        #pragma unroll
+        for (uint a = 0; a < P; ++a) {
+            float pa = ph[a] * wt;
+            #pragma unroll
+            for (uint b = 0; b < P; ++b)
+                if (b <= a) acc[a * (a + 1) / 2 + b] += pa * ph[b];
+            acc[PTRI + a] += ph[a] * rt;
+        }
+    }
+    threadgroup float shm[(NTHR / 32) * NACC];
+    for (uint i = 0; i < NACC; ++i) {
+        float v = simd_sum(acc[i]);
+        if (lane == 0) shm[sg * NACC + i] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < NACC; i += NTHR) {
+        float v = 0.0f;
+        for (uint g = 0; g < NTHR / 32; ++g) v += shm[g * NACC + i];
+        out[chain * NACC + i] = v;
+    }
+"""
+
+_normal_eq_kernels: dict = {}
+_NORMAL_EQ_THREADS = 128
+#: threadgroup memory: (threads / 32) * (p(p+1)/2 + p) floats, under 32 KiB
+MAX_NORMAL_EQ_COLS = 40
+
+
+def normal_equations(phi_t, r, w):
+    """``(A (n, p, p), b (n, p))`` with ``A = Phi^T diag(w) Phi`` and
+    ``b = Phi^T diag(w) r``, float32, for the basis **transposed**,
+    ``phi_t`` ``(n | 1, p, N)``, ``r`` ``(n, N)`` and ``w`` ``(N,)``.  No
+    VJP: for quantities under ``stop_gradient``."""
+    n, N = r.shape
+    p = phi_t.shape[1]
+    if p > MAX_NORMAL_EQ_COLS:
+        raise ValueError(f"normal_equations supports p <= "
+                         f"{MAX_NORMAL_EQ_COLS}, got {p}")
+    ptri = p * (p + 1) // 2
+    nacc = ptri + p
+    key = p
+    if key not in _normal_eq_kernels:
+        _normal_eq_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_normal_eq_p{p}",
+            input_names=["phi", "r", "w", "npts", "phi_stride"],
+            output_names=["out"],
+            source=_SRC_NORMAL_EQ.replace("NACC", str(nacc))
+                                 .replace("PTRI", str(ptri))
+                                 .replace("PCOL", str(p))
+                                 .replace("NTHR", str(_NORMAL_EQ_THREADS)),
+        )
+    shared = phi_t.shape[0] == 1 and n > 1
+    phi_t = phi_t[0] if shared else phi_t
+    out = _normal_eq_kernels[key](
+        inputs=[phi_t.astype(mx.float32), r.astype(mx.float32),
+                w.astype(mx.float32), int(N), 0 if shared else int(N * p)],
+        output_shapes=[(n, nacc)], output_dtypes=[mx.float32],
+        grid=(n * _NORMAL_EQ_THREADS, 1, 1),
+        threadgroup=(_NORMAL_EQ_THREADS, 1, 1))[0]
+    rows, cs = np.tril_indices(p)
+    A = mx.zeros((n, p * p), dtype=mx.float32)
+    A = A.at[:, mx.array(rows * p + cs)].add(out[:, :ptri])
+    A = A.at[:, mx.array(cs * p + rows)].add(
+        mx.where(mx.array(rows != cs), out[:, :ptri], 0.0))
+    return A.reshape(n, p, p), out[:, ptri:]
+
+
+
+#: ``(x^-1, log|det x|)`` for a batch of small general matrices, one thread
+#: per matrix: `linalg.inv_logdet`'s Gauss-Jordan with partial pivoting, in
+#: registers.  The MLX form is ``p^3`` separate elementwise launches -- 12
+#: ms for 1024 10 x 10 matrices, 4 ms compiled -- where this is one.  A
+#: singular matrix gives an infinite pivot inverse and non-finite output,
+#: as the MLX form does.
+_SRC_SMALL_INV = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_mat) return;
+    const uint P = PDIM;
+    float a[PDIM][PDIM], g[PDIM][PDIM];
+    for (uint i = 0; i < P; ++i)
+        for (uint j = 0; j < P; ++j) {
+            a[i][j] = x[(gid * P + i) * P + j];
+            g[i][j] = (i == j) ? 1.0f : 0.0f;
+        }
+    float logdet = 0.0f;
+    for (uint k = 0; k < P; ++k) {
+        uint best = k;
+        float bval = fabs(a[k][k]);
+        for (uint r = k + 1; r < P; ++r)
+            if (fabs(a[r][k]) > bval) { best = r; bval = fabs(a[r][k]); }
+        if (best != k)
+            for (uint j = 0; j < P; ++j) {
+                float t = a[k][j]; a[k][j] = a[best][j]; a[best][j] = t;
+                t = g[k][j]; g[k][j] = g[best][j]; g[best][j] = t;
+            }
+        float piv = a[k][k];
+        logdet += metal::precise::log(fabs(piv));
+        float inv = 1.0f / piv;
+        for (uint j = 0; j < P; ++j) { a[k][j] *= inv; g[k][j] *= inv; }
+        for (uint r = 0; r < P; ++r) {
+            if (r == k) continue;
+            float f = a[r][k];
+            for (uint j = 0; j < P; ++j) {
+                a[r][j] -= f * a[k][j];
+                g[r][j] -= f * g[k][j];
+            }
+        }
+    }
+    for (uint i = 0; i < P; ++i)
+        for (uint j = 0; j < P; ++j) out_inv[(gid * P + i) * P + j] = g[i][j];
+    out_ld[gid] = logdet;
+"""
+
+_small_inv_kernels: dict = {}
+#: Largest matrix `small_inv_logdet` takes (two p x p arrays per thread).
+MAX_SMALL_INV = 32
+
+
+def small_inv_logdet(x: mx.array):
+    """``(x^-1, log|det x|)`` for float32 ``x`` ``(..., p, p)``, ``p <=
+    MAX_SMALL_INV``, one thread per matrix.  No VJP: see
+    `linalg.inv_logdet_fast`."""
+    p = x.shape[-1]
+    batch = x.shape[:-2]
+    n = 1
+    for d in batch:
+        n *= int(d)
+    if p not in _small_inv_kernels:
+        _small_inv_kernels[p] = mx.fast.metal_kernel(
+            name=f"anvilgp_small_inv_p{p}",
+            input_names=["x", "n_mat"], output_names=["out_inv", "out_ld"],
+            source=_SRC_SMALL_INV.replace("PDIM", str(p)))
+    inv, ld = _small_inv_kernels[p](
+        inputs=[x.reshape(n, p, p).astype(mx.float32), int(n)],
+        output_shapes=[(n, p, p), (n,)], output_dtypes=[mx.float32] * 2,
+        grid=(max(n, 1), 1, 1), threadgroup=(min(64, max(n, 1)), 1, 1))
+    return inv.reshape(*batch, p, p), ld.reshape(batch)
+
+
 #: The square-root boundary's process-noise factor: ``L`` with ``L L^T =
 #: Q`` for every entry of the lag table, one thread per (chain, lag).
 #: docs/boundary-plan.md, stage 1.
@@ -2405,6 +2929,23 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                    ell=outs[5])
 
 
+def _boundary_states(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
+                     blk_len, formal, use_sqrt):
+    """Entry states for `scan_loglike`'s ``boundary``, and what the seeds
+    need: pass 1's elements (dense), or the square-root blocks and the
+    start states they were centred on."""
+    el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
+                     blk_len, formal=formal, with_ell=False)
+    if not use_sqrt:
+        ent_m, ent_C = entry_states(el, formal)
+        return ent_m, ent_C, (el.A, el.b, el.C, el.eta, el.J)
+    st_m, st_C = entry_states(el, formal)
+    blocks = sqrt_blocks(p_t, q_t, q_factor(q_t), lg, inst, hv, rs, rr,
+                         j2, st_m, st_C, blk_len)
+    ent_m, ent_C = sqrt_scan(blocks, st_m, st_C)
+    return ent_m, ent_C, (*blocks, st_m, st_C)
+
+
 def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                  s_floor_rel, blk_len, slots=None, formal=False,
                  boundary="dense") -> mx.array:
@@ -2452,19 +2993,8 @@ def scan_loglike(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     use_sqrt = boundary == "sqrt" and -(-resid.shape[0] // blk_len) > 1
 
     def boundary(p_t, q_t, lg, hv, rs, rr, j2):
-        """Entry states for ``boundary``, and what the seeds need: pass 1's
-        elements (dense), or the square-root blocks and the start states
-        they were centred on."""
-        el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                         blk_len, formal=formal, with_ell=False)
-        if not use_sqrt:
-            ent_m, ent_C = entry_states(el, formal)
-            return ent_m, ent_C, (el.A, el.b, el.C, el.eta, el.J)
-        st_m, st_C = entry_states(el, formal)
-        blocks = sqrt_blocks(p_t, q_t, q_factor(q_t), lg, inst, hv, rs, rr,
-                             j2, st_m, st_C, blk_len)
-        ent_m, ent_C = sqrt_scan(blocks, st_m, st_C)
-        return ent_m, ent_C, (*blocks, st_m, st_C)
+        return _boundary_states(p_t, q_t, lg, inst, hv, rs, rr, j2,
+                                s_floor_rel, blk_len, formal, use_sqrt)
 
     def seeds(aux, cot):
         """``(ent_m, ent_C, seed_m, seed_C)`` from `boundary`'s ``aux``.  The

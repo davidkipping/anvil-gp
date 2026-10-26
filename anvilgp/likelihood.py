@@ -1070,6 +1070,27 @@ class GPLogLike:
         table goes on to :meth:`kappa`.
         """
         from .metal import scan_loglike
+        pt, qt, h, r, jit2, q = self._metal_inputs(v, resid)
+        # scan_loglike, not scan_blocks + tree_reduce here: the
+        # differentiation boundary has to enclose the reduction so the
+        # custom function's output is one scalar per chain.  See its
+        # docstring.
+        out = scan_loglike(pt, qt, self._metal_lag, self._metal_inst, h, r,
+                           self._r_ref32,
+                           jit2, self.policy.s_floor_rel, self.metal_block,
+                           slots=(self._metal_slot_id,
+                                  self._metal_slot_start,
+                                  self.n_metal_slots,
+                                  self._metal_fold_plan),
+                           formal=self._formal,
+                           boundary=self._metal_boundary)
+        return out, (q, h)
+
+    def _metal_inputs(self, v: mx.array, resid: mx.array | None = None):
+        """The kernel's inputs for ``v``: ``(phi table, Q table, h, residual
+        (npts, n_chains[, k]), jit2, Q)``.  ``resid`` replaces the data's
+        residual: ``(n_chains, n_data)``, or ``(n_chains, k, n_data)``
+        columns for :func:`anvilgp.metal.scan_gram`."""
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
         if self._metal_slot_id is None:        # deferred at construction
@@ -1099,7 +1120,9 @@ class GPLogLike:
         # chains-fastest grid: adjacent threads then read adjacent floats.
         # Constructed transposed rather than transposed afterwards, which
         # would be a full copy of the residual every call.
-        if resid is not None:          # `_marginal`'s combinations
+        if resid is not None and resid.ndim == 3:     # `_marginal`'s columns
+            r = mx.transpose(resid, (2, 0, 1))
+        elif resid is not None:        # `_marginal`'s combinations
             r = mx.swapaxes(resid, 0, 1)
         else:
             r = mx.broadcast_to(self._y32[:, None], (self.n_data, n))
@@ -1138,21 +1161,7 @@ class GPLogLike:
                 jit = corr if jit is None else jit + corr
             jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
                     else mx.broadcast_to(jit, (n, 1)))
-
-        # scan_loglike, not scan_blocks + tree_reduce here: the
-        # differentiation boundary has to enclose the reduction so the
-        # custom function's output is one scalar per chain.  See its
-        # docstring.
-        out = scan_loglike(pt, qt, self._metal_lag, self._metal_inst, h, r,
-                           self._r_ref32,
-                           jit2, self.policy.s_floor_rel, self.metal_block,
-                           slots=(self._metal_slot_id,
-                                  self._metal_slot_start,
-                                  self.n_metal_slots,
-                                  self._metal_fold_plan),
-                           formal=self._formal,
-                           boundary=self._metal_boundary)
-        return out, (q, h)
+        return pt, qt, h, r, jit2, q
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None,
                   resid=None):
@@ -1423,8 +1432,52 @@ class GPLogLike:
         if self.linear_basis is not None:
             return self._marginal(v, self._raw_resid, self._y32,
                                   self._x_mean32, self._noise_x32,
-                                  self._r_ref32)[0]
+                                  self._r_ref32,
+                                  gram_fn=(self._gram_metal if self._metal_ok
+                                           else None))[0]
         return self._raw_resid(v, None)
+
+    def _gram_metal(self, v: mx.array, cols: mx.array):
+        """`_gram_polarised` on the kernel by one multi-column filter
+        (:func:`anvilgp.metal.scan_gram`): ``1`` filter carrying ``k``
+        means instead of ``1 + k(k+1)/2`` filters.
+
+        The value only, for now: the VJP differentiates `_gram_polarised`,
+        whose value this is to float32 rounding.  So the gradient costs
+        polarisation's plus this forward (measured +6-15% on value +
+        gradient, p = 2-10) until the multi-column backward exists
+        (docs/general-features-plan.md, item 3).  Above `MAX_GRAM_COLS`
+        columns `_marginal` polarises instead.
+        """
+        from .metal import scan_gram
+        if cols.shape[1] > MAX_GRAM_COLS:
+            return self._gram_polarised(v, self._raw_resid, cols)
+
+        @mx.custom_function
+        def gram(v, cols):
+            pull = self._infeasible_pull(v)
+            pt, qt, h, r, jit2, q = self._metal_inputs(v, cols)
+            ld, g = scan_gram(pt, qt, self._metal_lag, self._metal_inst, h,
+                              r, self._r_ref32, jit2,
+                              self.policy.s_floor_rel, self.metal_block,
+                              formal=self._formal,
+                              boundary=self._metal_boundary)
+            # `ld` is the plain likelihood of a zero residual, refused and
+            # sanitised exactly as `_raw_resid` does it.
+            ld = self._refuse_outside_series(v, ld)
+            ld = _sanitize(self._refuse_ill_conditioned(v, ld, (q, h)), pull)
+            return ld, g
+
+        @gram.vjp
+        def _gram_vjp(primals, cotangents, outputs):
+            _, vjps = mx.vjp(
+                lambda a, b: list(self._gram_polarised(
+                    a, self._raw_resid, b)[:2]),
+                list(primals), list(cotangents))
+            return tuple(vjps)
+
+        ld, g = gram(v, cols)
+        return ld, g, ld
 
     def _raw_resid(self, v: mx.array, resid: mx.array | None) -> mx.array:
         """`_raw_call` for the data's residual, or for ``resid``
@@ -1441,7 +1494,7 @@ class GPLogLike:
         out = self._refuse_outside_series(v, out)
         return _sanitize(self._refuse_ill_conditioned(v, out, tables), pull)
 
-    def _marginal(self, v, ev, y, x_mean, x_lin, r_ref):
+    def _marginal(self, v, ev, y, x_mean, x_lin, r_ref, gram_fn=None):
         """The likelihood with the linear mean parameters integrated out.
 
         With ``r = y - m0 - offsets``, ``Phi = linear_basis(v_mean, x, m0)``
@@ -1462,10 +1515,11 @@ class GPLogLike:
         q(a + b) - q(a) - q(b)``, all combinations evaluated at once as extra
         chains (``ev``, the plain likelihood of a supplied residual).  So
         every path and every gradient works as it is -- at ``1 + k(k+1)/2``
-        evaluations for ``k = p + 1`` columns (7 at p = 2); a multi-column
-        filter on the kernel is the planned speed-up
-        (docs/general-features-plan.md, item 3).  The log-determinant is
-        bit-identical across combinations, so it cancels exactly.
+        evaluations for ``k = p + 1`` columns (7 at p = 2).  The
+        log-determinant is bit-identical across combinations, so it cancels
+        exactly.  ``gram_fn(v, cols)`` replaces the polarisation
+        (`_gram_polarised`) where there is something faster -- on the kernel,
+        one filter carrying all ``k`` columns (`_gram_metal`).
 
         Two steps keep float32 honest.  ``r`` is first centred on a
         white-noise least-squares fit of the basis, ``beta0`` -- the marginal
@@ -1481,7 +1535,9 @@ class GPLogLike:
         Returns ``(log L, b, C^-1)`` -- the last two for
         :meth:`linear_posterior`.
         """
-        from .linalg import inv_logdet
+        from .linalg import inv_logdet_fast as inv_logdet
+        from .metal import (MAX_NORMAL_EQ_COLS, metal_available,
+                            normal_equations)
         pm = self.param_map
         n, N, dtype = v.shape[0], self.n_data, v.dtype
         vm = v[:, pm.mean] if pm.mean is not None else v[:, :0]
@@ -1494,37 +1550,37 @@ class GPLogLike:
         if off is not None:
             r = r - off
         phi = self.linear_basis(vm, x_lin, m0).astype(dtype)
+        phi_own = phi if phi.ndim == 3 else phi[None]
         phi = mx.broadcast_to(phi, (n, N, phi.shape[-1]))
         p = phi.shape[-1]
         k = p + 1
 
         w = (1.0 / r_ref)[None, :, None]
-        a_w = mx.swapaxes(phi * w, 1, 2)                        # (n, p, N)
-        a_inv, _ = inv_logdet(a_w @ phi)
-        beta0 = mx.stop_gradient((a_inv @ (a_w @ r[..., None]))[..., 0])
+        if (dtype == mx.float32 and mx.default_device() == mx.gpu
+                and p <= MAX_NORMAL_EQ_COLS and metal_available()):
+            # The same fit by a reduction kernel: MLX's batched matmul is
+            # slower than the whole likelihood here (`normal_equations`).
+            # A basis shared by every chain is read once, not per chain.
+            a_mat, a_r = normal_equations(
+                mx.stop_gradient(mx.swapaxes(phi_own, 1, 2)),
+                mx.stop_gradient(r), 1.0 / r_ref)
+            a_inv, _ = inv_logdet(a_mat)
+            beta0 = mx.stop_gradient((a_inv @ a_r[..., None])[..., 0])
+            phi_w2 = mx.diagonal(a_mat, axis1=1, axis2=2)
+        else:
+            a_w = mx.swapaxes(phi * w, 1, 2)                    # (n, p, N)
+            a_inv, _ = inv_logdet(a_w @ phi)
+            beta0 = mx.stop_gradient((a_inv @ (a_w @ r[..., None]))[..., 0])
+            phi_w2 = mx.sum(phi * phi * w, 1)
         rc = r - (phi @ beta0[..., None])[..., 0]
         size = mx.maximum(mx.sum(rc * rc * w[..., 0], -1, keepdims=True),
                           float(N))
-        c = mx.stop_gradient(mx.sqrt(size / mx.maximum(
-            mx.sum(phi * phi * w, 1), 1e-30)))                   # (n, p)
+        c = mx.stop_gradient(mx.sqrt(size / mx.maximum(phi_w2, 1e-30)))
 
         cols = mx.concatenate([rc[:, None, :],
                                mx.swapaxes(phi * c[:, None, :], 1, 2)], 1)
-        pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
-        combos = ([mx.zeros((n, 1, N), dtype=dtype)]
-                  + [cols[:, i:i + 1] for i in range(k)]
-                  + [cols[:, i:i + 1] + cols[:, j:j + 1] for i, j in pairs])
-        R = mx.concatenate(combos, axis=1)                       # (n, M, N)
-        M = R.shape[1]
-        ell = ev(mx.repeat(v, M, axis=0), R.reshape(n * M, N)).reshape(n, M)
-        ell0 = ell[:, 0]
-        q = -2.0 * (ell - ell0[:, None])
-        g = [[None] * k for _ in range(k)]
-        for i in range(k):
-            g[i][i] = q[:, 1 + i]
-        for t_, (i, j) in enumerate(pairs):
-            g[i][j] = g[j][i] = 0.5 * (q[:, 1 + k + t_] - g[i][i] - g[j][j])
-        gram = mx.stack([mx.stack(row, axis=-1) for row in g], axis=-2)
+        ell0, gram, worst = (self._gram_polarised(v, ev, cols)
+                             if gram_fn is None else gram_fn(v, cols))
 
         a, b, cs = gram[:, 0, 0], gram[:, 0, 1:], gram[:, 1:, 1:]
         cs_inv, logdet_cs = inv_logdet(cs)
@@ -1553,9 +1609,32 @@ class GPLogLike:
         # Every combination shares the chain's hyperparameters, so a refused
         # chain is refused in all of them; a singular basis (collinear
         # columns) makes the value non-finite.  Both get the failure value.
-        failed = mx.any(ell <= _FAILED, axis=1)
-        out = mx.where(failed, mx.min(ell, axis=1), out)
+        out = mx.where(worst <= _FAILED, worst, out)
         return _sanitize(out, self._infeasible_pull(v)), beta, cov
+
+    @staticmethod
+    def _gram_polarised(v, ev, cols):
+        """``(ell0, Z^T K^-1 Z, worst)`` for the columns ``Z`` = ``cols``
+        ``(n_chains, k, n_data)``, by polarisation of the plain likelihood
+        ``ev(v, resid)``: ``ell0`` is that of a zero residual, ``worst`` the
+        lowest of every combination (the failure value, where one failed)."""
+        n, k, N = cols.shape
+        pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
+        combos = ([mx.zeros((n, 1, N), dtype=cols.dtype)]
+                  + [cols[:, i:i + 1] for i in range(k)]
+                  + [cols[:, i:i + 1] + cols[:, j:j + 1] for i, j in pairs])
+        R = mx.concatenate(combos, axis=1)                       # (n, M, N)
+        M = R.shape[1]
+        ell = ev(mx.repeat(v, M, axis=0), R.reshape(n * M, N)).reshape(n, M)
+        ell0 = ell[:, 0]
+        q = -2.0 * (ell - ell0[:, None])
+        g = [[None] * k for _ in range(k)]
+        for i in range(k):
+            g[i][i] = q[:, 1 + i]
+        for t_, (i, j) in enumerate(pairs):
+            g[i][j] = g[j][i] = 0.5 * (q[:, 1 + k + t_] - g[i][i] - g[j][j])
+        gram = mx.stack([mx.stack(row, axis=-1) for row in g], axis=-2)
+        return ell0, gram, mx.min(ell, axis=1)
 
     def linear_posterior(self, v: mx.array):
         """The linear mean parameters' conditional posterior given ``v``:
@@ -1764,6 +1843,15 @@ def _auto_sub_block(m: int) -> int:
 #: survives 4096 chains.  Each cap is half the shortest block killed.
 #: Shorter blocks cost accuracy where the boundary carries it: m = 5 at
 #: 20 s, s/e 100 is 0.36 posterior sigma at 256, 0.67 at 64.
+#: Most columns (``p + 1`` for ``p`` marginalised linear parameters) the
+#: kernel's multi-column filter takes (`GPLogLike._gram_metal`); above it
+#: `_marginal` polarises.  Only a bound on the kernel's size: the filter
+#: measured faster than polarisation at every k tried -- 1.5-3.3x from 4 to
+#: 26 columns at m = 2, 4-62x from 4 to 21 at m = 6 (N = 4096 x 128
+#: chains, 2026-10-26) -- and polarising 26 columns at m = 6 tripped the
+#: GPU watchdog.
+MAX_GRAM_COLS = 32
+
 _MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048, 4: 256, 5: 128}
 _MAX_METAL_BLOCK_HI_M = 64
 

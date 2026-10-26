@@ -272,3 +272,173 @@ def test_marginalised_and_sampled_posteriors_agree():
     sd = np.sqrt(0.5 * (m.var(0) + s.var(0)))
     assert np.all(np.abs(m.mean(0) - s.mean(0)) < 0.2 * sd), (
         (m.mean(0) - s.mean(0)) / sd)
+
+
+# ---- the multi-column filter on the kernel (`metal.scan_gram`) -------------
+
+def _cols64(row, data):
+    """Columns the size `_marginal` gives them: a centred residual and a
+    scaled basis."""
+    K, r, phi = _dense_parts(row, data)
+    rc = r - phi @ np.linalg.lstsq(phi, r, rcond=None)[0]
+    return K, np.column_stack([rc, phi * 1e-2])
+
+
+@pytest.mark.parametrize("boundary", ["dense", "sqrt"])
+@pytest.mark.parametrize("blk", [512, 64], ids=["one-block", "blocks"])
+def test_the_multi_column_filter_is_the_dense_gram(boundary, blk):
+    """``Z^T K^-1 Z`` and ``-1/2 log|K|`` (relative to ``r_ref``) from one
+    filter carrying three columns, against dense float64 -- one block, and
+    eight through either boundary, whose entry means are per column."""
+    from anvilgp.metal import scan_gram
+    gp, data = _gp(True)
+    gp.metal_block = blk
+    yerr = data[3]
+    parts = [_cols64(row, data) for row in ROWS]
+    cols = mx.array(np.stack([Z.T for _, Z in parts]).astype(np.float32))
+    pt, qt, h, rr, jit2, _ = gp._metal_inputs(mx.array(ROWS, dtype=mx.float32),
+                                             cols)
+    ld, G = scan_gram(pt, qt, gp._metal_lag, gp._metal_inst, h, rr,
+                      gp._r_ref32, jit2, gp.policy.s_floor_rel, blk,
+                      boundary=boundary)
+    ld, G = np.array(ld), np.array(G)
+    for c, (K, Z) in enumerate(parts):
+        want = Z.T @ np.linalg.solve(K, Z)
+        scale = np.sqrt(np.outer(np.diag(want), np.diag(want)))
+        assert np.abs(G[c] - want).max() / scale.max() < 2e-5
+        np.testing.assert_array_equal(G[c], G[c].T)
+        ld_want = -0.5 * (np.linalg.slogdet(K)[1] - np.sum(np.log(yerr ** 2)))
+        assert abs(ld[c] - ld_want) < 2e-4
+
+
+def _scale_jitter(vn, d):
+    from anvilgp.special import exp_acc
+    return (exp_acc(vn[:, :1]) * d.yerr) ** 2 + exp_acc(2.0 * vn[:, 1:2])
+
+
+_GRAM_CASES = {
+    "sho": (TERM, KP, "none"),
+    "sho-jitter": (TERM, KP, "jitter"),
+    "sho2-noise_fn": (TERM + ag.SHOTerm(), KP + [5e-4, 0.1, 2.0], "noise_fn"),
+    "rot+sho": (ag.RotationTerm() + ag.SHOTerm(),
+                [1e-3, 0.3, 3.0, 1.0, 0.4, 5e-4, 0.1, 0.7], "none"),
+}
+
+
+def _gp_case(name, metal_block=None):
+    term, kp, noise = _GRAM_CASES[name]
+    t, tc, y, yerr, shape = _setup()
+    mean_fn, basis = _model(t, tc, shape)
+    k = len(kp)
+    kern = [KernelParam(link="log", index=1 + i, ref=r)
+            for i, r in enumerate(kp)]
+    extra = {"jitter": 1, "noise_fn": 2}.get(noise, 0)
+    pm = ParamMap(kernel=kern, n_dim=1 + k + extra, mean=slice(0, 1),
+                  jitter=([KernelParam(link="log", index=1 + k, ref=1e-4)]
+                          if noise == "jitter" else []),
+                  noise=(slice(1 + k, 3 + k) if noise == "noise_fn"
+                         else None))
+    gp = GPLogLike(mean_fn, t, t, y, yerr, term, pm,
+                   GPPolicy(metal=True, kappa_max=None), linear_basis=basis,
+                   noise_fn=_scale_jitter if noise == "noise_fn" else None)
+    if metal_block is not None:
+        gp.metal_block = metal_block
+    rows = np.zeros((2, pm.n_dim))
+    rows[:, 0] = [0.01, 0.008]
+    rows[1, 1:1 + k] = 0.05 * np.cos(np.arange(k))
+    if noise == "noise_fn":
+        rows[:, 1 + k:] = [[0.0, -9.0], [0.1, -8.5]]
+    return gp, rows
+
+
+def _polarised(gp, v):
+    return gp._marginal(v, gp._raw_resid, gp._y32, gp._x_mean32,
+                        gp._noise_x32, gp._r_ref32)[0]
+
+
+@pytest.mark.parametrize("blk", [None, 64], ids=["auto", "blocks"])
+@pytest.mark.parametrize("name", list(_GRAM_CASES))
+def test_the_kernel_gram_is_the_polarised_marginal(name, blk):
+    """The marginal on the kernel, by one multi-column filter, against the
+    float64 path and against the polarisation it replaces: as close to
+    float64 as polarisation is, or closer, for m = 2, 4 and 6 and every
+    noise variant.  And the gradient is polarisation's own -- the VJP
+    differentiates it until the multi-column backward exists -- up to the
+    cotangent, which the algebra downstream evaluates at the kernel's Gram
+    matrix rather than polarisation's (~1e-5 relative)."""
+    gp, rows = _gp_case(name, blk)
+    hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64), refuse=False))
+    with mx.stream(mx.gpu):
+        v = mx.array(rows, dtype=mx.float32)
+        new = np.array(gp._raw_call(v))
+        old = np.array(_polarised(gp, v))
+        g_new = np.array(mx.grad(lambda u: gp._raw_call(u).sum())(v))
+        g_old = np.array(mx.grad(lambda u: _polarised(gp, u).sum())(v))
+    assert np.abs(new - hi).max() < max(2e-3, 1.5 * np.abs(old - hi).max())
+    assert np.abs(g_new - g_old).max() < 1e-4 * np.abs(g_old).max()
+
+
+def test_past_the_column_cap_the_kernel_polarises(monkeypatch):
+    import anvilgp.likelihood as lk
+    from anvilgp import metal
+    gp, rows = _gp_case("sho")
+    v = mx.array(rows, dtype=mx.float32)
+    want = np.array(_polarised(gp, v))
+    monkeypatch.setattr(lk, "MAX_GRAM_COLS", 2)          # k = 3 here
+
+    def boom(*a, **k):
+        raise AssertionError("scan_gram called past the cap")
+    monkeypatch.setattr(metal, "scan_gram", boom)
+    np.testing.assert_array_equal(np.array(gp._raw_call(v)), want)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["per-chain", "shared"])
+@pytest.mark.parametrize("p", [1, 3, 10])
+def test_the_normal_equations_kernel(p, shared):
+    """The centring fit's reduction kernel against float64, for a basis per
+    chain and one shared by every chain (read once, not broadcast)."""
+    from anvilgp.metal import normal_equations
+    rng = np.random.default_rng(p)
+    n, N = 5, 1777                       # not a multiple of the threadgroup
+    phi = rng.standard_normal((1 if shared else n, p, N))
+    r, w = rng.standard_normal((n, N)), rng.uniform(0.5, 2.0, N)
+    with mx.stream(mx.gpu):
+        A, b = normal_equations(mx.array(phi.astype(np.float32)),
+                                mx.array(r.astype(np.float32)),
+                                mx.array(w.astype(np.float32)))
+    P = np.broadcast_to(phi, (n, p, N))
+    A_ref = np.einsum("cat,t,cbt->cab", P, w, P)
+    b_ref = np.einsum("cat,t,ct->ca", P, w, r)
+    np.testing.assert_allclose(np.array(A), A_ref, rtol=0,
+                               atol=1e-5 * np.abs(A_ref).max())
+    np.testing.assert_allclose(np.array(b), b_ref, rtol=0,
+                               atol=1e-5 * np.abs(b_ref).max())
+
+
+@pytest.mark.parametrize("p", [1, 2, 5, 12])
+def test_the_small_inverse_and_its_vjp(p):
+    """`linalg.inv_logdet_fast`: the kernel's inverse and log-determinant
+    against float64, and the analytic VJP against differentiating the
+    unrolled elimination it replaces.  Indefinite matrices included (the
+    pivoting is what makes those work); singular gives non-finite."""
+    from anvilgp.linalg import inv_logdet, inv_logdet_fast
+    rng = np.random.default_rng(p)
+    x = rng.standard_normal((7, p, p)) + 2 * np.eye(p)
+    wt = mx.array(rng.standard_normal((p, p)).astype(np.float32))
+
+    def loss(fn):
+        return lambda z: ((fn(z)[0] * wt).sum() + 0.3 * fn(z)[1].sum())
+    with mx.stream(mx.gpu):
+        xm = mx.array(x.astype(np.float32))
+        inv, ld = inv_logdet_fast(xm)
+        g = np.array(mx.grad(loss(inv_logdet_fast))(xm))
+        g_ref = np.array(mx.grad(loss(inv_logdet))(xm))
+        sing = inv_logdet_fast(mx.ones((2, p, p)) if p > 1
+                               else mx.zeros((2, 1, 1)))
+    np.testing.assert_allclose(np.array(inv), np.linalg.inv(x), rtol=1e-4,
+                               atol=1e-5)
+    np.testing.assert_allclose(np.array(ld), np.linalg.slogdet(x)[1],
+                               rtol=0, atol=1e-4)
+    np.testing.assert_allclose(g, g_ref, rtol=1e-3,
+                               atol=1e-4 * np.abs(g_ref).max())
+    assert not np.all(np.isfinite(np.array(sing[0])))

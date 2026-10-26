@@ -243,3 +243,73 @@ n_chains)`, a joint start from each member's `u_ref()` placed by
 `anvil.joint` (skipped before anvil 0.12.0). Caveat, documented on
 `joint_u0`: sharing a GP *hyperparameter* across members needs equal
 specs, which `make_target`'s data-derived bounds do not give.
+
+## Item 3, second half, Stage A: the multi-column forward (2026-10-26)
+
+Agreed staging (option C, revised after review): A, the forward on the
+kernel; measure; C, a multi-column backward. Stage B (the gradient as
+k + 1 single-column backward runs) was dropped as a shipping stage: each
+of its runs replays the covariance recursion that A removes from the
+forward, and polarisation is already the gradient oracle.
+
+- **The filter.** `metal.scan_gram(...)` returns `-1/2 log|K|` (relative
+  to `r_ref`) and `Z^T K^-1 Z` for k columns from one filter: the
+  covariance recursion, `S` and the gain once, k means
+  (`_FWD_MC`). `_FWD_STEP`'s data-dependent lines are now tokens
+  (`MEAN_PREDICT`, `INNOVATION`, `MEAN_UPDATE`), so the single-column
+  source is unchanged (a declaration split, diffed) and the sqrt
+  backward, when it comes, ports the multi-column variant mechanically.
+- **Entry states.** Covariances from the existing boundary run once, on
+  column 0 (they are not a function of the data). Each column's entry
+  means from the blocks' mean maps `m_exit = T_b m_entry + d_b`: one
+  affine pass from the shared entry covariances (`_SRC_AFFINE`) and a
+  prefix over blocks (`_SRC_MEAN_PREFIX`). No inverse anywhere, unlike
+  the information-form boundary. The first version ran the boundary with
+  the columns as k virtual chains, and the boundary was then most of the
+  cost: 8.7 / 16.1 ms at k = 3 / 6 against 3.0 for one (N = 1e4 x 1024
+  chains, SHO).
+- **Wiring.** `GPLogLike._gram_metal`, a `custom_function` whose VJP
+  differentiates `_gram_polarised` (the polarisation, factored out of
+  `_marginal`). The gradient therefore costs polarisation's plus this
+  forward until Stage C: +6-15% on value + gradient, p = 2-10. The MLX
+  path and `.hi` polarise as before.
+- **Two costs that were not the filter**, found by profiling, fixed for
+  every route (polarisation included):
+  - the white-noise centring fit's batched `Phi^T W Phi` -- MLX's batched
+    matmul for a p x p result over a long N ran at ~5 GB/s, 3.9 ms at
+    N = 1e4 and 38 ms at 1e5 x 256 chains, more than the likelihood. Now
+    `metal.normal_equations`, a reduction kernel (a shared basis is read
+    once): 0.3 / 1.1 ms at p = 2.
+  - the p x p inverses: `linalg.inv_logdet` is p^3 unrolled launches,
+    12 ms forward and 74 ms gradient for 1024 10 x 10 matrices.
+    `linalg.inv_logdet_fast`: one Metal thread per matrix forward
+    (`metal.small_inv_logdet`), the analytic VJP; 0.30 / 0.57 ms.
+- **A compiler cliff.** The Gram accumulation fully unrolled ran 10-15x
+  slower at exactly k = 7-8 than on either side; the loop shape kept
+  (outer rolled, inner unrolled, `1/S` hoisted) was the fastest of four
+  at every k from 3 to 16.
+- **Accuracy.** Gram against dense float64 to 2-5e-6 relative, one block
+  and eight, both boundaries. The marginal is as close to float64 as
+  polarisation or closer: over 24 evaluations at m = 6 (N = 4096, k = 8)
+  median 1.6e-3, max 4.0e-3, against 2.7e-3 and 7.0e-3; per column it
+  equals the plain single-column likelihood's own floor.
+- **Cost, forward** (N = 1e4, 1024 chains, SHO, quiet machine), against
+  the plain likelihood:
+
+  | p (k) | polarised | multi-column |
+  |---|---|---|
+  | 2 (3) | 5.6x | 2.2x |
+  | 5 (6) | 15.9x | 3.1x |
+  | 10 (11) | 47x | 7.2x |
+
+  At k = 3 the remainder is about one-third filter passes (boundary 2.8
+  ms, affine 1.8, replay 2.3) and one-third the marginal's own algebra
+  (columns built and transposed, ~3 ms). `MAX_GRAM_COLS = 32` only
+  bounds the kernel's size: the filter beat polarisation at every k
+  measured, 1.5-3.3x (k = 4-26, m = 2) and 4-62x (k = 4-21, m = 6), and
+  polarising 26 columns at m = 6 tripped the GPU watchdog.
+- `benchmarks/marginal_cost.py` reproduces the table (`--grad` for value
+  + gradient).
+
+Next: Stage C, the multi-column backward, which removes the polarised
+gradient (and its +6-15%).
