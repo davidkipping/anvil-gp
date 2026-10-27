@@ -227,7 +227,8 @@ def test_a_gaussian_prior_makes_a_singular_basis_well_defined(kind):
     column got the failure value, and the level + offsets case a finite
     WRONG value (240 log-units on the kernel, 3.7 in float64).  A zero
     column is exactly zero in float32 too, so float32 resolves it; exact
-    collinearity it does not, and refuses (`_COLLINEAR_LOG_R`)."""
+    collinearity, since 2026-10-27, because a shared basis is
+    orthonormalised in float64 (`GPLogLike._cache_shared_basis`)."""
     rng = np.random.default_rng(11)
     t = np.arange(N) * CAD
     tc, yerr, shape = float(t.mean()), np.full(N, 1e-4), None
@@ -257,14 +258,12 @@ def test_a_gaussian_prior_makes_a_singular_basis_well_defined(kind):
             g = np.array(mx.grad(lambda u: gp(u).sum())(u))
         hi = _hi(gp, ROWS[:, 1:])
         np.testing.assert_allclose(hi, ref, rtol=1e-10)
-        if kind == "level+offsets":
-            # Exactly collinear: float32 resolves the degenerate direction
-            # only to the Gram's rounding (4.6 log-units off on the kernel
-            # before it was refused), so float32 refuses it under either
-            # prior; float64, above, is exact.
-            assert np.all(lo <= -1e29), (metal, lo)
-            continue
-        assert np.abs(lo - ref).max() < 2e-3, (metal, np.abs(lo - ref))
+        # Exactly collinear (level + offsets) was 4.6 log-units off on the
+        # kernel in float32, then refused; a shared basis is now
+        # orthonormalised in float64 first, so the redundant direction is
+        # an exactly zero column the prior carries.
+        tol = 2e-3 if kind == "zero-column" else 1e-2
+        assert np.abs(lo - ref).max() < tol, (metal, np.abs(lo - ref))
         G = np.zeros_like(ROWS[:, 1:])
         for i in range(3):
             dp = np.zeros(3)
@@ -299,10 +298,15 @@ def test_a_bad_linear_prior_is_refused():
 
 
 @pytest.mark.parametrize("metal", [False, True], ids=["mlx", "kernel"])
-def test_a_shared_basis_is_the_per_chain_one(metal):
-    """A basis returned as (N, p) -- on the kernel a separate, chain-stride-0
-    input with no cotangent (`metal._col_layout`) -- gives the value and
-    gradient of the same basis returned per chain, (n, N, p)."""
+def test_a_shared_basis_and_a_per_chain_one(metal):
+    """The same basis returned as (N, p) -- cached, orthonormalised in
+    float64 (`GPLogLike._cache_shared_basis`) and on the kernel a separate,
+    chain-stride-0 input with no cotangent (`metal._col_layout`) -- and per
+    chain, (n, N, p), evaluated every time: the same model, each within its
+    route's float32 floor of float64 in value and gradient.  (They take
+    different routes, so they agree with each other only to that floor:
+    measured 3.0e-4 / 1.4e-3 in value on the kernel, 2.5e-2 / 1.7e-2 on the
+    MLX path, the gradients 2-3e-6 and 1.2-1.6e-4.)"""
     t, tc, y, yerr, shape = _setup()
 
     def shared(vm, x, m0):
@@ -310,18 +314,102 @@ def test_a_shared_basis_is_the_per_chain_one(metal):
 
     def per_chain(vm, x, m0):
         return mx.broadcast_to(shared(vm, x, m0), m0.shape + (2,))
-    out = []
+    rows = ROWS[:, 1:]
+    his = []
     for basis in (shared, per_chain):
         gp = GPLogLike(None, t, None, y, yerr, TERM, ParamMap.log(KP),
                        GPPolicy(metal=metal, kappa_max=None),
                        linear_basis=basis)
+        assert (gp._basis_q64 is not None) is (basis is shared)
         with mx.stream(mx.gpu):
-            u = mx.array(ROWS[:, 1:], dtype=mx.float32)
-            out.append((np.array(gp(u)),
-                        np.array(mx.grad(lambda u: gp(u).sum())(u))))
-    np.testing.assert_allclose(out[0][0], out[1][0], rtol=1e-6)
-    np.testing.assert_allclose(out[0][1], out[1][1], rtol=1e-4,
-                               atol=1e-4 * np.abs(out[1][1]).max())
+            u = mx.array(rows, dtype=mx.float32)
+            lo = np.array(gp(u)).astype(np.float64) + gp.log_norm_const
+            g = np.array(mx.grad(lambda u: gp(u).sum())(u))
+        hi = _hi(gp, rows)
+        his.append(hi)
+        G = np.zeros_like(rows)
+        for i in range(3):
+            dp = np.zeros(3)
+            dp[i] = 1e-6
+            G[:, i] = (_hi(gp, rows + dp) - _hi(gp, rows - dp)) / 2e-6
+        assert np.abs(lo - hi).max() < (5e-3 if metal else 5e-2)
+        assert np.abs(g - G).max() / np.abs(G).max() < (1e-4 if metal
+                                                        else 1e-3)
+    # float64: the same model, the orthonormalisation exact
+    np.testing.assert_allclose(his[0], his[1], rtol=1e-10)
+
+
+@pytest.mark.parametrize("t0", [3000.0, 2459000.0], ids=["t~3e3", "BJD"])
+@pytest.mark.parametrize("prior", [None, "gauss"], ids=["flat", "gauss"])
+def test_a_raw_time_baseline(t0, prior):
+    """``[1, t]`` in raw times, shared: ``1 - rho^2`` is 3.7e-6 at t ~ 3000
+    and 1e-11 for a BJD, which float32 refused (and before 2026-10-26 got
+    0.16-5.8 log-units wrong).  Orthonormalised in float64 at
+    construction, it is now the model with ``[1, t - tc]`` exactly (the
+    map has unit determinant; a Gaussian prior is mapped to match), on
+    every path, gradient included, and its posterior is in raw units.  A
+    per-chain raw-time basis is evaluated in float32 every time and is
+    still refused."""
+    if prior == "gauss" and t0 > 1e4:
+        pytest.skip("no float64 reference: a prior on the raw intercept (the "
+                    "level at t = 0) is a centred prior of correlation 1 - "
+                    "1e-12, which the reference model cannot invert")
+    t, tc0, y, yerr, shape = _setup()
+    tr = t0 + t
+    tc = float(tr.mean())
+    # broad in raw coordinates, as a raw-time prior would be: intercept at
+    # t = 0 within 100, slope within 1 per day
+    mu, S = np.array([0.0, 0.0]), np.diag([100.0, 1.0]) ** 2
+    # the same prior on the centred coefficients: (a + b tc, b)
+    a_inv = np.array([[1.0, tc], [0.0, 1.0]])
+    lp_raw = None if prior is None else (mu, S)
+    lp_c = None if prior is None else (a_inv @ mu, a_inv @ S @ a_inv.T)
+    raw = GPLogLike(None, tr, None, y, yerr, TERM, ParamMap.log(KP),
+                    GPPolicy(metal=True, kappa_max=None), linear_prior=lp_raw,
+                    linear_basis=lambda vm, x, m0: mx.stack(
+                        [mx.ones_like(x), x], -1))
+    cen = GPLogLike(None, tr, None, y, yerr, TERM, ParamMap.log(KP),
+                    GPPolicy(metal=True, kappa_max=None), linear_prior=lp_c,
+                    linear_basis=lambda vm, x, m0: mx.stack(
+                        [mx.ones_like(x), x - tc], -1))
+    rows = ROWS[:, 1:]
+    ref = _hi(cen, rows)
+    # float64 carries a BJD to ~2.5e-10 d, over this fixture's 0.69-d span
+    # ~1e-9 of the slope column, in any parametrisation: measured 4e-9
+    np.testing.assert_allclose(_hi(raw, rows), ref,
+                               rtol=1e-10 if t0 < 1e4 else 1e-8)
+    for metal in (True, False):
+        raw.policy.metal = metal
+        raw._metal_ok = metal
+        with mx.stream(mx.gpu):
+            u = mx.array(rows, dtype=mx.float32)
+            lo = np.array(raw(u)).astype(np.float64) + raw.log_norm_const
+            g = np.array(mx.grad(lambda u: raw(u).sum())(u))
+        assert np.abs(lo - ref).max() < (5e-3 if metal else 5e-2), metal
+        G = np.zeros_like(rows)
+        for i in range(3):
+            dp = np.zeros(3)
+            dp[i] = 1e-6
+            G[:, i] = (_hi(cen, rows + dp) - _hi(cen, rows - dp)) / 2e-6
+        assert np.abs(g - G).max() / np.abs(G).max() < (1e-4 if metal
+                                                        else 1e-3), metal
+    b_raw, c_raw = raw.linear_posterior(rows)
+    b_cen, c_cen = cen.linear_posterior(rows)
+    # beta_raw = A beta_cen, A = [[1, -tc], [0, 1]]
+    A = np.linalg.inv(a_inv)
+    np.testing.assert_allclose(b_raw, b_cen @ A.T, rtol=1e-6,
+                               atol=1e-9 * np.abs(b_raw).max())
+    np.testing.assert_allclose(c_raw, A @ c_cen @ A.T, rtol=1e-6,
+                               atol=1e-9 * np.abs(c_raw).max())
+    if t0 == 3000.0 and prior is None:
+        per_chain = GPLogLike(
+            None, tr, None, y, yerr, TERM, ParamMap.log(KP),
+            GPPolicy(metal=True, kappa_max=None),
+            linear_basis=lambda vm, x, m0: mx.stack(
+                [mx.ones_like(m0), mx.broadcast_to(x, m0.shape)], -1))
+        with mx.stream(mx.gpu):
+            assert np.all(np.array(per_chain(mx.array(
+                rows, dtype=mx.float32))) <= -1e29)
 
 
 def test_make_target_marginalises():

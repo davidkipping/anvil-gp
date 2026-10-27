@@ -618,6 +618,7 @@ class GPLogLike:
         self._noise_x64 = (self._t64 if self._x_mean64 is None
                            else self._x_mean64)
         self._noise_x32 = mx.array(self._noise_x64.astype(np.float32))
+        self._cache_shared_basis()
         inst = param_map.instrument
         if inst is not None:
             # `mx.take` is silent on an out-of-range label -- it clamps or
@@ -1114,6 +1115,96 @@ class GPLogLike:
                            boundary=self._metal_boundary)
         return out, (q, h)
 
+    def _cache_shared_basis(self):
+        """A ``linear_basis`` shared by every chain -- one returning ``(N,
+        p)`` -- is a constant, so it is evaluated once, here, in float64
+        from the float64 abscissa, and replaced by an orthonormal basis
+        ``Q = Phi A`` (``Q^T W Q = I`` under the white-noise weights ``W =
+        1 / yerr^2``) that every evaluation, float32 or float64, uses
+        instead.
+
+        That is exact: the marginal over ``beta`` is the same model in
+        ``gamma = A^-1 beta``, with a Gaussian prior mapped alike (``mu' =
+        A^-1 mu``, ``S'^-1 = A^T S^-1 A``) and, under the flat prior, the
+        constant ``log|det A|`` added back (``-1/2 log|C|`` moves by it).
+        What it buys is conditioning: columns float32 cannot tell apart --
+        ``[1, t]`` with raw times, ``1 - rho^2`` from 3.7e-6 (t ~ 3000) to
+        1e-11 (a BJD), which float32 refused and before 2026-10-26 got
+        silently wrong -- are orthonormal before any float32 arithmetic
+        sees them.  A direction the basis does not span (exactly collinear
+        columns) becomes an exactly zero column: improper and refused under
+        the flat prior, carried by the prior under a Gaussian one, which
+        float32 then resolves exactly as it does a zero column.
+
+        Sets ``_basis_q64`` / ``_basis_q32`` (None for a per-chain basis,
+        which depends on the chain and is evaluated every time),
+        ``_basis_a``, ``_basis_logdet_a`` and the prior in ``gamma``
+        (``_prior_mu_eff``, ``_prior_prec_eff``, ``_prior_logdet_eff``)."""
+        self._basis_q64 = self._basis_q32 = self._basis_a = None
+        self._basis_logdet_a = 0.0
+        if self._linear_prior is not None:
+            self._prior_mu_eff = self._linear_prior[0]
+            self._prior_prec_eff = self._prior_prec
+            self._prior_logdet_eff = self._prior_logdet
+        if self.linear_basis is None:
+            return
+        pm = self.param_map
+        n_mean = (0 if pm.mean is None
+                  else len(range(pm.n_dim)[pm.mean]))
+        with mx.stream(mx.cpu):
+            phi = self.linear_basis(
+                mx.zeros((1, n_mean), dtype=mx.float64),
+                mx.array(self._noise_x64, dtype=mx.float64),
+                mx.zeros((1, self.n_data), dtype=mx.float64))
+            if phi.ndim != 2:
+                return                        # per chain: evaluated each time
+            phi = np.array(phi.astype(mx.float64))
+        if phi.shape[0] != self.n_data:
+            raise ValueError(f"linear_basis returned {phi.shape}; a shared "
+                             f"basis is ({self.n_data}, p)")
+        # Gram-Schmidt, twice per column, of the weighted, column-normalised
+        # basis, W^1/2 Phi D^-1 = Q_w R.  R_jj -- the part of column j not in
+        # the earlier ones, relative to its own norm -- decides a dead
+        # direction, not a singular value against the largest, which a BJD
+        # column's 2.5e6 scale swamps.  A dead column gets a zero q_j, so no
+        # later column has a component along it (Householder QR gives it an
+        # arbitrary direction that later columns do project on, and zeroing
+        # it afterwards broke Q = Phi A).  The orthonormal columns come from
+        # Q_w directly: no Phi @ A recombination to cancel.
+        w = 1.0 / self._yerr64
+        d = np.sqrt(np.sum((phi * w[:, None]) ** 2, axis=0))
+        d = np.where(d > 0, d, 1.0)
+        x = phi * w[:, None] / d[None, :]
+        n_col = x.shape[1]
+        q_w = np.zeros_like(x)
+        r = np.zeros((n_col, n_col))
+        live = np.zeros(n_col, dtype=bool)
+        for j in range(n_col):
+            vj = x[:, j].copy()
+            for _ in range(2):                  # reorthogonalised
+                cj = q_w[:, :j].T @ vj
+                vj -= q_w[:, :j] @ cj
+                r[:j, j] += cj
+            norm = np.sqrt(vj @ vj)
+            live[j] = norm > 1e-12
+            r[j, j] = norm if live[j] else 1.0  # any invertible map is exact
+            if live[j]:
+                q_w[:, j] = vj / norm
+        a = np.diag(1.0 / d) @ np.linalg.inv(r)          # A = D^-1 R^-1
+        q = q_w / w[:, None]                             # Phi A, Q^T W Q = I
+        self._basis_a = a
+        self._basis_logdet_a = float(-np.sum(np.log(d))
+                                     - np.sum(np.log(np.abs(np.diag(r)))))
+        self._basis_q64 = q
+        self._basis_q32 = mx.array(q.astype(np.float32))
+        if self._linear_prior is not None:
+            mu, _ = self._linear_prior
+            a_inv = r @ np.diag(d)                     # A^-1 = R D
+            self._prior_mu_eff = a_inv @ mu
+            self._prior_prec_eff = a.T @ self._prior_prec @ a
+            self._prior_logdet_eff = (self._prior_logdet
+                                      - 2.0 * self._basis_logdet_a)
+
     def _metal_inputs(self, v: mx.array, resid: mx.array | None = None,
                       need_resid: bool = True):
         """The kernel's inputs for ``v``: ``(phi table, Q table, h, residual
@@ -1608,7 +1699,11 @@ class GPLogLike:
         off = pm.offsets(v, self._inst32)
         if off is not None:
             r = r - off
-        phi = self.linear_basis(vm, x_lin, m0).astype(dtype)
+        if self._basis_q64 is not None:  # shared, orthonormal, cached
+            phi = (self._basis_q32 if dtype == mx.float32
+                   else mx.array(self._basis_q64, dtype=dtype))
+        else:
+            phi = self.linear_basis(vm, x_lin, m0).astype(dtype)
         shared = phi.ndim == 2          # one basis for every chain: (N, p)
         phi_own = phi[None] if shared else phi
         p = phi.shape[-1]
@@ -1654,8 +1749,15 @@ class GPLogLike:
                   else (phi @ beta0[..., None])[..., 0])
         size = mx.maximum(mx.sum(rc * rc * w[..., 0], -1, keepdims=True),
                           float(N))
+        # A dead column (zero, or a direction an orthonormalised basis does
+        # not span) carries only the prior: under a Gaussian one it is
+        # scaled so its prior precision is the residual's size too, which
+        # keeps C + S^-1 well conditioned in float32 (any scale is exact).
+        dead_c = (1.0 if self._linear_prior is None else mx.sqrt(
+            size / mx.array(np.maximum(np.diag(self._prior_prec_eff), 1e-300),
+                            dtype=dtype)))
         c = mx.stop_gradient(mx.where(
-            live, mx.sqrt(size / mx.maximum(phi_w2, 1e-30)), 1.0))
+            live, mx.sqrt(size / mx.maximum(phi_w2, 1e-30)), dead_c))
 
         if split:
             ell0, gram, worst = gram_fn(v, (rc, phi))
@@ -1681,7 +1783,8 @@ class GPLogLike:
             beta = beta0 + c * cs_b                       # C^-1 Phi^T K^-1 r
             cov = c[:, :, None] * cs_inv * c[:, None, :]  # C^-1
             out = (ell0 - 0.5 * rpr - 0.5 * (logdet_cs - 2.0 * log_c)
-                   + 0.5 * p * math.log(2.0 * math.pi))
+                   + 0.5 * p * math.log(2.0 * math.pi)
+                   + self._basis_logdet_a)   # 0 unless orthonormalised
         else:
             if self._linear_prior[0].shape != (p,):
                 raise ValueError(
@@ -1690,8 +1793,8 @@ class GPLogLike:
             # In the scaled columns (beta = beta0 + c * gamma): the prior on
             # gamma has mean ms = (mu - beta0) / c and precision
             # ps = c c^T * S^-1.
-            mu = mx.array(self._linear_prior[0], dtype=dtype)
-            ps = (c[:, :, None] * mx.array(self._prior_prec, dtype=dtype)
+            mu = mx.array(self._prior_mu_eff, dtype=dtype)
+            ps = (c[:, :, None] * mx.array(self._prior_prec_eff, dtype=dtype)
                   * c[:, None, :])
             ms = (mu - beta0) / c
             m_inv, logdet_m = inv_logdet(cs + ps)
@@ -1702,7 +1805,7 @@ class GPLogLike:
             beta = beta0 + c * (m_b + w)                  # posterior mean
             cov = c[:, :, None] * m_inv * c[:, None, :]   # posterior cov
             out = (ell0 - 0.5 * quad
-                   - 0.5 * (self._prior_logdet - 2.0 * log_c + logdet_m))
+                   - 0.5 * (self._prior_logdet_eff - 2.0 * log_c + logdet_m))
         # A rank-deficient basis -- exactly collinear columns; a zero column
         # is excluded above -- is improper under the flat prior.  In
         # rounding its Gram can still invert to a finite, meaningless value
@@ -1717,7 +1820,10 @@ class GPLogLike:
         # log-units on the kernel, with the p x p system's own determinant
         # unable to tell.  So float32 refuses it under either prior.
         # (The centring fit used to fail on such a basis and make the old
-        # code refuse it by accident.)
+        # code refuse it by accident.)  This now reaches only a per-chain
+        # basis: a shared one is orthonormalised in float64 at construction
+        # (`_cache_shared_basis`), so its log|R| is 0 and a direction it
+        # does not span is an exactly zero column instead.
         if self._linear_prior is None or not f64:
             out = mx.where(log_ra < _COLLINEAR_LOG_R[f64],
                            mx.array(float("nan"), dtype), out)

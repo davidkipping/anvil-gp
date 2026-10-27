@@ -143,6 +143,9 @@ def linear_posterior(gp, v):
     for c, vc in _chunks(gp, v, grid, k, False):
         b, cv = _beta_posterior(
             gp, _smooth(gp, vc, grid, return_var=False, gram=True)["gram"])
+        if gp._basis_a is not None:       # gamma -> beta = A gamma
+            a = gp._basis_a
+            b, cv = b @ a.T, a @ cv @ a.T
         mean[c:c + vc.shape[0]], cov[c:c + vc.shape[0]] = b, cv
     return mean, cov
 
@@ -155,9 +158,9 @@ def _beta_posterior(gp, gram):
     (exact; it keeps columns of very different scale from costing
     digits), and NaN for a chain whose system is singular."""
     d, C = gram[:, 1:, 0], gram[:, 1:, 1:]
-    if gp._linear_prior is not None:
-        C = C + gp._prior_prec
-        d = d + gp._prior_prec @ gp._linear_prior[0]
+    if gp._linear_prior is not None:      # in the columns' own coordinates
+        C = C + gp._prior_prec_eff
+        d = d + gp._prior_prec_eff @ gp._prior_mu_eff
     sc = np.sqrt(np.maximum(np.diagonal(C, axis1=1, axis2=2), 1e-300))
     Cn = C / (sc[:, :, None] * sc[:, None, :])
     p = Cn.shape[-1]
@@ -251,7 +254,12 @@ def _columns(gp, v64):
         None if gp._x_mean64 is None else a64(gp._x_mean64),
         gp._inst32, 0, N, get)
     cols = [r[:, None, :]]
-    if gp.linear_basis is not None:
+    if gp.linear_basis is not None and gp._basis_q64 is not None:
+        # shared and orthonormalised (`GPLogLike._cache_shared_basis`): the
+        # posterior below is in its coordinates, gamma = A^-1 beta
+        q = mx.array(gp._basis_q64.T, dtype=mx.float64)[None]
+        cols.append(mx.broadcast_to(q, (v64.shape[0],) + q.shape[1:]))
+    elif gp.linear_basis is not None:
         vm = v64[:, pm.mean] if pm.mean is not None else v64[:, :0]
         if gp.mean_fn is not None and pm.mean is not None:
             m0 = gp.mean_fn(vm, a64(gp._x_mean64))
