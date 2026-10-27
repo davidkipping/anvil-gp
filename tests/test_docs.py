@@ -269,8 +269,7 @@ def test_the_tutorials_feature_sections():
     n, tc = t.size, float(t.mean())
 
     def baseline(v_mean, x, m0):
-        one = mx.ones_like(m0)
-        return mx.stack([one, mx.broadcast_to(x - tc, m0.shape)], axis=-1)
+        return mx.stack([mx.ones_like(x), x - tc], axis=-1)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         gn = make_target(ag.SHOTerm(), t, y, yerr,
@@ -281,6 +280,21 @@ def test_the_tutorials_feature_sections():
                         'log_noise_scale', 'log_noise_jitter']
     assert gt.names == ['log_gp_sigma', 'log_gp_rho', 'log_gp_Q',
                         'log_jitter']
+    # "raw times (... a BJD) give exactly the same float32 value as the
+    # centred form": the GP sees only time differences, so shifting t to a
+    # BJD changes nothing else
+    u = gt.u0(4, seed=1)
+    for t0 in (0.0, 2459000.0):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw = make_target(ag.SHOTerm(), t + t0,
+                              y + 3.0 + 0.05 * (t - tc), yerr,
+                              linear_basis=lambda vm, x, m0: mx.stack(
+                                  [mx.ones_like(x), x], -1))
+        with mx.stream(mx.gpu):
+            np.testing.assert_allclose(np.array(raw.target.log_prob(u)),
+                                       np.array(gt.target.log_prob(u)),
+                                       rtol=1e-6)
     vs = np.array(gt.transform.to_model(gt.u0(4, seed=1))).astype(np.float64)
     beta, cov = gt.linear_posterior(vs)
     assert beta.shape == (4, 2) and cov.shape == (4, 2, 2)

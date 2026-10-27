@@ -332,9 +332,8 @@ analytically:
 ```python
 tc = float(t.mean())
 
-def baseline(v_mean, x, m0):             # -> (n_chains, N, p), linear in beta
-    one = mx.ones_like(m0)               # m0 is the mean model, (n_chains, N)
-    return mx.stack([one, mx.broadcast_to(x - tc, m0.shape)], axis=-1)
+def baseline(v_mean, x, m0):             # -> (N, p): one basis for every chain
+    return mx.stack([mx.ones_like(x), x - tc], axis=-1)
 
 y_lin = y + 3.0 + 0.05 * (t - tc)        # an offset and a trend to remove
 gt = make_target(ag.SHOTerm(), t, y_lin, yerr, linear_basis=baseline)
@@ -350,33 +349,44 @@ draws = beta + np.einsum("cij,cj->ci", np.linalg.cholesky(cov),
                          rng.standard_normal(beta.shape))
 ```
 
-The basis is rebuilt at every evaluation, so it may depend on the mean
-model (through `m0`), on any covariate and on sampled parameters. Centre
-and scale its columns (`x - tc` above, not raw `x`): the marginal's small
-p x p algebra runs in float32 on the GPU, and nearly parallel columns
-cost it digits: `[1, 1 + 1e-3 (t - tc)]` (correlation 0.99998) is off by
-1e-3 log-units on the kernel and by 41 on the MLX path, whose Gram comes
-from differences of likelihoods. **Exactly** collinear columns
-(a global level beside one offset per instrument) are refused in float32
-under either prior, because float32 cannot resolve the redundant
-direction; drop one column. Under a flat prior they are improper anyway;
-under a Gaussian `linear_prior` the float64 paths (`gp.hi`,
-`linear_posterior`, `predict`) evaluate them exactly.
 `draws` are posterior draws of β: one per draw of the rest, from its
-exact conditional. Here they give a level of 2.97 (16-84%: 2.88-3.09)
+exact conditional. Here they give a level of 2.97 (16-84%: 2.88-3.10)
 and a slope of 0.061 (0.051-0.071) against 3.0 and 0.05.
+
+The basis comes in two forms, and the first is the one to use when it
+fits:
+
+* **Shared, `(N, p)`**, as above: the same columns for every chain. It is
+  a constant, so it is evaluated once, when the target is built, in
+  float64, and orthonormalised there; float32 never sees the columns as
+  you wrote them. So their conditioning does not matter: raw times work
+  (`mx.stack([mx.ones_like(x), x], -1)` with `x` a BJD gives exactly the
+  same float32 value as the centred form above), nearly parallel columns
+  cost nothing, and exactly collinear ones (a global level beside one
+  offset per instrument) are fine under a Gaussian `linear_prior` and
+  refused as improper under a flat one. It is also the cheapest: the
+  kernel reads it once for every chain.
+* **Per chain, `(n_chains, N, p)`**, when the columns move with the mean
+  model (`(1 + m0)(a + b t)` around a transit, through `m0`) or with
+  sampled parameters. It is rebuilt at every evaluation, in float32 on the
+  GPU, from a float32 `x` -- which rounds a BJD to 0.25 d before your
+  function sees it, as it does for `mean_fn`. So pass `x_mean` relative to
+  a reference time, and centre and scale the columns yourself: nearly
+  parallel ones cost digits (`[1, 1 + 1e-3 (t - tc)]`, correlation
+  0.99998, is off by 1e-3 log-units on the kernel and by 41 on the MLX
+  path, whose Gram comes from differences of likelihoods), and exactly
+  collinear ones are refused in float32 under either prior (the float64
+  paths, `gp.hi`, `linear_posterior` and `predict`, evaluate them under a
+  Gaussian one).
 
 The likelihood is the restricted one: it keeps `-1/2 ln|Phi^T K^-1 Phi|`,
 which is what makes the marginal posterior of the other parameters match a
 fit that samples β under a flat prior. `linear_prior=(mu, S)` gives a
 Gaussian prior on β instead. It costs, on the kernel at N = 1e4 x 1024
-chains, 1.9x the plain likelihood for p = 2 on value + gradient, rising
-to 6.3x at p = 10 ([benchmarks.md](benchmarks.md#what-the-general-features-cost)).
-This basis does not depend on the mean model, so it could be returned as
-`(N, p)` -- `mx.stack([mx.ones_like(x), x - tc], -1)` -- which the kernel
-reads once for every chain: 1.7x at p = 2, and less than half the memory
-at large N. Keep the `(n_chains, N, p)` form when the basis moves with
-`m0`, as `(1 + m0)(a + b t)` does.
+chains, 1.7x the plain likelihood for p = 2 on value + gradient with a
+shared basis, rising to 5.6x at p = 10 (per chain 1.9x and 6.3x, and
+about twice the memory at large N;
+[benchmarks.md](benchmarks.md#what-the-general-features-cost)).
 
 ### Predicting the GP
 

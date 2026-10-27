@@ -345,12 +345,14 @@ gradient, N = 1e4, SHO, against the plain likelihood (quiet machine,
 | 1 (2) | 1.5x | 1.7x | 3.1x | | | |
 | 2 (3) | 1.7x | 1.9x | 5.1x | 1.4x | 1.4x | 2.3x |
 | 5 (6) | 2.1x | 2.5x | 14.4x | 1.8x | 2.0x | 5.5x |
-| 10 (11) | 5.5x | 6.3x | 42.5x | | | |
+| 10 (11) | 5.6x | 6.3x | 42.5x | | | |
 
 The forward alone at 1024 chains: 1.7x, 1.8x, 2.0x and 6.4x shared,
 1.9x, 2.0x, 2.3x and 7.1x per chain. The residual and the basis go to the
 filter as separate inputs, never concatenated, and a shared basis is
-never expanded per chain; at N = 1e5 x 1024 chains (p = 2) that put the
+never expanded per chain (and, being a constant, it is orthonormalised
+once in float64, which also made its float32 value ~50x more accurate);
+at N = 1e5 x 1024 chains (p = 2) that put the
 value + gradient peak at 2.2 GB shared and 4.6 GB per chain, from 7.7 GB
 for both before 2026-10-26 (docs/review-2026-10-26.md, E1 and E5/E6).
 The white-noise centring fit and the p x p solves run on small Metal

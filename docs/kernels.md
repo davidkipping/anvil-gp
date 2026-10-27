@@ -441,11 +441,14 @@ paths.
 
 **Linear parameters** (`linear_basis`, integrated out rather than
 sampled) run on both paths, with up to 31 columns through one filter on
-the kernel. Centre and scale the columns: nearly parallel ones cost the
-float32 algebra digits, and **exactly** collinear ones (a global level
-beside one offset per instrument) are refused in float32 under either
-prior. Under a Gaussian `linear_prior` the float64 paths evaluate them
-exactly. See the tutorial, "Linear parameters, marginalised".
+the kernel. A basis shared by every chain, returned as `(N, p)`, is
+evaluated once in float64 and orthonormalised, so raw times and nearly
+parallel or collinear columns are handled for you (collinear ones are
+improper, and refused, under a flat prior). A per-chain basis, `(n_chains,
+N, p)`, is rebuilt in float32 every evaluation: centre and scale its
+columns and pass `x_mean` relative to a reference time; exactly collinear
+per-chain columns are refused in float32. See the tutorial, "Linear
+parameters, marginalised".
 
 **Cadence.** Any cadence works, including duplicate timestamps and large
 gaps. A cadence where every spacing is distinct makes the internal lag

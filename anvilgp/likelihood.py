@@ -464,8 +464,9 @@ class GPLogLike:
         #: sampled (`_marginal`); ``linear_prior`` None for a flat prior on
         #: them, or ``(mu, cov)`` for a Gaussian one.  A basis shared by
         #: every chain may be returned as ``(m, p)``: it is then a constant
-        #: (no gradient flows through it), read once by the kernel and never
-        #: expanded per chain.
+        #: (no gradient flows through it), evaluated once in float64 and
+        #: orthonormalised (`_cache_shared_basis`), read once by the kernel
+        #: and never expanded per chain.
         self.linear_basis = linear_basis
         self._linear_prior = (None if linear_prior is None else
                               (np.asarray(linear_prior[0], np.float64),

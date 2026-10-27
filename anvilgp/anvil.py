@@ -316,10 +316,13 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         for a shared basis, 1.7x, 1.9x and 6.3x per chain (N = 1e4 x 1024
         chains).  The MLX path, and the kernel above 31
         basis columns, polarise instead, at ``1 + (p+1)(p+2)/2`` likelihood
-        evaluations (7 at p = 2).  Centre and scale the columns (``x -
-        x.mean()``, not raw ``x``); exactly collinear columns (a global
-        level beside one offset per instrument) are refused in float32 --
-        drop the redundant one.
+        evaluations (7 at p = 2).  A shared ``(n_data, p)`` basis is
+        evaluated once in float64 and orthonormalised, so raw times and
+        collinear columns are handled for it.  A per-chain basis is
+        rebuilt in float32: centre and scale its columns (``x -
+        x.mean()``, not raw ``x``); exactly collinear per-chain columns (a
+        global level beside one offset per instrument) are refused in
+        float32 -- drop the redundant one.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic

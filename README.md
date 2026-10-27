@@ -92,10 +92,11 @@ kernel, gradient included. The tutorial has a runnable example of each
   model; the coefficients are integrated out analytically (the restricted
   likelihood, with `-1/2 ln|Phi^T K^-1 Phi|`), flat or under
   `linear_prior=(mu, S)`, and `gt.linear_posterior(v)` gives their
-  Gaussian conditional per draw. Value + gradient at N = 1e4 x 1024
-  chains, for a basis shared by every chain: 1.5x the plain likelihood at
-  p = 1, 1.7x at 2, 2.1x at 5, 5.5x at 10; per chain (one that moves with
-  the mean model) 1.7-6.3x
+  Gaussian conditional per draw. A basis shared by every chain, `(N,
+  p)`, is orthonormalised once in float64, so raw times (a BJD) and
+  collinear columns need no care. Value + gradient at N = 1e4 x 1024
+  chains, shared: 1.5x the plain likelihood at p = 1, 1.7x at 2, 2.1x at
+  5, 5.6x at 10; per chain (one that moves with the mean model) 1.7-6.3x
   ([docs/benchmarks.md](docs/benchmarks.md#what-the-general-features-cost)).
 * **Prediction.** `gt.predict(v, t_pred)`: the GP component's posterior
   mean and variance at any points, per draw, float64, with marginalised
