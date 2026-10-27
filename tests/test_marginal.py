@@ -655,14 +655,29 @@ def test_the_multi_column_gradient_in_the_hard_regime():
     assert np.abs(g - G).max() < 2e-5 * np.abs(G).max()
 
 
-def test_linear_posterior_is_tiled_over_chains():
-    """Tiled by ``hi_chain_block`` (in one batch a whole posterior asked for
-    ~440 GiB at N = 2000): tiles of 2 give the same answer as one tile."""
+def test_linear_posterior_is_chunked_over_chains(monkeypatch):
+    """Chunked over chains by `predict._CHUNK_BYTES` (in one batch the old
+    polarised route asked for ~440 GiB for a whole posterior at N = 2000):
+    one chain a chunk gives the same answer as one chunk."""
+    import anvilgp.predict as pr
     gp, _ = _gp(False)
     rows = np.tile(ROWS, (3, 1))
-    gp.policy.hi_chain_block = 64
-    whole = gp.linear_posterior(mx.array(rows, dtype=mx.float64))
-    gp.policy.hi_chain_block = 2
-    tiled = gp.linear_posterior(mx.array(rows, dtype=mx.float64))
+    whole = gp.linear_posterior(rows)
+    monkeypatch.setattr(pr, "_CHUNK_BYTES", 1)
+    tiled = gp.linear_posterior(rows)
     for a, b in zip(whole, tiled):
         np.testing.assert_allclose(a, b, rtol=1e-12, atol=0)
+
+
+def test_linear_posterior_of_a_singular_basis():
+    """Flat prior: no posterior, NaN for that chain (the others are
+    untouched).  Gaussian prior: the dense one (covered above)."""
+    t, tc, y, yerr, shape = _setup()
+
+    def twice(vm, x, m0):
+        col = mx.ones_like(m0)
+        return mx.stack([col, 2.0 * col], axis=-1)     # rank 1
+    gp = GPLogLike(None, t, None, y, yerr, TERM, ParamMap.log(KP),
+                   GPPolicy(metal=False), linear_basis=twice)
+    mean, cov = gp.linear_posterior(np.zeros((2, 3)))
+    assert np.all(np.isnan(mean)) and np.all(np.isnan(cov))

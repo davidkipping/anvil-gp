@@ -387,7 +387,7 @@ hyperparameters -- not including the mean model or the observation noise,
 and with β integrated over its posterior when it is marginalised. It
 matches the dense conditional to ~1e-14. It runs on the CPU, as a Kalman
 filter and smoother over data and prediction points together, vectorised
-over draws: 1.9 s for these 384 draws, and for a single draw about 0.2 s
+over draws: 0.7 s for these 384 draws, and for a single draw about 0.2 s
 at N = 1e4 and 2 s at N = 1e5. Thin the chain first. A parallel version is on the open list in the README.
 
 ### The primitives underneath
@@ -407,8 +407,8 @@ X = gt.apply_inverse(vs[:4], Y)                             # (4, N, 2)
 the marginalisation above is built on it, and the fused kernel carries all
 k columns through one filter (up to 32). `apply_inverse` is float64 and
 value-only -- no gradient in `v`. `Y` may be shared, `(N,)` or `(N, k)`,
-or per chain, `(n_chains, N, k)`. Here `Y^T X` agrees with `G` to 3e-6
-of its largest entry, float32 against float64.
+or per chain, `(n_chains, N, k)`. Here `Y^T X` agrees with `G` to ~1e-6
+of its largest entry (5e-7 to 3e-6 across runs), float32 against float64.
 
 ### Several datasets at once
 

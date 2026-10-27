@@ -1804,46 +1804,22 @@ class GPLogLike:
         v = np.asarray(v, dtype=np.float64)
         return predict(self, v, t_pred, return_var=return_var)
 
-    def linear_posterior(self, v: mx.array):
+    def linear_posterior(self, v):
         """The linear mean parameters' conditional posterior given ``v``:
         ``(mean (n_chains, p), cov (n_chains, p, p))``, float64 NumPy.
 
         Under a flat prior the generalised least-squares estimate
         ``C^-1 Phi^T K^-1 r`` and ``C^-1``; under a Gaussian prior
         ``N(mu, S)``, ``(C + S^-1)^-1 (Phi^T K^-1 r + S^-1 mu)`` and
-        ``(C + S^-1)^-1``, which exist even when ``C`` is singular.
-        Draws of beta for reporting are one Gaussian draw per posterior
-        sample of ``v``.  Tiled over chains by ``policy.hi_chain_block``, as
-        :meth:`hi` is: in one batch the float64 evaluation held ~6 MB per
-        draw at N = 2000, so a whole posterior (7.7e4 draws) asked for
-        ~440 GiB.
+        ``(C + S^-1)^-1``, which exist even when ``C`` is singular (under the
+        flat prior a singular basis gets NaN).  Draws of beta for
+        reporting are one Gaussian draw per posterior sample of ``v``.
+        From one forward pass of the float64 filter, chunked over chains;
+        see `anvilgp.predict.linear_posterior`.  (Until 2026-10-27 by
+        polarising the float64 likelihood, 3-5x slower.)
         """
-        if self.linear_basis is None:
-            raise ValueError("no linear_basis: nothing is marginalised")
-        self._check_v(v)
-        n_chains = v.shape[0]
-        with mx.stream(mx.cpu):
-            v64 = v.astype(mx.float64)
-
-            def ev(vv, resid):
-                return self._evaluate(
-                    vv, a64(self._dt64), a64(self._y64),
-                    a64(self._yerr64 ** 2),
-                    None if self._x_mean64 is None else a64(self._x_mean64),
-                    self._inst32, _pow2(self.policy.hi_block), True,
-                    uniq=self._uniq64, resid=resid)
-            parts = []
-            for c in range(0, n_chains, self.policy.hi_chain_block):
-                _, b, cv = self._marginal(
-                    v64[c:c + self.policy.hi_chain_block], ev, a64(self._y64),
-                    None if self._x_mean64 is None else a64(self._x_mean64),
-                    mx.array(self._noise_x64, dtype=mx.float64),
-                    a64(self._yerr64 ** 2))
-                mx.eval(b, cv)
-                parts.append((np.array(b), np.array(cv)))
-            beta = np.concatenate([b for b, _ in parts])
-            cov = np.concatenate([cv for _, cv in parts])
-        return beta, cov
+        from .predict import linear_posterior
+        return linear_posterior(self, np.asarray(v, dtype=np.float64))
 
     def __call__(self, v: mx.array) -> mx.array:
         """float32 GP log-likelihood, offset by :attr:`log_norm_const`.

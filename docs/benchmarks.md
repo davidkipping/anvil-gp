@@ -359,13 +359,21 @@ value + gradient; the defaults, 256 chains and p = 2, 5, 10, give the
 **Prediction** (`predict`) is float64 on the CPU, off the likelihood
 path: a Kalman filter and smoother over data and prediction points
 together, vectorised over chains. SHO, 1000 prediction points: 0.21 s at
-N = 1e4 and 2.0 s at N = 1e5 for one chain; 0.55 s and 7.3 s for 64
-chains; 2.9 s for 512 at N = 1e4. It is bound by NumPy's per-call
+N = 1e4 and 2.0 s at N = 1e5 for one chain; 0.56 s and 5.0 s for 64
+chains; 3.0 s for 512 at N = 1e4. The mean alone (`return_var=False`)
+skips the covariance adjoint: 0.17 and 1.6 s for one chain, 3.7 s for 64
+at N = 1e5. With a marginalised basis the linear parameters' posterior
+comes from the same pass: 0.66 s for 64 chains at N = 1e4, 8.1 s at
+1e5. It is bound by NumPy's per-call
 overhead (~20 us per merged point), not arithmetic; a parallel-in-time
 version, estimated ~10x at N = 1e5, is on the README's open list.
-`apply_inverse` runs the same smoother (not timed separately). `linear_posterior`
-is ~3.3 ms a draw in float64 at flat memory (0.40 GiB from 64 to 4096
-draws).
+`apply_inverse` runs the same smoother without the variance: 0.46 s for
+two columns, 64 chains, N = 1e4. `linear_posterior` is one forward pass
+of the same float64 filter, no backward: 0.35 s for 64 draws and 1.7 s
+for 512 at N = 1e4; 0.63 ms a draw at N = 2000, with memory flat at
+~1.0 GiB from ~2500 draws up (16384 measured). (Before 2026-10-27 it
+polarised the float64 likelihood: 3-5x slower, 0.40 GiB.) Measured on a
+quiet machine, 2026-10-27.
 
 ## What is not benchmarked here
 

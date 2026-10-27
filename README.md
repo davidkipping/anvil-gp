@@ -99,7 +99,7 @@ kernel, gradient included. The tutorial has a runnable example of each
   mean and variance at any points, per draw, float64, with marginalised
   coefficients integrated over; to ~1e-14 of the dense conditional. A
   host-side smoother: ~0.2 s for one draw at N = 1e4, 2 s at N = 1e5,
-  vectorised over draws (64 draws at N = 1e5: 7.3 s).
+  vectorised over draws (64 draws at N = 1e5: 5.0 s).
 * **The primitives.** `gp.gram(v, Y)` = `Y^T K^-1 Y` for any columns,
   batched and differentiable in `v` and `Y` (the kernel carries up to 32
   columns through one filter); `gt.apply_inverse(v, Y)` = `K^-1 Y`,
@@ -783,7 +783,7 @@ marked as an estimate.
   centring round. See [docs/boundary-plan.md](docs/boundary-plan.md), V.
 * **Parallel-in-time `predict`.** The smoother is one host-side step per
   merged point, bound by NumPy's per-call overhead (~20 us a point: 2.0 s
-  at N = 1e5 for one chain, 7.3 s for 64). Splitting the grid into
+  at N = 1e5 for one chain, 5.0 s for 64). Splitting the grid into
   ~sqrt(N + M) blocks -- block elements, a prefix over blocks, then the
   within-block filter and smoother vectorised over chains x blocks -- is
   estimated at ~10x at N = 1e5. Not started; see

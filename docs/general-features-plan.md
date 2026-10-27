@@ -147,7 +147,8 @@ one (marginalisation differentiates `gram`); built on request.
 
 From item 4: **parallel-in-time `predict`.** Today's smoother is one
 host-side step per merged point, bound by NumPy's per-call overhead (~20
-us a point: 2.0 s at N = 1e5 for one chain, 7.3 s for 64). Proposed:
+us a point: 2.0 s at N = 1e5 for one chain, 5.0 s for 64 since the
+2026-10-27 review fixes, 7.3 s before). Proposed:
 split the merged grid into ~sqrt(N + M) blocks; form each block's
 filtering element in float64 (vectorised over blocks), a prefix over the
 blocks for their entry states, then the within-block filter vectorised
