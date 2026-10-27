@@ -23,6 +23,8 @@ p.add_argument("--chains", type=int, default=256)
 p.add_argument("--p", type=int, nargs="+", default=[2, 5, 10])
 p.add_argument("--repeat", type=int, default=10)
 p.add_argument("--grad", action="store_true", help="also value + gradient")
+p.add_argument("--shared", action="store_true",
+                help="return the basis as (N, p), shared by every chain")
 a = p.parse_args()
 
 PROBE_QUIET_MS = 73.3
@@ -62,6 +64,8 @@ def build(n, n_lin):
     basis_m = mx.array(leg.astype(np.float32))
 
     def basis(vm, x_, m0):
+        if a.shared:                     # (N, p): read once by the kernel
+            return basis_m.astype(m0.dtype)
         return mx.broadcast_to(basis_m.astype(m0.dtype),
                                (m0.shape[0],) + basis_m.shape)
     kw = dict(kappa_max=None, metal=True)

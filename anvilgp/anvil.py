@@ -306,12 +306,15 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         Linear mean parameters to integrate out rather than sample:
         ``linear_basis(v_mean, x, m0) -> (n_chains, n_data, p)``, the
         columns the mean is linear in (``m0`` is ``mean_fn``'s output, zeros
-        without one; ``x`` is ``x_mean``, else ``t``).  ``linear_prior``
+        without one; ``x`` is ``x_mean``, else ``t``), or ``(n_data, p)``
+        for a basis shared by every chain -- a constant, and on the kernel
+        2.4x less memory than the per-chain form.  ``linear_prior``
         None for a flat prior on them (the restricted likelihood), or
         ``(mu, cov)``.  :meth:`GPTarget.linear_posterior` reports them.
         On the fused kernel all ``p + 1`` columns ride one filter: value +
-        gradient 1.7x the plain likelihood at p = 1, 2.0x at 2, 7.5x at 10
-        (N = 1e4 x 1024 chains).  The MLX path, and the kernel above 31
+        gradient 1.5x the plain likelihood at p = 1, 1.7x at 2, 5.5x at 10
+        for a shared basis, 1.7x, 1.9x and 6.3x per chain (N = 1e4 x 1024
+        chains).  The MLX path, and the kernel above 31
         basis columns, polarise instead, at ``1 + (p+1)(p+2)/2`` likelihood
         evaluations (7 at p = 2).  Centre and scale the columns (``x -
         x.mean()``, not raw ``x``); exactly collinear columns (a global

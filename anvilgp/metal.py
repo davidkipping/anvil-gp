@@ -909,6 +909,61 @@ _FWD_MC = {
 }
 
 
+#: The multi-column kernels' one column read and the backward's one
+#: column-cotangent write, in their single-array form.  `_col_src` rewrites
+#: them for a split layout.
+_COL_READ = "resid[(gi * (uint)n_chains + chain) * KCOL + c]"
+_DY_WRITE = "out_dy[(gi * (uint)n_chains + chain) * KCOL + c] = v_bar[c];"
+
+
+def _col_layout(cols):
+    """The multi-column kernels' columns: one array ``(npts, n_chains,
+    k)``, or a pair ``(a, b)`` -- ``a`` ``(npts, n_chains, ka)`` per chain,
+    then ``b`` either per chain too, ``(npts, n_chains, kb)``, or shared by
+    every chain, ``(npts, kb)``, read with a chain stride of 0.
+
+    The pair is the linear marginalisation's: the residual, then the basis.
+    Passed apart they are never concatenated (an (npts, n_chains, k) copy,
+    and MLX's concatenate along a last axis of 3 measured slower than the
+    filter at N = 1e5), a shared basis is never expanded per chain, and
+    the backward writes no cotangent for it (`_col_src`).  Returns
+    ``(inputs, ka, kb, shared)``."""
+    if isinstance(cols, (tuple, list)):
+        a, b = cols
+        shared = b.ndim == 2
+        return [a, b], a.shape[-1], b.shape[-1], shared
+    return [cols], cols.shape[-1], 0, False
+
+
+def _col_src(src: str, ka: int, kb: int, shared: bool) -> str:
+    """``src`` for a split column layout (`_col_layout`); unchanged for one
+    array.  Column ``c < ka`` reads ``resid``, the rest ``basis``; the
+    backward writes cotangents for the per-chain columns only: all ``k``
+    when ``basis`` is per chain, the first ``ka`` when it is shared (a
+    shared basis is a constant of the chain's parameters, and its
+    cotangent, summed over chains, is not asked for)."""
+    if kb == 0:
+        return src
+    row, col = ("1u", "0u") if shared else ("(uint)n_chains", "chain")
+    read = (f"(c < {ka}u ? resid[(gi * (uint)n_chains + chain) * {ka}u + c]"
+            f" : basis[(gi * {row} + {col}) * {kb}u + (c - {ka}u)])")
+    kout = ka if shared else ka + kb
+    write = (f"if (c < {kout}u) out_dy[(gi * (uint)n_chains + chain) * "
+             f"{kout}u + c] = v_bar[c];")
+    if _COL_READ not in src:
+        raise RuntimeError("a multi-column kernel no longer reads its "
+                           "columns through `_COL_READ`")
+    return src.replace(_COL_READ, read).replace(_DY_WRITE, write)
+
+
+def _col_inputs(names: list, kb: int) -> list:
+    """``names`` with ``basis`` after ``resid`` for a split layout."""
+    if kb == 0:
+        return names
+    i = names.index("resid")
+    return names[:i + 1] + ["basis"] + names[i + 1:]
+
+
 #: The affine pass's addition to the multi-column mean update: the block's
 #: mean map ``T <- (I - K h) Phi T``, so that the exit mean from an entry
 #: mean ``m`` is ``T m + d`` with ``d`` the exit mean from zero.
@@ -1536,19 +1591,27 @@ def _sub_len_mc(m: int, k: int) -> int:
     return 16
 
 
+def _layout_tag(ka: int, kb: int, shared: bool) -> str:
+    return "" if kb == 0 else f"_a{ka}b{kb}" + ("s" if shared else "")
+
+
 def _bwd_mc_kernel(m: int, k: int, slen: int, n_jit: int = 0,
-                   formal: bool = False):
-    key = (m, k, slen, _jit_key(n_jit), bool(formal))
+                   formal: bool = False, layout=(None, 0, False)):
+    ka, kb, shared = layout
+    key = (m, k, slen, _jit_key(n_jit), bool(formal), kb, shared)
     if key not in _bwd_mc_kernels:
-        body = _formal_src(_jitter_src(_bwd_mc_src(), n_jit), formal)
+        body = _formal_src(_jitter_src(
+            _col_src(_bwd_mc_src(), ka, kb, shared), n_jit), formal)
         _bwd_mc_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_bwd_mc_m{m}_k{k}_s{slen}_j{key[3]}"
-                 + ("_formal" if formal else ""),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref", "jit2", "cot", "gbar", "ent_m", "ent_C",
-                         "seed_m", "seed_C", "slot_id", "slot_start",
-                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                         "n_jit", "n_ckpt", "n_slots"],
+                 + ("_formal" if formal else "")
+                 + _layout_tag(ka, kb, shared),
+            input_names=_col_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                 "r_ref", "jit2", "cot", "gbar", "ent_m", "ent_C",
+                 "seed_m", "seed_C", "slot_id", "slot_start",
+                 "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                 "n_jit", "n_ckpt", "n_slots"], kb),
             output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
                           "out_drv", "ckpt"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m))
@@ -1564,21 +1627,25 @@ def backward_ckpt_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     ``c_ld`` ``(n_chains,)`` on the log-determinant half and the symmetric
     ``gs`` ``(n_chains, k, k)`` on the Gram matrix; ``cols``, ``ent_m``,
     ``seed_m`` and the returned ``dy`` carry a column axis
-    (``(npts, n_chains, k)``, ``(n_chains, n_blocks, k, m)``)."""
+    (``(npts, n_chains, k)``, ``(n_chains, n_blocks, k, m)``).  ``cols``
+    may be split (`_col_layout`); then ``dy`` covers the per-chain columns
+    only."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
-    npts, k = cols.shape[0], cols.shape[-1]
+    col_in, ka, kb, shared = _col_layout(cols)
+    npts, k = col_in[0].shape[0], ka + kb
+    kout = ka if shared else k
     slen = _sub_len_mc(m, k)
     n_blocks = (npts + blk_len - 1) // blk_len
     n_ckpt = (blk_len + slen - 1) // slen
     n_jit = _n_jit_of(jit2)
     n_slots = int(n_slots)
     shapes = [(n_chains, n_slots, m, m), (n_chains, n_slots, m, m),
-              (n_chains, n_blocks, m), (npts, n_chains, k),
+              (n_chains, n_blocks, m), (npts, n_chains, kout),
               ((npts, n_chains, 1) if n_jit < 0
                else (n_chains, n_blocks, max(1, n_jit))),
               (n_chains, n_blocks, n_ckpt, k * m + m * m)]
-    outs = _bwd_mc_kernel(m, k, slen, n_jit, formal)(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+    outs = _bwd_mc_kernel(m, k, slen, n_jit, formal, (ka, kb, shared))(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
                 c_ld.astype(mx.float32), mx.contiguous(gs.astype(mx.float32)),
                 ent_m, ent_C, mx.contiguous(seed_m), mx.contiguous(seed_C),
                 slot_id, slot_start,
@@ -2072,20 +2139,23 @@ _SRC_REPLAY_MC = """
 _replay_mc_kernels: dict = {}
 
 
-def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False):
-    key = (m, k, _jit_key(n_jit), bool(formal))
+def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
+                      layout=(None, 0, False)):
+    ka, kb, shared = layout
+    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared)
     if key not in _replay_mc_kernels:
-        body = _formal_src(_jitter_src(
+        body = _formal_src(_jitter_src(_col_src(
             _SRC_REPLAY_MC.replace("FWD_STEP", _fwd_step(True, multi=True)),
-            n_jit),
-            formal)
+            ka, kb, shared), n_jit), formal)
         _replay_mc_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_replay_mc_m{m}_k{k}_j{key[2]}"
-                 + ("_formal" if formal else ""),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref", "jit2", "ent_m", "ent_C",
-                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                         "n_jit"],
+                 + ("_formal" if formal else "")
+                 + _layout_tag(ka, kb, shared),
+            input_names=_col_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                 "r_ref", "jit2", "ent_m", "ent_C",
+                 "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                 "n_jit"], kb),
             output_names=["out_ld", "out_g"],
             source=body.replace("KTRI", str(k * (k + 1) // 2))
                        .replace("KCOL", str(k)).replace("MDIM", str(m)),
@@ -2100,14 +2170,15 @@ def replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     ``(npts, n_chains, k)``, replayed from per-column entry means ``ent_m``
     ``(n_chains, n_blocks, k, m)`` and the shared entry covariance
     ``ent_C`` ``(n_chains, n_blocks, m, m)``.  Inputs otherwise as
-    :func:`replay_blocks`."""
+    :func:`replay_blocks`; ``cols`` may be split (`_col_layout`)."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
-    npts, k = cols.shape[0], cols.shape[-1]
+    col_in, ka, kb, shared = _col_layout(cols)
+    npts, k = col_in[0].shape[0], ka + kb
     n_blocks = ent_m.shape[1]
     n_jit = _n_jit_of(jit2)
     ktri = k * (k + 1) // 2
-    outs = _replay_mc_kernel(m, k, n_jit, formal)(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+    outs = _replay_mc_kernel(m, k, n_jit, formal, (ka, kb, shared))(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
                 ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
                 int(n_chains), int(blk_len), int(n_jit)],
         output_shapes=[(n_chains, n_blocks), (n_chains, n_blocks, ktri)],
@@ -2185,18 +2256,22 @@ _affine_kernels: dict = {}
 _mean_prefix_kernels: dict = {}
 
 
-def _affine_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False):
-    key = (m, k, _jit_key(n_jit), bool(formal))
+def _affine_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
+                   layout=(None, 0, False)):
+    ka, kb, shared = layout
+    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared)
     if key not in _affine_kernels:
-        body = _formal_src(_jitter_src(
-            _SRC_AFFINE.replace("FWD_STEP", _fwd_step(affine=True)), n_jit),
-            formal)
+        body = _formal_src(_jitter_src(_col_src(
+            _SRC_AFFINE.replace("FWD_STEP", _fwd_step(affine=True)),
+            ka, kb, shared), n_jit), formal)
         _affine_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_affine_m{m}_k{k}_j{key[2]}"
-                 + ("_formal" if formal else ""),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref", "jit2", "ent_C", "npts", "n_lags",
-                         "n_blocks", "n_chains", "blk_len", "n_jit"],
+                 + ("_formal" if formal else "")
+                 + _layout_tag(ka, kb, shared),
+            input_names=_col_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                 "r_ref", "jit2", "ent_C", "npts", "n_lags",
+                 "n_blocks", "n_chains", "blk_len", "n_jit"], kb),
             output_names=["out_d", "out_T"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
         )
@@ -2207,13 +2282,15 @@ def column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
                        ent_C, blk_len, formal=False):
     """``(n_chains, n_blocks, k, m)``: every column's entry mean, given the
     blocks' shared entry covariances ``ent_C`` -- the affine pass
-    (`_SRC_AFFINE`) and the prefix over its maps (`_SRC_MEAN_PREFIX`)."""
+    (`_SRC_AFFINE`) and the prefix over its maps (`_SRC_MEAN_PREFIX`).
+    ``cols`` may be split (`_col_layout`)."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
-    npts, k = cols.shape[0], cols.shape[-1]
+    col_in, ka, kb, shared = _col_layout(cols)
+    npts, k = col_in[0].shape[0], ka + kb
     n_blocks = ent_C.shape[1]
     n_jit = _n_jit_of(jit2)
-    d, T = _affine_kernel(m, k, n_jit, formal)(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2, ent_C,
+    d, T = _affine_kernel(m, k, n_jit, formal, (ka, kb, shared))(
+        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_C,
                 int(npts), int(n_lags), int(n_blocks), int(n_chains),
                 int(blk_len), int(n_jit)],
         output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
@@ -2312,27 +2389,30 @@ def column_exit_sensitivities(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
     """``(n_chains, n_blocks, k, m)``: ``r_c`` at every block's exit, ``-1/2``
     the derivative of the later blocks' ``sum v_c^2 / S`` with respect to
     the exit mean (`_SRC_RSENS`, `_SRC_R_SUFFIX`).  Zero at the last
-    block."""
+    block.  ``cols`` may be split (`_col_layout`)."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
-    npts, k = cols.shape[0], cols.shape[-1]
+    col_in, ka, kb, shared = _col_layout(cols)
+    npts, k = col_in[0].shape[0], ka + kb
     n_blocks = ent_C.shape[1]
     n_jit = _n_jit_of(jit2)
-    key = (m, k, _jit_key(n_jit), bool(formal))
+    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared)
     if key not in _rsens_kernels:
-        body = _formal_src(_jitter_src(
-            _SRC_RSENS.replace("FWD_STEP", _fwd_step(sens=True)), n_jit),
-            formal)
+        body = _formal_src(_jitter_src(_col_src(
+            _SRC_RSENS.replace("FWD_STEP", _fwd_step(sens=True)),
+            ka, kb, shared), n_jit), formal)
         _rsens_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_rsens_m{m}_k{k}_j{key[2]}"
-                 + ("_formal" if formal else ""),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref", "jit2", "ent_m", "ent_C", "npts", "n_lags",
-                         "n_blocks", "n_chains", "blk_len", "n_jit"],
+                 + ("_formal" if formal else "")
+                 + _layout_tag(ka, kb, shared),
+            input_names=_col_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                 "r_ref", "jit2", "ent_m", "ent_C", "npts", "n_lags",
+                 "n_blocks", "n_chains", "blk_len", "n_jit"], kb),
             output_names=["out_g", "out_T"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
         )
     g, T = _rsens_kernels[key](
-        inputs=[phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2, ent_m,
+        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_m,
                 ent_C, int(npts), int(n_lags), int(n_blocks), int(n_chains),
                 int(blk_len), int(n_jit)],
         output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
@@ -2467,9 +2547,21 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     :func:`column_exit_sensitivities` and ``-1/2 c_ld Jt`` the existing
     seed of the zero residual at cotangent ``c_ld``.  One column, ``c_ld =
     cot`` and ``gs = -cot / 2``, is the single-column seed exactly.
+
+    ``cols`` may instead be a pair (`_col_layout`): per-chain columns, then
+    columns per chain or shared by every chain -- the marginalisation's
+    residual and basis, passed apart so nothing is concatenated or
+    expanded.  A shared block gets a zero cotangent: it must not depend on
+    anything differentiated (the caller stops its gradient).
     """
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
-    npts, k = cols.shape[0], cols.shape[-1]
+    col_in, ka, kb, shared = _col_layout(cols)
+    npts, k = col_in[0].shape[0], ka + kb
+    # the second block, or a placeholder primal when there is none
+    c_b = col_in[1] if kb else mx.zeros((1,), dtype=mx.float32)
+
+    def split(ca, cb):
+        return (ca, cb) if kb else ca
     if m > MAX_STATE:
         raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
     n_blocks = -(-npts // blk_len)
@@ -2479,7 +2571,8 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     off_diag = mx.array(rows != cs)
 
     @mx.custom_function
-    def core(p_t, q_t, hv, cz, j2):
+    def core(p_t, q_t, hv, ca, cb, j2):
+        cz = split(ca, cb)
         if n_blocks == 1:
             # Block 0 enters at zero (its first lag is row 0, Phi = 0), as
             # in `_SRC_PREFIX`; no boundary to run.
@@ -2505,7 +2598,8 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
-        p_t, q_t, hv, cz, j2 = primals
+        p_t, q_t, hv, ca, cb, j2 = primals
+        cz = split(ca, cb)
         c_ld = cotangents[0]
         gs = 0.5 * (cotangents[1] + mx.swapaxes(cotangents[1], 1, 2))
         ent_m, ent_C, aux = outputs[2], outputs[3], tuple(outputs[4:])
@@ -2531,7 +2625,11 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
             blk_len, formal)
         d_phi_tab, d_q_tab = _fold_slots(d_phi, d_q, fold_plan, n_chains,
                                          n_lags, m)
-        return (d_phi_tab, d_q_tab, mx.sum(d_h, axis=1), d_y,
+        if kb == 0 or shared:
+            d_a, d_b = d_y, mx.zeros_like(cb)
+        else:
+            d_a, d_b = d_y[..., :ka], d_y[..., ka:]
+        return (d_phi_tab, d_q_tab, mx.sum(d_h, axis=1), d_a, d_b,
                 _d_jit2(d_rv, j2))
 
     # Contiguous before the custom function, not inside it: a
@@ -2539,7 +2637,10 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     # receives the primal as passed, so a copy made inside `core` was made
     # again for each of the VJP's two readers.  A no-op when the caller
     # already passes contiguous columns (`GPLogLike._metal_inputs` does).
-    out = core(phi_tab, q_tab, hvec, mx.contiguous(cols), mx.contiguous(jit2))
+    out = core(phi_tab, q_tab, hvec, mx.contiguous(col_in[0]),
+               mx.contiguous(c_b) if kb == 0 or not shared
+               else mx.stop_gradient(mx.contiguous(c_b)),
+               mx.contiguous(jit2))
     return out[0], out[1]
 
 

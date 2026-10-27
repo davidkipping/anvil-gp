@@ -462,7 +462,10 @@ class GPLogLike:
         #: ``linear_basis(v_mean, x, m0) -> Phi (n_chains, m, p)``: linear
         #: mean parameters integrated out of the likelihood rather than
         #: sampled (`_marginal`); ``linear_prior`` None for a flat prior on
-        #: them, or ``(mu, cov)`` for a Gaussian one.
+        #: them, or ``(mu, cov)`` for a Gaussian one.  A basis shared by
+        #: every chain may be returned as ``(m, p)``: it is then a constant
+        #: (no gradient flows through it), read once by the kernel and never
+        #: expanded per chain.
         self.linear_basis = linear_basis
         self._linear_prior = (None if linear_prior is None else
                               (np.asarray(linear_prior[0], np.float64),
@@ -1111,11 +1114,14 @@ class GPLogLike:
                            boundary=self._metal_boundary)
         return out, (q, h)
 
-    def _metal_inputs(self, v: mx.array, resid: mx.array | None = None):
+    def _metal_inputs(self, v: mx.array, resid: mx.array | None = None,
+                      need_resid: bool = True):
         """The kernel's inputs for ``v``: ``(phi table, Q table, h, residual
         (npts, n_chains[, k]), jit2, Q)``.  ``resid`` replaces the data's
         residual: ``(n_chains, n_data)``, or ``(n_chains, k, n_data)``
-        columns for :func:`anvilgp.metal.scan_gram`."""
+        columns for :func:`anvilgp.metal.scan_gram`; ``need_resid=False``
+        builds none (the residual slot is None), for a caller that lays out
+        its own columns."""
         pm = self.param_map
         n, m, dtype = v.shape[0], self.term.n_state, v.dtype
         if self._metal_slot_id is None:        # deferred at construction
@@ -1150,7 +1156,9 @@ class GPLogLike:
         # the columns are read by up to five kernels (boundary, affine,
         # replay; r-sensitivities and the backward in the VJP) -- 1.2 GB
         # a copy at N = 1e5 x 1024 chains x 3 columns.
-        if resid is not None and resid.ndim == 3:     # `_marginal`'s columns
+        if not need_resid:
+            r = None
+        elif resid is not None and resid.ndim == 3:   # `gram`'s columns
             r = mx.contiguous(mx.transpose(resid, (2, 0, 1)))
         elif resid is not None:        # `_marginal`'s combinations
             r = mx.contiguous(mx.swapaxes(resid, 0, 1))
@@ -1471,17 +1479,31 @@ class GPLogLike:
                                            else None))[0]
         return self._raw_resid(v, None)
 
-    def _gram_metal(self, v: mx.array, cols: mx.array):
+    def _gram_metal(self, v: mx.array, cols):
         """`_gram_polarised` on the kernel by one multi-column filter
         (:func:`anvilgp.metal.scan_gram`): ``1`` filter carrying ``k``
         means instead of ``1 + k(k+1)/2`` filters, forward and backward.
         Above `MAX_GRAM_COLS` columns `_marginal` polarises instead.
+
+        ``cols`` is ``(n_chains, k, n_data)``, or the marginalisation's
+        pair ``(rc (n_chains, n_data), phi)`` with ``phi`` ``(n_data, p)``
+        shared or ``(n_chains, n_data, p)``: laid out time-major apart,
+        never concatenated, and a shared basis never expanded per chain
+        (`metal._col_layout`; its gradient is stopped).
         """
         from .metal import scan_gram
-        if cols.shape[1] > MAX_GRAM_COLS:
+        if not isinstance(cols, tuple) and cols.shape[1] > MAX_GRAM_COLS:
             return self._gram_polarised(v, self._raw_resid, cols)
         pull = self._infeasible_pull(v)
-        pt, qt, h, r, jit2, q = self._metal_inputs(v, cols)
+        if isinstance(cols, tuple):
+            rc, phi = cols
+            pt, qt, h, _, jit2, q = self._metal_inputs(v, need_resid=False)
+            a = mx.contiguous(mx.swapaxes(rc, 0, 1))[..., None]
+            b = (mx.stop_gradient(phi) if phi.ndim == 2
+                 else mx.contiguous(mx.transpose(phi, (1, 0, 2))))
+            r = (a, b)
+        else:
+            pt, qt, h, r, jit2, q = self._metal_inputs(v, cols)
         ld, g = scan_gram(pt, qt, self._metal_lag, self._metal_inst, h, r,
                           self._r_ref32, jit2, self.policy.s_floor_rel,
                           self.metal_block,
@@ -1587,10 +1609,14 @@ class GPLogLike:
         if off is not None:
             r = r - off
         phi = self.linear_basis(vm, x_lin, m0).astype(dtype)
-        phi_own = phi if phi.ndim == 3 else phi[None]
-        phi = mx.broadcast_to(phi, (n, N, phi.shape[-1]))
+        shared = phi.ndim == 2          # one basis for every chain: (N, p)
+        phi_own = phi[None] if shared else phi
         p = phi.shape[-1]
         k = p + 1
+        # On the kernel the residual and the basis go to the filter apart
+        # (`_gram_metal`), unscaled; the column scale is applied to the
+        # k x k Gram instead -- exact, and it saves a pass over the basis.
+        split = gram_fn is not None and k <= MAX_GRAM_COLS
 
         w = (1.0 / r_ref)[None, :, None]
         if (dtype == mx.float32 and mx.default_device() == mx.gpu
@@ -1602,8 +1628,9 @@ class GPLogLike:
                 mx.stop_gradient(mx.swapaxes(phi_own, 1, 2)),
                 mx.stop_gradient(r), 1.0 / r_ref)
         else:
-            a_w = mx.stop_gradient(mx.swapaxes(phi * w, 1, 2))  # (n, p, N)
-            a_mat = a_w @ mx.stop_gradient(phi)
+            phi_b = mx.broadcast_to(phi_own, (n, N, p))
+            a_w = mx.stop_gradient(mx.swapaxes(phi_b * w, 1, 2))  # (n, p, N)
+            a_mat = a_w @ mx.stop_gradient(phi_b)
             a_r = (a_w @ mx.stop_gradient(r)[..., None])[..., 0]
         # Any beta0 is exact, so the fit is ridged on the unit-diagonal
         # normal equations: a singular basis (a zero column, collinear
@@ -1620,16 +1647,27 @@ class GPLogLike:
             * mx.eye(p, dtype=dtype))
         beta0 = mx.stop_gradient(
             (a_inv @ (a_r / dn)[..., None])[..., 0] / dn)
-        rc = r - (phi @ beta0[..., None])[..., 0]
+        # A shared basis is centred by one GEMM, (n, p) @ (p, N): the
+        # batched (n, N, p) @ (n, p, 1) is MLX's slow shape (1.09 against
+        # 0.64 ms at N = 1e4 x 1024).
+        rc = r - (beta0 @ mx.swapaxes(phi, 0, 1) if shared
+                  else (phi @ beta0[..., None])[..., 0])
         size = mx.maximum(mx.sum(rc * rc * w[..., 0], -1, keepdims=True),
                           float(N))
         c = mx.stop_gradient(mx.where(
             live, mx.sqrt(size / mx.maximum(phi_w2, 1e-30)), 1.0))
 
-        cols = mx.concatenate([rc[:, None, :],
-                               mx.swapaxes(phi * c[:, None, :], 1, 2)], 1)
-        ell0, gram, worst = (self._gram_polarised(v, ev, cols)
-                             if gram_fn is None else gram_fn(v, cols))
+        if split:
+            ell0, gram, worst = gram_fn(v, (rc, phi))
+            dc = mx.concatenate([mx.ones((n, 1), dtype=dtype), c], -1)
+            gram = dc[:, :, None] * gram * dc[:, None, :]
+        else:
+            phi_b = mx.broadcast_to(phi_own, (n, N, p))
+            cols = mx.concatenate([rc[:, None, :],
+                                   mx.swapaxes(phi_b * c[:, None, :], 1, 2)],
+                                  1)
+            ell0, gram, worst = (self._gram_polarised(v, ev, cols)
+                                 if gram_fn is None else gram_fn(v, cols))
 
         a, b, cs = gram[:, 0, 0], gram[:, 0, 1:], gram[:, 1:, 1:]
         log_c = mx.sum(mx.log(c), -1)

@@ -370,8 +370,13 @@ The likelihood is the restricted one: it keeps `-1/2 ln|Phi^T K^-1 Phi|`,
 which is what makes the marginal posterior of the other parameters match a
 fit that samples β under a flat prior. `linear_prior=(mu, S)` gives a
 Gaussian prior on β instead. It costs, on the kernel at N = 1e4 x 1024
-chains, 1.7x the plain likelihood for p = 1 and 2.0x for p = 2 on value +
-gradient, rising to 7.5x at p = 10 ([benchmarks.md](benchmarks.md#what-the-general-features-cost)).
+chains, 1.9x the plain likelihood for p = 2 on value + gradient, rising
+to 6.3x at p = 10 ([benchmarks.md](benchmarks.md#what-the-general-features-cost)).
+This basis does not depend on the mean model, so it could be returned as
+`(N, p)` -- `mx.stack([mx.ones_like(x), x - tc], -1)` -- which the kernel
+reads once for every chain: 1.7x at p = 2, and less than half the memory
+at large N. Keep the `(n_chains, N, p)` form when the basis moves with
+`m0`, as `(1 + m0)(a + b t)` does.
 
 ### Predicting the GP
 

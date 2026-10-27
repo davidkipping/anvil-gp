@@ -298,6 +298,32 @@ def test_a_bad_linear_prior_is_refused():
             _hi(gp, np.zeros((1, 3)))
 
 
+@pytest.mark.parametrize("metal", [False, True], ids=["mlx", "kernel"])
+def test_a_shared_basis_is_the_per_chain_one(metal):
+    """A basis returned as (N, p) -- on the kernel a separate, chain-stride-0
+    input with no cotangent (`metal._col_layout`) -- gives the value and
+    gradient of the same basis returned per chain, (n, N, p)."""
+    t, tc, y, yerr, shape = _setup()
+
+    def shared(vm, x, m0):
+        return mx.stack([mx.ones_like(x), x - tc], axis=-1)
+
+    def per_chain(vm, x, m0):
+        return mx.broadcast_to(shared(vm, x, m0), m0.shape + (2,))
+    out = []
+    for basis in (shared, per_chain):
+        gp = GPLogLike(None, t, None, y, yerr, TERM, ParamMap.log(KP),
+                       GPPolicy(metal=metal, kappa_max=None),
+                       linear_basis=basis)
+        with mx.stream(mx.gpu):
+            u = mx.array(ROWS[:, 1:], dtype=mx.float32)
+            out.append((np.array(gp(u)),
+                        np.array(mx.grad(lambda u: gp(u).sum())(u))))
+    np.testing.assert_allclose(out[0][0], out[1][0], rtol=1e-6)
+    np.testing.assert_allclose(out[0][1], out[1][1], rtol=1e-4,
+                               atol=1e-4 * np.abs(out[1][1]).max())
+
+
 def test_make_target_marginalises():
     pytest.importorskip("anvil")
     from anvilgp.anvil import make_target

@@ -335,26 +335,32 @@ path and is bit-identical.
 Gram matrix of the residual and the p basis columns, k = p + 1 in all.
 The kernel carries all k through one filter (one covariance recursion, k
 means); the MLX path, and the kernel above 32 columns, polarise instead,
-one likelihood per pair. Value + gradient, N = 1e4, SHO, against the plain
-likelihood:
+one likelihood per pair. A basis shared by every chain, returned as
+`(N, p)`, is read once by the kernel rather than per chain. Value +
+gradient, N = 1e4, SHO, against the plain likelihood (quiet machine,
+2026-10-27):
 
-| p (k) | 1024 chains: one filter | polarised | 256 chains: one filter | polarised |
-|---|---:|---:|---:|---:|
-| 1 (2) | 1.7x | 3.2x | | |
-| 2 (3) | 2.0x | 5.3x | 1.5x | 2.4x |
-| 5 (6) | 3.1x | 14.9x | 2.1x | 5.8x |
-| 10 (11) | 7.5x | 44.6x | | |
+| p (k) | 1024 chains: shared basis | per-chain basis | polarised | 256 chains: shared | per-chain | polarised |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 (2) | 1.5x | 1.7x | 3.1x | | | |
+| 2 (3) | 1.7x | 1.9x | 5.1x | 1.4x | 1.4x | 2.3x |
+| 5 (6) | 2.1x | 2.5x | 14.4x | 1.8x | 2.0x | 5.5x |
+| 10 (11) | 5.5x | 6.3x | 42.5x | | | |
 
-The forward alone: 1.8x, 2.0x, 2.6x and 6.3x at 1024 chains. At k = 3
-about a third of the forward's overhead is not the filter but building
-and transposing the columns (~3 ms); the white-noise centring fit and the
-p x p solves run on small Metal kernels of their own, because MLX's
-batched matmul and inverse were slower than the likelihood at these
-shapes. The one-filter route beat polarisation at every k measured (up to
-26), and polarising 26 columns at m = 6 tripped the GPU watchdog. Reproduce with
-`benchmarks/marginal_cost.py --chains 1024 --p 1 2 5 10` (add `--grad` for
-value + gradient; the defaults, 256 chains and p = 2, 5, 10, give the
-256-chain column).
+The forward alone at 1024 chains: 1.7x, 1.8x, 2.0x and 6.4x shared,
+1.9x, 2.0x, 2.3x and 7.1x per chain. The residual and the basis go to the
+filter as separate inputs, never concatenated, and a shared basis is
+never expanded per chain; at N = 1e5 x 1024 chains (p = 2) that put the
+value + gradient peak at 2.2 GB shared and 4.6 GB per chain, from 7.7 GB
+for both before 2026-10-26 (docs/review-2026-10-26.md, E1 and E5/E6).
+The white-noise centring fit and the p x p solves run on small Metal
+kernels of their own, because MLX's batched matmul and inverse were
+slower than the likelihood at these shapes. The one-filter route beat
+polarisation at every k measured (up to 26), and polarising 26 columns at
+m = 6 tripped the GPU watchdog. Reproduce with
+`benchmarks/marginal_cost.py --chains 1024 --p 1 2 5 10 --grad`, adding
+`--shared` for the shared basis (the defaults, 256 chains and p = 2, 5,
+10, give the 256-chain columns).
 
 **Prediction** (`predict`) is float64 on the CPU, off the likelihood
 path: a Kalman filter and smoother over data and prediction points
