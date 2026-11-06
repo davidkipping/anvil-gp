@@ -1,0 +1,412 @@
+"""Held-out ("masked") conditioning: `GPLogLike(held_out=...)`.
+
+The GP is conditioned on S and applied to the held-out M through its
+two-sided conditional mean, M scored with its white noise alone
+(docs/masked-gp-plan.md).  Every case against ``Sigma``, the joint
+Gaussian that defines it, built densely (`oracle.dense_masked_covariance`).
+"""
+import math
+import warnings
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+import anvilgp as ag
+from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from anvilgp.oracle import (dense_covariance, dense_loglike,
+                            dense_masked_covariance, dense_masked_loglike,
+                            sample_ssm)
+from anvilgp.special import exp_acc
+
+N = 300
+_TERMS = {
+    "real": (ag.RealTerm(), [1.0, 0.7]),
+    "sho": (ag.SHOTerm(), [1.0, 2.0, 3.0]),
+    "matern52": (ag.Matern52Term(), [1.0, 1.5]),
+    "rot+sho": (ag.RotationTerm() + ag.SHOTerm(),
+                [1.0, 4.0, 3.0, 1.0, 0.4, 0.3, 0.5, 0.7]),
+}
+
+
+def _data(term, kp, t=None, seed=0):
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.uniform(0, 20, N)) if t is None else t
+    yerr = rng.uniform(0.1, 0.3, t.size)
+    grid = np.linspace(t.min(), t.max(), 4000)
+    y = (np.interp(t, grid, sample_ssm(term, kp, grid[1] - grid[0],
+                                       grid.size, rng))
+         + yerr * rng.standard_normal(t.size))
+    return t, y, yerr
+
+
+def _layout(name, t):
+    """Interior; leading plus two interior; trailing; a single point."""
+    return {"interior": (t > 8) & (t < 9.5),
+            "lead+2": (t < 1) | ((t > 5) & (t < 6)) | ((t > 12) & (t < 12.2)),
+            "trail": t > 18.5,
+            "single": np.arange(t.size) == t.size // 2}[name]
+
+
+def _rows(n_dim, n_kernel):
+    rows = np.zeros((2, n_dim))
+    rows[1, :n_kernel] = 0.1 * np.random.default_rng(2).standard_normal(
+        n_kernel)
+    return rows
+
+
+def _hi(gp, rows):
+    with mx.stream(mx.cpu):
+        return np.array(gp.hi_absolute(mx.array(rows, dtype=mx.float64),
+                                       refuse=False))
+
+
+def _gp(term, kp, t, y, yerr, mask, **kw):
+    return GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                     GPPolicy(metal=False, kappa_max=None), held_out=mask,
+                     **kw)
+
+
+@pytest.mark.parametrize("layout", ["interior", "lead+2", "trail", "single"])
+@pytest.mark.parametrize("name", list(_TERMS))
+def test_the_masked_likelihood_is_the_dense_sigma(name, layout):
+    """float64 against ``log N(r; 0, Sigma)``, m = 1 to 6: measured
+    1e-13 to 2e-11 absolute."""
+    term, kp = _TERMS[name]
+    t, y, yerr = _data(term, kp)
+    mask = _layout(layout, t)
+    gp = _gp(term, kp, t, y, yerr, mask)
+    rows = _rows(len(kp), len(kp))
+    got = _hi(gp, rows)
+    for c, row in enumerate(rows):
+        ref = dense_masked_loglike(term, np.asarray(kp) * np.exp(row), t, y,
+                                   yerr ** 2, mask)
+        assert abs(got[c] - ref) < 1e-10 * abs(ref)
+
+
+def test_windows_are_the_same_mask():
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    a = _gp(term, kp, t, y, yerr, (t >= 5) & (t <= 6) | (t >= 9) & (t <= 9.5))
+    b = _gp(term, kp, t, y, yerr, [(5.0, 6.0), (9.0, 9.5)])
+    rows = _rows(3, 3)
+    np.testing.assert_array_equal(_hi(a, rows), _hi(b, rows))
+
+
+def test_ties_across_a_window_edge():
+    """Duplicate timestamps, one of a pair held out and its twin kept, at
+    both edges of a window (a held-out point at lag 0 from the edge)."""
+    term, kp = _TERMS["sho"]
+    base = np.linspace(0, 10, 150)
+    t = np.sort(np.concatenate([base, base]))
+    t, y, yerr = _data(term, kp, t=t)
+    mask = (t > 4) & (t < 5)
+    lo, hi = np.flatnonzero(mask)[[0, -1]]
+    mask[lo - 1] = True                 # the twin of the first kept point
+    mask[hi] = False                    # keep the twin of the last
+    gp = _gp(term, kp, t, y, yerr, mask)
+    rows = _rows(3, 3)
+    got = _hi(gp, rows)
+    for c, row in enumerate(rows):
+        ref = dense_masked_loglike(term, np.asarray(kp) * np.exp(row), t, y,
+                                   yerr ** 2, mask)
+        assert abs(got[c] - ref) < 1e-10 * abs(ref)
+
+
+def test_a_convolved_term():
+    """A `TermConvolution`: its zero-lag correction is part of the GP on
+    S and absent from M's white noise, as in ``Sigma``."""
+    width = 0.04
+    term, kp = ag.TermConvolution(ag.SHOTerm(), width), [1.0, 2.0, 3.0]
+    t = np.arange(N) * 0.07
+    t, y, yerr = _data(ag.SHOTerm(), kp, t=t)
+    mask = ((t > 5) & (t < 6.5)) | (t > 19.5)
+    gp = _gp(term, kp, t, y, yerr, mask)
+    rows = _rows(3, 3)
+    got = _hi(gp, rows)
+    for c, row in enumerate(rows):
+        ref = dense_masked_loglike(term, np.asarray(kp) * np.exp(row), t, y,
+                                   yerr ** 2, mask)
+        assert abs(got[c] - ref) < 1e-9 * abs(ref)
+
+
+def test_an_empty_mask_is_the_unmasked_likelihood():
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    gp = _gp(term, kp, t, y, yerr, np.zeros(N, dtype=bool))
+    assert gp._held is None
+    ref = _gp(term, kp, t, y, yerr, None)
+    rows = _rows(3, 3)
+    np.testing.assert_array_equal(_hi(gp, rows), _hi(ref, rows))
+
+
+def test_scoring_m_by_the_predictive_would_be_the_full_gp():
+    """Why M is scored white: with the predictive covariance added, the two
+    terms are ``p(r_S) p(r_M | r_S) = p(r)``, the unmasked likelihood --
+    shown densely, since it is not an option."""
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    m = _layout("interior", t)
+    s = ~m
+    K = dense_covariance(term, kp, t, yerr)
+    kss, kms = K[np.ix_(s, s)], K[np.ix_(m, s)]
+    mean = kms @ np.linalg.solve(kss, y[s])
+    cov = K[np.ix_(m, m)] - kms @ np.linalg.solve(kss, kms.T)
+
+    def logn(x, c):
+        lo = np.linalg.cholesky(c)
+        a = np.linalg.solve(lo, x)
+        return (-0.5 * a @ a - np.sum(np.log(np.diag(lo)))
+                - 0.5 * x.size * math.log(2 * math.pi))
+    full = logn(y[s], kss) + logn(y[m] - mean, cov)
+    assert abs(full - dense_loglike(term, kp, t, y, yerr)) < 1e-9
+    white = logn(y[s], kss) + logn(y[m] - mean, np.diag(yerr[m] ** 2))
+    assert abs(white - dense_masked_loglike(term, kp, t, y, yerr ** 2,
+                                            m)) < 1e-9
+
+
+def _noise(vn, d):
+    return (exp_acc(vn[:, :1]) * d.yerr) ** 2 + exp_acc(2.0 * vn[:, 1:2])
+
+
+def _full_model(mask):
+    """A mean model, two instruments' offsets and a `noise_fn` -- each
+    evaluated on all the data, M included."""
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    inst = (np.arange(N) % 2).astype(np.int32)
+    y = y + 0.05 * t + 0.4 * inst
+    k = len(kp)
+
+    def mean_fn(vm, x):
+        return vm[:, :1] * x
+    pm = ParamMap(kernel=[KernelParam(link="log", index=1 + i, ref=r)
+                          for i, r in enumerate(kp)],
+                  n_dim=1 + k + 2 + 2, mean=slice(0, 1),
+                  offset=[KernelParam(link="linear", index=1 + k, ref=0.0),
+                          KernelParam(link="linear", index=2 + k, ref=0.0)],
+                  instrument=inst, noise=slice(3 + k, 5 + k))
+    gp = GPLogLike(mean_fn, t, t, y, yerr, term, pm,
+                   GPPolicy(metal=False, kappa_max=None), noise_fn=_noise,
+                   held_out=mask)
+    rows = np.array([[0.05, 0.0, 0.0, 0.0, 0.3, 0.7, 0.1, -2.0],
+                     [0.06, 0.1, -0.1, 0.05, 0.2, 0.75, -0.2, -1.5]])
+
+    def parts(row):
+        r = y - row[0] * t - np.where(inst == 1, row[5], row[4])
+        w = (np.exp(row[6]) * yerr) ** 2 + np.exp(2 * row[7])
+        return np.asarray(kp) * np.exp(row[1:4]), r, w
+    return gp, rows, parts, (term, t)
+
+
+def test_mean_model_offsets_and_noise_fn():
+    t = _data(*_TERMS["sho"])[0]
+    mask = _layout("lead+2", t)
+    gp, rows, parts, (term, t) = _full_model(mask)
+    got = _hi(gp, rows)
+    for c, row in enumerate(rows):
+        p, r, w = parts(row)
+        ref = dense_masked_loglike(term, p, t, r, w, mask)
+        assert abs(got[c] - ref) < 1e-10 * abs(ref)
+
+
+@pytest.mark.parametrize("name", ["sho", "rot+sho"])
+def test_float32_value_and_gradient(name):
+    """The float32 MLX path against float64, value and gradient (central
+    differences of `hi`).  Measured: values 4e-7 relative at m = 2 (a few
+    float32 ulps of the value), 3.6e-6 at m = 6 with a leading window,
+    against 2e-7 unmasked (see docs/masked-gp-plan.md, Phase 1);
+    gradients 1.4e-6 and 6.4e-6 relative."""
+    term, kp = _TERMS[name]
+    t, y, yerr = _data(term, kp)
+    gp = _gp(term, kp, t, y, yerr, _layout("lead+2", t))
+    rows = _rows(len(kp), len(kp))
+    with mx.stream(mx.gpu):
+        v32 = mx.array(rows, dtype=mx.float32)
+        val = np.array(gp(v32))
+        grad = np.array(mx.grad(lambda v: gp(v).sum())(v32))
+
+    def hi(r):
+        with mx.stream(mx.cpu):
+            return np.array(gp.hi(mx.array(r, dtype=mx.float64)))
+    ref = hi(rows)
+    tol = 2e-6 if name == "sho" else 1e-5
+    assert np.all(np.abs(val - ref) < tol * np.abs(ref))
+    fd = np.zeros_like(rows)
+    for i in range(rows.shape[1]):
+        d = np.zeros_like(rows)
+        d[:, i] = 1e-6
+        fd[:, i] = (hi(rows + d) - hi(rows - d)) / 2e-6
+    assert np.all(np.abs(grad - fd).max(1) < 3e-5 * np.abs(fd).max(1))
+
+
+def _basis_setup(shared, prior):
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    y = y + 2.0 + 0.3 * (t - 10.0)
+    mask = _layout("lead+2", t)
+    tc = float(t.mean())
+    if shared:
+        basis = lambda vm, x, m0: mx.stack(                 # noqa: E731
+            [mx.ones_like(x), x - tc], axis=-1)
+    else:
+        def basis(vm, x, m0):
+            return mx.stack([mx.ones_like(m0),
+                             mx.broadcast_to(x - tc, m0.shape)], axis=-1)
+    lp = (None if prior is None
+          else (np.array([1.5, 0.2]), np.diag([0.5 ** 2, 0.1 ** 2])))
+    gp = _gp(term, kp, t, y, yerr, mask, linear_basis=basis, linear_prior=lp)
+    phi = np.stack([np.ones_like(t), t - tc], 1)
+    return gp, term, kp, t, y, yerr, mask, phi, lp
+
+
+def _dense_marginal(sig, r, phi, lp):
+    """Flat prior: the restricted likelihood under ``Sigma``; Gaussian:
+    ``log N(r; Phi mu, Sigma + Phi S Phi^T)``.  Plus the posterior."""
+    si_r, si_phi = np.linalg.solve(sig, r), np.linalg.solve(sig, phi)
+    c = phi.T @ si_phi
+    d = phi.T @ si_r
+    n, p = phi.shape
+    if lp is None:
+        cov = np.linalg.inv(c)
+        mean = cov @ d
+        val = (-0.5 * (r @ si_r - d @ mean)
+               - 0.5 * np.linalg.slogdet(sig)[1] - 0.5 * np.linalg.slogdet(c)[1]
+               - 0.5 * (n - p) * math.log(2 * math.pi))
+    else:
+        mu, s = lp
+        tot = sig + phi @ s @ phi.T
+        e = r - phi @ mu
+        val = (-0.5 * e @ np.linalg.solve(tot, e)
+               - 0.5 * np.linalg.slogdet(tot)[1]
+               - 0.5 * n * math.log(2 * math.pi))
+        prec = np.linalg.inv(s)
+        cov = np.linalg.inv(c + prec)
+        mean = cov @ (d + prec @ mu)
+    return val, mean, cov
+
+
+@pytest.mark.parametrize("prior", [None, "gauss"], ids=["flat", "gauss"])
+@pytest.mark.parametrize("shared", [False, True], ids=["per-chain", "shared"])
+def test_a_marginalised_basis_under_the_mask(shared, prior):
+    """The marginal and `linear_posterior` against dense formulas with
+    ``Sigma`` for ``K``."""
+    gp, term, kp, t, y, yerr, mask, phi, lp = _basis_setup(shared, prior)
+    rows = _rows(3, 3)
+    got = _hi(gp, rows)
+    b, cb = gp.linear_posterior(rows)
+    for c, row in enumerate(rows):
+        sig = dense_masked_covariance(term, np.asarray(kp) * np.exp(row), t,
+                                      yerr ** 2, mask)
+        val, mean, cov = _dense_marginal(sig, y, phi, lp)
+        assert abs(got[c] - val) < 1e-10 * abs(val)
+        np.testing.assert_allclose(b[c], mean, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(cb[c], cov, rtol=1e-9, atol=1e-14)
+
+
+def _dense_s_conditional(term, p, t, r, w, mask, tp):
+    s = ~mask
+    K = dense_covariance(term, p, t[s], np.sqrt(w[s]))
+    ks = np.asarray(term.value_np(p, np.abs(tp[:, None] - t[s][None, :])
+                                  .ravel())).reshape(tp.size, s.sum())
+    k0 = term.value_np(p, np.zeros(1))[0]
+    mean = ks @ np.linalg.solve(K, r[s])
+    var = k0 - np.sum(ks * np.linalg.solve(K, ks.T).T, 1)
+    return mean, var, ks @ np.linalg.solve(K, np.eye(s.sum()))
+
+
+def test_predict_is_conditioned_on_s():
+    """No basis: the dense conditional on S, at new points and at M (where
+    the mean is the ``P r_S`` the likelihood applies)."""
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    mask = _layout("lead+2", t)
+    gp = _gp(term, kp, t, y, yerr, mask)
+    tp = np.concatenate([np.linspace(-2, 22, 41), t[mask]])
+    rows = _rows(3, 3)
+    mean, var = gp.predict(rows, tp)
+    for c, row in enumerate(rows):
+        p = np.asarray(kp) * np.exp(row)
+        dm, dv, _ = _dense_s_conditional(term, p, t, y, yerr ** 2, mask, tp)
+        np.testing.assert_allclose(mean[c], dm, rtol=0,
+                                   atol=1e-10 * np.abs(dm).max())
+        np.testing.assert_allclose(var[c], dv, rtol=0,
+                                   atol=1e-10 * np.abs(dv).max())
+
+
+@pytest.mark.parametrize("prior", [None, "gauss"], ids=["flat", "gauss"])
+def test_predict_with_a_basis_under_the_mask(prior):
+    """``P_* (r_S - Phi_S b)`` and ``var + u C_b u^T`` with ``u = P_*
+    Phi_S``, ``(b, C_b)`` the posterior under ``Sigma``."""
+    gp, term, kp, t, y, yerr, mask, phi, lp = _basis_setup(False, prior)
+    tp = np.concatenate([np.linspace(-2, 22, 41), t[mask]])
+    rows = _rows(3, 3)
+    mean, var = gp.predict(rows, tp)
+    for c, row in enumerate(rows):
+        p = np.asarray(kp) * np.exp(row)
+        sig = dense_masked_covariance(term, p, t, yerr ** 2, mask)
+        _, b, cb = _dense_marginal(sig, y, phi, lp)
+        _, dv, op = _dense_s_conditional(term, p, t, y, yerr ** 2, mask, tp)
+        u = op @ phi[~mask]
+        want_m = op @ (y[~mask] - phi[~mask] @ b)
+        want_v = dv + np.einsum("mp,pq,mq->m", u, cb, u)
+        np.testing.assert_allclose(mean[c], want_m, rtol=0,
+                                   atol=1e-9 * np.abs(want_m).max())
+        np.testing.assert_allclose(var[c], want_v, rtol=0,
+                                   atol=1e-9 * np.abs(want_v).max())
+
+
+def test_gram_is_the_masked_quadratic_form():
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    mask = _layout("interior", t)
+    gp = _gp(term, kp, t, y, yerr, mask)
+    rows = _rows(3, 3)
+    Y = np.random.default_rng(7).standard_normal((2, N, 3))
+    with mx.stream(mx.cpu):
+        G = np.array(gp.gram(mx.array(rows, dtype=mx.float64),
+                             mx.array(Y, dtype=mx.float64)))
+    for c, row in enumerate(rows):
+        sig = dense_masked_covariance(term, np.asarray(kp) * np.exp(row), t,
+                                      yerr ** 2, mask)
+        want = Y[c].T @ np.linalg.solve(sig, Y[c])
+        np.testing.assert_allclose(G[c], want, rtol=1e-10,
+                                   atol=1e-10 * np.abs(want).max())
+
+
+def test_bad_masks_and_unsupported_calls_are_refused():
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    with pytest.raises(ValueError, match="shape"):
+        _gp(term, kp, t, y, yerr, np.zeros(N - 1, dtype=bool))
+    with pytest.raises(ValueError, match="boolean mask"):
+        _gp(term, kp, t, y, yerr, np.zeros(N, dtype=np.int32))
+    with pytest.raises(ValueError, match="every point"):
+        _gp(term, kp, t, y, yerr, np.ones(N, dtype=bool))
+    with pytest.raises(ValueError, match="no data point"):
+        _gp(term, kp, t, y, yerr, [(5.0, 6.0), (30.0, 31.0)])
+    gp = _gp(term, kp, t, y, yerr, _layout("interior", t))
+    with pytest.raises(ValueError, match="held-out"):
+        gp.apply_inverse(np.zeros((1, 3)), y)
+    with pytest.warns(RuntimeWarning, match="held-out mask"):
+        gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                       GPPolicy(metal=True, kappa_max=None),
+                       held_out=_layout("interior", t))
+    assert not gp._metal_ok
+
+
+def test_make_target_passes_held_out():
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        plain = make_target(term, t, y, yerr)
+        gt = make_target(term, t, y, yerr, held_out=[(8.0, 9.5)])
+    assert gt.names == plain.names
+    assert gt.loglike._held is not None
+    v = np.array(gt.transform.to_model(gt.u0(3, seed=0)))
+    with mx.stream(mx.gpu):
+        out = np.array(gt.model_log_prob(mx.array(v)))
+    assert np.all(np.isfinite(out)) and np.all(out > -1e20)

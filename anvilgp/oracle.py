@@ -23,7 +23,8 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = ["dense_covariance", "dense_loglike", "dense_predict", "sample_ssm",
-           "celerite2_loglike"]
+           "celerite2_loglike", "dense_masked_covariance",
+           "dense_masked_loglike"]
 
 
 def dense_covariance(term, p, t, yerr, jitter=0.0) -> np.ndarray:
@@ -66,6 +67,35 @@ def dense_predict(term, p, t, y, yerr, t_pred=None, jitter=0.0):
     var = np.asarray(term.value_np(np.asarray(p, np.float64),
                                    np.zeros(1)), dtype=np.float64)[0]
     return mean, var - np.sum(v * v, axis=0)
+
+
+def dense_masked_covariance(term, p, t, noise_var, mask) -> np.ndarray:
+    """The held-out likelihood's covariance ``Sigma`` (`GPLogLike`'s
+    ``held_out``), built directly in float64: ``K + W`` on S, the GP's own
+    ``K_MS`` across, and ``K_MS C^-1 K_SM + W_M`` on M, where ``C = K_SS +
+    W_S`` and ``W`` is ``diag(noise_var)``.  ``mask`` is True on M."""
+    t = np.asarray(t, dtype=np.float64).ravel()
+    tau = np.abs(t[:, None] - t[None, :])
+    k = np.asarray(term.value_np(np.asarray(p, np.float64), tau.ravel()),
+                   dtype=np.float64).reshape(tau.shape)
+    w = np.asarray(noise_var, dtype=np.float64)
+    m = np.asarray(mask, dtype=bool)
+    s = ~m
+    c = k[np.ix_(s, s)] + np.diag(w[s])
+    k_ms = k[np.ix_(m, s)]
+    out = k + np.diag(w)
+    out[np.ix_(m, m)] = k_ms @ np.linalg.solve(c, k_ms.T) + np.diag(w[m])
+    return out
+
+
+def dense_masked_loglike(term, p, t, r, noise_var, mask) -> float:
+    """Absolute float64 ``log N(r; 0, Sigma)`` for
+    :func:`dense_masked_covariance`, by dense Cholesky.  O(N^3)."""
+    sig = dense_masked_covariance(term, p, t, noise_var, mask)
+    lo = np.linalg.cholesky(sig)
+    a = np.linalg.solve(lo, np.asarray(r, np.float64))
+    return float(-0.5 * a @ a - np.sum(np.log(np.diag(lo)))
+                 - 0.5 * sig.shape[0] * np.log(2.0 * np.pi))
 
 
 def celerite2_loglike(c2term, t, y, yerr, jitter=0.0) -> float:

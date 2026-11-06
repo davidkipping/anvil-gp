@@ -256,7 +256,7 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
                 order_groups: list[list[int]] | None = None,
                 policy: GPPolicy | None = None,
                 seed_period: bool = False, noise=None, linear_basis=None,
-                linear_prior=None) -> GPTarget:
+                linear_prior=None, held_out=None) -> GPTarget:
     """Build a ready-to-sample GP target with shipped defaults.
 
     Parameters
@@ -323,6 +323,16 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         x.mean()``, not raw ``x``); exactly collinear per-chain columns (a
         global level beside one offset per instrument) are refused in
         float32 -- drop the redundant one.
+    held_out
+        Points held out of the GP's conditioning: a boolean ``(n_data,)``
+        mask or a list of ``(t_lo, t_hi)`` windows.  The GP is fitted to
+        the rest and applied to these through its conditional mean; they
+        are scored with their white noise alone, so a short feature whose
+        shape is the measurement cannot be absorbed by the GP.  Does not
+        model correlated noise inside the windows; see
+        `anvilgp.likelihood.GPLogLike` for the construction and its
+        caveat.  The parameter vector is the same as without it.  Runs on
+        the MLX path.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic
@@ -366,7 +376,8 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
     loglike = GPLogLike(mean_fn, t, x_mean, y, yerr, term, pm,
                         policy or GPPolicy(),
                         noise_fn=None if noise is None else noise.fn,
-                        linear_basis=linear_basis, linear_prior=linear_prior)
+                        linear_basis=linear_basis, linear_prior=linear_prior,
+                        held_out=held_out)
     log_prior = make_log_prior(hypers, jitters, offsets,
                                n_mean=len(mean_specs))
 

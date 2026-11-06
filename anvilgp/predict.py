@@ -34,6 +34,12 @@ parameters over their posterior, from the same filter (`linear_posterior`):
     Var[f* | y] = var + s_Phi C_beta s_Phi^T
 
 with ``s_c`` the smoothed GP component of column ``c``.
+
+With points held out (`GPLogLike`'s ``held_out``) the GP is conditioned on
+S alone: the smoother runs over S, a prediction is S's conditional, and
+the linear parameters' posterior comes from the masked Gram, S's own plus
+``(Z_M - P Z_S)^T W_M^-1 (Z_M - P Z_S)`` with ``P Z_S`` the smoothed
+columns at M (`_posterior_gram`).
 """
 
 from __future__ import annotations
@@ -66,16 +72,25 @@ def predict(gp, v, t_pred, return_var: bool = True):
     grid = _grid(gp, t_pred)
     n_chains = v.shape[0]
     k = 1 if gp.linear_basis is None else 1 + _n_basis(gp, v[:1])
+    held = gp._held is not None
+    # held out with a basis: the posterior needs a second run, with M as
+    # its prediction points; chunked for whichever run is larger
+    g_grid = _gram_grid(gp) if held and k > 1 else None
+    size = (grid if g_grid is None or g_grid[2].size <= grid[2].size
+            else g_grid)
     mean = np.empty((n_chains, t_pred.size))
     var = np.empty((n_chains, t_pred.size)) if return_var else None
-    for c, vc in _chunks(gp, v, grid, k, return_var):
-        out = _smooth(gp, vc, grid, return_var=return_var, gram=k > 1)
+    for c, vc in _chunks(gp, v, size, k, return_var):
+        out = _smooth(gp, vc, grid, return_var=return_var,
+                      gram=k > 1 and not held)
         mu, va = out["mean"][:, 0], out.get("var")
         if k > 1:
             # The posterior from this run's own innovations: polarising the
             # float64 likelihood for it instead was two-thirds of the cost
             # (1.16 of 1.71 s at N = 1e4, 64 chains).
-            beta, c_beta = _beta_posterior(gp, out["gram"])
+            beta, c_beta = _beta_posterior(gp, _posterior_gram(
+                gp, out if not held else _smooth(gp, vc, g_grid, False,
+                                                 gram=True)))
             s_phi = out["mean"][:, 1:]                          # (n, p, M)
             mu = mu - np.einsum("np,npm->nm", beta, s_phi)
             if return_var:
@@ -101,6 +116,10 @@ def apply_inverse(gp, v, Y):
     quadratic form).
     """
     v = _check(gp, v)
+    if gp._held is not None:
+        raise ValueError("apply_inverse is not implemented for a likelihood "
+                         "with held-out points (Sigma^-1 Y); gram gives "
+                         "Y^T Sigma^-1 Y")
     n_chains, N = v.shape[0], gp.n_data
     Y = np.asarray(Y, dtype=np.float64)
     flat = Y.ndim == 1
@@ -136,18 +155,37 @@ def linear_posterior(gp, v):
     if gp.linear_basis is None:
         raise ValueError("no linear_basis: nothing is marginalised")
     v = _check(gp, v)
-    grid = _grid(gp, np.zeros(0))
+    grid = _gram_grid(gp)
     k = 1 + _n_basis(gp, v[:1])
     mean = np.empty((v.shape[0], k - 1))
     cov = np.empty((v.shape[0], k - 1, k - 1))
     for c, vc in _chunks(gp, v, grid, k, False):
-        b, cv = _beta_posterior(
-            gp, _smooth(gp, vc, grid, return_var=False, gram=True)["gram"])
+        b, cv = _beta_posterior(gp, _posterior_gram(
+            gp, _smooth(gp, vc, grid, return_var=False, gram=True)))
         if gp._basis_a is not None:       # gamma -> beta = A gamma
             a = gp._basis_a
             b, cv = b @ a.T, a @ cv @ a.T
         mean[c:c + vc.shape[0]], cov[c:c + vc.shape[0]] = b, cv
     return mean, cov
+
+
+def _gram_grid(gp):
+    """The grid for the Gram matrix: no prediction points, or with points
+    held out, the held-out points (whose smoothed columns it needs)."""
+    if gp._held is None:
+        return _grid(gp, np.zeros(0))
+    return _grid(gp, gp._t64[gp._held["m_pos_np"]])
+
+
+def _posterior_gram(gp, out):
+    """The Gram matrix of the columns under the likelihood's covariance,
+    from a `_smooth` run with ``gram`` over `_gram_grid`: the filter's own,
+    plus with points held out ``D^T W_M^-1 D``, ``D = Z_M - P Z_S``."""
+    if gp._held is None:
+        return out["gram"]
+    z_m, w_m = out["held"]
+    d = z_m - out["mean"]                                   # (n, k, M)
+    return out["gram"] + np.einsum("nkm,nlm->nkl", d / w_m[:, None, :], d)
 
 
 def _beta_posterior(gp, gram):
@@ -192,8 +230,10 @@ def _check(gp, v):
 
 def _grid(gp, t_pred):
     """The merged grid of data and prediction points: ``(is_obs, data_pos,
-    pred_slot, lag_u, lag_idx)``."""
-    t_data = gp._t64
+    pred_slot, lag_u, lag_idx)``.  The data are S when points are held
+    out."""
+    t_data = (gp._t64 if gp._held is None
+              else gp._t64[gp._held["s_pos_np"]])
     n_data, n_pred = t_data.size, t_pred.size
     # a stable sort puts a data point before a prediction point at the
     # same time, so the prediction sees it through dt = 0
@@ -281,7 +321,8 @@ def _smooth(gp, v, grid, return_var, cols=None, alpha=False, gram=False):
     Z`` from the filter's innovations, with ``gram``.  ``cols`` ``(n, k,
     N)`` replaces the likelihood's own (the residual, then any basis).
     With no prediction points and no ``alpha`` the backward pass is
-    skipped.
+    skipped.  With points held out the filter runs over S, and ``"held"``
+    is M's own columns ``(n, k, M)`` and white noise ``(n, M)``.
     """
     is_obs, data_pos, pred_slot, lag_u, lag_idx = grid
     pm = gp.param_map
@@ -289,19 +330,26 @@ def _smooth(gp, v, grid, return_var, cols=None, alpha=False, gram=False):
     with mx.stream(mx.cpu):
         v64 = mx.array(v, dtype=mx.float64)
         own, r_var = _columns(gp, v64)
-        if cols is None:
-            cols = own
         kp = pm.kernel_params(v64)
         phi_u, q_u, h = gp.term.matrices(kp, mx.array(lag_u,
                                                       dtype=mx.float64))
         pin = gp._p_inf(kp, mx.float64, dense=True) if gp._has_p_inf else None
         corr = gp.term.diag_correction(kp)
-        mx.eval(cols, r_var, phi_u, q_u, h)
-        cols, r_var = np.asarray(cols, dtype=np.float64), np.array(r_var)
+        mx.eval(own, r_var, phi_u, q_u, h)
+        own, r_var = np.asarray(own, dtype=np.float64), np.array(r_var)
         phi_u, q_u, h = np.array(phi_u), np.array(q_u), np.array(h)
         p_inf = (np.broadcast_to(np.eye(h.shape[-1]), (n,) + (h.shape[-1],) * 2)
                  if pin is None else np.array(pin))
         corr = None if corr is None else np.array(corr)[:, 0]
+    held = None
+    if gp._held is not None:
+        # M's white noise is the noise model's, without a convolution's
+        # zero-lag correction (part of the GP), as in the likelihood
+        s_pos, m_pos = gp._held["s_pos_np"], gp._held["m_pos_np"]
+        held = (own[:, :, m_pos], r_var[:, m_pos]
+                - (0.0 if corr is None else corr[:, None]))
+        own, r_var = own[:, :, s_pos], r_var[:, s_pos]
+    cols = own if cols is None else np.asarray(cols, dtype=np.float64)
     m, k = h.shape[-1], cols.shape[1]
     T = is_obs.size
     phi_ut = np.ascontiguousarray(np.swapaxes(phi_u, -1, -2))
@@ -355,7 +403,7 @@ def _smooth(gp, v, grid, return_var, cols=None, alpha=False, gram=False):
         else:
             mean, cov = mp, cp
 
-    out = {}
+    out = {} if held is None else {"held": held}
     if gram:
         # sum_t v_t v_t^T / S_t over the observations (the prediction
         # steps' innovations are zero)

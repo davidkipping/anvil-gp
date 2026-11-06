@@ -59,7 +59,7 @@ import numpy as np
 
 from .special import exp_acc
 from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
-                       first_point,
+                       combine, first_point,
                        leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from . import terms
@@ -452,11 +452,33 @@ class GPLogLike:
     `special.exp_acc` rather than ``mx.exp``.  The variance must stay above
     ``s_floor_rel * yerr^2`` (1e-6 by default), where the innovation floor
     starts to bind.
+
+    ``held_out`` holds a fixed subset M of the data out of the GP's
+    conditioning (`_resolve_held_out`): a boolean ``(N,)`` mask, or a list
+    of ``(t_lo, t_hi)`` windows (inclusive).  The GP is conditioned on the
+    rest, S, and applied to M through its two-sided conditional mean
+    ``P r_S``; M is scored with its white noise alone::
+
+        log L = log N(r_S; 0, K_SS + W_S) + log N(r_M - P r_S; 0, W_M)
+
+    the joint Gaussian ``Sigma`` that replaces ``K`` throughout (`gram`,
+    the linear marginalisation, `predict`).  That keeps a flexible GP from
+    absorbing a short feature whose *shape* is the measurement.  Adding
+    the predictive variance to the M term would give back the unmasked
+    likelihood exactly, which is why M is scored white.  Not modelled:
+    correlated noise inside M -- far inside a window longer than the
+    kernel's timescale ``P r_S -> 0``, and M is scored white about the bare
+    mean, which overstates a feature's significance unless the noise at
+    M's timescales is shown to be white independently.  To sample extra
+    white noise on M, label it as its own instrument with a jitter.  The
+    mask is data, fixed here; it cannot depend on the parameters.  Runs on
+    the MLX path.  See docs/masked-gp-plan.md.
     """
 
     def __init__(self, mean_fn, t, x_mean, y, yerr, kernel_spec: Term,
                  param_map: ParamMap, policy: GPPolicy | None = None,
-                 noise_fn=None, linear_basis=None, linear_prior=None):
+                 noise_fn=None, linear_basis=None, linear_prior=None,
+                 held_out=None):
         self.mean_fn = mean_fn
         self.noise_fn = noise_fn
         #: ``linear_basis(v_mean, x, m0) -> Phi (n_chains, m, p)``: linear
@@ -620,6 +642,7 @@ class GPLogLike:
                            else self._x_mean64)
         self._noise_x32 = mx.array(self._noise_x64.astype(np.float32))
         self._cache_shared_basis()
+        self._resolve_held_out(held_out)
         inst = param_map.instrument
         if inst is not None:
             # `mx.take` is silent on an out-of-range label -- it clamps or
@@ -798,13 +821,14 @@ class GPLogLike:
                 RuntimeWarning, stacklevel=2)
         self._guard = self._build_guard()
 
-    def _distinct_lags(self, dtype):
+    def _distinct_lags(self, dtype, dt64=None):
         """(values, inverse index) for the lags as seen in ``dtype``, or None.
 
         Reuse only pays once the saving is at least 4x; below that the gather
-        costs more than the transcendentals it avoids.
+        costs more than the transcendentals it avoids.  ``dt64`` replaces
+        the data's own lags (the held-out evaluation's S lags).
         """
-        lags = self._dt64.astype(dtype)
+        lags = (self._dt64 if dt64 is None else dt64).astype(dtype)
         uniq, inv = np.unique(lags, return_inverse=True)
         if uniq.size * 4 > lags.size:
             return None
@@ -991,6 +1015,9 @@ class GPLogLike:
         if len(self.param_map.jitter) > 1 and self.param_map.instrument is None:
             return False, ("per-instrument jitter needs "
                            "param_map.instrument to say which datum is which")
+        if self._held is not None:
+            return False, ("a held-out mask runs on the MLX path (the "
+                           "kernel does not implement it)")
         if not metal_available():
             return False, "mx.fast.metal_kernel is unavailable here"
         return True, ""
@@ -1206,6 +1233,76 @@ class GPLogLike:
             self._prior_logdet_eff = (self._prior_logdet
                                       - 2.0 * self._basis_logdet_a)
 
+    def _resolve_held_out(self, held_out) -> None:
+        """The fixed partition into S and the held-out M, and what
+        `_evaluate_masked` needs of it, host-side: ``self._held`` is None
+        without a mask (or with an empty one).
+
+        The S points fall into runs, *segments*, separated by M's windows.
+        Each segment is reduced with its first step at lag 0, and the true
+        lag into it (``gaps``) is a separate transition.  Each held-out
+        point records the segment before and after it (``prev``, ``next``;
+        the segment count for none) and its lags to their nearest points
+        (``lag_a``, ``lag_b``; 0 for none).  Lags are differences of the
+        float64 times, cast after.
+        """
+        self._held = None
+        if held_out is None:
+            return
+        t = self._t64
+        arr = np.asarray(held_out)
+        if arr.dtype == bool:
+            if arr.shape != t.shape:
+                raise ValueError(f"held_out mask has shape {arr.shape}, "
+                                 f"expected ({t.size},)")
+            mask = arr.copy()
+        elif (arr.ndim == 2 and arr.shape[1] == 2
+              and np.issubdtype(arr.dtype, np.number)):
+            mask = np.zeros(t.size, dtype=bool)
+            for lo, hi in arr.astype(np.float64):
+                inside = (t >= lo) & (t <= hi)
+                if not inside.any():
+                    raise ValueError(
+                        f"held_out window ({lo:g}, {hi:g}) contains no data "
+                        f"point; windows are in the units of t")
+                mask |= inside
+        else:
+            raise ValueError(
+                "held_out must be a boolean mask of shape (N,) or a list of "
+                f"(t_lo, t_hi) windows; got an array of shape {arr.shape} "
+                f"and dtype {arr.dtype}")
+        if mask.all():
+            raise ValueError("held_out holds out every point; at least one "
+                             "must condition the GP")
+        if not mask.any():
+            return
+        s_pos, m_pos = np.flatnonzero(~mask), np.flatnonzero(mask)
+        n_s = s_pos.size
+        first = np.flatnonzero(np.concatenate([[True], np.diff(s_pos) > 1]))
+        seg_of = np.cumsum(np.isin(np.arange(n_s), first)) - 1
+        t_s = t[s_pos]
+        dt_s = np.concatenate([[0.0], np.diff(t_s)])
+        gaps = dt_s[first[1:]].copy()
+        dt_s[first] = 0.0
+        nxt = np.searchsorted(s_pos, m_pos)
+        has_next, has_prev = nxt < n_s, nxt > 0
+        nx, pv = np.minimum(nxt, n_s - 1), np.maximum(nxt - 1, 0)
+        lag_a = np.where(has_prev, t[m_pos] - t_s[pv], 0.0)
+        lag_b = np.where(has_next, t_s[nx] - t[m_pos], 0.0)
+        i32 = lambda x: mx.array(x.astype(np.int32))      # noqa: E731
+        f32 = lambda x: mx.array(x.astype(np.float32))    # noqa: E731
+        self._held = dict(
+            mask=mask, s_pos=i32(s_pos), m_pos=i32(m_pos),
+            s_pos_np=s_pos, m_pos_np=m_pos,
+            bounds=list(zip(first.tolist(), np.append(first[1:], n_s).tolist())),
+            dt64=a64(dt_s), dt32=f32(dt_s),
+            uniq64=self._distinct_lags(np.float64, dt_s),
+            uniq32=self._distinct_lags(np.float32, dt_s),
+            gaps=gaps, gaps32=f32(gaps),
+            prev=i32(np.where(has_prev, seg_of[pv], first.size)),
+            next=i32(np.where(has_next, seg_of[nx], first.size)),
+            lag_a=lag_a, lag_a32=f32(lag_a), lag_b=lag_b, lag_b32=f32(lag_b))
+
     def _metal_inputs(self, v: mx.array, resid: mx.array | None = None,
                       need_resid: bool = True):
         """The kernel's inputs for ``v``: ``(phi table, Q table, h, residual
@@ -1311,30 +1408,165 @@ class GPLogLike:
         Metal path has always composed its blocks this way; this makes the
         MLX path agree.
         """
+        if self._held is not None:
+            return self._evaluate_masked(v, y, r_ref, x_mean, idx, block,
+                                         do_eval, resid)
         get_mat = self._matrices_fn(self.param_map.kernel_params(v), dt, uniq)
         roots: list[Element] = []
         for s in range(0, self.n_data, block):
             e = min(s + block, self.n_data)
             args = self.leaf_inputs(v, dt, y, r_ref, x_mean, idx, s, e, get_mat,
                                     resid=resid)
-            fm = self._formal
-            if self.blocked:
-                root = chunked_reduce_blocked(leaf_parts(*args, formal=fm),
-                                              sub_len=self.sub_block,
-                                              formal=fm)
-            else:
-                root = chunked_reduce(*leaf_elements(*args, formal=fm),
-                                      sub_len=self.sub_block, formal=fm)
-            if do_eval:
-                # bound peak memory: the block's leaf arrays die here, and
-                # the root that survives is one element per chain.
-                mx.eval(root)
-            roots.append(root)
+            roots.append(self._reduce_leaves(args, do_eval))
         if len(roots) == 1:
             return roots[0].ell
-        stacked = Element(*(mx.stack([getattr(r, f) for r in roots], axis=1)
-                            for f in Element._fields))
-        return tree_reduce(stacked, formal=self._formal).ell
+        return tree_reduce(_stack(roots), formal=self._formal).ell
+
+    def _reduce_leaves(self, args, do_eval):
+        """One block's leaves (`leaf_inputs`' tuple) reduced to its root."""
+        fm = self._formal
+        if self.blocked:
+            root = chunked_reduce_blocked(leaf_parts(*args, formal=fm),
+                                          sub_len=self.sub_block, formal=fm)
+        else:
+            root = chunked_reduce(*leaf_elements(*args, formal=fm),
+                                  sub_len=self.sub_block, formal=fm)
+        if do_eval:
+            # bound peak memory: the block's leaf arrays die here, and
+            # the root that survives is one element per chain.
+            mx.eval(root)
+        return root
+
+    def _evaluate_masked(self, v, y, r_ref, x_mean, idx, block, do_eval,
+                         resid=None):
+        """`_evaluate` with points held out (`held_out`): ``log N(r_S; 0, C)
+        + log N(r_M - P r_S; 0, W_M)`` -> (n_chains,), in ``v``'s dtype.
+
+        Each S segment (`_resolve_held_out`) is reduced in blocks as
+        `_evaluate` reduces the series, its first step at lag 0, so its
+        element maps the state at its first point to the state at its
+        last.  With ``start`` the stationary prior and ``G_j`` the true gap
+        into segment ``j``:
+
+        * the S term is the root of ``start, E_0, G_1, E_1, ...``, by the
+          pairwise tree;
+        * a prefix gives the filtered state at each segment's last point,
+          ``(b, C)`` of ``start E_0 G_1 ... E_j``, and a suffix the
+          information about the state at its first point from everything
+          after, ``(eta, J)`` of ``E_j G_j+1 ... E_K``;
+        * a held-out point predicts the left edge's state forward through
+          its own lag, pulls the right edge's information back through its
+          lag to the right edge, and fuses the two.  The fusion is a
+          `combine` with an element that passes the state through (``A =
+          I, C = 0``) carrying the information, so its output mean is the
+          smoothed state; ``P r_S`` is ``h`` of it.
+
+        M's white noise is the noise model's variance there, without a
+        convolution's zero-lag correction (part of the GP, not of the
+        noise).  Its log-determinant is taken against ``r_ref`` like every
+        other datum's, so `log_norm_const` is unchanged.
+        """
+        hd = self._held
+        pm = self.param_map
+        dtype = v.dtype
+        fm = self._formal
+        n, N = v.shape[0], self.n_data
+        f64 = dtype == mx.float64
+        kp = pm.kernel_params(v)
+        if resid is not None:
+            r = resid
+        else:
+            r = mx.broadcast_to(y, (n, N))
+            if self.mean_fn is not None and pm.mean is not None:
+                r = r - self.mean_fn(v[:, pm.mean], x_mean)
+            off = pm.offsets(v, idx)
+            if off is not None:
+                r = r - off
+        jit2 = (self._noise_extra(v, r_ref, 0, N) if self.noise_fn is not None
+                else pm.jitter_var(v, idx))
+        w = mx.broadcast_to(r_ref if jit2 is None else r_ref + jit2, (n, N))
+        sp, mp = hd["s_pos"], hd["m_pos"]
+        r_s, w_s = mx.take(r, sp, axis=1), mx.take(w, sp, axis=1)
+        corr = self.term.diag_correction(kp)
+        if corr is not None:
+            w_s = w_s + corr
+        rref_s = mx.take(r_ref, sp)
+        floor_s = self.policy.s_floor_rel * rref_s
+        get_mat = self._matrices_fn(kp, hd["dt64"] if f64 else hd["dt32"],
+                                    hd["uniq64"] if f64 else hd["uniq32"])
+
+        segs = []
+        for s, e in hd["bounds"]:
+            roots = []
+            for a in range(s, e, block):
+                b = min(a + block, e)
+                phi, q, h = get_mat(a, b)
+                roots.append(self._reduce_leaves(
+                    (phi, q, h, r_s[:, a:b], w_s[:, a:b], rref_s[a:b],
+                     floor_s[a:b]), do_eval))
+            segs.append(roots[0] if len(roots) == 1
+                        else tree_reduce(_stack(roots), formal=fm))
+
+        m = self.term.n_state
+        z0 = mx.zeros((n,), dtype=dtype)
+        z1 = mx.zeros((n, m), dtype=dtype)
+        z2 = mx.zeros((n, m, m), dtype=dtype)
+        pin = self._p_inf(kp, dtype, dense=True) if self._has_p_inf else None
+        p_inf = (mx.broadcast_to(mx.eye(m, dtype=dtype), (n, m, m))
+                 if pin is None else pin)
+        start = Element(A=z2, b=z1, C=p_inf, eta=z1, J=z2, ell=z0)
+        k = len(segs)
+        gaps = []
+        if k > 1:
+            phi_g, q_g, _ = self.term.matrices(
+                kp, a64(hd["gaps"]) if f64 else hd["gaps32"])
+            gaps = [None] + [Element(A=phi_g[:, j], b=z1, C=q_g[:, j],
+                                     eta=z1, J=z2, ell=z0)
+                             for j in range(k - 1)]
+        seq = [start, segs[0]]
+        for j in range(1, k):
+            seq += [gaps[j], segs[j]]
+        ell_s = tree_reduce(_stack(seq), formal=fm).ell
+
+        fwd = [combine(start, segs[0], formal=fm)]
+        for j in range(1, k):
+            fwd.append(combine(combine(fwd[-1], gaps[j], formal=fm), segs[j],
+                               formal=fm))
+        bwd = [segs[-1]]
+        for j in range(k - 2, -1, -1):
+            bwd.insert(0, combine(segs[j], combine(gaps[j + 1], bwd[0],
+                                                   formal=fm), formal=fm))
+        # Index k is "no segment on this side": the stationary prior on the
+        # left, no information on the right; both edges' lags are then 0.
+        ip, inx = hd["prev"], hd["next"]
+        b_a = mx.take(mx.stack([f.b for f in fwd] + [z1], 1), ip, axis=1)
+        c_a = mx.take(mx.stack([f.C for f in fwd] + [p_inf], 1), ip, axis=1)
+        eta_b = mx.take(mx.stack([e.eta for e in bwd] + [z1], 1), inx, axis=1)
+        j_b = mx.take(mx.stack([e.J for e in bwd] + [z2], 1), inx, axis=1)
+        phi_a, q_a, h = self.term.matrices(
+            kp, a64(hd["lag_a"]) if f64 else hd["lag_a32"])
+        phi_b, q_b, _ = self.term.matrices(
+            kp, a64(hd["lag_b"]) if f64 else hd["lag_b32"])
+        n_m = mp.size
+        y0 = mx.zeros((n, n_m), dtype=dtype)
+        y1 = mx.zeros((n, n_m, m), dtype=dtype)
+        y2 = mx.zeros((n, n_m, m, m), dtype=dtype)
+        eye = mx.broadcast_to(mx.eye(m, dtype=dtype), (n, n_m, m, m))
+        pre = combine(Element(A=y2, b=b_a, C=c_a, eta=y1, J=y2, ell=y0),
+                      Element(A=phi_a, b=y1, C=q_a, eta=y1, J=y2, ell=y0),
+                      formal=fm)
+        fut = combine(Element(A=phi_b, b=y1, C=q_b, eta=y1, J=y2, ell=y0),
+                      Element(A=eye, b=y1, C=y2, eta=eta_b, J=j_b, ell=y0),
+                      formal=fm)
+        smooth = combine(
+            Element(A=y2, b=pre.b, C=pre.C, eta=y1, J=y2, ell=y0),
+            Element(A=eye, b=y1, C=y2, eta=fut.eta, J=fut.J, ell=y0),
+            formal=fm)
+        d = mx.take(r, mp, axis=1) - mx.sum(h[:, None, :] * smooth.b, -1)
+        w_m = mx.take(w, mp, axis=1)
+        ell_m = -0.5 * mx.sum(d * d / w_m + mx.log(w_m / mx.take(r_ref, mp)),
+                              -1)
+        return ell_s + ell_m
 
     # -- the anvil LogDensity contract ------------------------------------
 
@@ -1875,7 +2107,9 @@ class GPLogLike:
         on the CPU stream, by polarisation of the float64 path.  A chain the
         likelihood refuses (``kappa_max``, a convolution's series range)
         gets NaN.  This is the primitive the linear marginalisation
-        (``linear_basis``) is built on.
+        (``linear_basis``) is built on.  With points held out, ``K`` is
+        the masked covariance ``Sigma`` (see the class docstring), the
+        likelihood's own.
         """
         self._check_v(v)
         n, N = v.shape[0], self.n_data
@@ -1924,8 +2158,8 @@ class GPLogLike:
         or ``(n_chains, N, k)`` gives ``(n_chains, N, k)``.  O(N k), from
         the state-space smoother that :meth:`predict` uses, and value only:
         for a differentiable quadratic form use :meth:`gram`.  As in
-        :meth:`predict`, no chain is refused.  See
-        `anvilgp.predict.apply_inverse`.
+        :meth:`predict`, no chain is refused.  Not implemented with points
+        held out.  See `anvilgp.predict.apply_inverse`.
         """
         from .predict import apply_inverse
         return apply_inverse(self, v, Y)
@@ -1944,6 +2178,9 @@ class GPLogLike:
         separate from the likelihood: see :mod:`anvilgp.predict`.  No
         chain is refused: a chain the likelihood refuses (``kappa_max``)
         still gets its exact float64 answer, unlike :meth:`gram`'s NaN.
+        With points held out (``held_out``) the GP is conditioned on the
+        rest alone, so at a held-out point the mean is ``P r_S``, the GP
+        component the likelihood applies there.
         """
         from .predict import predict
         v = np.asarray(v, dtype=np.float64)
@@ -2065,6 +2302,12 @@ class GPLogLike:
         return mx.add(self.hi(v, refuse=refuse),
                       mx.array(self.log_norm_const, dtype=mx.float64),
                       stream=mx.cpu)
+
+
+def _stack(elements) -> Element:
+    """A list of elements stacked along a new axis 1, for `tree_reduce`."""
+    return Element(*(mx.stack([getattr(e, f) for e in elements], axis=1)
+                     for f in Element._fields))
 
 
 def _auto_sub_block(m: int) -> int:
