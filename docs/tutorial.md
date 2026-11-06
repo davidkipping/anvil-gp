@@ -372,10 +372,10 @@ fits:
   GPU, from a float32 `x` -- which rounds a BJD to 0.25 d before your
   function sees it, as it does for `mean_fn`. So pass `x_mean` relative to
   a reference time, and centre and scale the columns yourself: nearly
-  parallel ones cost digits (`[1, 1 + 1e-3 (t - tc)]`, correlation
-  0.99998, is off by 1e-3 log-units on the kernel and by 41 on the MLX
-  path, whose Gram comes from differences of likelihoods), and exactly
-  collinear ones are refused in float32 under either prior (the float64
+  parallel ones cost digits (`[1, 1 + 1e-3 (t - tc)]` on this data,
+  correlation 0.99993, is off by 1e-3 log-units on the kernel and by 0.08
+  on the MLX path, whose Gram comes from differences of likelihoods), and
+  exactly collinear ones are refused in float32 under either prior (the float64
   paths, `gp.hi`, `linear_posterior` and `predict`, evaluate them under a
   Gaussian one).
 

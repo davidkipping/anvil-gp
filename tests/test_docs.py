@@ -336,3 +336,79 @@ def test_the_tutorials_feature_sections():
     assert G.shape == (4, 2, 2) and X.shape == (4, n, 2)
     err = np.abs(np.einsum("nk,cnl->ckl", Y, X) - G).max() / np.abs(G).max()
     assert err < 3e-5, f"tutorial says 3e-6, got {err:.1e}"
+
+
+def test_the_tutorials_per_chain_basis():
+    """docs/tutorial.md, "Linear parameters, marginalised", the per-chain
+    form ``(n_chains, N, p)``: ``(1 + m0)(a + b t)`` is the same model as
+    the shared basis (float64 to 1e-10) but evaluated every time, not
+    cached; ``[1, 1 + 1e-3 (t - tc)]``, correlation 0.99993, is off by 1e-3
+    log-units on the kernel and by 0.08 on the MLX path (measured 1.3e-3
+    and 8.2e-2 at these draws); exactly collinear columns are refused in
+    float32 under a Gaussian prior, which ``gp.hi``, ``linear_posterior``
+    and ``predict`` evaluate.  The tutorial's own example is shared, so
+    this is the only docs test on the per-chain path."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    t, y, yerr = _tutorial_data()
+    tc = float(t.mean())
+    y_lin = y + 3.0 + 0.05 * (t - tc)
+
+    def shared(vm, x, m0):
+        return mx.stack([mx.ones_like(x), x - tc], axis=-1)
+
+    def per_chain(vm, x, m0):
+        return (1 + m0)[..., None] * shared(vm, x, m0)
+
+    def parallel(vm, x, m0):
+        cols = mx.stack([mx.ones_like(x), 1 + 1e-3 * (x - tc)], axis=-1)
+        return mx.broadcast_to(cols, m0.shape + (2,))
+
+    def collinear(vm, x, m0):
+        one = mx.ones_like(m0)
+        return mx.stack([one, one], axis=-1)
+
+    def build(basis, metal, prior=None):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return make_target(ag.SHOTerm(), t, y_lin, yerr,
+                               linear_basis=basis, linear_prior=prior,
+                               policy=GPPolicy(metal=metal))
+
+    u = build(shared, True).u0(8, seed=1)
+
+    def lo_hi(gt):
+        vm = gt.transform.to_model(u)
+        with mx.stream(mx.gpu):
+            lo = np.array(gt.loglike(vm)).astype(np.float64)
+        with mx.stream(mx.cpu):
+            hi = np.array(gt.loglike.hi(
+                mx.array(np.array(vm), dtype=mx.float64), refuse=False))
+        return lo, hi
+
+    gs, gp = build(shared, True), build(per_chain, True)
+    assert gs.loglike._basis_q64 is not None and gp.loglike._basis_q64 is None
+    lo_s, hi_s = lo_hi(gs)
+    lo_p, hi_p = lo_hi(gp)
+    np.testing.assert_allclose(hi_p, hi_s, rtol=1e-10)
+    assert np.abs(lo_p - hi_p).max() < 5e-3
+
+    one, col = np.ones_like(t), 1 + 1e-3 * (t - tc)
+    assert round(one @ col / np.sqrt((one @ one) * (col @ col)), 5) == 0.99993
+    err = {}
+    for metal in (True, False):
+        lo, hi = lo_hi(build(parallel, metal))
+        err[metal] = np.abs(lo - hi).max()
+    assert err[True] < 3e-3, f"tutorial says 1e-3, got {err[True]:.1e}"
+    assert 0.02 < err[False] < 0.3, f"tutorial says 0.08, got {err[False]:.1e}"
+
+    prior = (np.zeros(2), np.eye(2))
+    for metal in (True, False):
+        gc = build(collinear, metal, prior)
+        lo, hi = lo_hi(gc)
+        assert np.all(lo <= -1e29), metal
+        assert np.all(np.isfinite(hi)) and np.all(hi > -1e20), metal
+    vs = np.array(gc.transform.to_model(u[:3])).astype(np.float64)
+    beta, cov = gc.linear_posterior(vs)
+    mean, var = gc.predict(vs, np.array([5.0, 20.0]))
+    assert all(np.all(np.isfinite(a)) for a in (beta, cov, mean, var))
