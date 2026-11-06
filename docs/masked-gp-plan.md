@@ -187,6 +187,57 @@ dense ``Sigma``, float32 within the unmasked kernel's budget on their
 posterior draws), the dense tests in tests/test_masked.py on the kernel,
 and a cost within ~1.5-2x the unmasked kernel, measured on a quiet GPU.
 
+**Status 2026-11-06: values done (2a, 2b, 2d's value); 2c not started.**
+Agreed order: values first.  As built, two things differ from the scope
+above:
+
+- *The right edge comes from a time-reversed run, not the suffix.*  In
+  every term's ``P_inf = I`` state, time reversal is a sign flip ``S``
+  with ``Phi^T = S Phi S``, ``I - Phi^T Phi = S Q S`` and ``h S = h``
+  (`Term.reversal_signs`; pinned for every term by
+  `test_time_reversal_is_a_sign_flip`).  So the kernel run unchanged
+  over S reversed, with the same lag table, is the backward filter: no
+  new numerics, and the square-root boundary on both sides.  A convolved
+  term has no ``S`` and stays on the MLX path.
+- *Block exits, not entries.*  The replay can write each block's exit
+  state (`metal._EXIT_1`), so the trailing and leading windows need no
+  special case: a window's left edge is the exit of the forward block
+  that ends there, its right edge the exit of the backward block that
+  ends there.
+
+The window step is the two-filter form in covariance terms,
+``B G^-1 a + A G^-T b`` with ``G = A + B - A B`` (`_held_out_mean`): no
+inverse of either side's covariance, so it does not lose the information
+gain the MLX path's information-form fusion loses.
+
+The gradient is the MLX path's for now: `_evaluate_metal_masked` and
+`_gram_metal_masked` are custom functions whose VJP differentiates the
+MLX evaluation.  So ensemble sampling (values only) runs on the kernel,
+and anything that differentiates still costs about what it did.
+
+Accuracy, float32 against float64 (dense-``Sigma`` verified):
+
+- N = 300, every term (m = 1 to 6) and window layout, auto blocks and
+  blocks of 16: 7e-6 to 1.4e-4 log-units, against 2.6e-5 to 6.4e-4 on
+  the MLX path.
+- Marginalised basis, shared and per chain, flat and Gaussian prior:
+  1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the MLX path); gradient against
+  float64 central differences 2e-5 to 7e-5 relative (the MLX
+  polarisation in the VJP needs its columns scaled, as `_marginal`
+  scales them: 1e-3 unscaled).
+- The requester's scale (N = 2800, one-minute cadence, transit plus
+  ingress and egress held out): sigma = yerr, 8.2e-5 against 1.0e-4
+  unmasked; sigma = 30 yerr, rho = 30 hr, 2.4e-3 against 1.6e-4 (the
+  held-out residuals all come from the same two edge states, so their
+  few-ulp float32 error adds coherently); 20x better than the MLX path's
+  5e-2.  The excluded regime (sigma = 300 yerr, rho = 10 hr): 0.54
+  against the MLX path's 88.
+
+Cost: owed, on a quiet GPU.  Two full passes over S (forward and
+reversed: boundary and replay each) plus O(held-out points) of MLX glue,
+so about 2x the unmasked kernel's value is expected.  Nothing is
+measured yet.
+
 ### 3. Docs and reply
 
 Docstrings (including the caveat above), a tutorial section, the cost

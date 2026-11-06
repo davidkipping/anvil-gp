@@ -397,6 +397,55 @@ def _jit_key(n_jit: int) -> int:
     return "d" if n_jit < 0 else 0
 
 
+def _starts_src(src: str, aligned: bool) -> str:
+    """Block ``i`` over ``[blk_start[i], blk_start[i + 1])`` instead of
+    ``[i * blk_len, ...)``: blocks of any length, placed by the caller --
+    for a held-out window (`GPLogLike`'s ``held_out``), so that every
+    window edge is a block boundary.  ``blk_start`` is the last input
+    (`_starts_inputs`).  Off, the source is unchanged."""
+    if not aligned:
+        return src
+    a = "uint start = blk_i * (uint)blk_len;"
+    b = "uint stop = min(start + (uint)blk_len, (uint)npts);"
+    if a not in src or b not in src:
+        raise RuntimeError("a block kernel no longer places its blocks "
+                           "the way `_starts_src` rewrites")
+    return (src.replace(a, "uint start = (uint)blk_start[blk_i];")
+               .replace(b, "uint stop = (uint)blk_start[blk_i + 1];"))
+
+
+def _starts_inputs(names: list, inputs: list | None, starts):
+    """``names`` (and ``inputs``) with ``blk_start`` appended when the
+    blocks are placed (`_starts_src`)."""
+    if starts is None:
+        return names if inputs is None else inputs
+    return names + ["blk_start"] if inputs is None else inputs + [starts]
+
+
+def _n_blocks_of(npts: int, blk_len: int, starts) -> int:
+    return (npts + blk_len - 1) // blk_len if starts is None \
+        else int(starts.shape[0]) - 1
+
+
+#: Appended to a replay's source for its exit state: the filtered state
+#: at the block's last observation, which is the next block's entry state
+#: -- except after the last block, and after a block that ends where a
+#: held-out window starts, where it is what the window needs.
+_EXIT_1 = """
+    for (uint i = 0; i < M; ++i) {
+        out_xm[ei * M + i] = mean[i];
+        for (uint j = 0; j < M; ++j) out_xC[ei * M * M + i * M + j] = cov[i][j];
+    }
+"""
+_EXIT_MC = """
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i)
+            out_xm[(ei * KCOL + c) * M + i] = mean[c][i];
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) out_xC[ei * M * M + i * M + j] = cov[i][j];
+"""
+
+
 def _formal_src(src: str, formal: bool) -> str:
     """Specialise a kernel source for a formal (convolved) model, or not.
 
@@ -445,20 +494,21 @@ def _formal_src(src: str, formal: bool) -> str:
 
 
 def _kernel(m: int, n_jit: int = 0, formal: bool = False,
-            with_ell: bool = True):
-    key = (m, _jit_key(n_jit), bool(formal), bool(with_ell))
+            with_ell: bool = True, aligned: bool = False):
+    key = (m, _jit_key(n_jit), bool(formal), bool(with_ell), bool(aligned))
     if key not in _kernels:
         _kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_scan_m{m}_j{key[1]}" + ("_formal" if formal else "")
-                 + ("" if with_ell else "_noell"),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref",
-                         "jit2", "sfloor", "npts", "n_lags", "n_blocks",
-                         "n_chains", "blk_len", "n_jit"],
+                 + ("" if with_ell else "_noell") + ("_al" if aligned else ""),
+            input_names=_starts_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid", "r_ref",
+                 "jit2", "sfloor", "npts", "n_lags", "n_blocks",
+                 "n_chains", "blk_len", "n_jit"], None, aligned or None),
             output_names=["out_A", "out_b", "out_C", "out_eta", "out_J",
                           "out_ell"],
-            source=_formal_src(_jitter_src(_ell_src(_SRC, with_ell), n_jit),
-                               formal).replace("MDIM", str(m)),
+            source=_starts_src(_formal_src(_jitter_src(
+                _ell_src(_SRC, with_ell), n_jit), formal), aligned)
+                .replace("MDIM", str(m)),
         )
     return _kernels[key]
 
@@ -2058,41 +2108,52 @@ _SRC_REPLAY = """
 _replay_kernels: dict = {}
 
 
-def _replay_kernel(m: int, n_jit: int = 0, formal: bool = False):
-    key = (m, _jit_key(n_jit), bool(formal))
+def _replay_kernel(m: int, n_jit: int = 0, formal: bool = False,
+                   aligned: bool = False, exits: bool = False):
+    key = (m, _jit_key(n_jit), bool(formal), bool(aligned), bool(exits))
     if key not in _replay_kernels:
-        body = _formal_src(_jitter_src(
-            _SRC_REPLAY.replace("FWD_STEP", _fwd_step(True)), n_jit), formal)
+        body = _starts_src(_formal_src(_jitter_src(
+            _SRC_REPLAY.replace("FWD_STEP", _fwd_step(True)), n_jit), formal),
+            aligned) + (_EXIT_1 if exits else "")
         _replay_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_replay_m{m}_j{key[1]}"
-                 + ("_formal" if formal else ""),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref", "jit2", "ent_m", "ent_C",
-                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                         "n_jit"],
-            output_names=["out_ell"],
+                 + ("_formal" if formal else "") + ("_al" if aligned else "")
+                 + ("_exit" if exits else ""),
+            input_names=_starts_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid",
+                 "r_ref", "jit2", "ent_m", "ent_C",
+                 "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                 "n_jit"], None, aligned or None),
+            output_names=["out_ell"] + (["out_xm", "out_xC"] if exits else []),
             source=body.replace("MDIM", str(m)),
         )
     return _replay_kernels[key]
 
 
 def replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                  ent_m, ent_C, blk_len, formal=False) -> mx.array:
+                  ent_m, ent_C, blk_len, formal=False, starts=None,
+                  exits=False):
     """``(n_chains, n_blocks)`` log-likelihood of each block, by the filter
     replayed from its entry state ``(ent_m, ent_C)`` (:func:`entry_states`).
-    Inputs otherwise as :func:`scan_blocks`."""
+    Inputs otherwise as :func:`scan_blocks`.  ``exits``: also return each
+    block's exit state ``(xm (n_chains, n_blocks, m), xC (..., m, m))``,
+    the filtered state at its last observation."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     npts = resid.shape[0]
     n_blocks = ent_m.shape[1]
     n_jit = _n_jit_of(jit2)
-    outs = _replay_kernel(m, n_jit, formal)(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
-                int(n_chains), int(blk_len), int(n_jit)],
-        output_shapes=[(n_chains, n_blocks)], output_dtypes=[mx.float32],
+    shapes = [(n_chains, n_blocks)] + ([(n_chains, n_blocks, m),
+                                        (n_chains, n_blocks, m, m)]
+                                       if exits else [])
+    outs = _replay_kernel(m, n_jit, formal, starts is not None, exits)(
+        inputs=_starts_inputs(None, [
+            phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+            ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
+            int(n_chains), int(blk_len), int(n_jit)], starts),
+        output_shapes=shapes, output_dtypes=[mx.float32] * len(shapes),
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
-    return outs[0]
+    return tuple(outs) if exits else outs[0]
 
 
 
@@ -2140,23 +2201,28 @@ _replay_mc_kernels: dict = {}
 
 
 def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
-                      layout=(None, 0, False)):
+                      layout=(None, 0, False), aligned: bool = False,
+                      exits: bool = False):
     ka, kb, shared = layout
-    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared)
+    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared, bool(aligned),
+           bool(exits))
     if key not in _replay_mc_kernels:
-        body = _formal_src(_jitter_src(_col_src(
+        body = _starts_src(_formal_src(_jitter_src(_col_src(
             _SRC_REPLAY_MC.replace("FWD_STEP", _fwd_step(True, multi=True)),
-            ka, kb, shared), n_jit), formal)
+            ka, kb, shared), n_jit), formal), aligned) \
+            + (_EXIT_MC if exits else "")
         _replay_mc_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_replay_mc_m{m}_k{k}_j{key[2]}"
                  + ("_formal" if formal else "")
-                 + _layout_tag(ka, kb, shared),
-            input_names=_col_inputs(
+                 + _layout_tag(ka, kb, shared)
+                 + ("_al" if aligned else "") + ("_exit" if exits else ""),
+            input_names=_starts_inputs(_col_inputs(
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "ent_m", "ent_C",
                  "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                 "n_jit"], kb),
-            output_names=["out_ld", "out_g"],
+                 "n_jit"], kb), None, aligned or None),
+            output_names=["out_ld", "out_g"]
+                         + (["out_xm", "out_xC"] if exits else []),
             source=body.replace("KTRI", str(k * (k + 1) // 2))
                        .replace("KCOL", str(k)).replace("MDIM", str(m)),
         )
@@ -2164,28 +2230,35 @@ def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
 
 
 def replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
-                     ent_m, ent_C, blk_len, formal=False):
+                     ent_m, ent_C, blk_len, formal=False, starts=None,
+                     exits=False):
     """``(ld, gram)``, each per (chain, block): the log-determinant half and
     the packed lower-triangular innovation Gram matrix of ``cols``
     ``(npts, n_chains, k)``, replayed from per-column entry means ``ent_m``
     ``(n_chains, n_blocks, k, m)`` and the shared entry covariance
     ``ent_C`` ``(n_chains, n_blocks, m, m)``.  Inputs otherwise as
-    :func:`replay_blocks`; ``cols`` may be split (`_col_layout`)."""
+    :func:`replay_blocks`; ``cols`` may be split (`_col_layout`).
+    ``exits``: also every column's exit mean ``(n_chains, n_blocks, k, m)``
+    and the shared exit covariance, as `replay_blocks`."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     col_in, ka, kb, shared = _col_layout(cols)
     npts, k = col_in[0].shape[0], ka + kb
     n_blocks = ent_m.shape[1]
     n_jit = _n_jit_of(jit2)
     ktri = k * (k + 1) // 2
-    outs = _replay_mc_kernel(m, k, n_jit, formal, (ka, kb, shared))(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
-                ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
-                int(n_chains), int(blk_len), int(n_jit)],
-        output_shapes=[(n_chains, n_blocks), (n_chains, n_blocks, ktri)],
-        output_dtypes=[mx.float32] * 2,
+    shapes = [(n_chains, n_blocks), (n_chains, n_blocks, ktri)] + (
+        [(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)]
+        if exits else [])
+    outs = _replay_mc_kernel(m, k, n_jit, formal, (ka, kb, shared),
+                             starts is not None, exits)(
+        inputs=_starts_inputs(None, [
+            phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
+            ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
+            int(n_chains), int(blk_len), int(n_jit)], starts),
+        output_shapes=shapes, output_dtypes=[mx.float32] * len(shapes),
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
-    return outs[0], outs[1]
+    return tuple(outs)
 
 
 #: The multi-column boundary's middle pass: each block's mean map from its
@@ -2257,21 +2330,22 @@ _mean_prefix_kernels: dict = {}
 
 
 def _affine_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
-                   layout=(None, 0, False)):
+                   layout=(None, 0, False), aligned: bool = False):
     ka, kb, shared = layout
-    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared)
+    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared, bool(aligned))
     if key not in _affine_kernels:
-        body = _formal_src(_jitter_src(_col_src(
+        body = _starts_src(_formal_src(_jitter_src(_col_src(
             _SRC_AFFINE.replace("FWD_STEP", _fwd_step(affine=True)),
-            ka, kb, shared), n_jit), formal)
+            ka, kb, shared), n_jit), formal), aligned)
         _affine_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_affine_m{m}_k{k}_j{key[2]}"
                  + ("_formal" if formal else "")
-                 + _layout_tag(ka, kb, shared),
-            input_names=_col_inputs(
+                 + _layout_tag(ka, kb, shared) + ("_al" if aligned else ""),
+            input_names=_starts_inputs(_col_inputs(
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "ent_C", "npts", "n_lags",
                  "n_blocks", "n_chains", "blk_len", "n_jit"], kb),
+                None, aligned or None),
             output_names=["out_d", "out_T"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
         )
@@ -2279,7 +2353,7 @@ def _affine_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
 
 
 def column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
-                       ent_C, blk_len, formal=False):
+                       ent_C, blk_len, formal=False, starts=None):
     """``(n_chains, n_blocks, k, m)``: every column's entry mean, given the
     blocks' shared entry covariances ``ent_C`` -- the affine pass
     (`_SRC_AFFINE`) and the prefix over its maps (`_SRC_MEAN_PREFIX`).
@@ -2289,10 +2363,12 @@ def column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     npts, k = col_in[0].shape[0], ka + kb
     n_blocks = ent_C.shape[1]
     n_jit = _n_jit_of(jit2)
-    d, T = _affine_kernel(m, k, n_jit, formal, (ka, kb, shared))(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_C,
-                int(npts), int(n_lags), int(n_blocks), int(n_chains),
-                int(blk_len), int(n_jit)],
+    d, T = _affine_kernel(m, k, n_jit, formal, (ka, kb, shared),
+                          starts is not None)(
+        inputs=_starts_inputs(None, [
+            phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_C,
+            int(npts), int(n_lags), int(n_blocks), int(n_chains),
+            int(blk_len), int(n_jit)], starts),
         output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
         output_dtypes=[mx.float32] * 2,
         grid=(n_blocks * n_chains, 1, 1),
@@ -2644,6 +2720,61 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     return out[0], out[1]
 
 
+
+
+def scan_states(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                s_floor_rel, starts, formal=False, boundary="dense"):
+    """``(ell, xm, xC)`` over blocks placed by ``starts`` (`_starts_src`):
+    each block's log-likelihood ``(n_chains, n_blocks)``, as
+    :func:`scan_loglike` forms it (boundary, then replay), and each block's
+    exit state, the filtered ``(mean, covariance)`` at its last observation.
+
+    For the held-out likelihood (`GPLogLike`'s ``held_out``), whose
+    windows need the state at their edges: blocks end where windows start.
+    **Value only**; nothing here has a VJP.  Inputs as `scan_loglike`.
+    """
+    n_chains, m = phi_tab.shape[0], phi_tab.shape[-1]
+    if m > MAX_STATE:
+        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
+    n_blocks = int(starts.shape[0]) - 1
+    resid = mx.contiguous(resid)
+    if n_blocks == 1:
+        # Block 0 enters at zero (its first lag is row 0, Phi = 0).
+        ent_m = mx.zeros((n_chains, 1, m), dtype=mx.float32)
+        ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+    else:
+        ent_m, ent_C, _ = _boundary_states(
+            phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, s_floor_rel,
+            0, formal, boundary == "sqrt", starts)
+    return replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                         ent_m, ent_C, 0, formal, starts=starts, exits=True)
+
+
+def scan_states_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
+                   s_floor_rel, starts, formal=False, boundary="dense"):
+    """`scan_states` for the columns of `scan_gram`: ``(ld, gram, xm,
+    xC)``, per block, with ``gram`` the packed lower triangle and ``xm``
+    every column's exit mean ``(n_chains, n_blocks, k, m)``.  Value only."""
+    n_chains, m = phi_tab.shape[0], phi_tab.shape[-1]
+    if m > MAX_STATE:
+        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
+    col_in, ka, kb, shared = _col_layout(cols)
+    npts, k = col_in[0].shape[0], ka + kb
+    n_blocks = int(starts.shape[0]) - 1
+    if n_blocks == 1:
+        ent_m = mx.zeros((n_chains, 1, k, m), dtype=mx.float32)
+        ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+    else:
+        zero = mx.zeros((npts, n_chains), dtype=mx.float32)
+        _, ent_C, _ = _boundary_states(
+            phi_tab, q_tab, lag, inst, hvec, zero, r_ref, jit2, s_floor_rel,
+            0, formal, boundary == "sqrt", starts)
+        ent_m = column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols,
+                                   r_ref, jit2, ent_C, 0, formal,
+                                   starts=starts)
+    return replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
+                            jit2, mx.contiguous(ent_m), mx.contiguous(ent_C),
+                            0, formal, starts=starts, exits=True)
 
 
 #: Weighted normal equations ``A = Phi^T W Phi`` (packed lower triangle)
@@ -3162,18 +3293,21 @@ _TRIA_X = _tria_src("X", "M", "2 * M")
 _sqrt_block_kernels: dict = {}
 
 
-def _sqrt_block_kernel(m: int, n_jit: int = 0):
-    key = (m, _jit_key(n_jit))
+def _sqrt_block_kernel(m: int, n_jit: int = 0, aligned: bool = False):
+    key = (m, _jit_key(n_jit), bool(aligned))
     if key not in _sqrt_block_kernels:
         body = _SRC_SQRT_BLOCKS.replace("FWD_STEP", _fwd_step(False)) \
                                .replace("TRIA_X", _TRIA_X)
-        body = _formal_src(_jitter_src(body, n_jit), False)
+        body = _starts_src(_formal_src(_jitter_src(body, n_jit), False),
+                           aligned)
         _sqrt_block_kernels[key] = mx.fast.metal_kernel(
-            name=f"anvilgp_sqrt_blocks_m{m}_j{key[1]}",
-            input_names=["phitab", "qtab", "lqtab", "lag", "inst", "hvec",
-                         "resid", "r_ref", "jit2", "start_m", "start_C",
-                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                         "n_jit"],
+            name=f"anvilgp_sqrt_blocks_m{m}_j{key[1]}"
+                 + ("_al" if aligned else ""),
+            input_names=_starts_inputs(
+                ["phitab", "qtab", "lqtab", "lag", "inst", "hvec",
+                 "resid", "r_ref", "jit2", "start_m", "start_C",
+                 "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                 "n_jit"], None, aligned or None),
             output_names=["out_A", "out_b", "out_U", "out_eta", "out_Z"],
             source=body.replace("MDIM", str(m)),
         )
@@ -3181,7 +3315,7 @@ def _sqrt_block_kernel(m: int, n_jit: int = 0):
 
 
 def sqrt_blocks(phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
-                start_m, start_C, blk_len):
+                start_m, start_C, blk_len, starts=None):
     """``(A, b, U, eta, Z)``, each ``(n_chains, n_blocks, m[, m])``: every
     block's element in the square-root information form, centred on the
     filter replayed from ``(start_m, start_C)`` -- approximate entry states,
@@ -3198,10 +3332,11 @@ def sqrt_blocks(phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
     shapes = [(n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m)]
-    return tuple(_sqrt_block_kernel(m, n_jit)(
-        inputs=[phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
-                start_m, start_C, int(npts), int(n_lags), int(n_blocks),
-                int(n_chains), int(blk_len), int(n_jit)],
+    return tuple(_sqrt_block_kernel(m, n_jit, starts is not None)(
+        inputs=_starts_inputs(None, [
+            phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
+            start_m, start_C, int(npts), int(n_lags), int(n_blocks),
+            int(n_chains), int(blk_len), int(n_jit)], starts),
         output_shapes=shapes, output_dtypes=[mx.float32] * 5,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1)))
@@ -3544,7 +3679,7 @@ def metal_available() -> bool:
 
 def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                 s_floor_rel, blk_len, n_blocks=None,
-                formal=False, with_ell=True) -> Element:
+                formal=False, with_ell=True, starts=None) -> Element:
     """Condense every block of ``blk_len`` observations into one element.
 
     ``phi_tab``/``q_tab``: (n_chains, n_lags, m, m) propagator and process
@@ -3555,7 +3690,9 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     jitter variance, or a (n_chains, 0) array for none.  ``formal`` selects
     the convolved-term variant; see :func:`_formal_src`.  ``with_ell=False``
     skips the blocks' own log-normalisers (``ell`` comes back zero), which
-    only :func:`reduce_blocks` reads; see :func:`_ell_src`.
+    only :func:`reduce_blocks` reads; see :func:`_ell_src`.  ``starts``:
+    ``(n_blocks + 1,)`` int32 block boundaries in place of ``blk_len``'s
+    (`_starts_src`).
 
     Returns an :class:`~anvilgp.elements.Element` with batch shape
     (n_chains, n_blocks), ready for :func:`anvilgp.elements.tree_reduce`.
@@ -3565,7 +3702,7 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     if m > MAX_STATE:
         raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
     if n_blocks is None:
-        n_blocks = (npts + blk_len - 1) // blk_len
+        n_blocks = _n_blocks_of(npts, blk_len, starts)
     n_jit = _n_jit_of(jit2)
 
     shapes = [(n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
@@ -3574,8 +3711,9 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
     scalars = [float(s_floor_rel), int(npts), int(n_lags), int(n_blocks),
                int(n_chains), int(blk_len), int(n_jit)]
 
-    outs = _kernel(m, n_jit, formal, with_ell)(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, *scalars],
+    outs = _kernel(m, n_jit, formal, with_ell, starts is not None)(
+        inputs=_starts_inputs(None, [phi_tab, q_tab, lag, inst, hvec, resid,
+                                     r_ref, jit2, *scalars], starts),
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -3584,18 +3722,18 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
 
 def _boundary_states(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                     blk_len, formal, use_sqrt):
+                     blk_len, formal, use_sqrt, starts=None):
     """Entry states for `scan_loglike`'s ``boundary``, and what the seeds
     need: pass 1's elements (dense), or the square-root blocks and the
     start states they were centred on."""
     el = scan_blocks(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                     blk_len, formal=formal, with_ell=False)
+                     blk_len, formal=formal, with_ell=False, starts=starts)
     if not use_sqrt:
         ent_m, ent_C = entry_states(el, formal)
         return ent_m, ent_C, (el.A, el.b, el.C, el.eta, el.J)
     st_m, st_C = entry_states(el, formal)
     blocks = sqrt_blocks(p_t, q_t, q_factor(q_t), lg, inst, hv, rs, rr,
-                         j2, st_m, st_C, blk_len)
+                         j2, st_m, st_C, blk_len, starts=starts)
     ent_m, ent_C = sqrt_scan(blocks, st_m, st_C)
     return ent_m, ent_C, (*blocks, st_m, st_C)
 

@@ -140,6 +140,25 @@ class Term:
             f"{type(self).__name__} has no exact celerite coefficients, so it "
             f"cannot be wrapped in TermConvolution; see its docstring")
 
+    #: `reversal_signs` for a term that has them; see there.
+    _REVERSAL = None
+
+    def reversal_signs(self) -> tuple[int, ...] | None:
+        """The state's signs under time reversal, or ``None`` if unknown.
+
+        A stationary covariance is even, so the process run backwards is
+        the same process.  In every term's ``P_inf = I`` state the reversal
+        is a sign flip, ``Phi(dt)^T = S Phi(dt) S`` and ``I - Phi^T Phi = S
+        Q S`` with ``S = diag(signs)``, and ``h S = h``, so the filter over
+        time-reversed data with the *same* tables is the backward pass:
+        its state is ``S`` times the reversed process's.  The held-out
+        likelihood on the kernel runs it (`GPLogLike`'s ``held_out``);
+        pinned for every term by ``tests/test_masked.py``.  ``None`` (a
+        convolved term, whose ``P_inf`` is not ``I``) keeps a held-out fit
+        on the MLX path.
+        """
+        return self._REVERSAL
+
     def diag_correction(self, p: mx.array):
         """Constant to add to every observation's variance, ``(n_chains, 1)``.
 
@@ -225,6 +244,7 @@ class RealTerm(Term):
     """
 
     n_state: int = field(default=1, init=False)
+    _REVERSAL = (1,)
     param_names: tuple[str, ...] = field(default=("sigma", "c"), init=False)
 
     def matrices(self, p: mx.array, dt: mx.array):
@@ -446,6 +466,7 @@ class SHOTerm(Term):
     """
 
     n_state: int = field(default=2, init=False)
+    _REVERSAL = (1, -1)
     param_names: tuple[str, ...] = field(default=("sigma", "rho", "Q"),
                                          init=False)
 
@@ -525,6 +546,7 @@ class Matern32Term(Term):
     """
 
     n_state: int = field(default=2, init=False)
+    _REVERSAL = (1, -1)
     param_names: tuple[str, ...] = field(default=("sigma", "rho"), init=False)
 
     def matrices(self, p: mx.array, dt: mx.array):
@@ -576,6 +598,7 @@ class ComplexTerm(Term):
     """
 
     n_state: int = field(default=2, init=False)
+    _REVERSAL = (1, -1)
     param_names: tuple[str, ...] = field(
         default=("a", "b", "c", "d"), init=False)
 
@@ -1088,6 +1111,7 @@ class Matern52Term(Term):
     """
 
     n_state: int = field(default=3, init=False)
+    _REVERSAL = (1, -1, 1)
     param_names: tuple[str, ...] = field(default=("sigma", "rho"), init=False)
 
     def matrices(self, p: mx.array, dt: mx.array):
@@ -1238,6 +1262,7 @@ class RotationTerm(Term):
     """
 
     n_state: int = field(default=4, init=False)
+    _REVERSAL = (1, -1, 1, -1)
     param_names: tuple[str, ...] = field(
         default=("sigma", "period", "Q0", "dQ", "f"), init=False)
 
@@ -1396,6 +1421,11 @@ class TermSum(Term):
     def matrices(self, p: mx.array, dt: mx.array):
         phis, qs, h = self.matrices_blocks(p, dt)
         return _block_diag(*phis), _block_diag(*qs), h
+
+    def reversal_signs(self) -> tuple[int, ...] | None:
+        parts = [t.reversal_signs() for t in self.terms]
+        return (None if any(q is None for q in parts)
+                else tuple(x for q in parts for x in q))
 
     def matrices_blocks(self, p: mx.array, dt: mx.array):
         if dt.ndim == 1:

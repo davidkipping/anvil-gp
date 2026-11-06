@@ -471,12 +471,14 @@ class GPLogLike:
     mean, which overstates a feature's significance unless the noise at
     M's timescales is shown to be white independently.  To sample extra
     white noise on M, label it as its own instrument with a jitter.  The
-    mask is data, fixed here; it cannot depend on the parameters.  Runs on
-    the MLX path, not the fused kernel, so a masked fit costs roughly
-    10-30x the unmasked one on the kernel (a user's 2818-point fit: 8x per
-    ensemble step, 32x per optimiser start, the optimiser taking no more
-    iterations), and more with a marginalised basis, which the MLX path
-    polarises (`_marginal`).  See docs/masked-gp-plan.md.
+    mask is data, fixed here; it cannot depend on the parameters.  On the
+    fused kernel the *value* runs there (`_masked_metal_value`: S scanned
+    forward and time-reversed, `Term.reversal_signs`), a marginalised basis
+    included, and is more accurate in float32 than the MLX path's; the
+    *gradient* is still the MLX path's (`_evaluate_metal_masked`), so a
+    gradient-based fit runs at roughly MLX speed until the kernel has it
+    (docs/masked-gp-plan.md, Phase 2c).  A convolved term runs on the MLX
+    path entirely.  See docs/masked-gp-plan.md.
     """
 
     def __init__(self, mean_fn, t, x_mean, y, yerr, kernel_spec: Term,
@@ -1019,9 +1021,10 @@ class GPLogLike:
         if len(self.param_map.jitter) > 1 and self.param_map.instrument is None:
             return False, ("per-instrument jitter needs "
                            "param_map.instrument to say which datum is which")
-        if self._held is not None:
-            return False, ("the kernel does not implement a held-out "
-                           "mask yet, so a masked fit runs at the MLX "
+        if self._held is not None and self.term.reversal_signs() is None:
+            return False, ("a held-out mask needs the term's time reversal "
+                           "(Term.reversal_signs), which a convolved term "
+                           "does not have; a masked fit runs at the MLX "
                            "path's speed (roughly 10-30x the kernel's)")
         if not metal_available():
             return False, "mx.fast.metal_kernel is unavailable here"
@@ -1132,6 +1135,8 @@ class GPLogLike:
         table goes on to :meth:`kappa`.
         """
         from .metal import scan_loglike
+        if self._held is not None:
+            return self._evaluate_metal_masked(v, resid)
         pt, qt, h, r, jit2, q = self._metal_inputs(v, resid)
         # scan_loglike, not scan_blocks + tree_reduce here: the
         # differentiation boundary has to enclose the reduction so the
@@ -1298,7 +1303,10 @@ class GPLogLike:
         f32 = lambda x: mx.array(x.astype(np.float32))    # noqa: E731
         self._held = dict(
             mask=mask, s_pos=i32(s_pos), m_pos=i32(m_pos),
-            s_pos_np=s_pos, m_pos_np=m_pos,
+            s_pos_np=s_pos, m_pos_np=m_pos, first=first,
+            dt_true=np.concatenate([[0.0], np.diff(t_s)]),
+            prev_np=np.where(has_prev, seg_of[pv], first.size),
+            next_np=np.where(has_next, seg_of[nx], first.size),
             bounds=list(zip(first.tolist(), np.append(first[1:], n_s).tolist())),
             dt64=a64(dt_s), dt32=f32(dt_s),
             uniq64=self._distinct_lags(np.float64, dt_s),
@@ -1308,6 +1316,292 @@ class GPLogLike:
             next=i32(np.where(has_next, seg_of[nx], first.size)),
             lag_a=lag_a, lag_a32=f32(lag_a), lag_b=lag_b, lag_b32=f32(lag_b))
 
+    def _masked_metal_layout(self) -> dict:
+        """Host-side layout of the held-out likelihood on the kernel, for
+        the current `metal_block`; built on first use.
+
+        The S points are a series of their own (true lags across the
+        windows), cut into blocks of at most `metal_block` that also break
+        at every window, so each window's edges are block boundaries.  It
+        is run forward and, for the information from the right, backward
+        (`Term.reversal_signs`): the backward series is S reversed, whose
+        lag ``j`` is the forward's lag ``n_s - j``, so one lag table
+        serves both.  ``ia``/``ib`` pick each held-out point's left and
+        right edge state among the forward and backward blocks' exit
+        states, with one slot past the last for "no data on that side"
+        (the stationary prior).
+        """
+        hd = self._held
+        blk = int(self.metal_block)
+        lay = hd.get("metal")
+        if lay is not None and lay["blk"] == blk:
+            return lay
+        n_s = hd["s_pos_np"].size
+        first = hd["first"]
+        bounds = list(zip(first.tolist(), np.append(first[1:], n_s).tolist()))
+        uniq, inv = np.unique(hd["dt_true"].astype(np.float32),
+                              return_inverse=True)
+        lag_f = inv.astype(np.int32) + 1
+        lag_f[0] = 0
+        lag_b = np.concatenate([[0], lag_f[:0:-1]]).astype(np.int32)
+
+        def place(segs):
+            starts, last = [], []
+            for s0, e0 in segs:
+                starts.extend(range(s0, e0, blk))
+                last.append(len(starts) - 1)
+            return np.array(starts + [n_s], dtype=np.int32), np.array(last)
+        starts_f, last_f = place(bounds)
+        rsegs = [(n_s - e0, n_s - s0) for s0, e0 in bounds][::-1]
+        starts_b, last_b = place(rsegs)
+        last_b = last_b[::-1]                 # back in forward segment order
+        k = len(bounds)
+        nb_f, nb_b = starts_f.size - 1, starts_b.size - 1
+        ia = np.where(hd["prev_np"] < k,
+                      last_f[np.minimum(hd["prev_np"], k - 1)], nb_f)
+        ib = np.where(hd["next_np"] < k,
+                      last_b[np.minimum(hd["next_np"], k - 1)], nb_b)
+        rev = np.arange(n_s - 1, -1, -1)
+        s_pos, m_pos = hd["s_pos_np"], hd["m_pos_np"]
+        i32 = lambda x: mx.array(np.asarray(x, dtype=np.int32))  # noqa: E731
+        inst = np.array(self._metal_inst)
+        rr = self._yerr64 ** 2
+        lay = dict(
+            blk=blk, uniq=mx.array(uniq, dtype=mx.float32),
+            lag_f=i32(lag_f), lag_b=i32(lag_b),
+            starts_f=i32(starts_f), starts_b=i32(starts_b),
+            ia=i32(ia), ib=i32(ib), s_pos=i32(s_pos), m_pos=i32(m_pos),
+            s_rev=i32(s_pos[rev]),
+            inst_f=i32(inst[s_pos]), inst_b=i32(inst[s_pos][rev]),
+            rref_f=mx.array(rr[s_pos].astype(np.float32)),
+            rref_b=mx.array(rr[s_pos][rev].astype(np.float32)),
+            rref_m=mx.array(rr[m_pos].astype(np.float32)),
+            signs=mx.array(np.array(self.term.reversal_signs(),
+                                    dtype=np.float32)))
+        hd["metal"] = lay
+        return lay
+
+    def _held_out_mean(self, kp, lay, xm_f, xC_f, xm_b, xC_b):
+        """``h`` of the smoothed state at every held-out point: ``(n_chains,
+        n_m, k)`` for exit means ``(n_chains, n_blocks, k, m)``.
+
+        The two-filter form: the forward filter's state at the window's
+        left edge, ``N(a, A)`` once predicted to the point, and the
+        backward filter's at its right edge, ``N(b, B)`` predicted back to
+        it, are both conditionals of a process whose marginal is ``N(0,
+        I)``, so the smoothed state is ``N(a, A) N(b, B) / N(0, I)``.  With
+        ``G = A + B - A B`` its mean is
+
+            B G^-1 a + A G^-T b,
+
+        with no inverse of ``A`` or ``B`` (both are small where the data
+        pin the state), and exact at either extreme: ``B = I, b = 0`` (no
+        data to the right) gives ``a``, and ``A = I, a = 0`` gives ``b``.
+        Linear in the means, so every column shares ``G``.
+        """
+        from .linalg import inv_logdet_fast
+        hd = self._held
+        n, m = xm_f.shape[0], self.term.n_state
+        sg = lay["signs"]
+
+        def edge(xm, xC, idx):
+            zm = mx.zeros((n, 1) + xm.shape[2:], dtype=xm.dtype)
+            eye = mx.broadcast_to(mx.eye(m, dtype=xC.dtype), (n, 1, m, m))
+            xm = mx.take(mx.concatenate([xm, zm], 1), idx, axis=1)
+            xC = mx.take(mx.concatenate([xC, eye], 1), idx, axis=1)
+            return mx.swapaxes(xm, -1, -2), xC          # means (n, n_m, m, k)
+        ma, pa = edge(xm_f, xC_f, lay["ia"])
+        mb, pb = edge(xm_b, xC_b, lay["ib"])
+        phi_a, q_a, h = self.term.matrices(kp, hd["lag_a32"])
+        phi_b, q_b, _ = self.term.matrices(kp, hd["lag_b32"])
+        big_a = phi_a @ pa @ mx.swapaxes(phi_a, -1, -2) + q_a
+        big_b = ((phi_b @ pb @ mx.swapaxes(phi_b, -1, -2) + q_b)
+                 * (sg[:, None] * sg[None, :]))
+        a = phi_a @ ma
+        b = (phi_b @ mb) * sg[:, None]
+        g_inv, _ = inv_logdet_fast(big_a + big_b - big_a @ big_b)
+        mean = (big_b @ (g_inv @ a)
+                + big_a @ (mx.swapaxes(g_inv, -1, -2) @ b))
+        return mx.sum(h[:, None, :, None] * mean, axis=-2)
+
+    def _masked_metal_noise(self, lay, jit2):
+        """M's white-noise variance ``(n_chains, n_m)`` from the kernel's
+        jitter input (`_metal_resid_jit`)."""
+        if jit2.ndim == 3:                       # per datum
+            extra = mx.swapaxes(mx.take(jit2[..., 0], lay["m_pos"], 0), 0, 1)
+            return lay["rref_m"][None, :] + extra
+        if jit2.shape[1] == 0:
+            return mx.broadcast_to(lay["rref_m"][None, :],
+                                   (jit2.shape[0], lay["rref_m"].size))
+        return lay["rref_m"][None, :] + jit2[:, :1]
+
+    def _masked_metal_inputs(self, v, resid=None, need_resid=True):
+        """Lag tables, ``h``, ``Q``, the time-major residual and jitter, and
+        both series' share of the jitter, for the held-out kernel path."""
+        lay = self._masked_metal_layout()
+        kp = self.param_map.kernel_params(v)
+        phi, q, h = self.term.matrices(kp, lay["uniq"])
+        pt, qt = self._metal_tables(v, phi, q)
+        r, jit2 = self._metal_resid_jit(v, resid, need_resid)
+        if jit2.ndim == 3:
+            jf = mx.contiguous(mx.take(jit2, lay["s_pos"], 0))
+            jb = mx.contiguous(mx.take(jit2, lay["s_rev"], 0))
+        else:
+            jf = jb = jit2
+        return lay, kp, pt, qt, h, q, r, jit2, jf, jb
+
+    def _masked_metal_value(self, v, resid=None):
+        """``log N(r_S; 0, C) + log N(r_M - P r_S; 0, W_M)`` on the kernel,
+        value only: S's term from the forward scan over placed blocks
+        (`metal.scan_states`), ``P r_S`` from both scans' window-edge
+        states (`_held_out_mean`).  Returns ``(log L, None)``: no lag table
+        for `kappa`, whose median-cadence row indexes the whole series'
+        table, not this one (it rebuilds the row instead, as on the MLX
+        path)."""
+        from .metal import scan_states
+        lay, kp, pt, qt, h, q, r, jit2, jf, jb = self._masked_metal_inputs(
+            v, resid)
+        args = dict(s_floor_rel=self.policy.s_floor_rel,
+                    boundary=self._metal_boundary)
+        ell, xm_f, xc_f = scan_states(
+            pt, qt, lay["lag_f"], lay["inst_f"], h,
+            mx.take(r, lay["s_pos"], 0), lay["rref_f"], jf,
+            starts=lay["starts_f"], **args)
+        _, xm_b, xc_b = scan_states(
+            pt, qt, lay["lag_b"], lay["inst_b"], h,
+            mx.take(r, lay["s_rev"], 0), lay["rref_b"], jb,
+            starts=lay["starts_b"], **args)
+        pred = self._held_out_mean(kp, lay, xm_f[..., None, :], xc_f,
+                                   xm_b[..., None, :], xc_b)[..., 0]
+        d = mx.swapaxes(mx.take(r, lay["m_pos"], 0), 0, 1) - pred
+        w_m = self._masked_metal_noise(lay, jit2)
+        ell_m = -0.5 * mx.sum(d * d / w_m + mx.log(w_m / lay["rref_m"]), -1)
+        return mx.sum(ell, axis=1) + ell_m, None
+
+    def _evaluate_metal_masked(self, v, resid=None):
+        """`_masked_metal_value`, differentiable: until the kernel has the
+        held-out gradient (docs/masked-gp-plan.md, Phase 2c), the VJP is
+        the MLX path's, `_evaluate_masked` differentiated by MLX.  The
+        value a sampler sees is the kernel's; the gradient is that of the
+        same function evaluated the MLX way (float32-close, not equal)."""
+        has_r = resid is not None
+
+        @mx.custom_function
+        def core(vv, rr):
+            return self._masked_metal_value(vv, rr if has_r else None)[0]
+
+        @core.vjp
+        def _core_vjp(primals, cotangents, outputs):
+            vv, rr = primals
+            cot = (cotangents[0] if isinstance(cotangents, (list, tuple))
+                   else cotangents)
+
+            def mlx(w, x):
+                return self._evaluate(
+                    w, self._dt32, self._y32, self._r_ref32, self._x_mean32,
+                    self._inst32, _pow2(self.policy.block),
+                    self.policy.eval_blocks, uniq=self._uniq32,
+                    resid=x if has_r else None)
+            return tuple(mx.vjp(mlx, [vv, rr], [cot])[1])
+
+        out = core(v, resid if has_r else mx.zeros((1,), dtype=v.dtype))
+        return out, None
+
+    def _gram_metal_masked(self, v, cols):
+        """`_gram_metal` with points held out: ``(ld, Z^T Sigma^-1 Z)``.  ``Sigma^-1``'s Gram is S's, from the forward multi-column
+        scan, plus ``D^T W_M^-1 D`` with ``D = Z_M - P Z_S``, every
+        column's held-out residual (`_held_out_mean`); ``ld`` adds M's
+        log-determinant half.  Value on the kernel, gradient by MLX
+        polarisation of `_evaluate_masked` (as `_evaluate_metal_masked`).
+        """
+        from .metal import scan_states_mc
+        split = isinstance(cols, tuple)
+
+        def columns(rc, phi):
+            # (n, k, N) for polarisation, from either layout
+            if not split:
+                return rc
+            n = rc.shape[0]
+            pb = mx.broadcast_to(phi[None] if phi.ndim == 2 else phi,
+                                 (n,) + phi.shape[-2:])
+            return mx.concatenate([rc[:, None, :], mx.swapaxes(pb, 1, 2)], 1)
+
+        @mx.custom_function
+        def core(vv, rc, phi):
+            lay, kp, pt, qt, h, _, _, jit2, jf, jb = \
+                self._masked_metal_inputs(vv, need_resid=False)
+            if split:
+                a = mx.contiguous(mx.swapaxes(rc, 0, 1))[..., None]
+                zf = (mx.take(a, lay["s_pos"], 0),
+                      mx.take(phi, lay["s_pos"], 0) if phi.ndim == 2 else
+                      mx.take(mx.swapaxes(phi, 0, 1), lay["s_pos"], 0))
+                zb = (mx.take(a, lay["s_rev"], 0),
+                      mx.take(phi, lay["s_rev"], 0) if phi.ndim == 2 else
+                      mx.take(mx.swapaxes(phi, 0, 1), lay["s_rev"], 0))
+                zf = tuple(mx.contiguous(x) for x in zf)
+                zb = tuple(mx.contiguous(x) for x in zb)
+            else:
+                a = mx.transpose(rc, (2, 0, 1))           # (N, n, k)
+                zf = mx.contiguous(mx.take(a, lay["s_pos"], 0))
+                zb = mx.contiguous(mx.take(a, lay["s_rev"], 0))
+            args = dict(s_floor_rel=self.policy.s_floor_rel,
+                        boundary=self._metal_boundary)
+            ld, g, xm_f, xc_f = scan_states_mc(
+                pt, qt, lay["lag_f"], lay["inst_f"], h, zf, lay["rref_f"],
+                jf, starts=lay["starts_f"], **args)
+            _, _, xm_b, xc_b = scan_states_mc(
+                pt, qt, lay["lag_b"], lay["inst_b"], h, zb, lay["rref_b"],
+                jb, starts=lay["starts_b"], **args)
+            z = columns(rc, phi)
+            k = z.shape[1]
+            pred = self._held_out_mean(kp, lay, xm_f, xc_f, xm_b, xc_b)
+            d = mx.swapaxes(mx.take(z, lay["m_pos"], 2), 1, 2) - pred
+            w_m = self._masked_metal_noise(lay, jit2)
+            rows, cs = np.tril_indices(k)
+            g = mx.sum(g, axis=1)
+            full = mx.zeros((g.shape[0], k * k), dtype=g.dtype)
+            full = full.at[:, mx.array(rows * k + cs)].add(g)
+            full = full.at[:, mx.array(cs * k + rows)].add(
+                mx.where(mx.array(rows != cs), g, 0.0))
+            gram = (full.reshape(-1, k, k)
+                    + mx.swapaxes(d / w_m[..., None], 1, 2) @ d)
+            ld = (mx.sum(ld, axis=1)
+                  - 0.5 * mx.sum(mx.log(w_m / lay["rref_m"]), -1))
+            return ld, gram
+
+        @core.vjp
+        def _core_vjp(primals, cotangents, outputs):
+            vv, rc, phi = primals
+
+            def mlx(w, x, ph):
+                def ev(w2, resid):
+                    return self._evaluate(
+                        w2, self._dt32, self._y32, self._r_ref32,
+                        self._x_mean32, self._inst32,
+                        _pow2(self.policy.block), self.policy.eval_blocks,
+                        uniq=self._uniq32, resid=resid)
+                # Polarised at a common column size, as `_marginal` does:
+                # a basis far smaller than the residual loses its cross
+                # terms to float32 (measured 1e-3 of the gradient for a
+                # shared orthonormal basis, against 1e-5 scaled).
+                z = columns(x, ph)
+                wt = 1.0 / self._r_ref32
+                nrm = mx.sum(z * z * wt, axis=-1)                 # (n, k)
+                sc = mx.stop_gradient(mx.where(
+                    nrm > 0, mx.sqrt(mx.maximum(nrm[:, :1], 1.0)
+                                     / mx.maximum(nrm, 1e-30)), 1.0))
+                ell0, gram, _ = self._gram_polarised(w, ev,
+                                                     z * sc[..., None])
+                return ell0, gram / (sc[:, :, None] * sc[:, None, :])
+            return tuple(mx.vjp(mlx, [vv, rc, phi], list(cotangents))[1])
+
+        if split:
+            rc, phi = cols
+            phi = mx.stop_gradient(phi) if phi.ndim == 2 else phi
+        else:
+            rc, phi = cols, mx.zeros((1,), dtype=v.dtype)
+        return core(v, rc, phi)
+
     def _metal_inputs(self, v: mx.array, resid: mx.array | None = None,
                       need_resid: bool = True):
         """The kernel's inputs for ``v``: ``(phi table, Q table, h, residual
@@ -1316,8 +1610,6 @@ class GPLogLike:
         columns for :func:`anvilgp.metal.scan_gram`; ``need_resid=False``
         builds none (the residual slot is None), for a caller that lays out
         its own columns."""
-        pm = self.param_map
-        n, m, dtype = v.shape[0], self.term.n_state, v.dtype
         if self._metal_slot_id is None:        # deferred at construction
             self._build_slot_map()
         # The property setter makes this unreachable; it stays because the
@@ -1330,16 +1622,29 @@ class GPLogLike:
                 f"{self.metal_block}; assign `metal_block` rather than "
                 f"`_metal_block` so the map is rebuilt")
         phi, q, h = self._metal_matrices(v)
+        pt, qt = self._metal_tables(v, phi, q)
+        r, jit2 = self._metal_resid_jit(v, resid, need_resid)
+        return pt, qt, h, r, jit2, q
+
+    def _metal_tables(self, v, phi, q):
+        """The kernel's lag tables from ``(Phi, Q)`` at the distinct lags:
+        row 0 prepended for the first point's absent predecessor (``Phi =
+        0``, ``Q`` the stationary covariance -- the identity for every term
+        but a convolved one, which supplies its own; `Term.p_inf_blocks`)."""
+        n, m, dtype = v.shape[0], self.term.n_state, v.dtype
         pt = mx.concatenate(
             [mx.zeros((n, 1, m, m), dtype=dtype), phi], axis=1)
-        # Row 0 is the first point's absent predecessor, so its `Q` is the
-        # stationary covariance.  Identity for every term but a convolved
-        # one, which supplies its own -- see `Term.p_inf_blocks`.
-        pin = (self._p_inf(pm.kernel_params(v), dtype, dense=True)
+        pin = (self._p_inf(self.param_map.kernel_params(v), dtype, dense=True)
                if self._has_p_inf else None)
         q0 = (mx.broadcast_to(mx.eye(m, dtype=dtype), (n, 1, m, m))
               if pin is None else pin[:, None, :, :])
-        qt = mx.concatenate([q0, q], axis=1)
+        return pt, mx.concatenate([q0, q], axis=1)
+
+    def _metal_resid_jit(self, v, resid=None, need_resid=True):
+        """The kernel's residual and jitter for ``v``: ``(r, jit2)`` as
+        `_metal_inputs` returns them."""
+        pm = self.param_map
+        n, dtype = v.shape[0], v.dtype
 
         # Built time-major, (npts, n_chains), to match the kernel's flat
         # chains-fastest grid: adjacent threads then read adjacent floats.
@@ -1397,7 +1702,7 @@ class GPLogLike:
                 jit = corr if jit is None else jit + corr
             jit2 = (mx.zeros((n, 0), dtype=dtype) if jit is None
                     else mx.broadcast_to(jit, (n, 1)))
-        return pt, qt, h, r, jit2, q
+        return r, jit2
 
     def _evaluate(self, v, dt, y, r_ref, x_mean, idx, block, do_eval, uniq=None,
                   resid=None):
@@ -1824,6 +2129,12 @@ class GPLogLike:
         if not isinstance(cols, tuple) and cols.shape[1] > MAX_GRAM_COLS:
             return self._gram_polarised(v, self._raw_resid, cols)
         pull = self._infeasible_pull(v)
+        if self._held is not None:
+            # no lag table for `kappa`: see `_masked_metal_value`
+            ld, g = self._gram_metal_masked(v, cols)
+            ld = self._refuse_outside_series(v, ld)
+            ld = _sanitize(self._refuse_ill_conditioned(v, ld, None), pull)
+            return ld, g, ld
         if isinstance(cols, tuple):
             rc, phi = cols
             pt, qt, h, _, jit2, q = self._metal_inputs(v, need_resid=False)

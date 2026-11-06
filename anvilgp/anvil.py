@@ -331,9 +331,10 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         shape is the measurement cannot be absorbed by the GP.  Does not
         model correlated noise inside the windows; see
         `anvilgp.likelihood.GPLogLike` for the construction and its
-        caveat.  The parameter vector is the same as without it.  Runs on
-        the MLX path, roughly 10-30x the kernel's cost (more with
-        ``linear_basis``); see `anvilgp.likelihood.GPLogLike`.
+        caveat.  The parameter vector is the same as without it.  The
+        value runs on the kernel; the gradient, for now, on the MLX path
+        (roughly 10-30x the kernel's cost); see
+        `anvilgp.likelihood.GPLogLike`.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic

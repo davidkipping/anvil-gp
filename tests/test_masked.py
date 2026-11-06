@@ -14,6 +14,7 @@ import pytest
 
 import anvilgp as ag
 from anvilgp.likelihood import GPLogLike, GPPolicy, KernelParam, ParamMap
+from anvilgp.metal import metal_available
 from anvilgp.oracle import (dense_covariance, dense_loglike,
                             dense_masked_covariance, dense_masked_loglike,
                             sample_ssm)
@@ -41,11 +42,18 @@ def _data(term, kp, t=None, seed=0):
 
 
 def _layout(name, t):
-    """Interior; leading plus two interior; trailing; a single point."""
+    """Interior; leading plus two interior; trailing; a single point; both
+    ends held out, with one kept point alone between two windows."""
+    i = np.arange(t.size)
     return {"interior": (t > 8) & (t < 9.5),
             "lead+2": (t < 1) | ((t > 5) & (t < 6)) | ((t > 12) & (t < 12.2)),
             "trail": t > 18.5,
-            "single": np.arange(t.size) == t.size // 2}[name]
+            "single": i == t.size // 2,
+            "edges": np.isin(i, np.r_[0:5, 120:140, 141:160,
+                                      t.size - 5:t.size])}[name]
+
+
+_LAYOUTS = ["interior", "lead+2", "trail", "single", "edges"]
 
 
 def _rows(n_dim, n_kernel):
@@ -67,7 +75,7 @@ def _gp(term, kp, t, y, yerr, mask, **kw):
                      **kw)
 
 
-@pytest.mark.parametrize("layout", ["interior", "lead+2", "trail", "single"])
+@pytest.mark.parametrize("layout", _LAYOUTS)
 @pytest.mark.parametrize("name", list(_TERMS))
 def test_the_masked_likelihood_is_the_dense_sigma(name, layout):
     """float64 against ``log N(r; 0, Sigma)``, m = 1 to 6: measured
@@ -169,7 +177,7 @@ def _noise(vn, d):
     return (exp_acc(vn[:, :1]) * d.yerr) ** 2 + exp_acc(2.0 * vn[:, 1:2])
 
 
-def _full_model(mask):
+def _full_model(mask, policy=None):
     """A mean model, two instruments' offsets and a `noise_fn` -- each
     evaluated on all the data, M included."""
     term, kp = _TERMS["sho"]
@@ -187,8 +195,8 @@ def _full_model(mask):
                           KernelParam(link="linear", index=2 + k, ref=0.0)],
                   instrument=inst, noise=slice(3 + k, 5 + k))
     gp = GPLogLike(mean_fn, t, t, y, yerr, term, pm,
-                   GPPolicy(metal=False, kappa_max=None), noise_fn=_noise,
-                   held_out=mask)
+                   policy or GPPolicy(metal=False, kappa_max=None),
+                   noise_fn=_noise, held_out=mask)
     rows = np.array([[0.05, 0.0, 0.0, 0.0, 0.3, 0.7, 0.1, -2.0],
                      [0.06, 0.1, -0.1, 0.05, 0.2, 0.75, -0.2, -1.5]])
 
@@ -240,8 +248,9 @@ def test_float32_value_and_gradient(name):
     assert np.all(np.abs(grad - fd).max(1) < 3e-5 * np.abs(fd).max(1))
 
 
+@pytest.mark.parametrize("path", ["mlx", "kernel"])
 @pytest.mark.parametrize("case", ["white", "slow"])
-def test_float32_at_scale_tracks_the_unmasked_path(case):
+def test_float32_at_scale_tracks_the_unmasked_path(case, path):
     """N = 2800 at a one-minute cadence, the transit plus ingress and
     egress held out (169 points): where masking is appropriate -- the GP's
     interpolation into the window comparable to the white noise -- the
@@ -252,7 +261,16 @@ def test_float32_at_scale_tracks_the_unmasked_path(case):
     residuals there of 96 sigma, an M term of -2e5) the fusion inside the
     window loses the information gain, ~1e5, and the error is 88 log-units
     against 0.9 -- the regime the class docstring's caveat excludes, and
-    not one a sampler stays in."""
+    not one a sampler stays in.
+
+    On the kernel (Phase 2): "white" 8.2e-5 against 1.0e-4 unmasked;
+    "slow" 2.4e-3 against 1.6e-4.  There the held-out term carries it:
+    every held-out residual comes from the same two window-edge states,
+    whose float32 error (3e-5 in a prediction of a GP 30 times the noise,
+    a few ulps) adds coherently over the 169 points.  Still 20x better
+    than the MLX path, so the kernel's bound is its own."""
+    if path == "kernel" and not metal_available():
+        pytest.skip("needs the fused kernel")
     sig, rho = {"white": (1.0, 1 / 24), "slow": (30.0, 30 / 24)}[case]
     n, cad = 2800, 1 / 1440
     t = np.arange(n) * cad
@@ -266,13 +284,138 @@ def test_float32_at_scale_tracks_the_unmasked_path(case):
     rows[1:] = 0.2 * np.random.default_rng(2).standard_normal((3, 3))
     err = {}
     for held in (None, [(tc - half, tc + half)]):
-        gp = _gp(ag.SHOTerm(), kp, t, y, yerr, held)
+        gp = (_gp(ag.SHOTerm(), kp, t, y, yerr, held) if path == "mlx" else
+              GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
+                        ParamMap.log(kp), GPPolicy(kappa_max=None),
+                        held_out=held))
+        assert gp._metal_ok == (path == "kernel")
         with mx.stream(mx.gpu):
             lo = np.array(gp(mx.array(rows, dtype=mx.float32)))
         with mx.stream(mx.cpu):
             hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64)))
         err[held is None] = np.abs(lo - hi).max()
-    assert err[False] < 3.0 * err[True] + 1e-3
+    if path == "mlx":
+        assert err[False] < 3.0 * err[True] + 1e-3
+    else:
+        assert err[False] < 1e-2
+
+
+# -- on the kernel (docs/masked-gp-plan.md, Phase 2) ------------------------
+
+_on_kernel = pytest.mark.skipif(not metal_available(),
+                                reason="needs the fused kernel")
+
+
+def _kgp(term, kp, t, y, yerr, mask, block=None, **kw):
+    gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                   GPPolicy(kappa_max=None, metal_block=block),
+                   held_out=mask, **kw)
+    assert gp._metal_ok, gp._metal_why
+    return gp
+
+
+def _lo_hi(gp, rows):
+    with mx.stream(mx.gpu):
+        lo = np.array(gp(mx.array(rows, dtype=mx.float32)), dtype=np.float64)
+    with mx.stream(mx.cpu):
+        hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64), refuse=False))
+    return lo, hi
+
+
+@pytest.mark.parametrize(
+    "term", [ag.RealTerm(), ag.SHOTerm(), ag.Matern32Term(),
+             ag.Matern52Term(), ag.RotationTerm(), ag.ComplexTerm(),
+             ag.SHOTerm() + ag.RealTerm() + ag.Matern52Term()],
+    ids=lambda t: type(t).__name__)
+def test_time_reversal_is_a_sign_flip(term):
+    """`Term.reversal_signs`, which the kernel's backward series rests on:
+    ``Phi^T = S Phi S``, ``I - Phi^T Phi = S Q S`` and ``h S = h`` at
+    random parameters (an SHO under- and over-damped) and lags."""
+    sg = np.array(term.reversal_signs(), dtype=np.float64)
+    big_s, m = np.diag(sg), sg.size
+    rng = np.random.default_rng(5)
+    lags = np.array([0.0, 1e-3, 0.03, 0.4, 2.0, 9.0])
+    for _ in range(4):
+        p = np.exp(rng.uniform(-1.0, 1.5, term.n_params))
+        with mx.stream(mx.cpu):
+            phi, q, h = term.matrices(mx.array(p[None], dtype=mx.float64),
+                                      mx.array(lags, dtype=mx.float64))
+        phi, q, h = np.array(phi[0]), np.array(q[0]), np.array(h[0])
+        for f, g in zip(phi, q):
+            np.testing.assert_allclose(f.T, big_s @ f @ big_s, atol=1e-12)
+            np.testing.assert_allclose(np.eye(m) - f.T @ f,
+                                       big_s @ g @ big_s, atol=1e-11)
+        np.testing.assert_array_equal(h * sg, h)
+    assert ag.TermConvolution(ag.SHOTerm(), 0.01).reversal_signs() is None
+
+
+@_on_kernel
+@pytest.mark.parametrize("block", [None, 16], ids=["auto", "block16"])
+@pytest.mark.parametrize("layout", _LAYOUTS)
+@pytest.mark.parametrize("name", list(_TERMS))
+def test_the_kernel_value_under_the_mask(name, layout, block):
+    """The kernel's float32 value against float64: measured 7e-6 to
+    1.4e-4 absolute, against 2.6e-5 to 6.4e-4 on the MLX path.  Blocks of
+    16 put many block boundaries inside every segment."""
+    term, kp = _TERMS[name]
+    t, y, yerr = _data(term, kp)
+    gp = _kgp(term, kp, t, y, yerr, _layout(layout, t), block)
+    lo, hi = _lo_hi(gp, _rows(len(kp), len(kp)))
+    assert np.abs(lo - hi).max() < 5e-4
+
+
+@_on_kernel
+@pytest.mark.parametrize("name", ["sho", "rot+sho"])
+def test_the_kernel_gradient_is_the_mlx_paths(name):
+    """Until the kernel has the held-out gradient (Phase 2c) its VJP is
+    the MLX path's (`GPLogLike._evaluate_metal_masked`): measured equal to
+    8e-8 and 1.2e-7 relative."""
+    term, kp = _TERMS[name]
+    t, y, yerr = _data(term, kp)
+    mask = _layout("lead+2", t)
+    v = mx.array(_rows(len(kp), len(kp)), dtype=mx.float32)
+    grads = []
+    for gp in (_kgp(term, kp, t, y, yerr, mask),
+               _gp(term, kp, t, y, yerr, mask)):
+        with mx.stream(mx.gpu):
+            grads.append(np.array(mx.grad(lambda w: gp(w).sum())(v)))
+    assert np.abs(grads[0] - grads[1]).max() < 1e-5 * np.abs(grads[1]).max()
+
+
+@_on_kernel
+def test_the_full_model_on_the_kernel():
+    """Mean model, per-instrument offsets and a per-datum `noise_fn` with
+    the kernel's value: measured 1e-4 against float64."""
+    t = _data(*_TERMS["sho"])[0]
+    gp, rows, _, _ = _full_model(_layout("lead+2", t),
+                                 GPPolicy(kappa_max=None))
+    assert gp._metal_ok
+    lo, hi = _lo_hi(gp, rows)
+    assert np.abs(lo - hi).max() < 3e-4
+
+
+@_on_kernel
+def test_the_kernel_holds_a_large_gp_inside_the_window():
+    """The regime `test_float32_at_scale_tracks_the_unmasked_path` calls
+    out for the MLX path -- a large GP left unmodelled inside a long
+    window (sigma = 300 yerr, rho = 10 hr, the whole transit held out) --
+    on the kernel, whose window fusion is in covariance form
+    (`GPLogLike._held_out_mean`) rather than the MLX path's information
+    form.  Measured on these rows: 0.54 log-units against 88 on the MLX
+    path (and 9.5e-4 unmasked; the M term is -2e5 here)."""
+    n, cad = 2800, 1 / 1440
+    t = np.arange(n) * cad
+    tc = t.mean()
+    kp = [300.0, 10 / 24, 1 / math.sqrt(2)]
+    rng = np.random.default_rng(1)
+    yerr = np.ones(n)
+    y = (sample_ssm(ag.SHOTerm(), kp, cad, n, rng)
+         + yerr * rng.standard_normal(n))
+    gp = _kgp(ag.SHOTerm(), kp, t, y, yerr, [(tc - 1.4 / 24, tc + 1.4 / 24)])
+    rows = np.zeros((4, 3))
+    rows[1:] = 0.2 * np.random.default_rng(2).standard_normal((3, 3))
+    lo, hi = _lo_hi(gp, rows)
+    assert np.abs(lo - hi).max() < 3.0
 
 
 def _basis_setup(shared, prior):
@@ -350,6 +493,33 @@ def _dense_s_conditional(term, p, t, r, w, mask, tp):
     return mean, var, ks @ np.linalg.solve(K, np.eye(s.sum()))
 
 
+@_on_kernel
+@pytest.mark.parametrize("prior", [None, "gauss"], ids=["flat", "gauss"])
+@pytest.mark.parametrize("shared", [False, True], ids=["per-chain", "shared"])
+def test_a_marginalised_basis_on_the_kernel(shared, prior):
+    """The masked Gram on the kernel (`GPLogLike._gram_metal_masked`):
+    value against float64, measured 1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the
+    MLX path); gradient against central differences of `hi`, 2e-5 to
+    7e-5 relative."""
+    gp, term, kp, t, y, yerr, mask, phi, lp = _basis_setup(shared, prior)
+    gk = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                   GPPolicy(kappa_max=None), held_out=mask,
+                   linear_basis=gp.linear_basis, linear_prior=lp)
+    assert gk._metal_ok
+    rows = _rows(3, 3)
+    lo, hi = _lo_hi(gk, rows)
+    assert np.abs(lo - hi).max() < 3e-4
+    with mx.stream(mx.gpu):
+        grad = np.array(mx.grad(lambda w: gk(w).sum())(
+            mx.array(rows, dtype=mx.float32)))
+    fd = np.zeros_like(rows)
+    for i in range(3):
+        d = np.zeros_like(rows)
+        d[:, i] = 1e-5
+        fd[:, i] = (_lo_hi(gk, rows + d)[1] - _lo_hi(gk, rows - d)[1]) / 2e-5
+    assert np.abs(grad - fd).max() < 3e-4 * np.abs(fd).max()
+
+
 def test_predict_is_conditioned_on_s():
     """No basis: the dense conditional on S, at new points and at M (where
     the mean is the ``P r_S`` the likelihood applies)."""
@@ -409,6 +579,24 @@ def test_gram_is_the_masked_quadratic_form():
                                    atol=1e-10 * np.abs(want).max())
 
 
+@_on_kernel
+def test_gram_on_the_kernel():
+    """`gram` in float32 with the kernel's masked value: measured 7e-8
+    relative to the float64 Gram."""
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    gp = _kgp(term, kp, t, y, yerr, _layout("lead+2", t))
+    rows = _rows(3, 3)
+    Y = np.random.default_rng(7).standard_normal((2, N, 3))
+    with mx.stream(mx.cpu):
+        want = np.array(gp.gram(mx.array(rows, dtype=mx.float64),
+                                mx.array(Y, dtype=mx.float64)))
+    with mx.stream(mx.gpu):
+        got = np.array(gp.gram(mx.array(rows, dtype=mx.float32),
+                               mx.array(Y, dtype=mx.float32)))
+    assert np.abs(got - want).max() < 1e-5 * np.abs(want).max()
+
+
 def test_bad_masks_and_unsupported_calls_are_refused():
     term, kp = _TERMS["sho"]
     t, y, yerr = _data(term, kp)
@@ -423,8 +611,9 @@ def test_bad_masks_and_unsupported_calls_are_refused():
     gp = _gp(term, kp, t, y, yerr, _layout("interior", t))
     with pytest.raises(ValueError, match="held-out"):
         gp.apply_inverse(np.zeros((1, 3)), y)
-    with pytest.warns(RuntimeWarning, match="held-out mask"):
-        gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+    conv = ag.TermConvolution(term, 1e-5)
+    with pytest.warns(RuntimeWarning, match="time reversal"):
+        gp = GPLogLike(None, t, None, y, yerr, conv, ParamMap.log(kp),
                        GPPolicy(metal=True, kappa_max=None),
                        held_out=_layout("interior", t))
     assert not gp._metal_ok
@@ -445,18 +634,23 @@ def test_make_target_passes_held_out():
     with mx.stream(mx.gpu):
         out = np.array(gt.model_log_prob(mx.array(v)))
     assert np.all(np.isfinite(out)) and np.all(out > -1e20)
+    if gt.loglike._metal_ok:          # a jitter, on the kernel
+        lo, hi = _lo_hi(gt.loglike, v)
+        assert np.abs(lo - hi).max() < 3e-4
 
 
 @pytest.mark.slow
 def test_chees_samples_a_masked_target():
-    """A gradient sampler on the masked MLX path, as
+    """A gradient sampler on a masked target, as
     `test_calibration.test_chees_runs_on_the_fused_kernel` checks the
     kernel: a wrong gradient collapses the acceptance, and a random walk
     cannot find the jitter's posterior width in this budget.  The float64
     Laplace width of ``log_jitter`` at the mode is 0.138 on this problem;
     measured 0.154 (median per-chain), acceptance 0.89, 5 of 128 chains
     lost.  (At N = 1000, 256 chains and 300 + 300 steps: 0.094 against
-    0.089, acceptance 0.96, none lost.)"""
+    0.089, acceptance 0.96, none lost.)  Those were on the MLX path; since
+    Phase 2b the value comes from the kernel and the gradient from the MLX
+    path, and the same bounds hold."""
     anvil = pytest.importorskip("anvil")
     from anvilgp.anvil import make_target
     sigma, rho, qual, jit, err = 1.5, 7.3, 8.0, 0.12, 0.20
