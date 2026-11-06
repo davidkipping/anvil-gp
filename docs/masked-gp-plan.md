@@ -91,6 +91,38 @@ back, as for any problem the kernel cannot serve).  Gate: value and
 gradient against float64 within the float32 budgets the unmasked MLX
 path meets on the same data; ChEES runs; cost measured on a quiet GPU.
 
+**Status 2026-11-05.** Phase 0 done (ff1e712): float64 equals the dense
+``Sigma`` to ~1e-11 for m = 1 to 6, convolved terms, ties at a window
+edge, `mean_fn`/offsets/`noise_fn`, and bases (shared and per chain, flat
+and Gaussian prior).  Phase 1 measured, all but the cost:
+
+- *float32, small problems* (N = 300): value 4e-7 relative at m = 2 (a
+  few ulps), 3.6e-6 at m = 6 with a leading window (2e-7 unmasked);
+  gradients 1e-6 to 6e-6 relative, as unmasked.
+- *float32 at the requester's scale* (N = 2800, one-minute cadence, SHO,
+  ingress/egress or the whole transit held out): where masking is
+  appropriate -- the GP's interpolation into the window comparable to
+  the white noise -- the error is the unmasked path's: 1e-4 to 1e-3
+  log-units at sigma <= 3 yerr, 0.05 against 0.065 for slow systematics
+  at sigma = 30 yerr, rho = 30 hr.  Gradients 1e-6 to 3e-5.
+- *Where it is not*: with a large GP left unmodelled inside the window
+  (sigma = 300 yerr, rho = 10 hr: residuals of 96 sigma there, an M term
+  of -2e5) the error is 88 log-units against 0.9.  Located: the forward
+  state and the backward information are each float32-accurate (1e-5,
+  4e-7); the fusion deep inside the window loses the information gain
+  over the prior there (~1e5, the same factor kappa measures).  The
+  caveat already excludes that regime and a sampler does not stay in it
+  (the likelihood there is 1e5 log-units down); a covariance-form
+  backward pass would remove it if it ever mattered.
+- *ChEES* on a masked target (N = 1000, 256 chains, 300 + 300): acceptance
+  0.96, no chains lost, widths within 4-15% of the float64 Laplace widths
+  (log jitter 0.094 against 0.089).  A reduced version is a slow test.
+- *Memory* at 1024 chains x N = 2800, value + gradient: 2.25 GiB masked
+  against 2.02 GiB unmasked on the MLX path (the kernel: 0.04 GiB).
+- *Cost*: owed, on a quiet GPU.  The ChEES run above took 17 min on a
+  possibly shared GPU (not a timing); the MLX path is ~40x the kernel
+  unmasked, so this decides Phase 2.
+
 ### 2. Kernel path (only if Phase 1 is too slow at the requester's scale)
 
 Window edges aligned to the kernel's block boundaries, the window

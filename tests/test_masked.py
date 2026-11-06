@@ -240,6 +240,41 @@ def test_float32_value_and_gradient(name):
     assert np.all(np.abs(grad - fd).max(1) < 3e-5 * np.abs(fd).max(1))
 
 
+@pytest.mark.parametrize("case", ["white", "slow"])
+def test_float32_at_scale_tracks_the_unmasked_path(case):
+    """N = 2800 at a one-minute cadence, the transit plus ingress and
+    egress held out (169 points): where masking is appropriate -- the GP's
+    interpolation into the window comparable to the white noise -- the
+    masked float32 error is the unmasked path's.  Measured on these rows:
+    "white" (sigma = yerr, rho = 1 hr) 4.0e-4 against 1.4e-4; "slow" (sigma =
+    30 yerr, rho = 30 hr) 5.1e-2 against 6.5e-2.  Where the GP inside the
+    window is large and left unmodelled (sigma = 300 yerr, rho = 10 hr:
+    residuals there of 96 sigma, an M term of -2e5) the fusion inside the
+    window loses the information gain, ~1e5, and the error is 88 log-units
+    against 0.9 -- the regime the class docstring's caveat excludes, and
+    not one a sampler stays in."""
+    sig, rho = {"white": (1.0, 1 / 24), "slow": (30.0, 30 / 24)}[case]
+    n, cad = 2800, 1 / 1440
+    t = np.arange(n) * cad
+    tc, half = t.mean(), 1.4 / 24
+    kp = [sig, rho, 1 / math.sqrt(2)]
+    rng = np.random.default_rng(1)
+    yerr = np.ones(n)
+    y = (sample_ssm(ag.SHOTerm(), kp, cad, n, rng)
+         + yerr * rng.standard_normal(n))
+    rows = np.zeros((4, 3))
+    rows[1:] = 0.2 * np.random.default_rng(2).standard_normal((3, 3))
+    err = {}
+    for held in (None, [(tc - half, tc + half)]):
+        gp = _gp(ag.SHOTerm(), kp, t, y, yerr, held)
+        with mx.stream(mx.gpu):
+            lo = np.array(gp(mx.array(rows, dtype=mx.float32)))
+        with mx.stream(mx.cpu):
+            hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64)))
+        err[held is None] = np.abs(lo - hi).max()
+    assert err[False] < 3.0 * err[True] + 1e-3
+
+
 def _basis_setup(shared, prior):
     term, kp = _TERMS["sho"]
     t, y, yerr = _data(term, kp)
@@ -410,3 +445,41 @@ def test_make_target_passes_held_out():
     with mx.stream(mx.gpu):
         out = np.array(gt.model_log_prob(mx.array(v)))
     assert np.all(np.isfinite(out)) and np.all(out > -1e20)
+
+
+@pytest.mark.slow
+def test_chees_samples_a_masked_target():
+    """A gradient sampler on the masked MLX path, as
+    `test_calibration.test_chees_runs_on_the_fused_kernel` checks the
+    kernel: a wrong gradient collapses the acceptance, and a random walk
+    cannot find the jitter's posterior width in this budget.  The float64
+    Laplace width of ``log_jitter`` at the mode is 0.138 on this problem;
+    measured 0.154 (median per-chain), acceptance 0.89, 5 of 128 chains
+    lost.  (At N = 1000, 256 chains and 300 + 300 steps: 0.094 against
+    0.089, acceptance 0.96, none lost.)"""
+    anvil = pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    sigma, rho, qual, jit, err = 1.5, 7.3, 8.0, 0.12, 0.20
+    rng = np.random.default_rng(20260917)
+    n = 500
+    t = np.arange(n) * (40.0 / n)
+    yerr = np.full(n, err)
+    cov = dense_covariance(ag.SHOTerm(), np.array([sigma, rho, qual]), t,
+                           yerr, jitter=jit)
+    y = np.linalg.cholesky(cov) @ rng.standard_normal(n)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gt = make_target(ag.SHOTerm(), t, y, yerr,
+                         held_out=[(18.0, 20.0), (30.0, 30.5)])
+    with mx.stream(mx.gpu):
+        res = anvil.run(anvil.ChEESHMC(gt.target, max_leapfrog=16),
+                        gt.target, gt.u0(128, seed=1, spread=0.3),
+                        n_warmup=200, n_samples=200, seed=3, progress=False)
+    acc = float(np.mean(res.accept_fraction))
+    assert acc > 0.5, f"acceptance {acc:.2f}: the gradient is not right"
+    assert len(res.extras["lost_chains"]) <= 13
+    chain = np.asarray(res.get_chain(), dtype=np.float64)
+    vm = gt.transform.model_np(chain.reshape(-1, chain.shape[-1]))
+    j = vm.reshape(chain.shape)[:, :, gt.names.index("log_jitter")]
+    sd = float(np.median(j.std(axis=0)))
+    assert 0.11 < sd < 0.17, f"median per-chain log_jitter width {sd:.3f}"
