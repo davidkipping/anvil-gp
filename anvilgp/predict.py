@@ -69,29 +69,29 @@ def predict(gp, v, t_pred, return_var: bool = True):
     t_pred = np.asarray(t_pred, dtype=np.float64).ravel()
     if not np.all(np.isfinite(t_pred)):
         raise ValueError("t_pred must be finite")
-    grid = _grid(gp, t_pred)
-    n_chains = v.shape[0]
+    n_chains, n_pred = v.shape[0], t_pred.size
     k = 1 if gp.linear_basis is None else 1 + _n_basis(gp, v[:1])
     held = gp._held is not None
-    # held out with a basis: the posterior needs a second run, with M as
-    # its prediction points; chunked for whichever run is larger
-    g_grid = _gram_grid(gp) if held and k > 1 else None
-    size = (grid if g_grid is None or g_grid[2].size <= grid[2].size
-            else g_grid)
-    mean = np.empty((n_chains, t_pred.size))
-    var = np.empty((n_chains, t_pred.size)) if return_var else None
-    for c, vc in _chunks(gp, v, size, k, return_var):
-        out = _smooth(gp, vc, grid, return_var=return_var,
-                      gram=k > 1 and not held)
-        mu, va = out["mean"][:, 0], out.get("var")
+    # Held out with a basis, the posterior also needs every column's
+    # smoothed value at M (`_posterior_gram`): M rides in the same run as
+    # extra prediction points after the asked-for ones.
+    extra = (gp._t64[gp._held["m_pos_np"]] if held and k > 1
+             else np.zeros(0))
+    grid = _grid(gp, np.concatenate([t_pred, extra]))
+    mean = np.empty((n_chains, n_pred))
+    var = np.empty((n_chains, n_pred)) if return_var else None
+    for c, vc in _chunks(gp, v, grid, k, return_var):
+        out = _smooth(gp, vc, grid, return_var=return_var, gram=k > 1)
+        mu = out["mean"][:, 0, :n_pred]
+        va = out["var"][:, :n_pred] if return_var else None
         if k > 1:
             # The posterior from this run's own innovations: polarising the
             # float64 likelihood for it instead was two-thirds of the cost
             # (1.16 of 1.71 s at N = 1e4, 64 chains).
             beta, c_beta = _beta_posterior(gp, _posterior_gram(
-                gp, out if not held else _smooth(gp, vc, g_grid, False,
-                                                 gram=True)))
-            s_phi = out["mean"][:, 1:]                          # (n, p, M)
+                gp, dict(out, mean=out["mean"][..., n_pred:]) if held
+                else out))
+            s_phi = out["mean"][:, 1:, :n_pred]                 # (n, p, M)
             mu = mu - np.einsum("np,npm->nm", beta, s_phi)
             if return_var:
                 va = va + np.einsum("npm,npq,nqm->nm", s_phi, c_beta, s_phi)

@@ -364,6 +364,35 @@ m = 6 tripped the GPU watchdog. Reproduce with
 `--shared` for the shared basis (the defaults, 256 chains and p = 2, 5,
 10, give the 256-chain columns).
 
+**Held-out points** (`held_out`) scan the kept points twice on the
+kernel, forward and time-reversed, then join the two at each held-out
+point in one more kernel (forward and backward; docs/masked-gp-plan.md).
+At N = 2818 one-minute points with 398 (14%) held out in two windows,
+Matern-3/2, against the unmasked likelihood on the kernel (quiet machine,
+2026-11-06; probe 73.0 and 73.7 ms):
+
+| | 128 chains: value | value + gradient | 1024 chains: value | value + gradient |
+|---|---:|---:|---:|---:|
+| jitter only | 1.95 ms (2.1x) | 4.57 ms (2.4x) | 4.27 ms (2.9x) | 12.1 ms (4.1x) |
+| error scale + quadratic baseline | 3.00 ms (1.8x) | 6.85 ms (2.3x) | 8.22 ms (2.3x) | 19.7 ms (3.1x) |
+
+The unmasked figures they are against: 0.95, 1.93, 1.46 and 2.94 ms
+plain; 1.68, 3.00, 3.53 and 6.45 ms with the noise model and baseline.
+Two or four windows over the same points cost the same; one window
+holding all 398 costs a little more where the propagators matter (5.1x
+against 4.1x at 1024 chains, plain, value + gradient), because its
+points reach farther from the edges and there are twice as many distinct
+lags to evaluate. The number of windows itself only adds blocks.
+Where it goes, at 1024 chains, plain: the two scans 3.5 ms of value and
+6.9 of value + gradient (2.3x the unmasked scan, as two passes should
+be); the propagators to the window edges at the 199 distinct lags there,
+1.3 and 3.3 ms; the joining kernel 0.4 and 0.7 ms. On the MLX path the
+same masked fit took 40 ms and 183 ms at 128 chains, and with the
+baseline at 1024 chains 25 s for value + gradient. The first kernel
+version, with the joining step in MLX ops, was 10-90x the unmasked
+likelihood: MLX's batched matmul on (chains x points) 2 x 2 matrices cost
+10.7 ms a product. Reproduce with `benchmarks/masked_cost.py`.
+
 **Prediction** (`predict`) is float64 on the CPU, off the likelihood
 path: a Kalman filter and smoother over data and prediction points
 together, vectorised over chains. SHO, 1000 prediction points: 0.21 s at

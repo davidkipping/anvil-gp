@@ -425,6 +425,40 @@ def test_the_kernel_gradient_with_jitter(n_jit, boundary):
 
 
 @_on_kernel
+@pytest.mark.parametrize("basis", [False, True], ids=["one-column", "basis"])
+@pytest.mark.parametrize("name", list(_TERMS))
+def test_the_window_kernel_is_the_mlx_window_step(name, basis):
+    """`metal.held_out_mean` (one thread per chain and held-out point, its
+    VJP in closed form) against the same window step in MLX ops
+    (`GPLogLike._held_out_mean` with `_force_mlx_window`): measured equal
+    to float32 rounding in value, gradients 1e-7 to 1e-6 relative."""
+    term, kp = _TERMS[name]
+    t, y, yerr = _data(term, kp)
+    mask = _layout("edges", t)
+    if basis:
+        y = y + 2.0 + 0.3 * (t - 10.0)
+        tc = float(t.mean())
+
+        def phi(vm, x, m0):
+            return mx.stack([mx.ones_like(m0),
+                             mx.broadcast_to(x - tc, m0.shape)], axis=-1)
+        gp = _kgp(term, kp, t, y, yerr, mask, 16, linear_basis=phi)
+    else:
+        gp = _kgp(term, kp, t, y, yerr, mask, 16)
+    rows = mx.array(_rows(len(kp), len(kp)), dtype=mx.float32)
+    out = []
+    for force in (False, True):
+        gp._force_mlx_window = force
+        with mx.stream(mx.gpu):
+            v, g = mx.value_and_grad(lambda w: gp(w).sum())(rows)
+        out.append((float(v), np.array(g)))
+    gp._force_mlx_window = False
+    assert abs(out[0][0] - out[1][0]) < 1e-6 * abs(out[1][0]) + 1e-3
+    assert (np.abs(out[0][1] - out[1][1]).max()
+            < 1e-5 * np.abs(out[1][1]).max())
+
+
+@_on_kernel
 def test_the_full_model_on_the_kernel():
     """Mean model, per-instrument offsets and a per-datum `noise_fn` on the
     kernel: value measured 1e-4 against float64, gradient 5e-7 relative

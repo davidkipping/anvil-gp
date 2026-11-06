@@ -3223,6 +3223,289 @@ _SRC_SMALL_INV = """
     out_ld[gid] = logdet;
 """
 
+#: The held-out window step (`GPLogLike._held_out_mean`), one thread per
+#: (chain, held-out point): from the window's edge states, predicted to the
+#: point -- ``A = Phi_a P_a Phi_a^T + Q_a``, ``a = Phi_a m_a`` from the left,
+#: ``B = S (Phi_b P_b Phi_b^T + Q_b) S``, ``b = S Phi_b m_b`` from the
+#: right (`Term.reversal_signs`) -- the smoothed mean ``B G^-1 a + A G^-T
+#: b``, ``G = A + B - A B``, and its ``h``, for ``KCOL`` columns sharing
+#: the covariances.  In MLX this step was ~10 launches over (chains x
+#: points) arrays and its backward ~40; here it is one each.
+_WINDOW_HEAD = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_pts) return;
+    uint chain = gid / (uint)n_m;
+    const uint M = MDIM;
+    uint om = gid * M * M;
+    float FA[MDIM][MDIM], FB[MDIM][MDIM], AA[MDIM][MDIM], BB[MDIM][MDIM];
+    float T1[MDIM][MDIM], GA[MDIM][MDIM], GI[MDIM][MDIM], hv[MDIM], sg[MDIM];
+    for (uint i = 0; i < M; ++i) {
+        hv[i] = hvec[chain * M + i];
+        sg[i] = sgn[i];
+        for (uint j = 0; j < M; ++j) {
+            FA[i][j] = phia[om + i * M + j];
+            FB[i][j] = phib[om + i * M + j];
+        }
+    }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            float s = 0.0f;
+            for (uint t = 0; t < M; ++t) s += FA[i][t] * pa[om + t * M + j];
+            T1[i][j] = s;
+        }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            float s = qa[om + i * M + j];
+            for (uint t = 0; t < M; ++t) s += T1[i][t] * FA[j][t];
+            AA[i][j] = s;
+        }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            float s = 0.0f;
+            for (uint t = 0; t < M; ++t) s += FB[i][t] * pb[om + t * M + j];
+            T1[i][j] = s;
+        }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            float s = qb[om + i * M + j];
+            for (uint t = 0; t < M; ++t) s += T1[i][t] * FB[j][t];
+            BB[i][j] = s * sg[i] * sg[j];
+        }
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            float s = AA[i][j] + BB[i][j];
+            for (uint t = 0; t < M; ++t) s -= AA[i][t] * BB[t][j];
+            GA[i][j] = s;
+            GI[i][j] = (i == j) ? 1.0f : 0.0f;
+        }
+    for (uint k = 0; k < M; ++k) {          // Gauss-Jordan, partial pivoting
+        uint best = k;
+        float bval = fabs(GA[k][k]);
+        for (uint r = k + 1; r < M; ++r)
+            if (fabs(GA[r][k]) > bval) { best = r; bval = fabs(GA[r][k]); }
+        if (best != k)
+            for (uint j = 0; j < M; ++j) {
+                float t = GA[k][j]; GA[k][j] = GA[best][j]; GA[best][j] = t;
+                t = GI[k][j]; GI[k][j] = GI[best][j]; GI[best][j] = t;
+            }
+        float inv = 1.0f / GA[k][k];
+        for (uint j = 0; j < M; ++j) { GA[k][j] *= inv; GI[k][j] *= inv; }
+        for (uint r = 0; r < M; ++r) {
+            if (r == k) continue;
+            float f = GA[r][k];
+            for (uint j = 0; j < M; ++j) {
+                GA[r][j] -= f * GA[k][j];
+                GI[r][j] -= f * GI[k][j];
+            }
+        }
+    }
+"""
+
+#: Column ``c``'s ``a``, ``b``, ``u = G^-1 a``, ``w = G^-T b`` and mean.
+_WINDOW_COL = """
+        float av[MDIM], bv[MDIM], uv[MDIM], wv[MDIM], mv[MDIM];
+        uint oc = (gid * KCOL + c) * M;
+        for (uint i = 0; i < M; ++i) {
+            float x = 0.0f, y = 0.0f;
+            for (uint t = 0; t < M; ++t) {
+                x += FA[i][t] * ma[oc + t];
+                y += FB[i][t] * mb[oc + t];
+            }
+            av[i] = x;
+            bv[i] = sg[i] * y;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float x = 0.0f, y = 0.0f;
+            for (uint t = 0; t < M; ++t) {
+                x += GI[i][t] * av[t];
+                y += GI[t][i] * bv[t];
+            }
+            uv[i] = x;
+            wv[i] = y;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float x = 0.0f;
+            for (uint t = 0; t < M; ++t) x += BB[i][t] * uv[t] + AA[i][t] * wv[t];
+            mv[i] = x;
+        }
+"""
+
+_SRC_WINDOW = _WINDOW_HEAD + """
+    for (uint c = 0; c < KCOL; ++c) {
+""" + _WINDOW_COL + """
+        float pr = 0.0f;
+        for (uint i = 0; i < M; ++i) pr += hv[i] * mv[i];
+        out_pred[gid * KCOL + c] = pr;
+    }
+"""
+
+#: Its VJP, in closed form.  With ``p = gbar h`` per column: ``Bbar += p
+#: u^T``, ``Abar += p w^T``, ``abar = G^-T B^T p``, ``bbar = G^-1 A^T p``,
+#: ``Gbar -= abar u^T + w bbar^T``; then ``G = A + B - AB`` gives ``Abar +=
+#: Gbar - Gbar B^T``, ``Bbar += Gbar - A^T Gbar``, and each side's ``X =
+#: Phi P Phi^T + Q`` gives ``Phibar = Xbar Phi P^T + Xbar^T Phi P``, ``Pbar =
+#: Phi^T Xbar Phi``, ``Qbar = Xbar`` (the right side through ``S``).
+_SRC_WINDOW_VJP = _WINDOW_HEAD + """
+    float Ab[MDIM][MDIM], Bb[MDIM][MDIM], Gb[MDIM][MDIM];
+    float FAb[MDIM][MDIM], FBb[MDIM][MDIM], hb[MDIM];
+    for (uint i = 0; i < M; ++i) {
+        hb[i] = 0.0f;
+        for (uint j = 0; j < M; ++j) {
+            Ab[i][j] = 0.0f; Bb[i][j] = 0.0f; Gb[i][j] = 0.0f;
+            FAb[i][j] = 0.0f; FBb[i][j] = 0.0f;
+        }
+    }
+    for (uint c = 0; c < KCOL; ++c) {
+""" + _WINDOW_COL + """
+        float gb = cot[gid * KCOL + c];
+        float pv[MDIM], ub[MDIM], wb[MDIM], ab[MDIM], bb[MDIM];
+        for (uint i = 0; i < M; ++i) { pv[i] = gb * hv[i]; hb[i] += gb * mv[i]; }
+        for (uint i = 0; i < M; ++i) {
+            float x = 0.0f, y = 0.0f;
+            for (uint t = 0; t < M; ++t) {
+                x += BB[t][i] * pv[t];
+                y += AA[t][i] * pv[t];
+            }
+            ub[i] = x;
+            wb[i] = y;
+        }
+        for (uint i = 0; i < M; ++i) {
+            float x = 0.0f, y = 0.0f;
+            for (uint t = 0; t < M; ++t) {
+                x += GI[t][i] * ub[t];
+                y += GI[i][t] * wb[t];
+            }
+            ab[i] = x;
+            bb[i] = y;
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                Bb[i][j] += pv[i] * uv[j];
+                Ab[i][j] += pv[i] * wv[j];
+                Gb[i][j] -= ab[i] * uv[j] + wv[i] * bb[j];
+            }
+        // a = FA ma ;  b = S FB mb
+        for (uint i = 0; i < M; ++i) {
+            float x = 0.0f, y = 0.0f;
+            for (uint t = 0; t < M; ++t) {
+                x += FA[t][i] * ab[t];
+                y += FB[t][i] * sg[t] * bb[t];
+            }
+            d_ma[oc + i] = x;
+            d_mb[oc + i] = y;
+            for (uint j = 0; j < M; ++j) {
+                FAb[i][j] += ab[i] * ma[oc + j];
+                FBb[i][j] += sg[i] * bb[i] * mb[oc + j];
+            }
+        }
+    }
+    // G = A + B - A B
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) {
+            float x = Gb[i][j], y = Gb[i][j];
+            for (uint t = 0; t < M; ++t) {
+                x -= Gb[i][t] * BB[j][t];
+                y -= AA[t][i] * Gb[t][j];
+            }
+            Ab[i][j] += x;
+            Bb[i][j] += y;
+        }
+    // each side: X = F P F^T + Q  (the right side's X is S B S)
+    for (uint side = 0; side < 2; ++side) {
+        float Xb[MDIM][MDIM], F[MDIM][MDIM], P[MDIM][MDIM], FP[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                Xb[i][j] = side == 0 ? Ab[i][j] : Bb[i][j] * sg[i] * sg[j];
+                F[i][j] = side == 0 ? FA[i][j] : FB[i][j];
+                P[i][j] = side == 0 ? pa[om + i * M + j] : pb[om + i * M + j];
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float s = 0.0f;
+                for (uint t = 0; t < M; ++t) s += F[i][t] * P[t][j];
+                FP[i][j] = s;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                // Fbar = Xb F P^T + Xb^T F P
+                float f = side == 0 ? FAb[i][j] : FBb[i][j];
+                for (uint t = 0; t < M; ++t) {
+                    float fpt = 0.0f;
+                    for (uint r = 0; r < M; ++r) fpt += F[t][r] * P[j][r];
+                    f += Xb[i][t] * fpt + Xb[t][i] * FP[t][j];
+                }
+                // Pbar = F^T Xb F
+                float pbv = 0.0f;
+                for (uint t = 0; t < M; ++t)
+                    for (uint r = 0; r < M; ++r) pbv += F[t][i] * Xb[t][r] * F[r][j];
+                uint o = om + i * M + j;
+                if (side == 0) { d_phia[o] = f; d_pa[o] = pbv; d_qa[o] = Xb[i][j]; }
+                else { d_phib[o] = f; d_pb[o] = pbv; d_qb[o] = Xb[i][j]; }
+            }
+    }
+    for (uint i = 0; i < M; ++i) d_h[gid * M + i] = hb[i];
+"""
+
+_window_kernels: dict = {}
+
+_WINDOW_INPUTS = ["ma", "pa", "mb", "pb", "phia", "qa", "phib", "qb", "hvec",
+                  "sgn", "n_pts", "n_m"]
+
+
+def _window_kernel(m: int, k: int, vjp: bool):
+    key = (m, k, vjp)
+    if key not in _window_kernels:
+        src = _SRC_WINDOW_VJP if vjp else _SRC_WINDOW
+        _window_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_window{'_vjp' if vjp else ''}_m{m}_k{k}",
+            input_names=_WINDOW_INPUTS[:10] + (["cot"] if vjp else [])
+                        + _WINDOW_INPUTS[10:],
+            output_names=(["d_ma", "d_pa", "d_mb", "d_pb", "d_phia", "d_qa",
+                           "d_phib", "d_qb", "d_h"] if vjp else ["out_pred"]),
+            source=src.replace("KCOL", str(k)).replace("MDIM", str(m)))
+    return _window_kernels[key]
+
+
+def held_out_mean(ma, pa, mb, pb, phi_a, q_a, phi_b, q_b, hvec, signs):
+    """``(n_chains, n_m, k)``: ``h`` of the smoothed state at every held-out
+    point, from its window's edge states gathered per point -- means ``ma``,
+    ``mb`` ``(n_chains, n_m, k, m)``, covariances ``pa``, ``pb`` and the
+    point's propagators ``phi_*``, ``q_*`` ``(n_chains, n_m, m, m)``; the
+    right edge's in the time-reversed state, ``signs`` its sign flip.  One
+    thread per (chain, point), forward and VJP (`_SRC_WINDOW`,
+    `_SRC_WINDOW_VJP`); differentiable in everything but ``signs``."""
+    n, n_m, k, m = ma.shape
+    n_pts = n * n_m
+    sg = mx.array(np.asarray(signs, dtype=np.float32))
+    grid = dict(grid=(max(n_pts, 1), 1, 1),
+                threadgroup=(min(64, max(n_pts, 1)), 1, 1))
+
+    @mx.custom_function
+    def core(ma_, pa_, mb_, pb_, fa, qa, fb, qb, hv):
+        return _window_kernel(m, k, False)(
+            inputs=[ma_, pa_, mb_, pb_, fa, qa, fb, qb, hv, sg, int(n_pts),
+                    int(n_m)],
+            output_shapes=[(n, n_m, k)], output_dtypes=[mx.float32],
+            **grid)[0]
+
+    @core.vjp
+    def _core_vjp(primals, cotangents, outputs):
+        cot = (cotangents[0] if isinstance(cotangents, (list, tuple))
+               else cotangents)
+        vec, mat = (n, n_m, k, m), (n, n_m, m, m)
+        outs = _window_kernel(m, k, True)(
+            inputs=[*primals[:9], sg, mx.contiguous(cot.astype(mx.float32)),
+                    int(n_pts), int(n_m)],
+            output_shapes=[vec, mat, vec, mat, mat, mat, mat, mat,
+                           (n, n_m, m)],
+            output_dtypes=[mx.float32] * 9, **grid)
+        return (*outs[:8], mx.sum(outs[8], axis=1))
+
+    c = mx.contiguous
+    return core(c(ma), c(pa), c(mb), c(pb), c(phi_a), c(q_a), c(phi_b),
+                c(q_b), c(hvec))
+
+
 _small_inv_kernels: dict = {}
 #: Largest matrix `small_inv_logdet` takes (two p x p arrays per thread).
 MAX_SMALL_INV = 32

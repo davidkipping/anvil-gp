@@ -257,6 +257,35 @@ def test_the_tutorials_exposure_time_table():
     assert abs(ratio - 0.8781) < 1e-4, ratio
 
 
+def test_the_tutorials_held_out_section():
+    """docs/tutorial.md, "Holding a feature out of the GP": the parameter
+    list, `predict` at a held-out time is ``E[f_M | r_S]`` (finite, from
+    S), and the warm start through model space runs (few steps here)."""
+    anvil = pytest.importorskip("anvil")
+    from anvil import EnsembleKernel
+    from anvilgp.anvil import make_target
+    t, y, yerr = _tutorial_data()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gt = make_target(ag.SHOTerm(), t, y, yerr, held_out=[(18.0, 20.0)])
+        plain = make_target(ag.SHOTerm(), t, y, yerr)
+    assert gt.names == plain.names == ['log_gp_sigma', 'log_gp_rho',
+                                       'log_gp_Q', 'log_jitter']
+    assert gt.loglike._metal_ok
+    res0 = anvil.run(EnsembleKernel(plain.target, seed=2), plain.target,
+                     plain.u0(64, seed=1), n_warmup=50, n_samples=20,
+                     seed=3, progress=False)
+    v_last = plain.transform.model_np(
+        np.asarray(res0.get_chain()[-1], dtype=np.float64))
+    u_start = mx.array(gt.transform.from_model_np(v_last), dtype=mx.float32)
+    res = anvil.run(EnsembleKernel(gt.target, seed=2), gt.target, u_start,
+                    n_warmup=20, n_samples=20, seed=4, progress=False)
+    chain = np.asarray(res.get_chain())
+    assert chain.shape[1:] == (64, 4) and np.all(np.isfinite(chain))
+    mean, var = gt.predict(v_last[:3], np.array([18.5, 19.0, 19.5]))
+    assert mean.shape == (3, 3) and np.all(np.isfinite(mean))
+
+
 def test_the_tutorials_feature_sections():
     """docs/tutorial.md, "Beyond the plain likelihood": the parameter lists
     it prints, the shapes, and "``Y^T X`` agrees with ``G`` to 3e-6".  The

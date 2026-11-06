@@ -1287,20 +1287,28 @@ class GPLogLike:
         lag_b = np.where(has_next, t_s[nx] - t[m_pos], 0.0)
         i32 = lambda x: mx.array(x.astype(np.int32))      # noqa: E731
         f32 = lambda x: mx.array(x.astype(np.float32))    # noqa: E731
+        prev = np.where(has_prev, seg_of[pv], first.size)
+        nxt_seg = np.where(has_next, seg_of[nx], first.size)
+        # `bounds`, `prev_np` and `next_np` are the one definition of the
+        # segments and of each held-out point's neighbours: the MLX path
+        # reads them here and the kernel's layout (`_masked_metal_layout`)
+        # builds its blocks from them.
         self._held = dict(
             mask=mask, s_pos=i32(s_pos), m_pos=i32(m_pos),
-            s_pos_np=s_pos, m_pos_np=m_pos, first=first,
-            dt_true=np.concatenate([[0.0], np.diff(t_s)]),
-            prev_np=np.where(has_prev, seg_of[pv], first.size),
-            next_np=np.where(has_next, seg_of[nx], first.size),
+            s_pos_np=s_pos, m_pos_np=m_pos,
             bounds=list(zip(first.tolist(), np.append(first[1:], n_s).tolist())),
+            dt_true=np.concatenate([[0.0], np.diff(t_s)]),
             dt64=a64(dt_s), dt32=f32(dt_s),
             uniq64=self._distinct_lags(np.float64, dt_s),
             uniq32=self._distinct_lags(np.float32, dt_s),
             gaps=gaps, gaps32=f32(gaps),
-            prev=i32(np.where(has_prev, seg_of[pv], first.size)),
-            next=i32(np.where(has_next, seg_of[nx], first.size)),
+            prev_np=prev, next_np=nxt_seg, prev=i32(prev), next=i32(nxt_seg),
             lag_a=lag_a, lag_a32=f32(lag_a), lag_b=lag_b, lag_b32=f32(lag_b))
+
+    #: Tests only: route the held-out window step through MLX ops rather
+    #: than its kernel (`metal.held_out_mean`), to check one against the
+    #: other.
+    _force_mlx_window = False
 
     def _masked_metal_layout(self) -> dict:
         """Host-side layout of the held-out likelihood on the kernel, for
@@ -1323,8 +1331,7 @@ class GPLogLike:
         if lay is not None and lay["blk"] == blk:
             return lay
         n_s = hd["s_pos_np"].size
-        first = hd["first"]
-        bounds = list(zip(first.tolist(), np.append(first[1:], n_s).tolist()))
+        bounds = hd["bounds"]
         uniq, inv = np.unique(hd["dt_true"].astype(np.float32),
                               return_inverse=True)
         lag_f = inv.astype(np.int32) + 1
@@ -1349,6 +1356,11 @@ class GPLogLike:
                       last_b[np.minimum(hd["next_np"], k - 1)], nb_b)
         rev = np.arange(n_s - 1, -1, -1)
         s_pos, m_pos = hd["s_pos_np"], hd["m_pos_np"]
+        # the window step's lags to either edge, distinct (float32, as used)
+        n_m = m_pos.size
+        lag_u, lag_inv = np.unique(np.concatenate(
+            [hd["lag_a"], hd["lag_b"]]).astype(np.float32),
+            return_inverse=True)
         i32 = lambda x: mx.array(np.asarray(x, dtype=np.int32))  # noqa: E731
         inst = np.array(self._metal_inst)
         rr = self._yerr64 ** 2
@@ -1366,6 +1378,8 @@ class GPLogLike:
             lag_f=i32(lag_f), lag_b=i32(lag_b),
             starts_f=i32(starts_f), starts_b=i32(starts_b),
             ia=i32(ia), ib=i32(ib), s_pos=i32(s_pos), m_pos=i32(m_pos),
+            lag_u=mx.array(lag_u, dtype=mx.float32),
+            lag_ia=i32(lag_inv[:n_m]), lag_ib=i32(lag_inv[n_m:]),
             s_rev=i32(s_pos[rev]),
             inst_f=i32(inst[s_pos]), inst_b=i32(inst[s_pos][rev]),
             rref_f=mx.array(rr[s_pos].astype(np.float32)),
@@ -1393,9 +1407,14 @@ class GPLogLike:
         pin the state), and exact at either extreme: ``B = I, b = 0`` (no
         data to the right) gives ``a``, and ``A = I, a = 0`` gives ``b``.
         Linear in the means, so every column shares ``G``.
+
+        Every product is `linalg.matmul`, never ``@``: MLX's batched matmul
+        on (chains x held-out points) 2 x 2 matrices measured 10.7 ms a
+        product at 1024 x 398, against 0.43 ms unrolled, and with ``@``
+        this step was 67 of the masked value's 70 ms (2026-11-06).  The
+        propagators come from the distinct lags to either edge, gathered.
         """
-        from .linalg import inv_logdet_fast
-        hd = self._held
+        from .linalg import inv_logdet_fast, matmul
         n, m = xm_f.shape[0], self.term.n_state
         sg = lay["signs"]
 
@@ -1407,16 +1426,27 @@ class GPLogLike:
             return mx.swapaxes(xm, -1, -2), xC          # means (n, n_m, m, k)
         ma, pa = edge(xm_f, xC_f, lay["ia"])
         mb, pb = edge(xm_b, xC_b, lay["ib"])
-        phi_a, q_a, h = self.term.matrices(kp, hd["lag_a32"])
-        phi_b, q_b, _ = self.term.matrices(kp, hd["lag_b32"])
-        big_a = phi_a @ pa @ mx.swapaxes(phi_a, -1, -2) + q_a
-        big_b = ((phi_b @ pb @ mx.swapaxes(phi_b, -1, -2) + q_b)
+        phi_u, q_u, h = self.term.matrices(kp, lay["lag_u"])
+        phi_a, q_a = (mx.take(x, lay["lag_ia"], axis=1) for x in (phi_u, q_u))
+        phi_b, q_b = (mx.take(x, lay["lag_ib"], axis=1) for x in (phi_u, q_u))
+        if (xm_f.dtype == mx.float32 and mx.default_device() == mx.gpu
+                and not self._force_mlx_window):
+            from .metal import held_out_mean
+            # one thread per (chain, point), forward and VJP: the unrolled
+            # MLX below was still 4 ms of value and 22 of gradient at 1024
+            # chains x 398 points, its backward ~40 launches
+            return held_out_mean(mx.swapaxes(ma, -1, -2), pa,
+                                 mx.swapaxes(mb, -1, -2), pb, phi_a, q_a,
+                                 phi_b, q_b, h, self.term.reversal_signs())
+        tr = lambda x: mx.swapaxes(x, -1, -2)                   # noqa: E731
+        big_a = matmul(matmul(phi_a, pa), tr(phi_a)) + q_a
+        big_b = ((matmul(matmul(phi_b, pb), tr(phi_b)) + q_b)
                  * (sg[:, None] * sg[None, :]))
-        a = phi_a @ ma
-        b = (phi_b @ mb) * sg[:, None]
-        g_inv, _ = inv_logdet_fast(big_a + big_b - big_a @ big_b)
-        mean = (big_b @ (g_inv @ a)
-                + big_a @ (mx.swapaxes(g_inv, -1, -2) @ b))
+        a = matmul(phi_a, ma)
+        b = matmul(phi_b, mb) * sg[:, None]
+        g_inv, _ = inv_logdet_fast(big_a + big_b - matmul(big_a, big_b))
+        mean = (matmul(big_b, matmul(g_inv, a))
+                + matmul(big_a, matmul(tr(g_inv), b)))
         return mx.sum(h[:, None, :, None] * mean, axis=-2)
 
     def _masked_metal_noise(self, lay, jit2):

@@ -256,11 +256,26 @@ Gradient accuracy, float32 against float64 central differences:
   1.4e-5), where the MLX path's masked gradient is 1.5e-6, 1.5e-4 and
   1.7e-3.
 
-Cost: owed, on a quiet GPU.  Two full passes over S (forward and
-reversed: boundary and replay each) plus O(held-out points) of MLX glue,
-so about 2x the unmasked kernel's value is expected, and on the
-gradient two backward sweeps plus the r-sensitivity passes.  Nothing is
-measured yet.
+Cost, measured on a quiet machine (2026-11-06; benchmarks.md has the
+table): at N = 2818 with 14% held out, 1.8-2.9x the unmasked kernel's
+value and 2.3-4.1x value + gradient from 128 to 1024 chains; with the
+requester's noise model and baseline at 128 chains, 1.8x and 2.3x.  The
+first measurement was 10-90x: the window step in MLX ops spent 10.7 ms
+per batched 2 x 2 product.  Unrolled (`linalg.matmul`, also now in
+`inv_logdet_fast`'s VJP) and then fused into one kernel each way
+(`metal.held_out_mean`, its VJP in closed form) it costs 0.4 ms of value
+and 0.7 of gradient.  What is left above the two scans' 2.3x is the term
+algebra at the window's distinct lags (1.3 ms value, 3.3 gradient at
+1024 chains); walking each window inside the kernel with the cadence's
+propagator would remove it, at the price of a hand-written reverse walk
+-- not done.
+
+### Status
+
+Phase 2 done; Phase 3's docs done (the tutorial's "Holding a feature out
+of the GP", with the warm start from an unmasked fit; benchmarks.md; the
+README).  The reply to the requester is drafted
+(docs/masked-gp-reply.md) and needs sign-off before it is sent.
 
 ### 3. Docs and reply
 

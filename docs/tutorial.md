@@ -405,6 +405,74 @@ filter and smoother over data and prediction points together, vectorised
 over draws: 0.7 s for these 384 draws, and for a single draw about 0.2 s
 at N = 1e4 and 2 s at N = 1e5. Thin the chain first. A parallel version is on the open list in the README.
 
+### Holding a feature out of the GP
+
+When the measurement is the *shape* of a short feature -- a transit's
+ingress and egress, a spot crossing, a flare -- a flexible GP fitted to
+all the data is free to absorb part of it as noise. `held_out` keeps
+those points out of the GP's conditioning:
+
+```python
+gt = make_target(ag.SHOTerm(), t, y, yerr, held_out=[(18.0, 20.0)])
+gt.names   # ['log_gp_sigma', 'log_gp_rho', 'log_gp_Q', 'log_jitter']: as before
+```
+
+The GP is conditioned on the rest, S, and applied to the held-out points,
+M, through its conditional mean given S; M is scored with its white noise
+alone:
+
+    log L = log N(r_S; 0, K_SS + W_S) + log N(r_M - E[f_M | r_S]; 0, W_M)
+
+That is a proper Gaussian likelihood -- the joint covariance whose Schur
+complement on M is `W_M` -- so the marginalised baseline, `gram`,
+`linear_posterior` and `predict` work with it unchanged; `predict`
+conditions on S only, so at a held-out time it gives `E[f_M | r_S]`.
+`held_out` takes a boolean mask of length N or a list of `(t_lo, t_hi)`
+windows. It is data, fixed when the target is built, and the parameter
+vector is the same as without it. (Adding the conditional variance to the
+M term instead would give back the unmasked likelihood exactly, which is
+why M is scored white.)
+
+What it does not model is correlated noise *inside* a window. Deep inside
+one much longer than the kernel's timescale `E[f | r_S]` falls back to
+zero, and the points there are scored as white noise about the mean
+model, which can overstate a feature's significance unless the noise on
+those timescales is independently shown to be white. To sample extra
+white noise on the held-out points, label them as their own instrument
+and give it a jitter.
+
+It runs on the fused kernel, value and gradient, a marginalised baseline
+included: S is scanned forward and time-reversed, and the two are joined
+at each held-out point. In float32 that is more accurate than the MLX
+path. At N = 2818 with 14% held out in two windows, an error-scale noise
+model and a quadratic baseline, a value costs 1.8x the unmasked
+likelihood at 128 chains (2.3x at 1024) and value + gradient 2.3x (3.1x)
+([benchmarks.md](benchmarks.md#what-the-general-features-cost)). A
+convolved term (`TermConvolution`) runs on the MLX path.
+
+**Starting from an unmasked fit.** The parameters are the same, so an
+unmasked run's last positions are a start for the masked one; there is
+no need to run `anvil.optimize` again:
+
+```python
+plain = make_target(ag.SHOTerm(), t, y, yerr)
+res0 = anvil.run(EnsembleKernel(plain.target, seed=2), plain.target,
+                 plain.u0(256, seed=1), n_warmup=1000, n_samples=300,
+                 seed=3, progress=False)
+v_last = plain.transform.model_np(
+    np.asarray(res0.get_chain()[-1], dtype=np.float64))
+u_start = mx.array(gt.transform.from_model_np(v_last),   # via model space;
+                   dtype=mx.float32)                     # anvil wants mx
+res = anvil.run(EnsembleKernel(gt.target, seed=2), gt.target, u_start,
+                n_warmup=500, n_samples=300, seed=4, progress=False)
+```
+
+Going through model space keeps this right even if the two targets'
+transforms differ (`seed_period`, for one, reads only the kept points).
+The posterior moves once the feature stops being absorbed, so keep a
+warm-up and check convergence as usual: the start saves the search, not
+the burn-in.
+
 ### The primitives underneath
 
 The quadratic form `Y^T K^-1 Y` and the solve `K^-1 Y`, for any columns

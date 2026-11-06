@@ -224,9 +224,14 @@ def inv_logdet_fast(x: mx.array) -> tuple[mx.array, mx.array]:
 
     @f.vjp
     def f_vjp(primals, cotangents, outputs):
+        # `matmul`, not ``@``: for a batch of tiny matrices MLX's batched
+        # matmul was 21 ms of this VJP at 1024 x 398 2 x 2 matrices (the
+        # held-out window step), 1.6 ms unrolled; above `UNROLL_MAX_WORK`
+        # it is ``mx.matmul`` again.
         xit = mx.swapaxes(outputs[0], -1, -2)
         g_inv, g_ld = cotangents
-        return (g_ld[..., None, None] * xit - xit @ g_inv @ xit,)
+        return (g_ld[..., None, None] * xit
+                - matmul(matmul(xit, g_inv), xit),)
 
     inv, ld = f(x)
     return inv, ld

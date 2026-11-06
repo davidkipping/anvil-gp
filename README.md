@@ -56,6 +56,7 @@ parameter is an offset from, proper default priors, and a jitter — see
 | [docs/anvil-joint-target-note.md](docs/anvil-joint-target-note.md) | Note to anvil proposing a joint target over several log-densities with shared parameters, composed in model space; one API request (expose `model_log_prob` / `model_log_prob_hi`) |
 | [docs/general-features-plan.md](docs/general-features-plan.md) | The general-features plan, landed: noise models, joint-target members, `gram` / `apply_inverse` and marginalised linear parameters, `predict` -- design, measurements and what is parked |
 | [docs/wasp103-reply.md](docs/wasp103-reply.md) | Our reply to the WASP-103b CHEOPS brief that prompted it: what was declined (multi-input kernels) and why, and what shipped |
+| [docs/masked-gp-plan.md](docs/masked-gp-plan.md) | Held-out ("masked") GP conditioning, landed: the construction, the kernel path (forward and time-reversed scans, exit-state seeds), accuracy and cost |
 
 **The one-line summary of the comparison:** celerite2 is faster for a
 single likelihood and seven orders more accurate in absolute terms;
@@ -78,8 +79,8 @@ much and why.
 
 ## Beyond the plain likelihood
 
-All general and all `O(N)`; the first two and `gram` run on the fused
-kernel, gradient included. The tutorial has a runnable example of each
+All general and all `O(N)`; the first two, `gram` and held-out points
+run on the fused kernel, gradient included. The tutorial has a runnable example of each
 ([docs/tutorial.md](docs/tutorial.md#beyond-the-plain-likelihood)).
 
 * **Noise models.** `make_target(noise=noise.scale_and_jitter(yerr))`, or
@@ -110,6 +111,15 @@ kernel, gradient included. The tutorial has a runnable example of each
 * **Several datasets.** `anvil.joint(members, shared)` (anvil >= 0.12.0)
   composes anvil-gp targets, and any other anvil log-density, with some
   parameters in common; `anvilgp.anvil.joint_u0` starts it.
+* **Held-out points.** `make_target(..., held_out=[(t_lo, t_hi), ...])`
+  (or a boolean mask) conditions the GP on the rest and scores the
+  held-out points with their white noise about its conditional mean, so a
+  short feature whose shape is the measurement cannot be absorbed as
+  noise. A proper Gaussian likelihood with the same parameter vector;
+  correlated noise inside the windows is not modelled. On the kernel,
+  gradient included: at N = 2818 with 14% held out, 1.8-2.9x the
+  unmasked value and 2.3-4.1x value + gradient from 128 to 1024 chains
+  ([docs/benchmarks.md](docs/benchmarks.md#what-the-general-features-cost)).
 
 **Not supported, deliberately:** kernels of more than one input. They have
 no `O(N)` form, and this library ships only kernels it can evaluate in
