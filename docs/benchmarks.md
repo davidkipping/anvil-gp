@@ -365,33 +365,40 @@ m = 6 tripped the GPU watchdog. Reproduce with
 10, give the 256-chain columns).
 
 **Held-out points** (`held_out`) scan the kept points twice on the
-kernel, forward and time-reversed, then join the two at each held-out
-point in one more kernel (forward and backward; docs/masked-gp-plan.md).
-At N = 2818 one-minute points with 398 (14%) held out in two windows,
-Matern-3/2, against the unmasked likelihood on the kernel (quiet machine,
-2026-11-06; probe 73.0 and 73.7 ms):
+kernel, forward and time-reversed (the backward needing only its
+boundary pass, no replay, unless a window leads the data), then join the
+two at the held-out points by walking each window from its edges with
+the cadence's propagator, restarting from the edge every 16 points to
+keep its float32 rounding from compounding (docs/masked-gp-plan.md). At
+N = 2818 one-minute points with 398 (14%) held out in two windows,
+Matern-3/2, against the unmasked likelihood on the kernel (quiet
+machine, 2026-11-07; probe 73.3 and 74.1 ms):
 
 | | 128 chains: value | value + gradient | 1024 chains: value | value + gradient |
 |---|---:|---:|---:|---:|
-| jitter only | 1.95 ms (2.1x) | 4.57 ms (2.4x) | 4.27 ms (2.9x) | 12.1 ms (4.1x) |
-| error scale + quadratic baseline | 3.00 ms (1.8x) | 6.85 ms (2.3x) | 8.22 ms (2.3x) | 19.7 ms (3.1x) |
+| jitter only | 1.72 ms (1.8x) | 4.15 ms (2.2x) | 3.16 ms (2.2x) | 7.31 ms (2.5x) |
+| error scale + quadratic baseline | 2.62 ms (1.7x) | 6.08 ms (2.0x) | 7.21 ms (2.0x) | 13.9 ms (2.0x) |
 
-The unmasked figures they are against: 0.95, 1.93, 1.46 and 2.94 ms
-plain; 1.68, 3.00, 3.53 and 6.45 ms with the noise model and baseline.
-Two or four windows over the same points cost the same; one window
-holding all 398 costs a little more where the propagators matter (5.1x
-against 4.1x at 1024 chains, plain, value + gradient), because its
-points reach farther from the edges and there are twice as many distinct
-lags to evaluate. The number of windows itself only adds blocks.
-Where it goes, at 1024 chains, plain: the two scans 3.5 ms of value and
-6.9 of value + gradient (2.3x the unmasked scan, as two passes should
-be); the propagators to the window edges at the 199 distinct lags there,
-1.3 and 3.3 ms; the joining kernel 0.4 and 0.7 ms. On the MLX path the
-same masked fit took 40 ms and 183 ms at 128 chains, and with the
-baseline at 1024 chains 25 s for value + gradient. The first kernel
-version, with the joining step in MLX ops, was 10-90x the unmasked
-likelihood: MLX's batched matmul on (chains x points) 2 x 2 matrices cost
-10.7 ms a product. Reproduce with `benchmarks/masked_cost.py`.
+The unmasked figures they are against: 0.94, 1.93, 1.46 and 2.95 ms
+plain; 1.57, 3.01, 3.57 and 6.88 ms with the noise model and baseline.
+At 128 chains the unmasked times are near 1 ms, mostly launch latency,
+and the ratios move by about 0.2 between runs. Four windows over the
+same points cost about what two do; one window holding all 398 costs a
+little more at small chain counts (2.2x against 1.8x at 128 chains,
+plain value), because the walk is one thread per chain and window.
+
+Most of what is left is the two scans: with the joining step stubbed
+out, the masked likelihood is 1.8x the unmasked value and 1.9x value +
+gradient at 1024 chains. The first kernel version, measured
+2026-11-06, was 10-90x the unmasked likelihood: the joining step was
+MLX ops, and MLX's batched matmul on (chains x points) 2 x 2 matrices
+cost 10.7 ms a product. A per-point kernel brought it to 2.9x / 4.1x at
+1024 chains (plain); the rest was the MLX gathers around that kernel,
+their scatter-add backward, and the term algebra at the 199 distinct
+lags from a point to its edges, which the walk removes. On the MLX path
+the same masked fit took 40 ms and 183 ms at 128 chains, and with the
+baseline at 1024 chains 25 s for value + gradient. Reproduce with
+`benchmarks/masked_cost.py`.
 
 **Prediction** (`predict`) is float64 on the CPU, off the likelihood
 path: a Kalman filter and smoother over data and prediction points

@@ -2861,13 +2861,20 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
 
 
 
-def _masked_side(p_t, q_t, hv, cols, j2, sd, s_floor_rel, formal, boundary):
+def _masked_side(p_t, q_t, hv, cols, j2, sd, s_floor_rel, formal, boundary,
+                 lq=None):
     """One direction of the held-out scan (`scan_masked`): entry states
     over blocks placed by ``sd["starts"]``, then the replay with exits.
     ``cols`` is one residual ``(npts, n_chains)``, or a column layout
     (`_col_layout`) for the multi-column replay.  Returns ``(out, xm, xC,
     ent_m, ent_C, aux, use_sqrt)`` with ``out`` the replay's own outputs
-    (``ell``, or ``(ld, gram)``)."""
+    (``ell``, or ``(ld, gram)``).
+
+    With ``sd["entry_exits"]`` (the backward direction, whose value is not
+    used, when no window needs its last block's exit) there is no replay:
+    a block's exit state is the next block's entry state, which the
+    boundary already gives (``out`` is None and the last exit is zero).
+    ``lq`` is `q_factor` of the table, shared by both directions."""
     n, m = p_t.shape[0], p_t.shape[-1]
     starts = sd["starts"]
     nb = int(starts.shape[0]) - 1
@@ -2889,14 +2896,19 @@ def _masked_side(p_t, q_t, hv, cols, j2, sd, s_floor_rel, formal, boundary):
         zero = mx.zeros((npts, n), dtype=mx.float32)
         _, ent_C, aux = _boundary_states(p_t, q_t, *args, hv, zero,
                                          sd["r_ref"], j2, s_floor_rel, 0,
-                                         formal, use_sqrt, starts)
+                                         formal, use_sqrt, starts, lq)
         ent_m = column_entry_means(p_t, q_t, *args, hv, cols, sd["r_ref"],
                                    j2, ent_C, 0, formal, starts=starts)
     else:
         ent_m, ent_C, aux = _boundary_states(p_t, q_t, *args, hv, cols,
                                              sd["r_ref"], j2, s_floor_rel, 0,
-                                             formal, use_sqrt, starts)
+                                             formal, use_sqrt, starts, lq)
     ent_m, ent_C = mx.contiguous(ent_m), mx.contiguous(ent_C)
+    if sd.get("entry_exits"):
+        def shift(x):
+            return mx.concatenate([x[:, 1:], mx.zeros_like(x[:, :1])], axis=1)
+        return (None, shift(ent_m), shift(ent_C), ent_m, ent_C, tuple(aux),
+                use_sqrt)
     if multi:
         ld, g, xm, xC = replay_blocks_mc(p_t, q_t, *args, hv, cols,
                                          sd["r_ref"], j2, ent_m, ent_C, 0,
@@ -2984,12 +2996,13 @@ def scan_masked(phi_tab, q_tab, hvec, resid_f, resid_b, jit_f, jit_b, fwd,
     @mx.custom_function
     def core(p_t, q_t, hv, rf, rb, jf, jb):
         rf, rb = mx.contiguous(rf), mx.contiguous(rb)
+        lq = q_factor(q_t) if boundary == "sqrt" else None
         ell, xm_f, xc_f, em_f, ec_f, aux_f, _ = _masked_side(
-            p_t, q_t, hv, rf, jf, fwd, s_floor_rel, formal, boundary)
+            p_t, q_t, hv, rf, jf, fwd, s_floor_rel, formal, boundary, lq)
         # The backward's value is not used, so its boundary blocks (the
         # seeds of a value cotangent) are not needed: not passed out.
         _, xm_b, xc_b, em_b, ec_b, _, _ = _masked_side(
-            p_t, q_t, hv, rb, jb, bwd, s_floor_rel, formal, boundary)
+            p_t, q_t, hv, rb, jb, bwd, s_floor_rel, formal, boundary, lq)
         return (mx.sum(ell, axis=1), xm_f, xc_f, xm_b, xc_b,
                 em_f, ec_f, em_b, ec_b, *aux_f)
 
@@ -3033,12 +3046,13 @@ def scan_masked_mc(phi_tab, q_tab, hvec, cols_f, cols_b, jit_f, jit_b, fwd,
 
     @mx.custom_function
     def core(p_t, q_t, hv, caf, cbf, cab, cbb, jf, jb):
+        lq = q_factor(q_t) if boundary == "sqrt" else None
         (ld, g), xm_f, xc_f, em_f, ec_f, aux_f, _ = _masked_side(
             p_t, q_t, hv, split(caf, cbf), jf, fwd, s_floor_rel, formal,
-            boundary)
+            boundary, lq)
         _, xm_b, xc_b, em_b, ec_b, _, _ = _masked_side(
             p_t, q_t, hv, split(cab, cbb), jb, bwd, s_floor_rel, formal,
-            boundary)
+            boundary, lq)
         ld, g = mx.sum(ld, axis=1), mx.sum(g, axis=1)
         n = g.shape[0]
         full = mx.zeros((n, k * k), dtype=g.dtype)
@@ -3223,287 +3237,604 @@ _SRC_SMALL_INV = """
     out_ld[gid] = logdet;
 """
 
-#: The held-out window step (`GPLogLike._held_out_mean`), one thread per
-#: (chain, held-out point): from the window's edge states, predicted to the
-#: point -- ``A = Phi_a P_a Phi_a^T + Q_a``, ``a = Phi_a m_a`` from the left,
-#: ``B = S (Phi_b P_b Phi_b^T + Q_b) S``, ``b = S Phi_b m_b`` from the
-#: right (`Term.reversal_signs`) -- the smoothed mean ``B G^-1 a + A G^-T
-#: b``, ``G = A + B - A B``, and its ``h``, for ``KCOL`` columns sharing
-#: the covariances.  In MLX this step was ~10 launches over (chains x
-#: points) arrays and its backward ~40; here it is one each.
-_WINDOW_HEAD = """
+#: The held-out window step as a walk: one thread per (chain, window).
+#: The thread reads its window's two edge states straight from the
+#: scans' block exits and walks the window's points with the lag table's
+#: propagators -- ``A <- Phi A Phi^T + Q``, ``a <- Phi a`` rightward from
+#: the left edge, the same leftward from the right edge in the reversed
+#: state -- and fusing them at each point (`GPLogLike._held_out_mean`).  The walk is the
+#: filter's own prediction step, and its lags are the data's cadence, so
+#: no propagator is evaluated at a per-point lag and nothing is gathered
+#: or scattered per point (both were most of the step's cost in MLX).
+#: The step is three kernels: the forward (one thread per chain and
+#: window: the walks, storing every point's left and right states, fusing
+#: on the way), and in the VJP the fusion's backward (one thread per chain
+#: and point) and the walks reversed (per window).  The walks are cheap
+#: and sequential; the fusion's backward is the arithmetic, so it runs
+#: wide.  Buffers
+#: are packed -- a kernel has at most 31 -- and named back here: ``dims``
+#: the sizes, ``idx`` the window starts, edge blocks and each point's two
+#: step rows, ``st`` the points' states (left ``A``, ``a``; right ``B``,
+#: ``b`` in reversed coordinates), ``lc`` their cotangents.
+_WALK_PRO = """
+    int n_win = dims[0], n_chains = dims[1], n_m = dims[2];
+    int nb_f = dims[3], nb_b = dims[4], n_lags = dims[5];
+    auto win_start = idx;
+    auto edge_l = idx + (n_win + 1);
+    auto edge_r = edge_l + n_win;
+    auto lagf = edge_r + n_win;
+    auto lagb = lagf + n_m;
+    uint MSZ = (uint)n_chains * (uint)n_m * MDIM * MDIM;
+    uint VSZ = (uint)n_chains * (uint)n_m * KCOL * MDIM;
+    auto sA = st;
+    auto sa = st + MSZ;
+    auto sB = sa + VSZ;
+    auto sb = sB + MSZ;
+"""
+_WALK_PRO_REV = _WALK_PRO + """
+    int n_slots = dims[6];
+    auto slot_id = slots;
+    auto slot_start = slots + 2 * n_m;
+    auto d_lA = lc;
+    auto d_la = lc + MSZ;
+    auto d_lB = d_la + VSZ;
+    auto d_lb = d_lB + MSZ;
+    device float* d_em_l = d_edge_m;
+    device float* d_em_r = d_edge_m + (uint)n_chains * (uint)n_win * KCOL * MDIM;
+    device float* d_ec_l = d_edge_c;
+    device float* d_ec_r = d_edge_c + (uint)n_chains * (uint)n_win * MDIM * MDIM;
+"""
+#: The per-point kernels' head: ``chain`` and point ``p``.
+_POINT_HEAD = """
+    int n_chains = dims[1], n_m = dims[2];
+    uint MSZ = (uint)n_chains * (uint)n_m * MDIM * MDIM;
+    uint VSZ = (uint)n_chains * (uint)n_m * KCOL * MDIM;
+    auto sA = st;
+    auto sa = st + MSZ;
+    auto sB = sa + VSZ;
+    auto sb = sB + MSZ;
     uint gid = thread_position_in_grid.x;
-    if (gid >= (uint)n_pts) return;
+    if (gid >= (uint)n_chains * (uint)n_m) return;
     uint chain = gid / (uint)n_m;
+    uint p = gid % (uint)n_m;
     const uint M = MDIM;
-    uint om = gid * M * M;
-    float FA[MDIM][MDIM], FB[MDIM][MDIM], AA[MDIM][MDIM], BB[MDIM][MDIM];
-    float T1[MDIM][MDIM], GA[MDIM][MDIM], GI[MDIM][MDIM], hv[MDIM], sg[MDIM];
+    float hv[MDIM], sg[MDIM];
+    for (uint i = 0; i < M; ++i) { hv[i] = hvec[chain * M + i]; sg[i] = sgn[i]; }
+    float BYs[MDIM][MDIM], bys[KCOL][MDIM];
+    {
+        uint ob = chain * (uint)n_m + p;
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) bys[c][i] = sb[(ob * KCOL + c) * M + i];
+            for (uint j = 0; j < M; ++j) BYs[i][j] = sB[(ob * M + i) * M + j];
+        }
+    }
+"""
+
+_WALK_HEAD = """
+    uint gid = thread_position_in_grid.x;
+    if (gid >= (uint)n_win * (uint)n_chains) return;
+    uint chain = gid % (uint)n_chains;
+    uint w = gid / (uint)n_chains;
+    const uint M = MDIM;
+    uint p0 = (uint)win_start[w], p1 = (uint)win_start[w + 1];
+    int el = edge_l[w], er = edge_r[w];
+    float hv[MDIM], sg[MDIM];
+    for (uint i = 0; i < M; ++i) { hv[i] = hvec[chain * M + i]; sg[i] = sgn[i]; }
+    float A[MDIM][MDIM], a[KCOL][MDIM], F[MDIM][MDIM], Q[MDIM][MDIM];
+    float T1[MDIM][MDIM], EA[MDIM][MDIM], Ea[KCOL][MDIM];
+"""
+
+#: A step row with this bit set is an anchor: the step starts from the
+#: window's edge state, not the previous point's (`_WALK_ANCHOR_LOAD`).
+WALK_ANCHOR_BIT = 1 << 30
+
+#: Keep the edge state in ``EA``, ``Ea`` (after `_WALK_EDGE`).
+_WALK_EDGE_KEEP = """
     for (uint i = 0; i < M; ++i) {
-        hv[i] = hvec[chain * M + i];
-        sg[i] = sgn[i];
-        for (uint j = 0; j < M; ++j) {
-            FA[i][j] = phia[om + i * M + j];
-            FB[i][j] = phib[om + i * M + j];
-        }
-    }
-    for (uint i = 0; i < M; ++i)
-        for (uint j = 0; j < M; ++j) {
-            float s = 0.0f;
-            for (uint t = 0; t < M; ++t) s += FA[i][t] * pa[om + t * M + j];
-            T1[i][j] = s;
-        }
-    for (uint i = 0; i < M; ++i)
-        for (uint j = 0; j < M; ++j) {
-            float s = qa[om + i * M + j];
-            for (uint t = 0; t < M; ++t) s += T1[i][t] * FA[j][t];
-            AA[i][j] = s;
-        }
-    for (uint i = 0; i < M; ++i)
-        for (uint j = 0; j < M; ++j) {
-            float s = 0.0f;
-            for (uint t = 0; t < M; ++t) s += FB[i][t] * pb[om + t * M + j];
-            T1[i][j] = s;
-        }
-    for (uint i = 0; i < M; ++i)
-        for (uint j = 0; j < M; ++j) {
-            float s = qb[om + i * M + j];
-            for (uint t = 0; t < M; ++t) s += T1[i][t] * FB[j][t];
-            BB[i][j] = s * sg[i] * sg[j];
-        }
-    for (uint i = 0; i < M; ++i)
-        for (uint j = 0; j < M; ++j) {
-            float s = AA[i][j] + BB[i][j];
-            for (uint t = 0; t < M; ++t) s -= AA[i][t] * BB[t][j];
-            GA[i][j] = s;
-            GI[i][j] = (i == j) ? 1.0f : 0.0f;
-        }
-    for (uint k = 0; k < M; ++k) {          // Gauss-Jordan, partial pivoting
-        uint best = k;
-        float bval = fabs(GA[k][k]);
-        for (uint r = k + 1; r < M; ++r)
-            if (fabs(GA[r][k]) > bval) { best = r; bval = fabs(GA[r][k]); }
-        if (best != k)
-            for (uint j = 0; j < M; ++j) {
-                float t = GA[k][j]; GA[k][j] = GA[best][j]; GA[best][j] = t;
-                t = GI[k][j]; GI[k][j] = GI[best][j]; GI[best][j] = t;
-            }
-        float inv = 1.0f / GA[k][k];
-        for (uint j = 0; j < M; ++j) { GA[k][j] *= inv; GI[k][j] *= inv; }
-        for (uint r = 0; r < M; ++r) {
-            if (r == k) continue;
-            float f = GA[r][k];
-            for (uint j = 0; j < M; ++j) {
-                GA[r][j] -= f * GA[k][j];
-                GI[r][j] -= f * GI[k][j];
-            }
-        }
-    }
-"""
+        for (uint c = 0; c < KCOL; ++c) Ea[c][i] = a[c][i];
+        for (uint j = 0; j < M; ++j) EA[i][j] = A[i][j];
+    }"""
 
-#: Column ``c``'s ``a``, ``b``, ``u = G^-1 a``, ``w = G^-T b`` and mean.
-_WINDOW_COL = """
-        float av[MDIM], bv[MDIM], uv[MDIM], wv[MDIM], mv[MDIM];
-        uint oc = (gid * KCOL + c) * M;
-        for (uint i = 0; i < M; ++i) {
-            float x = 0.0f, y = 0.0f;
-            for (uint t = 0; t < M; ++t) {
-                x += FA[i][t] * ma[oc + t];
-                y += FB[i][t] * mb[oc + t];
-            }
-            av[i] = x;
-            bv[i] = sg[i] * y;
-        }
-        for (uint i = 0; i < M; ++i) {
-            float x = 0.0f, y = 0.0f;
-            for (uint t = 0; t < M; ++t) {
-                x += GI[i][t] * av[t];
-                y += GI[t][i] * bv[t];
-            }
-            uv[i] = x;
-            wv[i] = y;
-        }
-        for (uint i = 0; i < M; ++i) {
-            float x = 0.0f;
-            for (uint t = 0; t < M; ++t) x += BB[i][t] * uv[t] + AA[i][t] * wv[t];
-            mv[i] = x;
-        }
-"""
+#: Step row ``LR`` -> ``li``; at an anchor, restart from the edge state.
+#: Anchors bound how far the walk compounds the propagator's float32
+#: rounding: for a slow process one cadence's ``Phi`` differs from ``I``
+#: only past its fourth digit, and walking 170 points compounded that
+#: error 170-fold (6.4e-3 log-units at sigma = 30 yerr, rho = 30 hr,
+#: against 1.8e-3 propagating every point directly); a direct propagator
+#: from the edge every 16 points gives 7.6e-4 (`GPLogLike._walk_anchor`).
+_WALK_ANCHOR_LOAD = """
+        int lr = LR;
+        bool anc = lr >= (int)ANCBIT;
+        int li = lr & ((int)ANCBIT - 1);
+        if (anc)
+            for (uint i = 0; i < M; ++i) {
+                for (uint c = 0; c < KCOL; ++c) a[c][i] = Ea[c][i];
+                for (uint j = 0; j < M; ++j) A[i][j] = EA[i][j];
+            }"""
 
-_SRC_WINDOW = _WINDOW_HEAD + """
-    for (uint c = 0; c < KCOL; ++c) {
-""" + _WINDOW_COL + """
-        float pr = 0.0f;
-        for (uint i = 0; i < M; ++i) pr += hv[i] * mv[i];
-        out_pred[gid * KCOL + c] = pr;
-    }
-"""
-
-#: Its VJP, in closed form.  With ``p = gbar h`` per column: ``Bbar += p
-#: u^T``, ``Abar += p w^T``, ``abar = G^-T B^T p``, ``bbar = G^-1 A^T p``,
-#: ``Gbar -= abar u^T + w bbar^T``; then ``G = A + B - AB`` gives ``Abar +=
-#: Gbar - Gbar B^T``, ``Bbar += Gbar - A^T Gbar``, and each side's ``X =
-#: Phi P Phi^T + Q`` gives ``Phibar = Xbar Phi P^T + Xbar^T Phi P``, ``Pbar =
-#: Phi^T Xbar Phi``, ``Qbar = Xbar`` (the right side through ``S``).
-_SRC_WINDOW_VJP = _WINDOW_HEAD + """
-    float Ab[MDIM][MDIM], Bb[MDIM][MDIM], Gb[MDIM][MDIM];
-    float FAb[MDIM][MDIM], FBb[MDIM][MDIM], hb[MDIM];
-    for (uint i = 0; i < M; ++i) {
-        hb[i] = 0.0f;
-        for (uint j = 0; j < M; ++j) {
-            Ab[i][j] = 0.0f; Bb[i][j] = 0.0f; Gb[i][j] = 0.0f;
-            FAb[i][j] = 0.0f; FBb[i][j] = 0.0f;
-        }
-    }
-    for (uint c = 0; c < KCOL; ++c) {
-""" + _WINDOW_COL + """
-        float gb = cot[gid * KCOL + c];
-        float pv[MDIM], ub[MDIM], wb[MDIM], ab[MDIM], bb[MDIM];
-        for (uint i = 0; i < M; ++i) { pv[i] = gb * hv[i]; hb[i] += gb * mv[i]; }
-        for (uint i = 0; i < M; ++i) {
-            float x = 0.0f, y = 0.0f;
-            for (uint t = 0; t < M; ++t) {
-                x += BB[t][i] * pv[t];
-                y += AA[t][i] * pv[t];
-            }
-            ub[i] = x;
-            wb[i] = y;
-        }
-        for (uint i = 0; i < M; ++i) {
-            float x = 0.0f, y = 0.0f;
-            for (uint t = 0; t < M; ++t) {
-                x += GI[t][i] * ub[t];
-                y += GI[i][t] * wb[t];
-            }
-            ab[i] = x;
-            bb[i] = y;
-        }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                Bb[i][j] += pv[i] * uv[j];
-                Ab[i][j] += pv[i] * wv[j];
-                Gb[i][j] -= ab[i] * uv[j] + wv[i] * bb[j];
-            }
-        // a = FA ma ;  b = S FB mb
-        for (uint i = 0; i < M; ++i) {
-            float x = 0.0f, y = 0.0f;
-            for (uint t = 0; t < M; ++t) {
-                x += FA[t][i] * ab[t];
-                y += FB[t][i] * sg[t] * bb[t];
-            }
-            d_ma[oc + i] = x;
-            d_mb[oc + i] = y;
-            for (uint j = 0; j < M; ++j) {
-                FAb[i][j] += ab[i] * ma[oc + j];
-                FBb[i][j] += sg[i] * bb[i] * mb[oc + j];
-            }
-        }
-    }
-    // G = A + B - A B
-    for (uint i = 0; i < M; ++i)
-        for (uint j = 0; j < M; ++j) {
-            float x = Gb[i][j], y = Gb[i][j];
-            for (uint t = 0; t < M; ++t) {
-                x -= Gb[i][t] * BB[j][t];
-                y -= AA[t][i] * Gb[t][j];
-            }
-            Ab[i][j] += x;
-            Bb[i][j] += y;
-        }
-    // each side: X = F P F^T + Q  (the right side's X is S B S)
-    for (uint side = 0; side < 2; ++side) {
-        float Xb[MDIM][MDIM], F[MDIM][MDIM], P[MDIM][MDIM], FP[MDIM][MDIM];
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                Xb[i][j] = side == 0 ? Ab[i][j] : Bb[i][j] * sg[i] * sg[j];
-                F[i][j] = side == 0 ? FA[i][j] : FB[i][j];
-                P[i][j] = side == 0 ? pa[om + i * M + j] : pb[om + i * M + j];
-            }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                float s = 0.0f;
-                for (uint t = 0; t < M; ++t) s += F[i][t] * P[t][j];
-                FP[i][j] = s;
-            }
-        for (uint i = 0; i < M; ++i)
-            for (uint j = 0; j < M; ++j) {
-                // Fbar = Xb F P^T + Xb^T F P
-                float f = side == 0 ? FAb[i][j] : FBb[i][j];
-                for (uint t = 0; t < M; ++t) {
-                    float fpt = 0.0f;
-                    for (uint r = 0; r < M; ++r) fpt += F[t][r] * P[j][r];
-                    f += Xb[i][t] * fpt + Xb[t][i] * FP[t][j];
+#: ``F``, ``Q`` from table row ``LI``.
+_WALK_TAB = """
+        {
+            uint tb = (chain * (uint)n_lags + (uint)(LI)) * M * M;
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    F[i][j] = phitab[tb + i * M + j];
+                    Q[i][j] = qtab[tb + i * M + j];
                 }
-                // Pbar = F^T Xb F
-                float pbv = 0.0f;
-                for (uint t = 0; t < M; ++t)
-                    for (uint r = 0; r < M; ++r) pbv += F[t][i] * Xb[t][r] * F[r][j];
-                uint o = om + i * M + j;
-                if (side == 0) { d_phia[o] = f; d_pa[o] = pbv; d_qa[o] = Xb[i][j]; }
-                else { d_phib[o] = f; d_pb[o] = pbv; d_qb[o] = Xb[i][j]; }
+        }"""
+
+#: Edge state into ``A``, ``a`` from block ``E`` of exits ``XM``, ``XC``
+#: (``NB`` blocks), or the stationary prior when ``E < 0``.
+_WALK_EDGE = """
+    if (E >= 0) {
+        uint eb = chain * (uint)NB + (uint)E;
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) a[c][i] = XM[(eb * KCOL + c) * M + i];
+            for (uint j = 0; j < M; ++j) A[i][j] = XC[(eb * M + i) * M + j];
+        }
+    } else {
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) a[c][i] = 0.0f;
+            for (uint j = 0; j < M; ++j) A[i][j] = (i == j) ? 1.0f : 0.0f;
+        }
+    }"""
+
+#: One prediction step of ``A``, ``a`` through ``F``, ``Q``.
+_WALK_STEP = """
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float x = 0.0f;
+                for (uint t = 0; t < M; ++t) x += F[i][t] * A[t][j];
+                T1[i][j] = x;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j <= i; ++j) {
+                float x = Q[i][j];
+                for (uint t = 0; t < M; ++t) x += T1[i][t] * F[j][t];
+                A[i][j] = x;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = i + 1; j < M; ++j) A[i][j] = A[j][i];
+        for (uint c = 0; c < KCOL; ++c) {
+            float na[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float x = 0.0f;
+                for (uint t = 0; t < M; ++t) x += F[i][t] * a[c][t];
+                na[i] = x;
+            }
+            for (uint i = 0; i < M; ++i) a[c][i] = na[i];
+        }"""
+
+#: Store ``A``, ``a`` as point ``P``'s, in ``SA``, ``SM``.
+_WALK_STORE = """
+        {
+            uint ob = chain * (uint)n_m + (uint)(P);
+            for (uint i = 0; i < M; ++i) {
+                for (uint c = 0; c < KCOL; ++c) SM[(ob * KCOL + c) * M + i] = a[c][i];
+                for (uint j = 0; j < M; ++j) SA[(ob * M + i) * M + j] = A[i][j];
+            }
+        }"""
+
+#: Load point ``P``'s left state into ``AA``, ``av`` and its right state,
+#: held in ``BY``, ``by`` (reversed coordinates), into ``BB``, ``bv`` (the
+#: data's), then form ``G^-1`` -> ``GI``.
+_WALK_FUSE_HEAD = """
+        float AA[MDIM][MDIM], BB[MDIM][MDIM], GA[MDIM][MDIM], GI[MDIM][MDIM];
+        float av[KCOL][MDIM], bv[KCOL][MDIM];
+        {
+            uint ob = chain * (uint)n_m + (uint)(P);
+            for (uint i = 0; i < M; ++i) {
+                for (uint c = 0; c < KCOL; ++c) {
+                    av[c][i] = sa[(ob * KCOL + c) * M + i];
+                    bv[c][i] = sg[i] * BYM[c][i];
+                }
+                for (uint j = 0; j < M; ++j) {
+                    AA[i][j] = sA[(ob * M + i) * M + j];
+                    BB[i][j] = BY[i][j] * sg[i] * sg[j];
+                }
+            }
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float x = AA[i][j] + BB[i][j];
+                for (uint t = 0; t < M; ++t) x -= AA[i][t] * BB[t][j];
+                GA[i][j] = x;
+                GI[i][j] = (i == j) ? 1.0f : 0.0f;
+            }
+        for (uint k = 0; k < M; ++k) {
+            uint best = k;
+            float bval = fabs(GA[k][k]);
+            for (uint r = k + 1; r < M; ++r)
+                if (fabs(GA[r][k]) > bval) { best = r; bval = fabs(GA[r][k]); }
+            if (best != k)
+                for (uint j = 0; j < M; ++j) {
+                    float t = GA[k][j]; GA[k][j] = GA[best][j]; GA[best][j] = t;
+                    t = GI[k][j]; GI[k][j] = GI[best][j]; GI[best][j] = t;
+                }
+            float inv = 1.0f / GA[k][k];
+            for (uint j = 0; j < M; ++j) { GA[k][j] *= inv; GI[k][j] *= inv; }
+            for (uint r = 0; r < M; ++r) {
+                if (r == k) continue;
+                float f = GA[r][k];
+                for (uint j = 0; j < M; ++j) {
+                    GA[r][j] -= f * GA[k][j];
+                    GI[r][j] -= f * GI[k][j];
+                }
+            }
+        }"""
+
+#: Column ``c``'s ``u = G^-1 a``, ``w = G^-T b`` and mean, at the point.
+_WALK_FUSE_COL = """
+            float uv[MDIM], wv[MDIM], mv[MDIM];
+            for (uint i = 0; i < M; ++i) {
+                float x = 0.0f, y = 0.0f;
+                for (uint t = 0; t < M; ++t) {
+                    x += GI[i][t] * av[c][t];
+                    y += GI[t][i] * bv[c][t];
+                }
+                uv[i] = x;
+                wv[i] = y;
+            }
+            for (uint i = 0; i < M; ++i) {
+                float x = 0.0f;
+                for (uint t = 0; t < M; ++t) x += BB[i][t] * uv[t] + AA[i][t] * wv[t];
+                mv[i] = x;
+            }"""
+
+_LEFT_WALK = (_WALK_EDGE.replace("E >= 0", "el >= 0").replace("(uint)E", "(uint)el")
+              .replace("NB", "nb_f").replace("XM", "xm_f").replace("XC", "xc_f")
+              + _WALK_EDGE_KEEP + """
+    for (uint p = p0; p < p1; ++p) {""" + _WALK_ANCHOR_LOAD.replace("LR", "lagf[p]")
+              + _WALK_TAB.replace("LI", "li") + _WALK_STEP
+              + _WALK_STORE.replace("P", "p").replace("SA", "sA").replace("SM", "sa")
+              + """
+    }""")
+
+#: The fusion's backward at one point (after `_WALK_FUSE_HEAD`).
+_FUSE_VJP_BODY = ("""        float Ab[MDIM][MDIM], Bb[MDIM][MDIM], Gb[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) { Ab[i][j] = 0.0f; Bb[i][j] = 0.0f; Gb[i][j] = 0.0f; }
+        uint ob = chain * (uint)n_m + p;
+        for (uint c = 0; c < KCOL; ++c) {""" + _WALK_FUSE_COL + """
+            float gb = cot[ob * KCOL + c];
+            float pv[MDIM], ub[MDIM], wb[MDIM], ab[MDIM], bb[MDIM];
+            for (uint i = 0; i < M; ++i) { pv[i] = gb * hv[i]; hb[i] += gb * mv[i]; }
+            for (uint i = 0; i < M; ++i) {
+                float x = 0.0f, y = 0.0f;
+                for (uint t = 0; t < M; ++t) {
+                    x += BB[t][i] * pv[t];
+                    y += AA[t][i] * pv[t];
+                }
+                ub[i] = x;
+                wb[i] = y;
+            }
+            for (uint i = 0; i < M; ++i) {
+                float x = 0.0f, y = 0.0f;
+                for (uint t = 0; t < M; ++t) {
+                    x += GI[t][i] * ub[t];
+                    y += GI[i][t] * wb[t];
+                }
+                ab[i] = x;
+                bb[i] = y;
+            }
+            for (uint i = 0; i < M; ++i) {
+                for (uint j = 0; j < M; ++j) {
+                    Bb[i][j] += pv[i] * uv[j];
+                    Ab[i][j] += pv[i] * wv[j];
+                    Gb[i][j] -= ab[i] * uv[j] + wv[i] * bb[j];
+                }
+                d_la[(ob * KCOL + c) * M + i] = ab[i];
+                d_lb[(ob * KCOL + c) * M + i] = sg[i] * bb[i];
+            }
+        }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float x = Gb[i][j], y = Gb[i][j];
+                for (uint t = 0; t < M; ++t) {
+                    x -= Gb[i][t] * BB[j][t];
+                    y -= AA[t][i] * Gb[t][j];
+                }
+                d_lA[(ob * M + i) * M + j] = Ab[i][j] + x;
+                d_lB[(ob * M + i) * M + j] = (Bb[i][j] + y) * sg[i] * sg[j];
+            }
+""")
+
+#: The walks reversed, one thread per (chain, window): each walk carries
+#: its adjoint back to its edge -- ``C <- F^T C F``, ``c <- F^T c`` --
+#: adding every step's ``Fbar = C F X^T + C^T F X + sum_c c x_c^T``,
+#: ``Qbar = C`` (``X``, ``x`` the state the step started from) into the
+#: thread's own slot for that lag, as the scans' backward does.
+_WALK_REV_BODY = ("""    // this thread's slots: block w (left walk) and n_win + w (right walk)
+    for (uint blk = 0; blk < 2; ++blk) {
+        uint bi = blk * (uint)n_win + w;
+        for (uint sl = (uint)slot_start[bi]; sl < (uint)slot_start[bi + 1]; ++sl)
+            for (uint i = 0; i < M * M; ++i) {
+                d_phi[(chain * (uint)n_slots + sl) * M * M + i] = 0.0f;
+                d_q[(chain * (uint)n_slots + sl) * M * M + i] = 0.0f;
             }
     }
-    for (uint i = 0; i < M; ++i) d_h[gid * M + i] = hb[i];
+
+    // the two reverse walks.  Each step's Fbar, Qbar are summed in
+    // registers while the lag's slot is unchanged (a window's steps are
+    // mostly one cadence) and flushed to the thread's slot when it changes.
+    for (uint side = 0; side < 2; ++side) {
+        float C[MDIM][MDIM], cv[KCOL][MDIM], accF[MDIM][MDIM], accQ[MDIM][MDIM];
+        uint cur = 0xFFFFFFFFu;
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) cv[c][i] = 0.0f;
+            for (uint j = 0; j < M; ++j) { C[i][j] = 0.0f; accF[i][j] = 0.0f; accQ[i][j] = 0.0f; }
+        }
+        float EC[MDIM][MDIM], Ecv[KCOL][MDIM];
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) Ecv[c][i] = 0.0f;
+            for (uint j = 0; j < M; ++j) EC[i][j] = 0.0f;
+        }
+        uint n_pts = p1 - p0;
+        for (uint s = 0; s < n_pts; ++s) {
+            // left walk reversed: p1-1 .. p0, from p-1 (or the left edge);
+            // right walk reversed: p0 .. p1-1, from p+1 (or the right edge)
+            uint p = side == 0 ? p1 - 1 - s : p0 + s;
+            uint ob = chain * (uint)n_m + p;
+            for (uint i = 0; i < M; ++i) {
+                for (uint c = 0; c < KCOL; ++c)
+                    cv[c][i] += side == 0 ? d_la[(ob * KCOL + c) * M + i]
+                                          : d_lb[(ob * KCOL + c) * M + i];
+                for (uint j = 0; j < M; ++j)
+                    C[i][j] += side == 0 ? d_lA[(ob * M + i) * M + j]
+                                         : d_lB[(ob * M + i) * M + j];
+            }
+            // the state this step started from: the edge's at an anchor
+            float X[MDIM][MDIM], xs[KCOL][MDIM];
+            int lr = side == 0 ? lagf[p] : lagb[p];
+            bool at_edge = lr >= (int)ANCBIT;
+            int li = lr & ((int)ANCBIT - 1);
+            int ed = side == 0 ? el : er;
+            if (!at_edge) {
+                uint oq = chain * (uint)n_m + (side == 0 ? p - 1 : p + 1);
+                for (uint i = 0; i < M; ++i) {
+                    for (uint c = 0; c < KCOL; ++c)
+                        xs[c][i] = side == 0 ? sa[(oq * KCOL + c) * M + i]
+                                             : sb[(oq * KCOL + c) * M + i];
+                    for (uint j = 0; j < M; ++j)
+                        X[i][j] = side == 0 ? sA[(oq * M + i) * M + j]
+                                            : sB[(oq * M + i) * M + j];
+                }
+            } else if (ed >= 0) {
+                uint nbs = side == 0 ? (uint)nb_f : (uint)nb_b;
+                uint eb = chain * nbs + (uint)ed;
+                for (uint i = 0; i < M; ++i) {
+                    for (uint c = 0; c < KCOL; ++c)
+                        xs[c][i] = side == 0 ? xm_f[(eb * KCOL + c) * M + i]
+                                             : xm_b[(eb * KCOL + c) * M + i];
+                    for (uint j = 0; j < M; ++j)
+                        X[i][j] = side == 0 ? xc_f[(eb * M + i) * M + j]
+                                            : xc_b[(eb * M + i) * M + j];
+                }
+            } else {
+                for (uint i = 0; i < M; ++i) {
+                    for (uint c = 0; c < KCOL; ++c) xs[c][i] = 0.0f;
+                    for (uint j = 0; j < M; ++j) X[i][j] = (i == j) ? 1.0f : 0.0f;
+                }
+            }
+""" + _WALK_TAB.replace("LI", "li") + """
+            // Fbar = C F X^T + C^T F X + sum_c c x^T ;  Qbar = C
+            float FX[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float x = 0.0f;
+                    for (uint t = 0; t < M; ++t) x += F[i][t] * X[t][j];
+                    FX[i][j] = x;
+                }
+            uint sl = (uint)slot_id[side * (uint)n_m + p];
+            if (sl != cur) {
+                if (cur != 0xFFFFFFFFu) {
+                    uint so = (chain * (uint)n_slots + cur) * M * M;
+                    for (uint i = 0; i < M; ++i)
+                        for (uint j = 0; j < M; ++j) {
+                            d_phi[so + i * M + j] += accF[i][j];
+                            d_q[so + i * M + j] += accQ[i][j];
+                            accF[i][j] = 0.0f;
+                            accQ[i][j] = 0.0f;
+                        }
+                }
+                cur = sl;
+            }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float f = 0.0f;
+                    for (uint t = 0; t < M; ++t)     // X is symmetric
+                        f += (C[i][t] + C[t][i]) * FX[t][j];
+                    for (uint c = 0; c < KCOL; ++c) f += cv[c][i] * xs[c][j];
+                    accF[i][j] += f;
+                    accQ[i][j] += C[i][j];
+                }
+            // C <- F^T C F ;  c <- F^T c
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float x = 0.0f;
+                    for (uint t = 0; t < M; ++t) x += C[i][t] * F[t][j];
+                    T1[i][j] = x;
+                }
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float x = 0.0f;
+                    for (uint t = 0; t < M; ++t) x += F[t][i] * T1[t][j];
+                    C[i][j] = x;
+                }
+            for (uint c = 0; c < KCOL; ++c) {
+                float nc[MDIM];
+                for (uint i = 0; i < M; ++i) {
+                    float x = 0.0f;
+                    for (uint t = 0; t < M; ++t) x += F[t][i] * cv[c][t];
+                    nc[i] = x;
+                }
+                for (uint i = 0; i < M; ++i) cv[c][i] = nc[i];
+            }
+            if (at_edge)               // the edge's; the walk restarts here
+                for (uint i = 0; i < M; ++i) {
+                    for (uint c = 0; c < KCOL; ++c) { Ecv[c][i] += cv[c][i]; cv[c][i] = 0.0f; }
+                    for (uint j = 0; j < M; ++j) { EC[i][j] += C[i][j]; C[i][j] = 0.0f; }
+                }
+        }
+        if (cur != 0xFFFFFFFFu) {
+            uint so = (chain * (uint)n_slots + cur) * M * M;
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    d_phi[so + i * M + j] += accF[i][j];
+                    d_q[so + i * M + j] += accQ[i][j];
+                }
+        }
+        // what reaches the edge
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) {
+                uint o = ((chain * (uint)n_win + w) * KCOL + c) * M + i;
+                if (side == 0) d_em_l[o] = Ecv[c][i]; else d_em_r[o] = Ecv[c][i];
+            }
+            for (uint j = 0; j < M; ++j) {
+                uint o = ((chain * (uint)n_win + w) * M + i) * M + j;
+                if (side == 0) d_ec_l[o] = EC[i][j]; else d_ec_r[o] = EC[i][j];
+            }
+        }
+    }
+""")
+
+#: The forward in one kernel: the walks, storing every point's states
+#: for the VJP, and the fusion at each point on the right walk's way.  One
+#: launch beats the split forward at small chain counts (128 chains:
+#: 1.69 against 1.98 ms for the whole masked value), where launches are
+#: most of the cost; the VJP's fusion runs per point (`_SRC_FUSE_VJP`).
+_SRC_WALK = _WALK_PRO + _WALK_HEAD + _LEFT_WALK + """
+    // right walk, storing its states and fusing at each point
+""" + (_WALK_EDGE.replace("E >= 0", "er >= 0").replace("(uint)E", "(uint)er")
+       .replace("NB", "nb_b").replace("XM", "xm_b").replace("XC", "xc_b")) + """
+""" + _WALK_EDGE_KEEP + """
+    for (int pp = (int)p1 - 1; pp >= (int)p0; --pp) {
+        uint p = (uint)pp;""" + _WALK_ANCHOR_LOAD.replace("LR", "lagb[p]") + (
+    _WALK_TAB.replace("LI", "li")) + _WALK_STEP + (
+    _WALK_STORE.replace("P", "p").replace("SA", "sB").replace("SM", "sb")) + (
+    _WALK_FUSE_HEAD.replace("(P)", "(p)").replace("BYM", "a").replace("BY", "A")) + """
+        for (uint c = 0; c < KCOL; ++c) {""" + _WALK_FUSE_COL + """
+            float pr = 0.0f;
+            for (uint i = 0; i < M; ++i) pr += hv[i] * mv[i];
+            out_pred[(chain * (uint)n_m + p) * KCOL + c] = pr;
+        }
+    }
 """
 
-_window_kernels: dict = {}
+#: The fusion's VJP at one point, in closed form (`_FUSE_VJP_BODY`): the
+#: cotangents of the point's two states (``d_lA``, ``d_la``; ``d_lB``,
+#: ``d_lb`` in reversed coordinates) and its share of ``h``'s.
+_SRC_FUSE_VJP = _POINT_HEAD + """
+    auto d_lA = lc;
+    auto d_la = lc + MSZ;
+    auto d_lB = d_la + VSZ;
+    auto d_lb = d_lB + MSZ;
+    float hb[MDIM];
+    for (uint i = 0; i < M; ++i) hb[i] = 0.0f;
+""" + (_WALK_FUSE_HEAD.replace("(P)", "(p)").replace("BYM", "bys")
+       .replace("BY", "BYs")) + _FUSE_VJP_BODY + """
+    for (uint i = 0; i < M; ++i) d_hp[gid * M + i] = hb[i];
+"""
 
-_WINDOW_INPUTS = ["ma", "pa", "mb", "pb", "phia", "qa", "phib", "qb", "hvec",
-                  "sgn", "n_pts", "n_m"]
+_SRC_WALK_REV = _WALK_PRO_REV + _WALK_HEAD + _WALK_REV_BODY + """
+"""
+
+_walk_kernels: dict = {}
+
+_WALK_KERNELS = {
+    "walk": (["xm_f", "xc_f", "xm_b", "xc_b", "phitab", "qtab", "hvec",
+              "sgn", "idx", "dims"], ["out_pred", "st"]),
+    "fuse_vjp": (["st", "hvec", "sgn", "cot", "dims"], ["lc", "d_hp"]),
+    "rev": (["xm_f", "xc_f", "xm_b", "xc_b", "phitab", "qtab", "hvec", "sgn",
+             "idx", "st", "lc", "slots", "dims"],
+            ["d_edge_m", "d_edge_c", "d_phi", "d_q"]),
+}
 
 
-def _window_kernel(m: int, k: int, vjp: bool):
-    key = (m, k, vjp)
-    if key not in _window_kernels:
-        src = _SRC_WINDOW_VJP if vjp else _SRC_WINDOW
-        _window_kernels[key] = mx.fast.metal_kernel(
-            name=f"anvilgp_window{'_vjp' if vjp else ''}_m{m}_k{k}",
-            input_names=_WINDOW_INPUTS[:10] + (["cot"] if vjp else [])
-                        + _WINDOW_INPUTS[10:],
-            output_names=(["d_ma", "d_pa", "d_mb", "d_pb", "d_phia", "d_qa",
-                           "d_phib", "d_qb", "d_h"] if vjp else ["out_pred"]),
-            source=src.replace("KCOL", str(k)).replace("MDIM", str(m)))
-    return _window_kernels[key]
+def _walk_kernel(m: int, k: int, which: str):
+    key = (m, k, which)
+    if key not in _walk_kernels:
+        ins, outs = _WALK_KERNELS[which]
+        src = {"walk": _SRC_WALK, "fuse_vjp": _SRC_FUSE_VJP,
+               "rev": _SRC_WALK_REV}[which]
+        _walk_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_walk_{which}_m{m}_k{k}", input_names=ins,
+            output_names=outs,
+            source=src.replace("KCOL", str(k)).replace("MDIM", str(m))
+                      .replace("ANCBIT", str(WALK_ANCHOR_BIT)))
+    return _walk_kernels[key]
 
 
-def held_out_mean(ma, pa, mb, pb, phi_a, q_a, phi_b, q_b, hvec, signs):
+def window_walk(xm_f, xc_f, xm_b, xc_b, phi_tab, q_tab, hvec, walk):
     """``(n_chains, n_m, k)``: ``h`` of the smoothed state at every held-out
-    point, from its window's edge states gathered per point -- means ``ma``,
-    ``mb`` ``(n_chains, n_m, k, m)``, covariances ``pa``, ``pb`` and the
-    point's propagators ``phi_*``, ``q_*`` ``(n_chains, n_m, m, m)``; the
-    right edge's in the time-reversed state, ``signs`` its sign flip.  One
-    thread per (chain, point), forward and VJP (`_SRC_WINDOW`,
-    `_SRC_WINDOW_VJP`); differentiable in everything but ``signs``."""
-    n, n_m, k, m = ma.shape
-    n_pts = n * n_m
-    sg = mx.array(np.asarray(signs, dtype=np.float32))
-    grid = dict(grid=(max(n_pts, 1), 1, 1),
-                threadgroup=(min(64, max(n_pts, 1)), 1, 1))
+    point, from the scans' block exits (``xm_*`` ``(n_chains, n_blocks, k,
+    m)``, ``xc_*`` ``(..., m, m)``; the backward's in reversed coordinates)
+    and the lag table (``phi_tab``, ``q_tab`` with row 0, as the scans read
+    it).  ``walk`` is the host-side layout (`GPLogLike._masked_metal_layout`):
+    ``idx`` packs the window starts, each window's edge blocks (-1 for the
+    stationary prior) and each point's table row for the step from the
+    previous point (or the left edge) and toward the next (or the right
+    edge); ``slots`` = ``(slot_id, slot_start, n_slots, fold_plan)`` for
+    the steps.  Three kernels (`_SRC_WALK`, and in the VJP `_SRC_FUSE_VJP`
+    and `_SRC_WALK_REV`); differentiable in the exits, the tables and
+    ``h``."""
+    n, nb_f, k, m = xm_f.shape
+    nb_b = xm_b.shape[1]
+    n_lags = phi_tab.shape[1]
+    n_win, n_m = int(walk["n_win"]), int(walk["n_m"])
+    slot_id, slot_start, n_slots, fold_plan = walk["slots"]
+    slots = walk["slots_packed"]
+    dims = mx.array([n_win, n, n_m, nb_f, nb_b, n_lags, n_slots],
+                    dtype=mx.int32)
+
+    def grid(n_thr):
+        return dict(grid=(max(n_thr, 1), 1, 1),
+                    threadgroup=(min(64, max(n_thr, 1)), 1, 1))
+    st_size = 2 * n * n_m * (m * m + k * m)
+    el_np, er_np = walk["edge_l_np"], walk["edge_r_np"]
+    wl, wr = np.flatnonzero(el_np >= 0), np.flatnonzero(er_np >= 0)
+    bl, br = mx.array(el_np[wl]), mx.array(er_np[wr])
+    wl, wr = mx.array(wl), mx.array(wr)
+    sg, idx = walk["signs"], walk["idx"]
 
     @mx.custom_function
-    def core(ma_, pa_, mb_, pb_, fa, qa, fb, qb, hv):
-        return _window_kernel(m, k, False)(
-            inputs=[ma_, pa_, mb_, pb_, fa, qa, fb, qb, hv, sg, int(n_pts),
-                    int(n_m)],
-            output_shapes=[(n, n_m, k)], output_dtypes=[mx.float32],
-            **grid)[0]
+    def core(xmf, xcf, xmb, xcb, pt, qt, hv):
+        pred, st = _walk_kernel(m, k, "walk")(
+            inputs=[xmf, xcf, xmb, xcb, pt, qt, hv, sg, idx, dims],
+            output_shapes=[(n, n_m, k), (st_size,)],
+            output_dtypes=[mx.float32] * 2, **grid(n_win * n))
+        # the states go out too, only so the VJP need not walk again
+        return pred, st
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
-        cot = (cotangents[0] if isinstance(cotangents, (list, tuple))
-               else cotangents)
-        vec, mat = (n, n_m, k, m), (n, n_m, m, m)
-        outs = _window_kernel(m, k, True)(
-            inputs=[*primals[:9], sg, mx.contiguous(cot.astype(mx.float32)),
-                    int(n_pts), int(n_m)],
-            output_shapes=[vec, mat, vec, mat, mat, mat, mat, mat,
-                           (n, n_m, m)],
-            output_dtypes=[mx.float32] * 9, **grid)
-        return (*outs[:8], mx.sum(outs[8], axis=1))
+        cot = cotangents[0]
+        st = outputs[1]
+        xmf, xcf, xmb, xcb, pt, qt, hv = primals
+        lc, d_hp = _walk_kernel(m, k, "fuse_vjp")(
+            inputs=[st, hv, sg, mx.contiguous(cot.astype(mx.float32)), dims],
+            output_shapes=[(st_size,), (n * n_m, m)],
+            output_dtypes=[mx.float32] * 2, **grid(n * n_m))
+        d_em, d_ec, d_phi, d_q = _walk_kernel(m, k, "rev")(
+            inputs=[xmf, xcf, xmb, xcb, pt, qt, hv, sg, idx, st, lc, slots,
+                    dims],
+            output_shapes=[(2, n, n_win, k, m), (2, n, n_win, m, m),
+                           (n, n_slots, m, m), (n, n_slots, m, m)],
+            output_dtypes=[mx.float32] * 4, **grid(n_win * n))
+        # each edge is one window's (distinct windows have distinct edge
+        # blocks), so these scatters never repeat an index
+        z = mx.zeros_like
+        d_xmf = z(xmf).at[:, bl].add(mx.take(d_em[0], wl, axis=1))
+        d_xcf = z(xcf).at[:, bl].add(mx.take(d_ec[0], wl, axis=1))
+        d_xmb = z(xmb).at[:, br].add(mx.take(d_em[1], wr, axis=1))
+        d_xcb = z(xcb).at[:, br].add(mx.take(d_ec[1], wr, axis=1))
+        d_pt, d_qt = _fold_slots(d_phi, d_q, fold_plan, n, n_lags, m)
+        d_hv = mx.sum(d_hp.reshape(n, n_m, m), axis=1)
+        return d_xmf, d_xcf, d_xmb, d_xcb, d_pt, d_qt, d_hv
 
     c = mx.contiguous
-    return core(c(ma), c(pa), c(mb), c(pb), c(phi_a), c(q_a), c(phi_b),
-                c(q_b), c(hvec))
+    return core(c(xm_f), c(xc_f), c(xm_b), c(xc_b), c(phi_tab), c(q_tab),
+                c(hvec))[0]
 
 
 _small_inv_kernels: dict = {}
@@ -4314,7 +4645,7 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
 
 
 def _boundary_states(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
-                     blk_len, formal, use_sqrt, starts=None):
+                     blk_len, formal, use_sqrt, starts=None, lq=None):
     """Entry states for `scan_loglike`'s ``boundary``, and what the seeds
     need: pass 1's elements (dense), or the square-root blocks and the
     start states they were centred on."""
@@ -4324,8 +4655,9 @@ def _boundary_states(p_t, q_t, lg, inst, hv, rs, rr, j2, s_floor_rel,
         ent_m, ent_C = entry_states(el, formal)
         return ent_m, ent_C, (el.A, el.b, el.C, el.eta, el.J)
     st_m, st_C = entry_states(el, formal)
-    blocks = sqrt_blocks(p_t, q_t, q_factor(q_t), lg, inst, hv, rs, rr,
-                         j2, st_m, st_C, blk_len, starts=starts)
+    blocks = sqrt_blocks(p_t, q_t, q_factor(q_t) if lq is None else lq, lg,
+                         inst, hv, rs, rr, j2, st_m, st_C, blk_len,
+                         starts=starts)
     ent_m, ent_C = sqrt_scan(blocks, st_m, st_C)
     return ent_m, ent_C, (*blocks, st_m, st_C)
 

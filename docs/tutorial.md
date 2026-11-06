@@ -445,10 +445,10 @@ It runs on the fused kernel, value and gradient, a marginalised baseline
 included: S is scanned forward and time-reversed, and the two are joined
 at each held-out point. In float32 that is more accurate than the MLX
 path. At N = 2818 with 14% held out in two windows, an error-scale noise
-model and a quadratic baseline, a value costs 1.8x the unmasked
-likelihood at 128 chains (2.3x at 1024) and value + gradient 2.3x (3.1x)
-([benchmarks.md](benchmarks.md#what-the-general-features-cost)). A
-convolved term (`TermConvolution`) runs on the MLX path.
+model and a quadratic baseline, a value costs 1.7x the unmasked
+likelihood at 128 chains (2.0x at 1024) and value + gradient 2.0x
+(2.0x) ([benchmarks.md](benchmarks.md#what-the-general-features-cost)).
+A convolved term (`TermConvolution`) runs on the MLX path.
 
 **Starting from an unmasked fit.** The parameters are the same, so an
 unmasked run's last positions are a start for the masked one; there is

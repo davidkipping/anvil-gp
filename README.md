@@ -117,8 +117,8 @@ run on the fused kernel, gradient included. The tutorial has a runnable example 
   short feature whose shape is the measurement cannot be absorbed as
   noise. A proper Gaussian likelihood with the same parameter vector;
   correlated noise inside the windows is not modelled. On the kernel,
-  gradient included: at N = 2818 with 14% held out, 1.8-2.9x the
-  unmasked value and 2.3-4.1x value + gradient from 128 to 1024 chains
+  gradient included: at N = 2818 with 14% held out, 1.7-2.2x the
+  unmasked value and 2.0-2.5x value + gradient from 128 to 1024 chains
   ([docs/benchmarks.md](docs/benchmarks.md#what-the-general-features-cost)).
 
 **Not supported, deliberately:** kernels of more than one input. They have

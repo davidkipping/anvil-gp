@@ -27,13 +27,15 @@ against the same likelihood unmasked on the kernel:
 
 | | 128 chains | 1024 chains |
 |---|---:|---:|
-| value | 3.00 ms (1.8x) | 8.22 ms (2.3x) |
-| value + gradient | 6.85 ms (2.3x) | 19.7 ms (3.1x) |
+| value | 2.62 ms (1.7x) | 7.21 ms (2.0x) |
+| value + gradient | 6.08 ms (2.0x) | 13.9 ms (2.0x) |
 
-The unmasked kernel takes 1.68, 3.00, 3.53 and 6.45 ms for the same
+The unmasked kernel takes 1.57, 3.01, 3.57 and 6.88 ms for the same
 four cells. The MLX fallback took 51 ms (value) and 342 ms (value +
-gradient) at 128 chains. For your ensemble runs, which need values only,
-that is inside the 1.5-2x you asked for. Gradients are at 2.3x. These
+gradient) at 128 chains. So masking now costs at most about twice the
+unmasked likelihood, value or gradient, within the 1.5-2x you asked for.
+(At 128 chains the unmasked times are near 1 ms, mostly launch latency,
+and these ratios move by about 0.2 between runs.) These
 are likelihood-only figures. Your step also evaluates the transit model,
 which costs the same masked or not, so the whole-step ratio you see
 should be lower.
@@ -41,11 +43,13 @@ should be lower.
 How it works, briefly: the kept points are scanned forward and
 time-reversed by the existing kernels (in every term's state, time
 reversal is a sign flip, so the same lag tables serve both directions).
-The two are joined at each held-out point by one further kernel. Your
+Each window is then walked from its two edges with the cadence's
+propagator, and the two sides are joined at each held-out point. Your
 §4 decomposition is answered by this as well. On the kernel, masking
-costs about two passes over the data. The number of windows makes
-little difference: two or four windows over the same points cost the
-same, and one long window a little more.
+costs about two passes over the data, and the joining adds little on
+top. The number of windows makes little difference: four windows over
+the same points cost about what two do, and one long window a little
+more at small chain counts.
 
 ## 2. Accuracy: please re-run your reference check
 
@@ -53,10 +57,10 @@ The kernel path is more accurate in float32 than the MLX path you
 validated. Against float64:
 
 - **Value, at your scale:** 8e-5 log-units with a GP comparable to the
-  noise. With slow systematics at 30x the noise it is 2.4e-3, against
+  noise. With slow systematics at 30x the noise it is 7.6e-4, against
   5e-2 on the MLX path.
 - **Gradient, at your scale:** as accurate as the unmasked kernel's,
-  8e-7 to 9e-6 relative.
+  1e-6 to 7e-6 relative.
 
 The float64 `hi` path is unchanged and still matches the dense covariance
 to ~1e-11. Your §2 comparison (`hi` within ~1e-6 of your celerite2

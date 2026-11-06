@@ -264,11 +264,11 @@ def test_float32_at_scale_tracks_the_unmasked_path(case, path):
     not one a sampler stays in.
 
     On the kernel (Phase 2): "white" 8.2e-5 against 1.0e-4 unmasked;
-    "slow" 2.4e-3 against 1.6e-4.  There the held-out term carries it:
+    "slow" 7.6e-4 against 1.6e-4.  There the held-out term carries it:
     every held-out residual comes from the same two window-edge states,
-    whose float32 error (3e-5 in a prediction of a GP 30 times the noise,
-    a few ulps) adds coherently over the 169 points.  Still 20x better
-    than the MLX path, so the kernel's bound is its own."""
+    whose float32 error (a few ulps of a GP 30 times the noise) adds
+    coherently over the 169 points.  Still 60x better than the MLX path,
+    so the kernel's bound is its own."""
     if path == "kernel" and not metal_available():
         pytest.skip("needs the fused kernel")
     sig, rho = {"white": (1.0, 1 / 24), "slow": (30.0, 30 / 24)}[case]
@@ -428,10 +428,12 @@ def test_the_kernel_gradient_with_jitter(n_jit, boundary):
 @pytest.mark.parametrize("basis", [False, True], ids=["one-column", "basis"])
 @pytest.mark.parametrize("name", list(_TERMS))
 def test_the_window_kernel_is_the_mlx_window_step(name, basis):
-    """`metal.held_out_mean` (one thread per chain and held-out point, its
-    VJP in closed form) against the same window step in MLX ops
-    (`GPLogLike._held_out_mean` with `_force_mlx_window`): measured equal
-    to float32 rounding in value, gradients 1e-7 to 1e-6 relative."""
+    """`metal.window_walk` (each window walked from its edges with the
+    cadence's propagator; its VJP the fusion's backward per point and the
+    walks reversed) against the window step in MLX ops, which evaluates
+    the propagators at each point's own lags (`GPLogLike._held_out_mean`
+    with `_force_mlx_window`): measured equal to float32 rounding in
+    value, gradients within 3e-6 of each other."""
     term, kp = _TERMS[name]
     t, y, yerr = _data(term, kp)
     mask = _layout("edges", t)
@@ -477,8 +479,8 @@ def test_the_full_model_on_the_kernel():
 @pytest.mark.parametrize("case", ["white", "slow", "big"])
 def test_the_kernel_gradient_at_scale(case):
     """The requester's scale (N = 2800, the transit plus ingress and egress
-    held out), against central differences of `hi`: measured 7.8e-7,
-    6.7e-6 and 8.9e-6 relative ("big": sigma = 300 yerr, rho = 10 hr),
+    held out), against central differences of `hi`: measured 9.6e-7,
+    7.4e-6 and 5.8e-6 relative ("big": sigma = 300 yerr, rho = 10 hr),
     against 8.5e-7, 5.4e-6 and 1.4e-5 unmasked on the kernel, and 1.5e-6,
     1.5e-4 and 1.7e-3 masked on the MLX path."""
     sig, rho = {"white": (1.0, 1 / 24), "slow": (30.0, 30 / 24),
@@ -505,7 +507,7 @@ def test_the_kernel_holds_a_large_gp_inside_the_window():
     window (sigma = 300 yerr, rho = 10 hr, the whole transit held out) --
     on the kernel, whose window fusion is in covariance form
     (`GPLogLike._held_out_mean`) rather than the MLX path's information
-    form.  Measured on these rows: 0.54 log-units against 88 on the MLX
+    form.  Measured on these rows: 0.49 log-units against 88 on the MLX
     path (and 9.5e-4 unmasked; the M term is -2e5 here)."""
     n, cad = 2800, 1 / 1440
     t = np.arange(n) * cad

@@ -238,11 +238,13 @@ Accuracy, float32 against float64 (dense-``Sigma`` verified):
   1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the MLX path).
 - The requester's scale (N = 2800, one-minute cadence, transit plus
   ingress and egress held out): sigma = yerr, 8.2e-5 against 1.0e-4
-  unmasked; sigma = 30 yerr, rho = 30 hr, 2.4e-3 against 1.6e-4 (the
+  unmasked; sigma = 30 yerr, rho = 30 hr, 7.6e-4 against 1.6e-4 (the
   held-out residuals all come from the same two edge states, so their
-  few-ulp float32 error adds coherently); 20x better than the MLX path's
-  5e-2.  The excluded regime (sigma = 300 yerr, rho = 10 hr): 0.54
-  against the MLX path's 88.
+  few-ulp float32 error adds coherently); 60x better than the MLX path's
+  5e-2.  The excluded regime (sigma = 300 yerr, rho = 10 hr): 0.49
+  against the MLX path's 88.  (These are the window walk's, with anchors
+  every 16 points; the per-point version before it measured 2.4e-3 and
+  0.54, the unanchored walk 6.4e-3 and 1.75.)
 
 Gradient accuracy, float32 against float64 central differences:
 
@@ -251,24 +253,48 @@ Gradient accuracy, float32 against float64 central differences:
   instrument, sqrt and dense boundary; mean model, offsets and a
   per-datum `noise_fn` (5e-7).
 - Marginalised basis: 4.7e-6 to 9.9e-6 (MLX path 1.2e-5 to 6.1e-5).
-- The requester's scale: sigma = yerr 7.8e-7, sigma = 30 yerr 6.7e-6,
-  sigma = 300 yerr 8.9e-6 -- the unmasked kernel's own (8.5e-7, 5.4e-6,
+- The requester's scale: sigma = yerr 9.6e-7, sigma = 30 yerr 7.4e-6,
+  sigma = 300 yerr 5.8e-6 -- the unmasked kernel's own (8.5e-7, 5.4e-6,
   1.4e-5), where the MLX path's masked gradient is 1.5e-6, 1.5e-4 and
   1.7e-3.
 
-Cost, measured on a quiet machine (2026-11-06; benchmarks.md has the
-table): at N = 2818 with 14% held out, 1.8-2.9x the unmasked kernel's
-value and 2.3-4.1x value + gradient from 128 to 1024 chains; with the
-requester's noise model and baseline at 128 chains, 1.8x and 2.3x.  The
-first measurement was 10-90x: the window step in MLX ops spent 10.7 ms
-per batched 2 x 2 product.  Unrolled (`linalg.matmul`, also now in
-`inv_logdet_fast`'s VJP) and then fused into one kernel each way
-(`metal.held_out_mean`, its VJP in closed form) it costs 0.4 ms of value
-and 0.7 of gradient.  What is left above the two scans' 2.3x is the term
-algebra at the window's distinct lags (1.3 ms value, 3.3 gradient at
-1024 chains); walking each window inside the kernel with the cadence's
-propagator would remove it, at the price of a hand-written reverse walk
--- not done.
+Cost, measured on a quiet machine (benchmarks.md has the table): at
+N = 2818 with 14% held out, 1.7-2.2x the unmasked kernel's value and
+2.0-2.5x value + gradient from 128 to 1024 chains; with the requester's
+noise model and baseline, 1.7x and 2.0x at 128 chains, 2.0x and 2.0x at
+1024.  How it got there (2026-11-06/07):
+
+- First measurement, 10-90x.  The window step was MLX ops, and MLX's
+  batched matmul spent 10.7 ms per (chains x points) 2 x 2 product.
+- Unrolled (`linalg.matmul`, also now in `inv_logdet_fast`'s VJP), then a
+  per-point kernel each way: 2.9x / 4.1x at 1024 chains.  Ablating the
+  step showed the rest was MLX plumbing around that kernel -- gathering
+  each point's edge states and propagators, the scatter-add backward of
+  those gathers -- and the term algebra at the 199 distinct lags from a
+  point to its edges.
+- The walk (`metal.window_walk`): one thread per (chain, window) reads
+  its edge states from the scans' exits and steps through its points
+  with the cadence's propagator (the filter's own prediction step, so
+  only the few lags already in the table), fusing at each point.  Its
+  VJP is the fusion's backward per point (`_SRC_FUSE_VJP`, run wide) and
+  the walks reversed per window (`_SRC_WALK_REV`), each step's
+  propagator adjoint summed in registers and flushed per lag slot as the
+  scans' backward does.  The forward stays one kernel: at 128 chains,
+  where launches dominate, splitting it cost 0.3 ms.
+- Anchors.  Walking compounds the cadence propagator's float32 rounding:
+  for a slow process ``Phi(dt)`` differs from ``I`` only past its fourth
+  digit, and 170 steps took the error at sigma = 30 yerr, rho = 30 hr
+  from 1.8e-3 (each point propagated directly) to 6.4e-3.  Every 16th
+  point from each edge now steps from the edge itself with its own lag
+  (15 table rows here, not 199): 7.6e-4, for 0.2 ms of value + gradient
+  at 1024 chains.
+- The backward series skips its replay unless a window leads the data:
+  its block exits are its next blocks' entry states, which the boundary
+  already gives.  The two directions share one `q_factor`.
+
+With the window step stubbed out the masked likelihood is 1.8x the
+unmasked value and 1.9x value + gradient at 1024 chains, so what is left
+is the two scans.
 
 ### Status
 
