@@ -101,5 +101,5 @@ kernel's timescale, points are scored as white noise about the mean
 model. To sample extra white noise there, label the held-out points as
 their own instrument with a jitter.
 
-The commit to pick up is `b62ee94`; docs/masked-gp-plan.md records the
+The commit to pick up is `c5943fe`; docs/masked-gp-plan.md records the
 design and every measurement.
