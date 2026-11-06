@@ -2485,13 +2485,14 @@ _r_suffix_kernels: dict = {}
 
 def column_exit_sensitivities(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
                               jit2, ent_m, ent_C, blk_len, formal=False,
-                              starts=None, parts=False):
+                              starts=None, parts=False, suffix=True):
     """``(n_chains, n_blocks, k, m)``: ``r_c`` at every block's exit, ``-1/2``
     the derivative of the later blocks' ``sum v_c^2 / S`` with respect to
     the exit mean (`_SRC_RSENS`, `_SRC_R_SUFFIX`).  Zero at the last
     block.  ``cols`` may be split (`_col_layout`).  ``parts``: also
     return each block's own ``(g, T)`` -- its data's sensitivity to its
-    entry mean and its mean map -- as ``(r, g, T)`` (`inject_seeds`)."""
+    entry mean and its mean map -- as ``(r, g, T)`` (`inject_seeds`);
+    ``suffix=False`` skips ``r`` (None) when only those are wanted."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     col_in, ka, kb, shared = _col_layout(cols)
     npts, k = col_in[0].shape[0], ka + kb
@@ -2524,6 +2525,8 @@ def column_exit_sensitivities(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
         output_dtypes=[mx.float32] * 2,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
+    if parts and not suffix:
+        return None, g, T
     if (m, k) not in _r_suffix_kernels:
         _r_suffix_kernels[(m, k)] = mx.fast.metal_kernel(
             name=f"anvilgp_r_suffix_m{m}_k{k}",
@@ -2926,9 +2929,10 @@ def _masked_side_vjp(p_t, q_t, hv, cols, j2, sd, blk_len, formal, ent_m,
     args = (sd["lag"], sd["inst"])
     col_arg = cols if multi else cols[..., None]
     em = ent_m if multi else ent_m[:, :, None, :]
-    r_c, g, T = column_exit_sensitivities(p_t, q_t, *args, hv, col_arg,
-                                          sd["r_ref"], j2, em, ent_C, 0,
-                                          formal, starts=starts, parts=True)
+    # r_c is read only by the multi-column seed of the value's cotangent
+    r_c, g, T = column_exit_sensitivities(
+        p_t, q_t, *args, hv, col_arg, sd["r_ref"], j2, em, ent_C, 0, formal,
+        starts=starts, parts=True, suffix=multi and c_ld is not None)
     seed_m = mx.zeros((n, nb, k, m), dtype=mx.float32)
     seed_C = mx.zeros((n, nb, m, m), dtype=mx.float32)
     if c_ld is not None and nb > 1:
@@ -2977,26 +2981,24 @@ def scan_masked(phi_tab, q_tab, hvec, resid_f, resid_b, jit_f, jit_b, fwd,
     downstream differentiates by MLX and the kernels carry the rest.
     ``blk_len`` bounds the blocks' length (the backward's checkpoints).
     """
-    n_aux = {}
-
     @mx.custom_function
     def core(p_t, q_t, hv, rf, rb, jf, jb):
         rf, rb = mx.contiguous(rf), mx.contiguous(rb)
         ell, xm_f, xc_f, em_f, ec_f, aux_f, _ = _masked_side(
             p_t, q_t, hv, rf, jf, fwd, s_floor_rel, formal, boundary)
-        _, xm_b, xc_b, em_b, ec_b, aux_b, _ = _masked_side(
+        # The backward's value is not used, so its boundary blocks (the
+        # seeds of a value cotangent) are not needed: not passed out.
+        _, xm_b, xc_b, em_b, ec_b, _, _ = _masked_side(
             p_t, q_t, hv, rb, jb, bwd, s_floor_rel, formal, boundary)
-        n_aux["f"], n_aux["b"] = len(aux_f), len(aux_b)
         return (mx.sum(ell, axis=1), xm_f, xc_f, xm_b, xc_b,
-                em_f, ec_f, em_b, ec_b, *aux_f, *aux_b)
+                em_f, ec_f, em_b, ec_b, *aux_f)
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
         p_t, q_t, hv, rf, rb, jf, jb = primals
         c_ell, cm_f, cc_f, cm_b, cc_b = cotangents[:5]
         em_f, ec_f, em_b, ec_b = outputs[5:9]
-        aux_f = tuple(outputs[9:9 + n_aux["f"]])
-        aux_b = tuple(outputs[9 + n_aux["f"]:])
+        aux_f, aux_b = tuple(outputs[9:]), ()
         sq_f = boundary == "sqrt" and int(fwd["starts"].shape[0]) > 2
         sq_b = boundary == "sqrt" and int(bwd["starts"].shape[0]) > 2
         f = _masked_side_vjp(p_t, q_t, hv, rf, jf, fwd, blk_len, formal,
@@ -3024,7 +3026,6 @@ def scan_masked_mc(phi_tab, q_tab, hvec, cols_f, cols_b, jit_f, jit_b, fwd,
     rows, cs = np.tril_indices(k)
     lower, upper = mx.array(rows * k + cs), mx.array(cs * k + rows)
     off_diag = mx.array(rows != cs)
-    n_aux = {}
     zero = mx.zeros((1,), dtype=mx.float32)
 
     def split(ca, cb):
@@ -3035,7 +3036,7 @@ def scan_masked_mc(phi_tab, q_tab, hvec, cols_f, cols_b, jit_f, jit_b, fwd,
         (ld, g), xm_f, xc_f, em_f, ec_f, aux_f, _ = _masked_side(
             p_t, q_t, hv, split(caf, cbf), jf, fwd, s_floor_rel, formal,
             boundary)
-        _, xm_b, xc_b, em_b, ec_b, aux_b, _ = _masked_side(
+        _, xm_b, xc_b, em_b, ec_b, _, _ = _masked_side(
             p_t, q_t, hv, split(cab, cbb), jb, bwd, s_floor_rel, formal,
             boundary)
         ld, g = mx.sum(ld, axis=1), mx.sum(g, axis=1)
@@ -3043,9 +3044,8 @@ def scan_masked_mc(phi_tab, q_tab, hvec, cols_f, cols_b, jit_f, jit_b, fwd,
         full = mx.zeros((n, k * k), dtype=g.dtype)
         full = full.at[:, lower].add(g)
         full = full.at[:, upper].add(mx.where(off_diag, g, 0.0))
-        n_aux["f"], n_aux["b"] = len(aux_f), len(aux_b)
         return (ld, full.reshape(n, k, k), xm_f, xc_f, xm_b, xc_b,
-                em_f, ec_f, em_b, ec_b, *aux_f, *aux_b)
+                em_f, ec_f, em_b, ec_b, *aux_f)
 
     @core.vjp
     def _core_vjp(primals, cotangents, outputs):
@@ -3054,8 +3054,7 @@ def scan_masked_mc(phi_tab, q_tab, hvec, cols_f, cols_b, jit_f, jit_b, fwd,
         gs = 0.5 * (cotangents[1] + mx.swapaxes(cotangents[1], 1, 2))
         cm_f, cc_f, cm_b, cc_b = cotangents[2:6]
         em_f, ec_f, em_b, ec_b = outputs[6:10]
-        aux_f = tuple(outputs[10:10 + n_aux["f"]])
-        aux_b = tuple(outputs[10 + n_aux["f"]:])
+        aux_f, aux_b = tuple(outputs[10:]), ()
         sq_f = boundary == "sqrt" and int(fwd["starts"].shape[0]) > 2
         sq_b = boundary == "sqrt" and int(bwd["starts"].shape[0]) > 2
         f = _masked_side_vjp(p_t, q_t, hv, split(caf, cbf), jf, fwd, blk_len,

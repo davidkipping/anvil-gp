@@ -30,7 +30,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import numpy as np
 
-from .likelihood import GPLogLike, GPPolicy
+from .likelihood import GPLogLike, GPPolicy, _held_mask
 from .priors import (SpecHint, auto_order_groups, build_param_map,
                      default_hypers, jitter_hyper, make_log_prior,
                      offset_hyper, periodogram_period)
@@ -359,7 +359,14 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
             "a jitter (`anvilgp.noise.scale_and_jitter`).")
     noise_specs = [] if noise is None else list(noise.specs)
 
-    period_ref = periodogram_period(t, y) if seed_period else None
+    period_ref = None
+    if seed_period:
+        # Over the kept points only: a held-out feature (a transit) would
+        # otherwise set the period reference the mask keeps it out of.
+        keep = (slice(None) if held_out is None
+                else ~_held_mask(np.asarray(t, dtype=np.float64), held_out))
+        period_ref = periodogram_period(np.asarray(t)[keep],
+                                        np.asarray(y)[keep])
     hypers = default_hypers(term, t, y, yerr, period_ref=period_ref)
     jitters = [jitter_hyper(yerr, f"log_jitter{i}" if n_jitter > 1
                             else "log_jitter") for i in range(n_jitter)]

@@ -966,11 +966,13 @@ class GPLogLike:
         `error_scaling.py`-style sweeps build many.  The setter still
         rebuilds on every assignment, so the never-stale property holds.
         """
-        if not self._may_use_metal():
+        if not self._may_use_metal() or self._held is not None:
             # Deferred, not skipped: `_evaluate_metal` rebuilds on first
             # use, so flipping `policy.metal` after construction still
             # works.  `_slot_map_blk` stays unset so the launch guard
-            # cannot mistake a deferred map for a stale one.
+            # cannot mistake a deferred map for a stale one.  A held-out
+            # instance never reads this map: its kernel path builds its
+            # own, for its placed blocks (`_masked_metal_layout`).
             self._metal_slot_id = self._metal_slot_start = None
             self._metal_slot_lag = self._metal_fold_plan = None
             self._slot_map_blk = None
@@ -1047,8 +1049,10 @@ class GPLogLike:
             return _block_diag(*blocks) if len(blocks) > 1 else blocks[0]
         return blocks
 
-    def _metal_matrices(self, v: mx.array):
+    def _metal_matrices(self, v: mx.array, uniq=None):
         """``(Phi, Q, h)`` for the lag table, with a chunked backward.
+        ``uniq`` replaces the data's own table (the held-out path's S lags,
+        `_masked_metal_layout`), with its own cached custom function.
 
         The value is exactly :meth:`Term.matrices`; only the *backward* is
         different, and only when the lag table is large.  MLX retains every
@@ -1070,7 +1074,10 @@ class GPLogLike:
         conditioning.  Pinned by
         ``tests/test_metal.py::test_the_chunked_front_end_charges_h_once``.
         """
-        term, uniq = self.term, self._metal_uniq_dt
+        term = self.term
+        own = uniq is None
+        if own:
+            uniq = self._metal_uniq_dt
         kp = self.param_map.kernel_params
         n_chunk = _front_end_chunks(v.shape[0], uniq.shape[0], term.n_state)
         if n_chunk <= 1:
@@ -1082,7 +1089,8 @@ class GPLogLike:
         # step) and a fresh primitive each time defeats any graph-level
         # caching keyed on identity.  Same pattern as
         # `metal._bwd_ckpt_kernels`.
-        cached = getattr(self, "_metal_matrices_fn", None)
+        attr = "_metal_matrices_fn" if own else "_masked_matrices_fn"
+        cached = getattr(self, attr, None)
         if cached is not None and cached[0] == (v.shape[0], n_chunk):
             return cached[1](v)
 
@@ -1121,7 +1129,7 @@ class GPLogLike:
                 acc = g if acc is None else acc + g
             return acc
 
-        self._metal_matrices_fn = ((v.shape[0], n_chunk), core)
+        setattr(self, attr, ((v.shape[0], n_chunk), core))
         return core(v)
 
     def _evaluate_metal(self, v: mx.array, resid: mx.array | None = None):
@@ -1258,27 +1266,7 @@ class GPLogLike:
         if held_out is None:
             return
         t = self._t64
-        arr = np.asarray(held_out)
-        if arr.dtype == bool:
-            if arr.shape != t.shape:
-                raise ValueError(f"held_out mask has shape {arr.shape}, "
-                                 f"expected ({t.size},)")
-            mask = arr.copy()
-        elif (arr.ndim == 2 and arr.shape[1] == 2
-              and np.issubdtype(arr.dtype, np.number)):
-            mask = np.zeros(t.size, dtype=bool)
-            for lo, hi in arr.astype(np.float64):
-                inside = (t >= lo) & (t <= hi)
-                if not inside.any():
-                    raise ValueError(
-                        f"held_out window ({lo:g}, {hi:g}) contains no data "
-                        f"point; windows are in the units of t")
-                mask |= inside
-        else:
-            raise ValueError(
-                "held_out must be a boolean mask of shape (N,) or a list of "
-                f"(t_lo, t_hi) windows; got an array of shape {arr.shape} "
-                f"and dtype {arr.dtype}")
+        mask = _held_mask(t, held_out)
         if mask.all():
             raise ValueError("held_out holds out every point; at least one "
                              "must condition the GP")
@@ -1447,7 +1435,7 @@ class GPLogLike:
         both series' share of the jitter, for the held-out kernel path."""
         lay = self._masked_metal_layout()
         kp = self.param_map.kernel_params(v)
-        phi, q, h = self.term.matrices(kp, lay["uniq"])
+        phi, q, h = self._metal_matrices(v, lay["uniq"])
         pt, qt = self._metal_tables(v, phi, q)
         r, jit2 = self._metal_resid_jit(v, resid, need_resid)
         if jit2.ndim == 3:
@@ -2057,7 +2045,7 @@ class GPLogLike:
             return self._gram_polarised(v, self._raw_resid, cols)
         pull = self._infeasible_pull(v)
         if self._held is not None:
-            # no lag table for `kappa`: see `_masked_metal_value`
+            # no lag table for `kappa`: see `_evaluate_metal_masked`
             ld, g = self._gram_metal_masked(v, cols)
             ld = self._refuse_outside_series(v, ld)
             ld = _sanitize(self._refuse_ill_conditioned(v, ld, None), pull)
@@ -2631,6 +2619,33 @@ MAX_GRAM_COLS = 32
 
 _MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048, 4: 256, 5: 128}
 _MAX_METAL_BLOCK_HI_M = 64
+
+
+def _held_mask(t: np.ndarray, held_out) -> np.ndarray:
+    """The boolean ``(N,)`` mask a ``held_out`` argument denotes: itself,
+    or the union of its ``(t_lo, t_hi)`` windows (inclusive), each of
+    which must contain a point.  See `GPLogLike._resolve_held_out`."""
+    arr = np.asarray(held_out)
+    if arr.dtype == bool:
+        if arr.shape != t.shape:
+            raise ValueError(f"held_out mask has shape {arr.shape}, "
+                             f"expected ({t.size},)")
+        return arr.copy()
+    if (arr.ndim == 2 and arr.shape[1] == 2
+            and np.issubdtype(arr.dtype, np.number)):
+        mask = np.zeros(t.size, dtype=bool)
+        for lo, hi in arr.astype(np.float64):
+            inside = (t >= lo) & (t <= hi)
+            if not inside.any():
+                raise ValueError(
+                    f"held_out window ({lo:g}, {hi:g}) contains no data "
+                    f"point; windows are in the units of t")
+            mask |= inside
+        return mask
+    raise ValueError(
+        "held_out must be a boolean mask of shape (N,) or a list of "
+        f"(t_lo, t_hi) windows; got an array of shape {arr.shape} "
+        f"and dtype {arr.dtype}")
 
 
 def _slot_map(lag: np.ndarray, blk_len: int, starts=None):

@@ -709,6 +709,31 @@ def test_make_target_passes_held_out():
         assert np.abs(lo - hi).max() < 3e-4
 
 
+def test_seed_period_ignores_the_held_out_points():
+    """`make_target(seed_period=True)` runs its periodogram on the kept
+    points: a deep feature inside a window must not set the period
+    reference the mask keeps it out of."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    rng = np.random.default_rng(3)
+    n = 2000
+    t = np.arange(n) * 0.01
+    y = 0.3 * np.sin(2 * np.pi * t / 3.7) + 0.05 * rng.standard_normal(n)
+    yerr = np.full(n, 0.05)
+    # a deep, repeated dip every 1.3 d
+    dip = (t % 1.3) < 0.1
+    y[dip] -= 20.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        plain = make_target(ag.RotationTerm(), t, y, yerr, seed_period=True)
+        masked = make_target(ag.RotationTerm(), t, y, yerr, seed_period=True,
+                             held_out=dip)
+    i = plain.names.index("log_gp_P")
+    period = lambda gt: gt.loglike.param_map.kernel[i].ref  # noqa: E731
+    assert abs(period(masked) - 3.7) < 0.2, period(masked)
+    assert abs(period(plain) - 3.7) > 0.2, period(plain)
+
+
 @pytest.mark.slow
 def test_chees_samples_a_masked_target():
     """A gradient sampler on a masked target, as
