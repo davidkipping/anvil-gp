@@ -472,7 +472,11 @@ class GPLogLike:
     M's timescales is shown to be white independently.  To sample extra
     white noise on M, label it as its own instrument with a jitter.  The
     mask is data, fixed here; it cannot depend on the parameters.  Runs on
-    the MLX path.  See docs/masked-gp-plan.md.
+    the MLX path, not the fused kernel, so a masked fit costs roughly
+    10-30x the unmasked one on the kernel (a user's 2818-point fit: 8x per
+    ensemble step, 32x per optimiser start, the optimiser taking no more
+    iterations), and more with a marginalised basis, which the MLX path
+    polarises (`_marginal`).  See docs/masked-gp-plan.md.
     """
 
     def __init__(self, mean_fn, t, x_mean, y, yerr, kernel_spec: Term,
@@ -1016,8 +1020,9 @@ class GPLogLike:
             return False, ("per-instrument jitter needs "
                            "param_map.instrument to say which datum is which")
         if self._held is not None:
-            return False, ("a held-out mask runs on the MLX path (the "
-                           "kernel does not implement it)")
+            return False, ("the kernel does not implement a held-out "
+                           "mask yet, so a masked fit runs at the MLX "
+                           "path's speed (roughly 10-30x the kernel's)")
         if not metal_available():
             return False, "mx.fast.metal_kernel is unavailable here"
         return True, ""

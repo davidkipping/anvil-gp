@@ -332,7 +332,8 @@ def make_target(term: Term, t, y, yerr, mean_fn=None, x_mean=None,
         model correlated noise inside the windows; see
         `anvilgp.likelihood.GPLogLike` for the construction and its
         caveat.  The parameter vector is the same as without it.  Runs on
-        the MLX path.
+        the MLX path, roughly 10-30x the kernel's cost (more with
+        ``linear_basis``); see `anvilgp.likelihood.GPLogLike`.
     seed_period
         Run a host-side Lomb-Scargle first and centre a rotation kernel's
         period reference on the peak, so chains start inside one harmonic

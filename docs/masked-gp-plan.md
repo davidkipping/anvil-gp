@@ -119,15 +119,73 @@ and Gaussian prior).  Phase 1 measured, all but the cost:
   (log jitter 0.094 against 0.089).  A reduced version is a slow test.
 - *Memory* at 1024 chains x N = 2800, value + gradient: 2.25 GiB masked
   against 2.02 GiB unmasked on the MLX path (the kernel: 0.04 GiB).
-- *Cost*: owed, on a quiet GPU.  The ChEES run above took 17 min on a
-  possibly shared GPU (not a timing); the MLX path is ~40x the kernel
-  unmasked, so this decides Phase 2.
+- *Cost*: measured by the requester on their own idle GPU, 2026-11-06
+  (`~/Downloads/anvilgp_masked_speed_gap.md`): a joint two-detector fit,
+  N = 2818 each, Matern-3/2, `error_scale`, a per-chain polynomial basis
+  marginalised, 14% held out in two windows.  32 optimiser starts 561 s
+  against 17.4 s on the kernel unmasked (32x); an ensemble step 0.21 s at
+  96 chains against 0.028 s at 128 (8x as measured); a fit to R-hat < 1.1
+  1.5-2.5 hr projected against 7-10 min.  Their correctness check on real
+  posterior draws: `hi` within 1e-6 to 3.4e-6 of an independent celerite2
+  reference, float32 within 2.5e-4 to 1e-3 log-units.  Not yet measured
+  here (needs a quiet GPU): masked against unmasked *on the MLX path*, to
+  split masking's own cost from the MLX path's.
+- *Optimiser iterations* (CPU device, no timing; N = 2818, Matern-3/2,
+  quadratic basis, two windows of 199 points, 32 starts): median 9-10
+  iterations masked against 10 unmasked, all converged.  Masking does not
+  make the objective harder; the 32x is cost per evaluation.
+- *Where the cost comes from, from the code*: the masked evaluation is
+  the unmasked MLX reduction plus O(windows + held-out points) of glue,
+  so masking itself should cost little over the MLX path.  But the MLX
+  path polarises a marginalised basis -- ``1 + (p+1)(p+2)/2`` likelihood
+  evaluations, batched along the chains (7 at p = 2) -- where the kernel
+  carries every column in one filter (1.7-1.9x).  That and the MLX path's
+  own ~40x (value + gradient) account for the ratios above.
+
+Verdict: too slow at the requester's scale; Phase 2 is needed, and it has
+to include the marginalised basis to help them.
 
 ### 2. Kernel path (only if Phase 1 is too slow at the requester's scale)
 
 Window edges aligned to the kernel's block boundaries, the window
 fusion fed by the seeds kernel's prefix and suffix, and the M term's
 cotangent injected at those boundaries in the VJP.
+
+Scoped 2026-11-06, from reading `metal.py`; not started.  The S points
+are just an irregular series, which the kernel already serves; what is
+new is the M term and its gradient.  Four pieces, each usable alone:
+
+- *2a. Blocks that start where segments start.*  The kernels place
+  block ``i`` at ``i * blk_len``.  A block-start array instead, through
+  the forward, replay, seeds, backward and square-root kernels, so every
+  window edge is a block boundary.  Mechanical, but in every kernel.
+- *2b. Value.*  The S term is the existing replay.  The filtered state
+  at each window's left edge is the entry state `entry_states` already
+  returns for the block after it.  The information at the right edge is
+  the suffix the seeds kernel already forms (``suf_eta``, ``suf_J``), or,
+  more accurately in float32, the entry state of a second, time-reversed
+  run of the same kernels.  In the ``P_inf = I`` gauge every term but a
+  convolution uses, reversal is ``Phi -> Phi^T``, ``Q -> I - Phi^T Phi``.
+  Fusing the two at the held-out points is the glue `_evaluate_masked`
+  already has, in MLX.  This alone serves an ensemble sampler (values
+  only).
+- *2c. Gradient.*  MLX differentiates the glue and gives cotangents on
+  those entry states.  The backward's seeds are the adjoints of each
+  block's entry state, formed by a backward recursion over the blocks.
+  An extra cotangent on one block's entry state enters that recursion
+  additively, so the seeds kernel (dense and square-root) takes a
+  per-block injection, and `backward_ckpt` runs unchanged.  The
+  derivation has to be checked against docs/m4-plan.md first.
+- *2d. A marginalised basis.*  ``Gram_S + D^T W_M^-1 D``, ``D = Z_M - P
+  Z_S``, needs each column's smoothed mean at M: the column versions of
+  2b and 2c (`column_entry_means`, `scan_gram`'s VJP).  The requester's
+  fit needs this; without it a masked fit with a basis stays on the MLX
+  path.
+
+Acceptance: the requester's numbers in Phase 1 (``hi`` within ~1e-6 of the
+dense ``Sigma``, float32 within the unmasked kernel's budget on their
+posterior draws), the dense tests in tests/test_masked.py on the kernel,
+and a cost within ~1.5-2x the unmasked kernel, measured on a quiet GPU.
 
 ### 3. Docs and reply
 
