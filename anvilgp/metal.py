@@ -410,16 +410,27 @@ def _starts_src(src: str, aligned: bool) -> str:
     if a not in src or b not in src:
         raise RuntimeError("a block kernel no longer places its blocks "
                            "the way `_starts_src` rewrites")
-    return (src.replace(a, "uint start = (uint)blk_start[blk_i];")
-               .replace(b, "uint stop = (uint)blk_start[blk_i + 1];"))
+    out = (src.replace(a, "uint start = (uint)blk_start[blk_i];")
+              .replace(b, "uint stop = (uint)blk_start[blk_i + 1];"))
+    if "blk_len" in out:
+        raise RuntimeError("a placed-block kernel still reads blk_len, "
+                           "whose buffer `_starts_inputs` gives to blk_start")
+    return out
 
 
-def _starts_inputs(names: list, inputs: list | None, starts):
-    """``names`` (and ``inputs``) with ``blk_start`` appended when the
-    blocks are placed (`_starts_src`)."""
-    if starts is None:
-        return names if inputs is None else inputs
-    return names + ["blk_start"] if inputs is None else inputs + [starts]
+def _starts_inputs(names: list, aligned):
+    """``names`` with ``blk_start`` in ``blk_len``'s place when the blocks
+    are placed (`_starts_src`), whose source no longer reads ``blk_len``.
+    In its place, not beside it: a kernel has at most 31 buffers, and the
+    multi-column backward with a split layout already uses 31."""
+    if not aligned:
+        return names
+    return ["blk_start" if x == "blk_len" else x for x in names]
+
+
+def _blk_arg(blk_len, starts):
+    """The ``blk_len`` input, or ``starts`` in its place (`_starts_inputs`)."""
+    return int(blk_len) if starts is None else starts
 
 
 def _n_blocks_of(npts: int, blk_len: int, starts) -> int:
@@ -503,7 +514,7 @@ def _kernel(m: int, n_jit: int = 0, formal: bool = False,
             input_names=_starts_inputs(
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid", "r_ref",
                  "jit2", "sfloor", "npts", "n_lags", "n_blocks",
-                 "n_chains", "blk_len", "n_jit"], None, aligned or None),
+                 "n_chains", "blk_len", "n_jit"], aligned),
             output_names=["out_A", "out_b", "out_C", "out_eta", "out_J",
                           "out_ell"],
             source=_starts_src(_formal_src(_jitter_src(
@@ -1346,20 +1357,22 @@ _bwd_ckpt_kernels: dict = {}
 _SUB_LEN = {1: 32, 2: 32, 3: 16, 4: 8}
 
 
-def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0, formal: bool = False):
-    key = (m, slen, _jit_key(n_jit), bool(formal))
+def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0, formal: bool = False,
+                     aligned: bool = False):
+    key = (m, slen, _jit_key(n_jit), bool(formal), bool(aligned))
     if key not in _bwd_ckpt_kernels:
-        body = _formal_src(_jitter_src(
-            _SRC_BWD_CKPT.replace("FWD_STEP", _fwd_step()), n_jit), formal)
+        body = _starts_src(_formal_src(_jitter_src(
+            _SRC_BWD_CKPT.replace("FWD_STEP", _fwd_step()), n_jit), formal),
+            aligned)
         _bwd_ckpt_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_bwd_ckpt_m{m}_s{slen}_j{key[2]}"
-                 + ("_formal" if formal else ""),
-            input_names=["phitab", "qtab", "lag", "inst", "hvec", "resid",
-                         "r_ref",
-                         "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
-                         "slot_id", "slot_start",
-                         "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                         "n_jit", "n_ckpt", "n_slots"],
+                 + ("_formal" if formal else "") + ("_al" if aligned else ""),
+            input_names=_starts_inputs(
+                ["phitab", "qtab", "lag", "inst", "hvec", "resid", "r_ref",
+                 "jit2", "cot", "ent_m", "ent_C", "seed_m", "seed_C",
+                 "slot_id", "slot_start",
+                 "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
+                 "n_jit", "n_ckpt", "n_slots"], aligned),
             output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
                           "out_drv", "ckpt"],
             source=body.replace("MDIM", str(m)).replace("SLEN", str(slen)),
@@ -1369,7 +1382,7 @@ def _bwd_ckpt_kernel(m: int, slen: int, n_jit: int = 0, formal: bool = False):
 
 def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                   ent_m, ent_C, seed_m, seed_C, slot_id, slot_start, n_slots,
-                  blk_len, sub_len=None, formal=False):
+                  blk_len, sub_len=None, formal=False, starts=None):
     """Checkpointed reverse sweep for every (chain, block), independently.
 
     Inputs are the forward's table form plus the per-block entry state
@@ -1391,6 +1404,10 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
     ``sigma/yerr`` (stage R).  The two are equal in exact arithmetic, and
     the sweep differentiates the *states*, so :mod:`anvilgp.adjoint`'s
     specification is unchanged.
+
+    ``starts`` places the blocks (`_starts_src`); ``blk_len`` must then be
+    at least the longest of them (it sizes the checkpoints), and the slot
+    map must have been built for the same blocks.
     """
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     npts = resid.shape[0]
@@ -1404,7 +1421,7 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
             raise TypeError(f"{nm} must be int32 for the kernel, got "
                             f"{arr.dtype}")
     slen = _SUB_LEN.get(m, 8) if sub_len is None else int(sub_len)
-    n_blocks = (npts + blk_len - 1) // blk_len
+    n_blocks = _n_blocks_of(npts, blk_len, starts)
     n_ckpt = (blk_len + slen - 1) // slen
     n_jit = _n_jit_of(jit2)
     n_slots = int(n_slots)
@@ -1414,11 +1431,12 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
               ((npts, n_chains, 1) if n_jit < 0
                else (n_chains, n_blocks, max(1, n_jit))),
               (n_chains, n_blocks, n_ckpt, m + m * m)]
-    outs = _bwd_ckpt_kernel(m, slen, n_jit, formal)(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
-                ent_m, ent_C, seed_m, seed_C, slot_id, slot_start,
-                int(npts), int(n_lags), int(n_blocks), int(n_chains),
-                int(blk_len), int(n_jit), int(n_ckpt), int(n_slots)],
+    outs = _bwd_ckpt_kernel(m, slen, n_jit, formal, starts is not None)(
+        inputs=[
+            phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
+            ent_m, ent_C, seed_m, seed_C, slot_id, slot_start,
+            int(npts), int(n_lags), int(n_blocks), int(n_chains),
+            _blk_arg(blk_len, starts), int(n_jit), int(n_ckpt), int(n_slots)],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -1646,22 +1664,24 @@ def _layout_tag(ka: int, kb: int, shared: bool) -> str:
 
 
 def _bwd_mc_kernel(m: int, k: int, slen: int, n_jit: int = 0,
-                   formal: bool = False, layout=(None, 0, False)):
+                   formal: bool = False, layout=(None, 0, False),
+                   aligned: bool = False):
     ka, kb, shared = layout
-    key = (m, k, slen, _jit_key(n_jit), bool(formal), kb, shared)
+    key = (m, k, slen, _jit_key(n_jit), bool(formal), kb, shared,
+           bool(aligned))
     if key not in _bwd_mc_kernels:
-        body = _formal_src(_jitter_src(
-            _col_src(_bwd_mc_src(), ka, kb, shared), n_jit), formal)
+        body = _starts_src(_formal_src(_jitter_src(
+            _col_src(_bwd_mc_src(), ka, kb, shared), n_jit), formal), aligned)
         _bwd_mc_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_bwd_mc_m{m}_k{k}_s{slen}_j{key[3]}"
                  + ("_formal" if formal else "")
-                 + _layout_tag(ka, kb, shared),
-            input_names=_col_inputs(
+                 + _layout_tag(ka, kb, shared) + ("_al" if aligned else ""),
+            input_names=_starts_inputs(_col_inputs(
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "cot", "gbar", "ent_m", "ent_C",
                  "seed_m", "seed_C", "slot_id", "slot_start",
                  "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                 "n_jit", "n_ckpt", "n_slots"], kb),
+                 "n_jit", "n_ckpt", "n_slots"], kb), aligned),
             output_names=["out_dphi", "out_dq", "out_dh", "out_dy",
                           "out_drv", "ckpt"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m))
@@ -1672,7 +1692,8 @@ def _bwd_mc_kernel(m: int, k: int, slen: int, n_jit: int = 0,
 
 def backward_ckpt_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
                      c_ld, gs, ent_m, ent_C, seed_m, seed_C, slot_id,
-                     slot_start, n_slots, blk_len, formal=False):
+                     slot_start, n_slots, blk_len, formal=False,
+                     starts=None):
     """:func:`backward_ckpt` for :func:`scan_gram`: the cotangent is
     ``c_ld`` ``(n_chains,)`` on the log-determinant half and the symmetric
     ``gs`` ``(n_chains, k, k)`` on the Gram matrix; ``cols``, ``ent_m``,
@@ -1685,7 +1706,7 @@ def backward_ckpt_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     npts, k = col_in[0].shape[0], ka + kb
     kout = ka if shared else k
     slen = _sub_len_mc(m, k)
-    n_blocks = (npts + blk_len - 1) // blk_len
+    n_blocks = _n_blocks_of(npts, blk_len, starts)
     n_ckpt = (blk_len + slen - 1) // slen
     n_jit = _n_jit_of(jit2)
     n_slots = int(n_slots)
@@ -1694,13 +1715,15 @@ def backward_ckpt_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
               ((npts, n_chains, 1) if n_jit < 0
                else (n_chains, n_blocks, max(1, n_jit))),
               (n_chains, n_blocks, n_ckpt, k * m + m * m)]
-    outs = _bwd_mc_kernel(m, k, slen, n_jit, formal, (ka, kb, shared))(
-        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
-                c_ld.astype(mx.float32), mx.contiguous(gs.astype(mx.float32)),
-                ent_m, ent_C, mx.contiguous(seed_m), mx.contiguous(seed_C),
-                slot_id, slot_start,
-                int(npts), int(n_lags), int(n_blocks), int(n_chains),
-                int(blk_len), int(n_jit), int(n_ckpt), int(n_slots)],
+    outs = _bwd_mc_kernel(m, k, slen, n_jit, formal, (ka, kb, shared),
+                          starts is not None)(
+        inputs=[
+            phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
+            c_ld.astype(mx.float32), mx.contiguous(gs.astype(mx.float32)),
+            ent_m, ent_C, mx.contiguous(seed_m), mx.contiguous(seed_C),
+            slot_id, slot_start,
+            int(npts), int(n_lags), int(n_blocks), int(n_chains),
+            _blk_arg(blk_len, starts), int(n_jit), int(n_ckpt), int(n_slots)],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -2123,7 +2146,7 @@ def _replay_kernel(m: int, n_jit: int = 0, formal: bool = False,
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "ent_m", "ent_C",
                  "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                 "n_jit"], None, aligned or None),
+                 "n_jit"], aligned),
             output_names=["out_ell"] + (["out_xm", "out_xC"] if exits else []),
             source=body.replace("MDIM", str(m)),
         )
@@ -2146,10 +2169,10 @@ def replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
                                         (n_chains, n_blocks, m, m)]
                                        if exits else [])
     outs = _replay_kernel(m, n_jit, formal, starts is not None, exits)(
-        inputs=_starts_inputs(None, [
+        inputs=[
             phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
             ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
-            int(n_chains), int(blk_len), int(n_jit)], starts),
+            int(n_chains), _blk_arg(blk_len, starts), int(n_jit)],
         output_shapes=shapes, output_dtypes=[mx.float32] * len(shapes),
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -2220,7 +2243,7 @@ def _replay_mc_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "ent_m", "ent_C",
                  "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                 "n_jit"], kb), None, aligned or None),
+                 "n_jit"], kb), aligned),
             output_names=["out_ld", "out_g"]
                          + (["out_xm", "out_xC"] if exits else []),
             source=body.replace("KTRI", str(k * (k + 1) // 2))
@@ -2251,10 +2274,10 @@ def replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
         if exits else [])
     outs = _replay_mc_kernel(m, k, n_jit, formal, (ka, kb, shared),
                              starts is not None, exits)(
-        inputs=_starts_inputs(None, [
+        inputs=[
             phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2,
             ent_m, ent_C, int(npts), int(n_lags), int(n_blocks),
-            int(n_chains), int(blk_len), int(n_jit)], starts),
+            int(n_chains), _blk_arg(blk_len, starts), int(n_jit)],
         output_shapes=shapes, output_dtypes=[mx.float32] * len(shapes),
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))
@@ -2345,7 +2368,7 @@ def _affine_kernel(m: int, k: int, n_jit: int = 0, formal: bool = False,
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "ent_C", "npts", "n_lags",
                  "n_blocks", "n_chains", "blk_len", "n_jit"], kb),
-                None, aligned or None),
+                aligned),
             output_names=["out_d", "out_T"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
         )
@@ -2365,10 +2388,10 @@ def column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     n_jit = _n_jit_of(jit2)
     d, T = _affine_kernel(m, k, n_jit, formal, (ka, kb, shared),
                           starts is not None)(
-        inputs=_starts_inputs(None, [
+        inputs=[
             phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_C,
             int(npts), int(n_lags), int(n_blocks), int(n_chains),
-            int(blk_len), int(n_jit)], starts),
+            _blk_arg(blk_len, starts), int(n_jit)],
         output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
         output_dtypes=[mx.float32] * 2,
         grid=(n_blocks * n_chains, 1, 1),
@@ -2461,36 +2484,42 @@ _r_suffix_kernels: dict = {}
 
 
 def column_exit_sensitivities(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
-                              jit2, ent_m, ent_C, blk_len, formal=False):
+                              jit2, ent_m, ent_C, blk_len, formal=False,
+                              starts=None, parts=False):
     """``(n_chains, n_blocks, k, m)``: ``r_c`` at every block's exit, ``-1/2``
     the derivative of the later blocks' ``sum v_c^2 / S`` with respect to
     the exit mean (`_SRC_RSENS`, `_SRC_R_SUFFIX`).  Zero at the last
-    block.  ``cols`` may be split (`_col_layout`)."""
+    block.  ``cols`` may be split (`_col_layout`).  ``parts``: also
+    return each block's own ``(g, T)`` -- its data's sensitivity to its
+    entry mean and its mean map -- as ``(r, g, T)`` (`inject_seeds`)."""
     n_chains, n_lags, m = phi_tab.shape[0], phi_tab.shape[1], phi_tab.shape[-1]
     col_in, ka, kb, shared = _col_layout(cols)
     npts, k = col_in[0].shape[0], ka + kb
     n_blocks = ent_C.shape[1]
     n_jit = _n_jit_of(jit2)
-    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared)
+    aligned = starts is not None
+    key = (m, k, _jit_key(n_jit), bool(formal), kb, shared, aligned)
     if key not in _rsens_kernels:
-        body = _formal_src(_jitter_src(_col_src(
+        body = _starts_src(_formal_src(_jitter_src(_col_src(
             _SRC_RSENS.replace("FWD_STEP", _fwd_step(sens=True)),
-            ka, kb, shared), n_jit), formal)
+            ka, kb, shared), n_jit), formal), aligned)
         _rsens_kernels[key] = mx.fast.metal_kernel(
             name=f"anvilgp_rsens_m{m}_k{k}_j{key[2]}"
                  + ("_formal" if formal else "")
-                 + _layout_tag(ka, kb, shared),
-            input_names=_col_inputs(
+                 + _layout_tag(ka, kb, shared) + ("_al" if aligned else ""),
+            input_names=_starts_inputs(_col_inputs(
                 ["phitab", "qtab", "lag", "inst", "hvec", "resid",
                  "r_ref", "jit2", "ent_m", "ent_C", "npts", "n_lags",
                  "n_blocks", "n_chains", "blk_len", "n_jit"], kb),
+                aligned),
             output_names=["out_g", "out_T"],
             source=body.replace("KCOL", str(k)).replace("MDIM", str(m)),
         )
     g, T = _rsens_kernels[key](
-        inputs=[phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_m,
-                ent_C, int(npts), int(n_lags), int(n_blocks), int(n_chains),
-                int(blk_len), int(n_jit)],
+        inputs=[
+            phi_tab, q_tab, lag, inst, hvec, *col_in, r_ref, jit2, ent_m,
+            ent_C, int(npts), int(n_lags), int(n_blocks), int(n_chains),
+            _blk_arg(blk_len, starts), int(n_jit)],
         output_shapes=[(n_chains, n_blocks, k, m), (n_chains, n_blocks, m, m)],
         output_dtypes=[mx.float32] * 2,
         grid=(n_blocks * n_chains, 1, 1),
@@ -2502,12 +2531,119 @@ def column_exit_sensitivities(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
             output_names=["out_r"],
             source=_SRC_R_SUFFIX.replace("KCOL", str(k))
                                 .replace("MDIM", str(m)))
-    return _r_suffix_kernels[(m, k)](
+    r = _r_suffix_kernels[(m, k)](
         inputs=[g, T, int(n_blocks), int(n_chains)],
         output_shapes=[(n_chains, n_blocks, k, m)],
         output_dtypes=[mx.float32],
         grid=(n_chains * k, 1, 1),
         threadgroup=(min(64, n_chains * k), 1, 1))[0]
+    return (r, g, T) if parts else r
+
+
+#: Seeds for cotangents on the blocks' exit states (`inject_seeds`), one
+#: thread per chain, backward over the blocks.  The adjoint ``(a, Pi)`` of
+#: block ``k``'s exit state, carried to block ``k - 1``'s exit through
+#: block ``k``'s mean map ``T`` and its data's sensitivity ``g`` to its
+#: entry mean:
+#:
+#:     a <- T^T a,   Pi <- T^T Pi T + sum_c sym(a_c g_c^T)
+#:
+#: (the filter's ``dm_exit = T dm_entry + T dP_entry g`` and ``dP_exit = T
+#: dP_entry T^T``, to first order), with each block's own injection added
+#: at its exit before it is written out as that block's seed.
+_SRC_INJECT = """
+    uint chain = thread_position_in_grid.x;
+    if (chain >= (uint)n_chains) return;
+    const uint M = MDIM;
+    uint base = chain * (uint)n_blocks;
+    float a[KCOL][MDIM], P[MDIM][MDIM];
+    for (uint c = 0; c < KCOL; ++c)
+        for (uint i = 0; i < M; ++i) a[c][i] = 0.0f;
+    for (uint i = 0; i < M; ++i)
+        for (uint j = 0; j < M; ++j) P[i][j] = 0.0f;
+    for (int kk = (int)n_blocks - 1; kk >= 0; --kk) {
+        uint k = (uint)kk;
+        uint om = (base + k) * M * M;
+        for (uint c = 0; c < KCOL; ++c)
+            for (uint i = 0; i < M; ++i) {
+                uint ov = ((base + k) * KCOL + c) * M + i;
+                a[c][i] += inj_m[ov];
+                out_m[ov] = a[c][i];
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                P[i][j] += 0.5f * (inj_C[om + i * M + j] + inj_C[om + j * M + i]);
+                out_C[om + i * M + j] = P[i][j];
+            }
+        if (k == 0) break;
+        float Tm[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) Tm[i][j] = in_T[om + i * M + j];
+        float na[KCOL][MDIM];
+        for (uint c = 0; c < KCOL; ++c)
+            for (uint i = 0; i < M; ++i) {
+                float s = 0.0f;
+                for (uint t = 0; t < M; ++t) s += Tm[t][i] * a[c][t];
+                na[c][i] = s;
+            }
+        float TP[MDIM][MDIM], nP[MDIM][MDIM];
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float s = 0.0f;
+                for (uint t = 0; t < M; ++t) s += Tm[t][i] * P[t][j];
+                TP[i][j] = s;
+            }
+        for (uint i = 0; i < M; ++i)
+            for (uint j = 0; j < M; ++j) {
+                float s = 0.0f;
+                for (uint t = 0; t < M; ++t) s += TP[i][t] * Tm[t][j];
+                nP[i][j] = s;
+            }
+        for (uint c = 0; c < KCOL; ++c) {
+            float gk[MDIM];
+            for (uint i = 0; i < M; ++i) gk[i] = in_g[((base + k) * KCOL + c) * M + i];
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j)
+                    nP[i][j] += 0.5f * (na[c][i] * gk[j] + gk[i] * na[c][j]);
+        }
+        for (uint i = 0; i < M; ++i) {
+            for (uint c = 0; c < KCOL; ++c) a[c][i] = na[c][i];
+            for (uint j = 0; j < M; ++j) P[i][j] = nP[i][j];
+        }
+    }
+"""
+
+_inject_kernels: dict = {}
+
+
+def inject_seeds(g, T, inj_m, inj_C):
+    """Seeds ``(seed_m (n_chains, n_blocks, k, m), seed_C (..., m, m))``
+    for cotangents ``inj_m``, ``inj_C`` on every block's exit state -- the
+    exit means of ``k`` columns sharing one covariance -- from each block's
+    ``(g, T)`` (`column_exit_sensitivities` with ``parts``).  Added to the
+    seeds of the likelihood's own cotangent, they are what the backward
+    sweep (`backward_ckpt`, `backward_ckpt_mc`) needs when something
+    downstream reads the filter's state, as the held-out likelihood's
+    window step does (`_SRC_INJECT`)."""
+    n_chains, n_blocks, k, m = g.shape
+    key = (m, k)
+    if key not in _inject_kernels:
+        _inject_kernels[key] = mx.fast.metal_kernel(
+            name=f"anvilgp_inject_m{m}_k{k}",
+            input_names=["in_g", "in_T", "inj_m", "inj_C", "n_blocks",
+                         "n_chains"],
+            output_names=["out_m", "out_C"],
+            source=_SRC_INJECT.replace("KCOL", str(k)).replace("MDIM", str(m)))
+    out = _inject_kernels[key](
+        inputs=[mx.contiguous(g), mx.contiguous(T),
+                mx.contiguous(inj_m.astype(mx.float32)),
+                mx.contiguous(inj_C.astype(mx.float32)),
+                int(n_blocks), int(n_chains)],
+        output_shapes=[(n_chains, n_blocks, k, m),
+                       (n_chains, n_blocks, m, m)],
+        output_dtypes=[mx.float32] * 2,
+        grid=(n_chains, 1, 1), threadgroup=(min(64, n_chains), 1, 1))
+    return out[0], out[1]
 
 
 def _boundary_seeds(aux, cot, formal, use_sqrt):
@@ -2722,59 +2858,233 @@ def scan_gram(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
 
 
 
-def scan_states(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                s_floor_rel, starts, formal=False, boundary="dense"):
-    """``(ell, xm, xC)`` over blocks placed by ``starts`` (`_starts_src`):
-    each block's log-likelihood ``(n_chains, n_blocks)``, as
-    :func:`scan_loglike` forms it (boundary, then replay), and each block's
-    exit state, the filtered ``(mean, covariance)`` at its last observation.
-
-    For the held-out likelihood (`GPLogLike`'s ``held_out``), whose
-    windows need the state at their edges: blocks end where windows start.
-    **Value only**; nothing here has a VJP.  Inputs as `scan_loglike`.
-    """
-    n_chains, m = phi_tab.shape[0], phi_tab.shape[-1]
-    if m > MAX_STATE:
-        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
-    n_blocks = int(starts.shape[0]) - 1
-    resid = mx.contiguous(resid)
-    if n_blocks == 1:
+def _masked_side(p_t, q_t, hv, cols, j2, sd, s_floor_rel, formal, boundary):
+    """One direction of the held-out scan (`scan_masked`): entry states
+    over blocks placed by ``sd["starts"]``, then the replay with exits.
+    ``cols`` is one residual ``(npts, n_chains)``, or a column layout
+    (`_col_layout`) for the multi-column replay.  Returns ``(out, xm, xC,
+    ent_m, ent_C, aux, use_sqrt)`` with ``out`` the replay's own outputs
+    (``ell``, or ``(ld, gram)``)."""
+    n, m = p_t.shape[0], p_t.shape[-1]
+    starts = sd["starts"]
+    nb = int(starts.shape[0]) - 1
+    use_sqrt = boundary == "sqrt" and nb > 1
+    multi = isinstance(cols, (tuple, list)) or cols.ndim == 3
+    if multi:
+        col_in, ka, kb, _ = _col_layout(cols)
+        npts, k = col_in[0].shape[0], ka + kb
+    else:
+        npts = cols.shape[0]
+    args = (sd["lag"], sd["inst"])
+    if nb == 1:
         # Block 0 enters at zero (its first lag is row 0, Phi = 0).
-        ent_m = mx.zeros((n_chains, 1, m), dtype=mx.float32)
-        ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+        ent_C = mx.zeros((n, 1, m, m), dtype=mx.float32)
+        ent_m = mx.zeros((n, 1, k, m) if multi else (n, 1, m),
+                         dtype=mx.float32)
+        aux = ()
+    elif multi:
+        zero = mx.zeros((npts, n), dtype=mx.float32)
+        _, ent_C, aux = _boundary_states(p_t, q_t, *args, hv, zero,
+                                         sd["r_ref"], j2, s_floor_rel, 0,
+                                         formal, use_sqrt, starts)
+        ent_m = column_entry_means(p_t, q_t, *args, hv, cols, sd["r_ref"],
+                                   j2, ent_C, 0, formal, starts=starts)
     else:
-        ent_m, ent_C, _ = _boundary_states(
-            phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, s_floor_rel,
-            0, formal, boundary == "sqrt", starts)
-    return replay_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
-                         ent_m, ent_C, 0, formal, starts=starts, exits=True)
+        ent_m, ent_C, aux = _boundary_states(p_t, q_t, *args, hv, cols,
+                                             sd["r_ref"], j2, s_floor_rel, 0,
+                                             formal, use_sqrt, starts)
+    ent_m, ent_C = mx.contiguous(ent_m), mx.contiguous(ent_C)
+    if multi:
+        ld, g, xm, xC = replay_blocks_mc(p_t, q_t, *args, hv, cols,
+                                         sd["r_ref"], j2, ent_m, ent_C, 0,
+                                         formal, starts=starts, exits=True)
+        out = (ld, g)
+    else:
+        out, xm, xC = replay_blocks(p_t, q_t, *args, hv, cols, sd["r_ref"],
+                                    j2, ent_m, ent_C, 0, formal,
+                                    starts=starts, exits=True)
+    return out, xm, xC, ent_m, ent_C, tuple(aux), use_sqrt
 
 
-def scan_states_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
-                   s_floor_rel, starts, formal=False, boundary="dense"):
-    """`scan_states` for the columns of `scan_gram`: ``(ld, gram, xm,
-    xC)``, per block, with ``gram`` the packed lower triangle and ``xm``
-    every column's exit mean ``(n_chains, n_blocks, k, m)``.  Value only."""
-    n_chains, m = phi_tab.shape[0], phi_tab.shape[-1]
-    if m > MAX_STATE:
-        raise ValueError(f"metal scan supports m <= {MAX_STATE}, got {m}")
-    col_in, ka, kb, shared = _col_layout(cols)
-    npts, k = col_in[0].shape[0], ka + kb
-    n_blocks = int(starts.shape[0]) - 1
-    if n_blocks == 1:
-        ent_m = mx.zeros((n_chains, 1, k, m), dtype=mx.float32)
-        ent_C = mx.zeros((n_chains, 1, m, m), dtype=mx.float32)
+def _masked_side_vjp(p_t, q_t, hv, cols, j2, sd, blk_len, formal, ent_m,
+                     ent_C, aux, use_sqrt, c_ld, gs, c_xm, c_xC):
+    """The VJP of `_masked_side` for cotangents on its value (``c_ld``,
+    and ``gs`` on the Gram matrix for columns; None for the backward
+    direction, whose value is not used) and on every block's exit state.
+    The likelihood's own seeds (as `scan_loglike` and `scan_gram` form
+    them) plus the exit states' (`inject_seeds`), then the unchanged
+    backward sweep.  Returns ``(d_phi_tab, d_q_tab, d_h, d_cols, d_j2)``,
+    ``d_cols`` per column layout as `backward_ckpt_mc` returns it."""
+    n, n_lags, m = p_t.shape[0], p_t.shape[1], p_t.shape[-1]
+    starts = sd["starts"]
+    nb = int(starts.shape[0]) - 1
+    multi = isinstance(cols, (tuple, list)) or cols.ndim == 3
+    k = ent_m.shape[2] if multi else 1
+    slot_id, slot_start, n_slots, fold_plan = sd["slots"]
+    npts = (cols[0] if multi else cols).shape[0]
+    _check_adjoint_budget(n, n_slots, n_lags, npts, m, fold_plan)
+    args = (sd["lag"], sd["inst"])
+    col_arg = cols if multi else cols[..., None]
+    em = ent_m if multi else ent_m[:, :, None, :]
+    r_c, g, T = column_exit_sensitivities(p_t, q_t, *args, hv, col_arg,
+                                          sd["r_ref"], j2, em, ent_C, 0,
+                                          formal, starts=starts, parts=True)
+    seed_m = mx.zeros((n, nb, k, m), dtype=mx.float32)
+    seed_C = mx.zeros((n, nb, m, m), dtype=mx.float32)
+    if c_ld is not None and nb > 1:
+        *_, s_m, s_C = _boundary_seeds(aux, c_ld, formal, use_sqrt)
+        if multi:
+            seed_m = -2.0 * mx.einsum("cab,cnbi->cnai", gs, r_c)
+            seed_C = s_C - mx.einsum("cnai,cab,cnbj->cnij", r_c, gs, r_c)
+        else:
+            seed_m, seed_C = s_m[:, :, None, :], s_C
+    i_m, i_C = inject_seeds(g, T, c_xm if multi else c_xm[:, :, None, :],
+                            c_xC)
+    seed_m, seed_C = seed_m + i_m, seed_C + i_C
+    if c_ld is None:
+        c_ld = mx.zeros((n,), dtype=mx.float32)
+    if multi:
+        if gs is None:
+            gs = mx.zeros((n, k, k), dtype=mx.float32)
+        d_phi, d_q, d_h, d_y, d_rv = backward_ckpt_mc(
+            p_t, q_t, *args, hv, cols, sd["r_ref"], j2, c_ld, gs, ent_m,
+            ent_C, seed_m, seed_C, slot_id, slot_start, n_slots, blk_len,
+            formal, starts=starts)
     else:
-        zero = mx.zeros((npts, n_chains), dtype=mx.float32)
-        _, ent_C, _ = _boundary_states(
-            phi_tab, q_tab, lag, inst, hvec, zero, r_ref, jit2, s_floor_rel,
-            0, formal, boundary == "sqrt", starts)
-        ent_m = column_entry_means(phi_tab, q_tab, lag, inst, hvec, cols,
-                                   r_ref, jit2, ent_C, 0, formal,
-                                   starts=starts)
-    return replay_blocks_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref,
-                            jit2, mx.contiguous(ent_m), mx.contiguous(ent_C),
-                            0, formal, starts=starts, exits=True)
+        d_phi, d_q, d_h, d_y, d_rv = backward_ckpt(
+            p_t, q_t, *args, hv, cols, sd["r_ref"], j2, c_ld, ent_m, ent_C,
+            mx.contiguous(seed_m[:, :, 0]), mx.contiguous(seed_C), slot_id,
+            slot_start, n_slots, blk_len, formal=formal, starts=starts)
+    d_pt, d_qt = _fold_slots(d_phi, d_q, fold_plan, n, n_lags, m)
+    return d_pt, d_qt, mx.sum(d_h, axis=1), d_y, _d_jit2(d_rv, j2)
+
+
+def scan_masked(phi_tab, q_tab, hvec, resid_f, resid_b, jit_f, jit_b, fwd,
+                bwd, s_floor_rel, blk_len, formal=False, boundary="dense"):
+    """The held-out likelihood's kernel half (`GPLogLike`'s ``held_out``):
+    ``(ell, xm_f, xC_f, xm_b, xC_b)`` -- S's log-likelihood ``(n_chains,)``
+    from the forward series, and every block's exit state in the forward
+    series and in the time-reversed one (`Term.reversal_signs`), whose
+    blocks are placed (``fwd["starts"]``, ``bwd["starts"]``) so that
+    window edges are block ends.
+
+    ``fwd`` and ``bwd`` each hold ``lag``, ``inst``, ``r_ref``,
+    ``starts`` and ``slots`` (the slot map for those blocks, as
+    `scan_loglike` takes it); ``resid_*`` and ``jit_*`` are each series'
+    own, time-major.  Differentiable in the tables, ``h``, the residuals
+    and the jitter, **including through the exit states**: the VJP adds
+    their cotangents to the seeds (`inject_seeds`), so a window step
+    downstream differentiates by MLX and the kernels carry the rest.
+    ``blk_len`` bounds the blocks' length (the backward's checkpoints).
+    """
+    n_aux = {}
+
+    @mx.custom_function
+    def core(p_t, q_t, hv, rf, rb, jf, jb):
+        rf, rb = mx.contiguous(rf), mx.contiguous(rb)
+        ell, xm_f, xc_f, em_f, ec_f, aux_f, _ = _masked_side(
+            p_t, q_t, hv, rf, jf, fwd, s_floor_rel, formal, boundary)
+        _, xm_b, xc_b, em_b, ec_b, aux_b, _ = _masked_side(
+            p_t, q_t, hv, rb, jb, bwd, s_floor_rel, formal, boundary)
+        n_aux["f"], n_aux["b"] = len(aux_f), len(aux_b)
+        return (mx.sum(ell, axis=1), xm_f, xc_f, xm_b, xc_b,
+                em_f, ec_f, em_b, ec_b, *aux_f, *aux_b)
+
+    @core.vjp
+    def _core_vjp(primals, cotangents, outputs):
+        p_t, q_t, hv, rf, rb, jf, jb = primals
+        c_ell, cm_f, cc_f, cm_b, cc_b = cotangents[:5]
+        em_f, ec_f, em_b, ec_b = outputs[5:9]
+        aux_f = tuple(outputs[9:9 + n_aux["f"]])
+        aux_b = tuple(outputs[9 + n_aux["f"]:])
+        sq_f = boundary == "sqrt" and int(fwd["starts"].shape[0]) > 2
+        sq_b = boundary == "sqrt" and int(bwd["starts"].shape[0]) > 2
+        f = _masked_side_vjp(p_t, q_t, hv, rf, jf, fwd, blk_len, formal,
+                             em_f, ec_f, aux_f, sq_f, c_ell, None, cm_f, cc_f)
+        b = _masked_side_vjp(p_t, q_t, hv, rb, jb, bwd, blk_len, formal,
+                             em_b, ec_b, aux_b, sq_b, None, None, cm_b, cc_b)
+        return (f[0] + b[0], f[1] + b[1], f[2] + b[2], f[3], b[3], f[4],
+                b[4])
+
+    out = core(phi_tab, q_tab, hvec, resid_f, resid_b, mx.contiguous(jit_f),
+               mx.contiguous(jit_b))
+    return out[:5]
+
+
+def scan_masked_mc(phi_tab, q_tab, hvec, cols_f, cols_b, jit_f, jit_b, fwd,
+                   bwd, s_floor_rel, blk_len, formal=False, boundary="dense"):
+    """`scan_masked` for the columns of `scan_gram`: ``(ld, gram, xm_f,
+    xC_f, xm_b, xC_b)`` with ``ld``, ``gram`` S's (`scan_gram`'s) and the
+    exit means per column ``(n_chains, n_blocks, k, m)``.  ``cols_*`` are
+    each series' columns, one array or a split pair (`_col_layout`; a
+    shared block gets no cotangent)."""
+    lay_f, lay_b = _col_layout(cols_f), _col_layout(cols_b)
+    _, ka, kb, shared = lay_f
+    k = ka + kb
+    rows, cs = np.tril_indices(k)
+    lower, upper = mx.array(rows * k + cs), mx.array(cs * k + rows)
+    off_diag = mx.array(rows != cs)
+    n_aux = {}
+    zero = mx.zeros((1,), dtype=mx.float32)
+
+    def split(ca, cb):
+        return (ca, cb) if kb else ca
+
+    @mx.custom_function
+    def core(p_t, q_t, hv, caf, cbf, cab, cbb, jf, jb):
+        (ld, g), xm_f, xc_f, em_f, ec_f, aux_f, _ = _masked_side(
+            p_t, q_t, hv, split(caf, cbf), jf, fwd, s_floor_rel, formal,
+            boundary)
+        _, xm_b, xc_b, em_b, ec_b, aux_b, _ = _masked_side(
+            p_t, q_t, hv, split(cab, cbb), jb, bwd, s_floor_rel, formal,
+            boundary)
+        ld, g = mx.sum(ld, axis=1), mx.sum(g, axis=1)
+        n = g.shape[0]
+        full = mx.zeros((n, k * k), dtype=g.dtype)
+        full = full.at[:, lower].add(g)
+        full = full.at[:, upper].add(mx.where(off_diag, g, 0.0))
+        n_aux["f"], n_aux["b"] = len(aux_f), len(aux_b)
+        return (ld, full.reshape(n, k, k), xm_f, xc_f, xm_b, xc_b,
+                em_f, ec_f, em_b, ec_b, *aux_f, *aux_b)
+
+    @core.vjp
+    def _core_vjp(primals, cotangents, outputs):
+        p_t, q_t, hv, caf, cbf, cab, cbb, jf, jb = primals
+        c_ld = cotangents[0]
+        gs = 0.5 * (cotangents[1] + mx.swapaxes(cotangents[1], 1, 2))
+        cm_f, cc_f, cm_b, cc_b = cotangents[2:6]
+        em_f, ec_f, em_b, ec_b = outputs[6:10]
+        aux_f = tuple(outputs[10:10 + n_aux["f"]])
+        aux_b = tuple(outputs[10 + n_aux["f"]:])
+        sq_f = boundary == "sqrt" and int(fwd["starts"].shape[0]) > 2
+        sq_b = boundary == "sqrt" and int(bwd["starts"].shape[0]) > 2
+        f = _masked_side_vjp(p_t, q_t, hv, split(caf, cbf), jf, fwd, blk_len,
+                             formal, em_f, ec_f, aux_f, sq_f, c_ld, gs,
+                             cm_f, cc_f)
+        b = _masked_side_vjp(p_t, q_t, hv, split(cab, cbb), jb, bwd,
+                             blk_len, formal, em_b, ec_b, aux_b, sq_b, None,
+                             None, cm_b, cc_b)
+
+        def parts(d_y, cb):
+            if kb == 0 or shared:
+                return d_y, mx.zeros_like(cb)
+            return d_y[..., :ka], d_y[..., ka:]
+        daf, dbf = parts(f[3], cbf)
+        dab, dbb = parts(b[3], cbb)
+        return (f[0] + b[0], f[1] + b[1], f[2] + b[2], daf, dbf, dab, dbb,
+                f[4], b[4])
+
+    def prep(lay):
+        col_in = lay[0]
+        cb = col_in[1] if kb else zero
+        cb = (mx.stop_gradient(mx.contiguous(cb)) if kb and shared
+              else mx.contiguous(cb))
+        return mx.contiguous(col_in[0]), cb
+    caf, cbf = prep(lay_f)
+    cab, cbb = prep(lay_b)
+    out = core(phi_tab, q_tab, hvec, caf, cbf, cab, cbb, mx.contiguous(jit_f),
+               mx.contiguous(jit_b))
+    return out[:6]
 
 
 #: Weighted normal equations ``A = Phi^T W Phi`` (packed lower triangle)
@@ -3307,7 +3617,7 @@ def _sqrt_block_kernel(m: int, n_jit: int = 0, aligned: bool = False):
                 ["phitab", "qtab", "lqtab", "lag", "inst", "hvec",
                  "resid", "r_ref", "jit2", "start_m", "start_C",
                  "npts", "n_lags", "n_blocks", "n_chains", "blk_len",
-                 "n_jit"], None, aligned or None),
+                 "n_jit"], aligned),
             output_names=["out_A", "out_b", "out_U", "out_eta", "out_Z"],
             source=body.replace("MDIM", str(m)),
         )
@@ -3333,10 +3643,10 @@ def sqrt_blocks(phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
               (n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m)]
     return tuple(_sqrt_block_kernel(m, n_jit, starts is not None)(
-        inputs=_starts_inputs(None, [
+        inputs=[
             phi_tab, q_tab, lq_tab, lag, inst, hvec, resid, r_ref, jit2,
             start_m, start_C, int(npts), int(n_lags), int(n_blocks),
-            int(n_chains), int(blk_len), int(n_jit)], starts),
+            int(n_chains), _blk_arg(blk_len, starts), int(n_jit)],
         output_shapes=shapes, output_dtypes=[mx.float32] * 5,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1)))
@@ -3709,11 +4019,11 @@ def scan_blocks(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
               (n_chains, n_blocks, m, m), (n_chains, n_blocks, m),
               (n_chains, n_blocks, m, m), (n_chains, n_blocks)]
     scalars = [float(s_floor_rel), int(npts), int(n_lags), int(n_blocks),
-               int(n_chains), int(blk_len), int(n_jit)]
+               int(n_chains), _blk_arg(blk_len, starts), int(n_jit)]
 
     outs = _kernel(m, n_jit, formal, with_ell, starts is not None)(
-        inputs=_starts_inputs(None, [phi_tab, q_tab, lag, inst, hvec, resid,
-                                     r_ref, jit2, *scalars], starts),
+        inputs=[phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2,
+                *scalars],
         output_shapes=shapes, output_dtypes=[mx.float32] * 6,
         grid=(n_blocks * n_chains, 1, 1),
         threadgroup=(min(64, n_blocks * n_chains), 1, 1))

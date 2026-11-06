@@ -187,9 +187,9 @@ dense ``Sigma``, float32 within the unmasked kernel's budget on their
 posterior draws), the dense tests in tests/test_masked.py on the kernel,
 and a cost within ~1.5-2x the unmasked kernel, measured on a quiet GPU.
 
-**Status 2026-11-06: values done (2a, 2b, 2d's value); 2c not started.**
-Agreed order: values first.  As built, two things differ from the scope
-above:
+**Status 2026-11-06: values done (2a, 2b, 2d's value), then the gradient
+(2c, 2d's gradient).**  Agreed order: values first.  As built, two
+things differ from the scope above:
 
 - *The right edge comes from a time-reversed run, not the suffix.*  In
   every term's ``P_inf = I`` state, time reversal is a sign flip ``S``
@@ -210,10 +210,24 @@ The window step is the two-filter form in covariance terms,
 inverse of either side's covariance, so it does not lose the information
 gain the MLX path's information-form fusion loses.
 
-The gradient is the MLX path's for now: `_evaluate_metal_masked` and
-`_gram_metal_masked` are custom functions whose VJP differentiates the
-MLX evaluation.  So ensemble sampling (values only) runs on the kernel,
-and anything that differentiates still costs about what it did.
+*The gradient (2c).*  `metal.scan_masked` (and `scan_masked_mc` for a
+basis) returns S's value and every block's exit state in both series;
+the window step downstream is MLX, so MLX hands the scan's VJP
+cotangents on the exit states.  Those enter the backward sweep through
+the seeds.  The seed of a block is the adjoint of its exit state; the
+likelihood's own part keeps its closed form, and the exit states' part
+is a linear recursion backward over the blocks (`metal.inject_seeds`):
+
+    a <- T^T a,   Pi <- T^T Pi T + sum_c sym(a_c g_c^T),
+
+with ``T`` a block's mean map and ``g`` its data's sensitivity to its
+entry mean -- both from the existing r-sensitivity pass, both in
+covariance form -- from the filter's first-order ``dm_exit = T dm_entry +
+T dP_entry g`` and ``dP_exit = T dP_entry T^T``.  The backward kernels
+are unchanged.  The placed-block variant passes ``blk_start`` in
+``blk_len``'s buffer: the multi-column backward with a split basis
+already uses 31, the Metal limit.  (Until 2c a custom VJP differentiated
+the MLX evaluation instead.)
 
 Accuracy, float32 against float64 (dense-``Sigma`` verified):
 
@@ -221,10 +235,7 @@ Accuracy, float32 against float64 (dense-``Sigma`` verified):
   blocks of 16: 7e-6 to 1.4e-4 log-units, against 2.6e-5 to 6.4e-4 on
   the MLX path.
 - Marginalised basis, shared and per chain, flat and Gaussian prior:
-  1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the MLX path); gradient against
-  float64 central differences 2e-5 to 7e-5 relative (the MLX
-  polarisation in the VJP needs its columns scaled, as `_marginal`
-  scales them: 1e-3 unscaled).
+  1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the MLX path).
 - The requester's scale (N = 2800, one-minute cadence, transit plus
   ingress and egress held out): sigma = yerr, 8.2e-5 against 1.0e-4
   unmasked; sigma = 30 yerr, rho = 30 hr, 2.4e-3 against 1.6e-4 (the
@@ -233,9 +244,22 @@ Accuracy, float32 against float64 (dense-``Sigma`` verified):
   5e-2.  The excluded regime (sigma = 300 yerr, rho = 10 hr): 0.54
   against the MLX path's 88.
 
+Gradient accuracy, float32 against float64 central differences:
+
+- N = 300, every term and layout, auto blocks and blocks of 16: 3e-7 to
+  7e-6 relative (MLX path 1.4e-7 to 2.3e-5).  One jitter and two per
+  instrument, sqrt and dense boundary; mean model, offsets and a
+  per-datum `noise_fn` (5e-7).
+- Marginalised basis: 4.7e-6 to 9.9e-6 (MLX path 1.2e-5 to 6.1e-5).
+- The requester's scale: sigma = yerr 7.8e-7, sigma = 30 yerr 6.7e-6,
+  sigma = 300 yerr 8.9e-6 -- the unmasked kernel's own (8.5e-7, 5.4e-6,
+  1.4e-5), where the MLX path's masked gradient is 1.5e-6, 1.5e-4 and
+  1.7e-3.
+
 Cost: owed, on a quiet GPU.  Two full passes over S (forward and
 reversed: boundary and replay each) plus O(held-out points) of MLX glue,
-so about 2x the unmasked kernel's value is expected.  Nothing is
+so about 2x the unmasked kernel's value is expected, and on the
+gradient two backward sweeps plus the r-sensitivity passes.  Nothing is
 measured yet.
 
 ### 3. Docs and reply

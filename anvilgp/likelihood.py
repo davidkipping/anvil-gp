@@ -471,14 +471,12 @@ class GPLogLike:
     mean, which overstates a feature's significance unless the noise at
     M's timescales is shown to be white independently.  To sample extra
     white noise on M, label it as its own instrument with a jitter.  The
-    mask is data, fixed here; it cannot depend on the parameters.  On the
-    fused kernel the *value* runs there (`_masked_metal_value`: S scanned
-    forward and time-reversed, `Term.reversal_signs`), a marginalised basis
-    included, and is more accurate in float32 than the MLX path's; the
-    *gradient* is still the MLX path's (`_evaluate_metal_masked`), so a
-    gradient-based fit runs at roughly MLX speed until the kernel has it
-    (docs/masked-gp-plan.md, Phase 2c).  A convolved term runs on the MLX
-    path entirely.  See docs/masked-gp-plan.md.
+    mask is data, fixed here; it cannot depend on the parameters.  It
+    runs on the fused kernel, value and gradient, a marginalised basis
+    included (`_evaluate_metal_masked`: S scanned forward and
+    time-reversed, `Term.reversal_signs`), and is more accurate in float32
+    there than on the MLX path.  A convolved term, which has no time
+    reversal, runs on the MLX path.  See docs/masked-gp-plan.md.
     """
 
     def __init__(self, mean_fn, t, x_mean, y, yerr, kernel_spec: Term,
@@ -1366,8 +1364,17 @@ class GPLogLike:
         i32 = lambda x: mx.array(np.asarray(x, dtype=np.int32))  # noqa: E731
         inst = np.array(self._metal_inst)
         rr = self._yerr64 ** 2
+        n_lags = int(uniq.size) + 1
+        slots = {}
+        for d, lg, st in (("f", lag_f, starts_f), ("b", lag_b, starts_b)):
+            sid, sstart, slag = _slot_map(lg, blk, starts=st)
+            kind, plan = _lag_fold_plan(slag, n_lags)
+            slots[d] = (mx.array(sid), mx.array(sstart), int(slag.size),
+                        (kind, mx.array(plan)) if kind == "dense" else
+                        (kind, [(mx.array(x), mx.array(y)) for x, y in plan]))
         lay = dict(
             blk=blk, uniq=mx.array(uniq, dtype=mx.float32),
+            slots_f=slots["f"], slots_b=slots["b"],
             lag_f=i32(lag_f), lag_b=i32(lag_b),
             starts_f=i32(starts_f), starts_b=i32(starts_b),
             ia=i32(ia), ib=i32(ib), s_pos=i32(s_pos), m_pos=i32(m_pos),
@@ -1450,157 +1457,77 @@ class GPLogLike:
             jf = jb = jit2
         return lay, kp, pt, qt, h, q, r, jit2, jf, jb
 
-    def _masked_metal_value(self, v, resid=None):
+    def _masked_sides(self, lay):
+        """The two series' kernel inputs for `metal.scan_masked`."""
+        return tuple(dict(lag=lay["lag_" + d], inst=lay["inst_" + d],
+                          r_ref=lay["rref_" + d], starts=lay["starts_" + d],
+                          slots=lay["slots_" + d]) for d in "fb")
+
+    def _evaluate_metal_masked(self, v, resid=None):
         """``log N(r_S; 0, C) + log N(r_M - P r_S; 0, W_M)`` on the kernel,
-        value only: S's term from the forward scan over placed blocks
-        (`metal.scan_states`), ``P r_S`` from both scans' window-edge
-        states (`_held_out_mean`).  Returns ``(log L, None)``: no lag table
-        for `kappa`, whose median-cadence row indexes the whole series'
-        table, not this one (it rebuilds the row instead, as on the MLX
-        path)."""
-        from .metal import scan_states
-        lay, kp, pt, qt, h, q, r, jit2, jf, jb = self._masked_metal_inputs(
+        value and gradient: S's term and every block's exit state from
+        `metal.scan_masked` (forward, and time-reversed), ``P r_S`` from
+        the window-edge exits (`_held_out_mean`, by MLX, whose cotangents
+        on the exits the scan's VJP carries into the kernels).  Returns
+        ``(log L, None)``: no lag table for `kappa`, whose median-cadence
+        row indexes the whole series' table, not this one (it rebuilds the
+        row instead, as on the MLX path)."""
+        from .metal import scan_masked
+        lay, kp, pt, qt, h, _, r, jit2, jf, jb = self._masked_metal_inputs(
             v, resid)
-        args = dict(s_floor_rel=self.policy.s_floor_rel,
-                    boundary=self._metal_boundary)
-        ell, xm_f, xc_f = scan_states(
-            pt, qt, lay["lag_f"], lay["inst_f"], h,
-            mx.take(r, lay["s_pos"], 0), lay["rref_f"], jf,
-            starts=lay["starts_f"], **args)
-        _, xm_b, xc_b = scan_states(
-            pt, qt, lay["lag_b"], lay["inst_b"], h,
-            mx.take(r, lay["s_rev"], 0), lay["rref_b"], jb,
-            starts=lay["starts_b"], **args)
+        fwd, bwd = self._masked_sides(lay)
+        ell, xm_f, xc_f, xm_b, xc_b = scan_masked(
+            pt, qt, h, mx.take(r, lay["s_pos"], 0),
+            mx.take(r, lay["s_rev"], 0), jf, jb, fwd, bwd,
+            self.policy.s_floor_rel, lay["blk"], boundary=self._metal_boundary)
         pred = self._held_out_mean(kp, lay, xm_f[..., None, :], xc_f,
                                    xm_b[..., None, :], xc_b)[..., 0]
         d = mx.swapaxes(mx.take(r, lay["m_pos"], 0), 0, 1) - pred
         w_m = self._masked_metal_noise(lay, jit2)
         ell_m = -0.5 * mx.sum(d * d / w_m + mx.log(w_m / lay["rref_m"]), -1)
-        return mx.sum(ell, axis=1) + ell_m, None
-
-    def _evaluate_metal_masked(self, v, resid=None):
-        """`_masked_metal_value`, differentiable: until the kernel has the
-        held-out gradient (docs/masked-gp-plan.md, Phase 2c), the VJP is
-        the MLX path's, `_evaluate_masked` differentiated by MLX.  The
-        value a sampler sees is the kernel's; the gradient is that of the
-        same function evaluated the MLX way (float32-close, not equal)."""
-        has_r = resid is not None
-
-        @mx.custom_function
-        def core(vv, rr):
-            return self._masked_metal_value(vv, rr if has_r else None)[0]
-
-        @core.vjp
-        def _core_vjp(primals, cotangents, outputs):
-            vv, rr = primals
-            cot = (cotangents[0] if isinstance(cotangents, (list, tuple))
-                   else cotangents)
-
-            def mlx(w, x):
-                return self._evaluate(
-                    w, self._dt32, self._y32, self._r_ref32, self._x_mean32,
-                    self._inst32, _pow2(self.policy.block),
-                    self.policy.eval_blocks, uniq=self._uniq32,
-                    resid=x if has_r else None)
-            return tuple(mx.vjp(mlx, [vv, rr], [cot])[1])
-
-        out = core(v, resid if has_r else mx.zeros((1,), dtype=v.dtype))
-        return out, None
+        return ell + ell_m, None
 
     def _gram_metal_masked(self, v, cols):
-        """`_gram_metal` with points held out: ``(ld, Z^T Sigma^-1 Z)``.  ``Sigma^-1``'s Gram is S's, from the forward multi-column
-        scan, plus ``D^T W_M^-1 D`` with ``D = Z_M - P Z_S``, every
-        column's held-out residual (`_held_out_mean`); ``ld`` adds M's
-        log-determinant half.  Value on the kernel, gradient by MLX
-        polarisation of `_evaluate_masked` (as `_evaluate_metal_masked`).
-        """
-        from .metal import scan_states_mc
-        split = isinstance(cols, tuple)
-
-        def columns(rc, phi):
-            # (n, k, N) for polarisation, from either layout
-            if not split:
-                return rc
-            n = rc.shape[0]
-            pb = mx.broadcast_to(phi[None] if phi.ndim == 2 else phi,
-                                 (n,) + phi.shape[-2:])
-            return mx.concatenate([rc[:, None, :], mx.swapaxes(pb, 1, 2)], 1)
-
-        @mx.custom_function
-        def core(vv, rc, phi):
-            lay, kp, pt, qt, h, _, _, jit2, jf, jb = \
-                self._masked_metal_inputs(vv, need_resid=False)
-            if split:
-                a = mx.contiguous(mx.swapaxes(rc, 0, 1))[..., None]
-                zf = (mx.take(a, lay["s_pos"], 0),
-                      mx.take(phi, lay["s_pos"], 0) if phi.ndim == 2 else
-                      mx.take(mx.swapaxes(phi, 0, 1), lay["s_pos"], 0))
-                zb = (mx.take(a, lay["s_rev"], 0),
-                      mx.take(phi, lay["s_rev"], 0) if phi.ndim == 2 else
-                      mx.take(mx.swapaxes(phi, 0, 1), lay["s_rev"], 0))
-                zf = tuple(mx.contiguous(x) for x in zf)
-                zb = tuple(mx.contiguous(x) for x in zb)
-            else:
-                a = mx.transpose(rc, (2, 0, 1))           # (N, n, k)
-                zf = mx.contiguous(mx.take(a, lay["s_pos"], 0))
-                zb = mx.contiguous(mx.take(a, lay["s_rev"], 0))
-            args = dict(s_floor_rel=self.policy.s_floor_rel,
-                        boundary=self._metal_boundary)
-            ld, g, xm_f, xc_f = scan_states_mc(
-                pt, qt, lay["lag_f"], lay["inst_f"], h, zf, lay["rref_f"],
-                jf, starts=lay["starts_f"], **args)
-            _, _, xm_b, xc_b = scan_states_mc(
-                pt, qt, lay["lag_b"], lay["inst_b"], h, zb, lay["rref_b"],
-                jb, starts=lay["starts_b"], **args)
-            z = columns(rc, phi)
-            k = z.shape[1]
-            pred = self._held_out_mean(kp, lay, xm_f, xc_f, xm_b, xc_b)
-            d = mx.swapaxes(mx.take(z, lay["m_pos"], 2), 1, 2) - pred
-            w_m = self._masked_metal_noise(lay, jit2)
-            rows, cs = np.tril_indices(k)
-            g = mx.sum(g, axis=1)
-            full = mx.zeros((g.shape[0], k * k), dtype=g.dtype)
-            full = full.at[:, mx.array(rows * k + cs)].add(g)
-            full = full.at[:, mx.array(cs * k + rows)].add(
-                mx.where(mx.array(rows != cs), g, 0.0))
-            gram = (full.reshape(-1, k, k)
-                    + mx.swapaxes(d / w_m[..., None], 1, 2) @ d)
-            ld = (mx.sum(ld, axis=1)
-                  - 0.5 * mx.sum(mx.log(w_m / lay["rref_m"]), -1))
-            return ld, gram
-
-        @core.vjp
-        def _core_vjp(primals, cotangents, outputs):
-            vv, rc, phi = primals
-
-            def mlx(w, x, ph):
-                def ev(w2, resid):
-                    return self._evaluate(
-                        w2, self._dt32, self._y32, self._r_ref32,
-                        self._x_mean32, self._inst32,
-                        _pow2(self.policy.block), self.policy.eval_blocks,
-                        uniq=self._uniq32, resid=resid)
-                # Polarised at a common column size, as `_marginal` does:
-                # a basis far smaller than the residual loses its cross
-                # terms to float32 (measured 1e-3 of the gradient for a
-                # shared orthonormal basis, against 1e-5 scaled).
-                z = columns(x, ph)
-                wt = 1.0 / self._r_ref32
-                nrm = mx.sum(z * z * wt, axis=-1)                 # (n, k)
-                sc = mx.stop_gradient(mx.where(
-                    nrm > 0, mx.sqrt(mx.maximum(nrm[:, :1], 1.0)
-                                     / mx.maximum(nrm, 1e-30)), 1.0))
-                ell0, gram, _ = self._gram_polarised(w, ev,
-                                                     z * sc[..., None])
-                return ell0, gram / (sc[:, :, None] * sc[:, None, :])
-            return tuple(mx.vjp(mlx, [vv, rc, phi], list(cotangents))[1])
-
-        if split:
+        """`_gram_metal` with points held out: ``(ld, Z^T Sigma^-1 Z)``.
+        ``Sigma^-1``'s Gram is S's, from the forward multi-column scan
+        (`metal.scan_masked_mc`), plus ``D^T W_M^-1 D`` with ``D = Z_M - P
+        Z_S``, every column's held-out residual (`_held_out_mean`); ``ld``
+        adds M's log-determinant half.  Differentiable as
+        `_evaluate_metal_masked`; a shared basis gets no cotangent."""
+        from .metal import scan_masked_mc
+        lay, kp, pt, qt, h, _, _, jit2, jf, jb = self._masked_metal_inputs(
+            v, need_resid=False)
+        sp, sr = lay["s_pos"], lay["s_rev"]
+        if isinstance(cols, tuple):
             rc, phi = cols
-            phi = mx.stop_gradient(phi) if phi.ndim == 2 else phi
-        else:
-            rc, phi = cols, mx.zeros((1,), dtype=v.dtype)
-        return core(v, rc, phi)
+            n = rc.shape[0]
+            a = mx.swapaxes(rc, 0, 1)[..., None]                 # (N, n, 1)
+            if phi.ndim == 2:                                    # shared
+                b = mx.stop_gradient(phi)
+                z_m = mx.concatenate(
+                    [mx.take(rc, lay["m_pos"], 1)[..., None],
+                     mx.broadcast_to(mx.take(b, lay["m_pos"], 0)[None],
+                                     (n, lay["m_pos"].size, b.shape[1]))], -1)
+            else:
+                b = mx.swapaxes(phi, 0, 1)                       # (N, n, p)
+                z_m = mx.concatenate(
+                    [mx.take(rc, lay["m_pos"], 1)[..., None],
+                     mx.take(phi, lay["m_pos"], 1)], -1)
+            zf = (mx.take(a, sp, 0), mx.take(b, sp, 0))
+            zb = (mx.take(a, sr, 0), mx.take(b, sr, 0))
+        else:                                                    # (n, k, N)
+            a = mx.transpose(cols, (2, 0, 1))
+            zf, zb = mx.take(a, sp, 0), mx.take(a, sr, 0)
+            z_m = mx.swapaxes(mx.take(cols, lay["m_pos"], 2), 1, 2)
+        fwd, bwd = self._masked_sides(lay)
+        ld, g, xm_f, xc_f, xm_b, xc_b = scan_masked_mc(
+            pt, qt, h, zf, zb, jf, jb, fwd, bwd, self.policy.s_floor_rel,
+            lay["blk"], boundary=self._metal_boundary)
+        d = z_m - self._held_out_mean(kp, lay, xm_f, xc_f, xm_b, xc_b)
+        w_m = self._masked_metal_noise(lay, jit2)
+        gram = g + mx.swapaxes(d / w_m[..., None], 1, 2) @ d
+        ld = ld - 0.5 * mx.sum(mx.log(w_m / lay["rref_m"]), -1)
+        return ld, gram
 
     def _metal_inputs(self, v: mx.array, resid: mx.array | None = None,
                       need_resid: bool = True):
@@ -2706,7 +2633,7 @@ _MAX_METAL_BLOCK = {1: 8192, 2: 8192, 3: 2048, 4: 256, 5: 128}
 _MAX_METAL_BLOCK_HI_M = 64
 
 
-def _slot_map(lag: np.ndarray, blk_len: int):
+def _slot_map(lag: np.ndarray, blk_len: int, starts=None):
     """Index map from observation to per-lag adjoint slot, and back to lag.
 
     The backward kernel accumulates the propagator adjoints ``dPhi``,
@@ -2734,10 +2661,17 @@ def _slot_map(lag: np.ndarray, blk_len: int):
     ``blk_len`` must be the block length the kernel is launched with; a
     map built for a different one silently misattributes every adjoint,
     with the *value* still correct because the forward never reads it.
+    ``starts`` (``(n_blocks + 1,)``) places the blocks instead, as the
+    held-out likelihood's kernels do (`metal._starts_src`).
     """
     n = int(lag.size)
-    n_blocks = -(-n // int(blk_len))
-    blk = np.arange(n, dtype=np.int64) // int(blk_len)
+    if starts is None:
+        n_blocks = -(-n // int(blk_len))
+        blk = np.arange(n, dtype=np.int64) // int(blk_len)
+    else:
+        starts = np.asarray(starts)
+        n_blocks = int(starts.size) - 1
+        blk = np.searchsorted(starts, np.arange(n), side="right") - 1
     stride = int(lag.max()) + 1
     key = blk * stride + lag.astype(np.int64)
     uniq, inv = np.unique(key, return_inverse=True)      # sorted: (block, lag)
