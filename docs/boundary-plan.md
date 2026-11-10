@@ -878,6 +878,18 @@ So the cut is 0.5 (`_SQRT_FDELTA`), at the reference point: a chain that
 walks well past it keeps the boundary chosen at construction and its
 value degrades as above (0.03 at ~1, 0.07 at ~2).
 
+*Corrected 2026-11-10.* Those are posterior sigma; further out the value
+itself goes wrong: against float64, at most 3.4e-3 log-units up to 3.2,
+then 0.08 at 3.6, 2.7 at 5 and -110 at 7.3, where the dense boundary
+holds 3e-3. A chain past 3 on the square-root boundary is now refused
+(`_SQRT_CHAIN_FDELTA`). And the Matern rows of step 1 below were chosen
+on the *gradient*; the same map on the *value* (regular cadence =
+exposure, N = 4000, five draws) has the square-root boundary at 1e-2 to
+0.3 log-units for a convolved Matern-5/2 at `||F delta||` of 0.08 to
+0.28, s/e 10 to 1000, and 0.09 for Matern-3/2 at 0.42, where the dense
+boundary is 2e-4 to 6e-3. That choice is open again
+(docs/review-2026-11-10.md).
+
 The rotation's 0.63 is the unconvolved rotation's level on the same kind
 of data (0.57); the gap to 0.33 is the Metal rounding V measured. Pinned
 in `tests/test_boundary.py`: the front end's float32 table equals the

@@ -740,3 +740,49 @@ def test_a_convolved_rotation_on_bright_data_is_accurate():
     e = (np.abs(g - G) * sd).max()
     assert e < 1.0, f"gradient {e:.2f} posterior sigma"
     assert np.std(f - _hi64(ref, V)) < 0.04
+
+
+def test_a_convolved_chain_past_the_sqrt_boundarys_range_is_refused():
+    """The square-root boundary is chosen at the reference point
+    (``||F delta|| <= 0.5`` there) and a chain keeps it wherever it walks.
+    Past about 3.2 its float32 value went wrong with no signal: 0.08
+    log-units at 3.6, 2.7 at 5, -110 at 7.3, where the dense boundary
+    held 3e-3 (2026-11-10 review).  Refused per chain past 3 now, on the
+    kernel and (so the two agree) in `hi`; the dense boundary and the MLX
+    path keep the whole series range."""
+    if not am.metal_available():
+        pytest.skip("needs mx.fast.metal_kernel")
+    n, delta, cad = 2000, 0.02, 0.03
+    rng = np.random.default_rng(2)
+    t = np.arange(n) * cad
+    inner = ag.SHOTerm()
+    kp = [1.0, 2.0, 0.3]
+    y = sample_ssm(inner, kp, cad, n, rng)
+    yerr = np.full(n, 0.1)
+    y = y + yerr * rng.standard_normal(n)
+    term = ag.TermConvolution(inner, delta)
+    rhos = np.array([0.3, 0.168, 0.118, 0.082])     # ||F delta|| 1.4 .. 5.1
+    rows = np.zeros((4, 3))
+    rows[:, 1] = np.log(rhos / kp[1])
+
+    def both(**kw):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                           GPPolicy(**kw))
+        with mx.stream(mx.gpu):
+            lo = np.array(gp(mx.array(rows, dtype=mx.float32)))
+        with mx.stream(mx.cpu):
+            hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64)))
+            raw = np.array(gp.hi(mx.array(rows, dtype=mx.float64),
+                                 refuse=False))
+        return gp, lo.astype(np.float64), hi, raw
+
+    gp, lo, hi, raw = both()
+    assert gp._metal_ok and gp._metal_boundary == "sqrt"
+    assert np.all(lo[2:] <= -1e29) and np.all(hi[2:] <= -1e29)
+    assert np.abs(lo[:2] - raw[:2]).max() < 5e-3
+    for kw in (dict(metal_boundary="dense"), dict(metal=False)):
+        gp, lo, hi, raw = both(**kw)
+        assert np.all(lo > -1e29) and np.all(hi > -1e29)
+        assert np.abs(lo - raw).max() < 2e-2, kw

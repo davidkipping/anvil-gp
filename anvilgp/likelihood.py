@@ -2235,15 +2235,22 @@ class GPLogLike:
         converged, and the value came back 432 log-units wrong in float64.
         Same norm as the construction check, per chain.  A no-op for every
         term but a convolved one.
+
+        On the kernel with the square-root boundary the range is shorter,
+        `_SQRT_CHAIN_FDELTA`: the boundary is chosen at the reference
+        point and a chain keeps it wherever it walks.
         """
         if not self._formal:
             return out
+        limit = (_SQRT_CHAIN_FDELTA
+                 if self._metal_ok and self._metal_boundary == "sqrt"
+                 else terms.MAX_FDELTA)
         kp = mx.stop_gradient(self.param_map.kernel_params(v))
         worst = None
         for g in self.term.term.generator(kp):
             nrm = mx.max(mx.abs(g), axis=(-2, -1)) * self.term.delta
             worst = nrm if worst is None else mx.maximum(worst, nrm)
-        bad = mx.logical_not(worst <= terms.MAX_FDELTA)
+        bad = mx.logical_not(worst <= limit)
         return mx.where(bad, mx.array(float("nan"), dtype=out.dtype), out)
 
     def _raw_call(self, v: mx.array) -> mx.array:
@@ -3169,6 +3176,20 @@ class _Float64FrontEnd:
 _SQRT_FDELTA = 0.5
 
 
+#: per-chain ``||F delta||`` (the series check's norm, largest generator
+#: entry times the exposure) past which a convolved term on the
+#: square-root boundary is refused.  `_SQRT_FDELTA` gates the *reference*
+#: point; a chain that walked on kept the boundary and its float32 value
+#: went wrong with no signal.  Convolved SHO, N = 2000, 256-point blocks,
+#: Q from 0.05 to 3 at s/e 10 and 100, against float64 (2026-11-10): at
+#: most 3.4e-3 log-units up to 3.2 for every Q, then 0.08 at 3.6, 0.2 to
+#: 0.6 at 4 to 4.5, 2.7 at 5, and -110 at 7.3 (N = 1500, Q = 0.07); the
+#: rotation term the same from 4.1.  The dense boundary stayed within
+#: 3e-3 over the whole series range on the same draws, so a posterior
+#: that lives out there wants ``GPPolicy(metal_boundary="dense")``.
+_SQRT_CHAIN_FDELTA = 3.0
+
+
 #: convolved member types the square-root boundary is measured on.  Inside
 #: the ``_SQRT_FDELTA`` guard their leaf's white-noise part ``r + c`` stays
 #: positive -- ``c >= 0`` for SHO, rotation and Matern-3/2, and Matern-5/2's
@@ -3197,7 +3218,8 @@ def _convolution_takes_sqrt(inner: Term, ref_fdelta: float | None) -> bool:
     measuring them inside the guard).  And only while ``Q``'s negative part is
     small, which it is below ``_SQRT_FDELTA`` at the reference point.  A
     chain that walks well past it keeps the square-root boundary (the
-    choice is fixed at construction) and its value degrades as above."""
+    choice is fixed at construction) and is refused beyond
+    ``_SQRT_CHAIN_FDELTA``."""
     members = inner.terms if isinstance(inner, TermSum) else (inner,)
     return (all(isinstance(t, _SQRT_CONVOLVED) for t in members)
             and ref_fdelta is not None and ref_fdelta <= _SQRT_FDELTA)
