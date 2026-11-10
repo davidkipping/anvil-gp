@@ -834,6 +834,8 @@ class GPLogLike:
         self._metal_ok, self._metal_why = self.metal_eligible()
         if self.policy.metal is None:
             _notice_metal_choice(self._metal_ok, self._metal_why)
+        if self._held is not None and not self._metal_ok:
+            self._warn_masked_on_mlx()
         if self.policy.metal is True and not self._metal_ok:
             # Asking for the kernel and silently getting the MLX path is a
             # 40x performance surprise with no signal.  Say so once, here,
@@ -1021,6 +1023,36 @@ class GPLogLike:
         #: Equal on a regular cadence; ~1/13 of it when every timestamp
         #: spacing is distinct at 13 blocks.
         self.n_metal_slots = int(slag.size)
+
+    #: held-out windows past which the MLX path's gradient is warned
+    #: about: its graph grows with every segment, and Metal's resource
+    #: limit (499000 live buffers) ended the process at 150 windows of a
+    #: convolved term at N = 6000, 64 chains; 80 survived, in 13 s.
+    _MLX_MASK_WINDOWS = 64
+
+    def _warn_masked_on_mlx(self) -> None:
+        """A held-out fit that is not on the kernel: say what that costs,
+        at construction.  Speed is in the path notice already; these are
+        the two things it does not say (2026-11-10 review)."""
+        n_seg = len(self._held["bounds"])
+        if not self._formal:
+            warnings.warn(
+                "held_out on the MLX path: its float32 value is less "
+                "accurate than the unmasked MLX path's.  Measured on a "
+                "four-SHO sum (m = 8), 96 draws within two prior sd: 1-2 "
+                "more than a log-unit from float64 (worst 2.5) and 3-8 "
+                "past 0.1, against none and 2 unmasked.  Check with "
+                "anvil.validate_precision, or keep the term within the "
+                "kernel's state budget.", RuntimeWarning, stacklevel=4)
+        if n_seg > self._MLX_MASK_WINDOWS:
+            warnings.warn(
+                f"held_out leaves {n_seg} kept segments on the MLX path, "
+                f"whose gradient graph grows with each: past about "
+                f"{self._MLX_MASK_WINDOWS} it takes tens of seconds, and "
+                f"at 150 it exhausted Metal's resource limit and ended the "
+                f"process (N = 6000, 64 chains).  The value alone is "
+                f"unaffected; use a gradient-free sampler, fewer windows, "
+                f"or a term the kernel serves.", RuntimeWarning, stacklevel=4)
 
     def _may_use_metal(self) -> bool:
         """Whether this instance can end up on the kernel: asked for, or
@@ -1313,6 +1345,7 @@ class GPLogLike:
         # segments and of each held-out point's neighbours: the MLX path
         # reads them here and the kernel's layout (`_masked_metal_layout`)
         # builds its blocks from them.
+        dt_r = np.concatenate([[0.0], dt_s[::-1][:-1]])
         self._held = dict(
             mask=mask, s_pos=i32(s_pos), m_pos=i32(m_pos),
             s_pos_np=s_pos, m_pos_np=m_pos,
@@ -1322,6 +1355,13 @@ class GPLogLike:
             uniq64=self._distinct_lags(np.float64, dt_s),
             uniq32=self._distinct_lags(np.float32, dt_s),
             gaps=gaps, gaps32=f32(gaps),
+            # S reversed, for the two-filter window step of the MLX and
+            # float64 paths: reversed position p is S index n_s - 1 - p,
+            # and each reversed segment again starts at lag 0.
+            rev_pos=i32(np.arange(n_s)[::-1].copy()),
+            dtr64=a64(dt_r), dtr32=f32(dt_r),
+            uniqr64=self._distinct_lags(np.float64, dt_r),
+            uniqr32=self._distinct_lags(np.float32, dt_r),
             prev_np=prev, next_np=nxt_seg, prev=i32(prev), next=i32(nxt_seg),
             lag_a=lag_a, lag_a32=f32(lag_a), lag_b=lag_b, lag_b32=f32(lag_b))
 
@@ -1800,6 +1840,20 @@ class GPLogLike:
           I, C = 0``) carrying the information, so its output mean is the
           smoothed state; ``P r_S`` is ``h`` of it.
 
+        That last step is the *information* form, and only a term with no
+        time reversal (`Term.reversal_signs`: a convolved one) still takes
+        it.  The suffix's ``(eta, J)`` grow with the signal-to-noise and
+        their composition cancels: against an 80-digit reference the
+        float64 value was 2e-3 off at sigma = 1e6 yerr and NaN at 1e9,
+        where the float32 kernel held 4e-4, and in float32 on a four-SHO
+        sum 7 of 96 draws inside two prior sd were more than a log-unit
+        off (2026-11-10 review).  Every other term runs the kernel's
+        two-filter form instead (`_held_out_mean`): S reversed is reduced
+        by the same machinery -- time reversal is a sign flip of the
+        state, so the same matrices serve -- its prefix is the *filtered
+        state* at each segment's first point from everything after, and
+        the two states are fused in covariance form.
+
         M's white noise is the noise model's variance there, without a
         convolution's zero-lag correction (part of the GP, not of the
         noise).  Its log-determinant is taken against ``r_ref`` like every
@@ -1871,37 +1925,80 @@ class GPLogLike:
         for j in range(1, k):
             fwd.append(combine(combine(fwd[-1], gaps[j], formal=fm), segs[j],
                                formal=fm))
-        bwd = [segs[-1]]
-        for j in range(k - 2, -1, -1):
-            bwd.insert(0, combine(segs[j], combine(gaps[j + 1], bwd[0],
-                                                   formal=fm), formal=fm))
         # Index k is "no segment on this side": the stationary prior on the
         # left, no information on the right; both edges' lags are then 0.
         ip, inx = hd["prev"], hd["next"]
         b_a = mx.take(mx.stack([f.b for f in fwd] + [z1], 1), ip, axis=1)
         c_a = mx.take(mx.stack([f.C for f in fwd] + [p_inf], 1), ip, axis=1)
-        eta_b = mx.take(mx.stack([e.eta for e in bwd] + [z1], 1), inx, axis=1)
-        j_b = mx.take(mx.stack([e.J for e in bwd] + [z2], 1), inx, axis=1)
         phi_a, q_a, h = self.term.matrices(
             kp, a64(hd["lag_a"]) if f64 else hd["lag_a32"])
         phi_b, q_b, _ = self.term.matrices(
             kp, a64(hd["lag_b"]) if f64 else hd["lag_b32"])
         n_m = mp.size
-        y0 = mx.zeros((n, n_m), dtype=dtype)
-        y1 = mx.zeros((n, n_m, m), dtype=dtype)
-        y2 = mx.zeros((n, n_m, m, m), dtype=dtype)
-        eye = mx.broadcast_to(mx.eye(m, dtype=dtype), (n, n_m, m, m))
-        pre = combine(Element(A=y2, b=b_a, C=c_a, eta=y1, J=y2, ell=y0),
-                      Element(A=phi_a, b=y1, C=q_a, eta=y1, J=y2, ell=y0),
-                      formal=fm)
-        fut = combine(Element(A=phi_b, b=y1, C=q_b, eta=y1, J=y2, ell=y0),
-                      Element(A=eye, b=y1, C=y2, eta=eta_b, J=j_b, ell=y0),
-                      formal=fm)
-        smooth = combine(
-            Element(A=y2, b=pre.b, C=pre.C, eta=y1, J=y2, ell=y0),
-            Element(A=eye, b=y1, C=y2, eta=fut.eta, J=fut.J, ell=y0),
-            formal=fm)
-        d = mx.take(r, mp, axis=1) - mx.sum(h[:, None, :] * smooth.b, -1)
+        signs = None if fm else self.term.reversal_signs()
+        if signs is not None:
+            from .linalg import inv_logdet_fast, matmul, matvec
+            rp = hd["rev_pos"]
+            r_r, w_r = mx.take(r_s, rp, axis=1), mx.take(w_s, rp, axis=1)
+            rref_r, floor_r = mx.take(rref_s, rp), mx.take(floor_s, rp)
+            get_rev = self._matrices_fn(
+                kp, hd["dtr64"] if f64 else hd["dtr32"],
+                hd["uniqr64"] if f64 else hd["uniqr32"])
+            n_s = int(rp.size)
+            rsegs = []
+            for s, e in hd["bounds"]:
+                roots = []
+                for a in range(n_s - e, n_s - s, block):
+                    b = min(a + block, n_s - s)
+                    phi, q, h_ = get_rev(a, b)
+                    roots.append(self._reduce_leaves(
+                        (phi, q, h_, r_r[:, a:b], w_r[:, a:b], rref_r[a:b],
+                         floor_r[a:b]), do_eval))
+                rsegs.append(roots[0] if len(roots) == 1
+                             else tree_reduce(_stack(roots), formal=fm))
+            # bwd[j]: the reversed filter's state at segment j's first
+            # point, from segments j.. (in the sign-flipped state)
+            bwd = [combine(start, rsegs[-1], formal=fm)]
+            for j in range(k - 2, -1, -1):
+                bwd.insert(0, combine(combine(bwd[0], gaps[j + 1],
+                                              formal=fm), rsegs[j],
+                                      formal=fm))
+            b_b = mx.take(mx.stack([e.b for e in bwd] + [z1], 1), inx, axis=1)
+            c_b = mx.take(mx.stack([e.C for e in bwd] + [p_inf], 1), inx,
+                          axis=1)
+            sg = mx.array(np.array(signs, dtype=np.float64), dtype=dtype)
+            tr = lambda x: mx.swapaxes(x, -1, -2)               # noqa: E731
+            big_a = matmul(matmul(phi_a, c_a), tr(phi_a)) + q_a
+            big_b = ((matmul(matmul(phi_b, c_b), tr(phi_b)) + q_b)
+                     * (sg[:, None] * sg[None, :]))
+            a_m = matvec(phi_a, b_a)
+            b_m = matvec(phi_b, b_b) * sg
+            g_inv, _ = inv_logdet_fast(big_a + big_b - matmul(big_a, big_b))
+            mean = (matvec(big_b, matvec(g_inv, a_m))
+                    + matvec(big_a, matvec(tr(g_inv), b_m)))
+        else:
+            bwd = [segs[-1]]
+            for j in range(k - 2, -1, -1):
+                bwd.insert(0, combine(segs[j], combine(gaps[j + 1], bwd[0],
+                                                       formal=fm), formal=fm))
+            eta_b = mx.take(mx.stack([e.eta for e in bwd] + [z1], 1), inx,
+                            axis=1)
+            j_b = mx.take(mx.stack([e.J for e in bwd] + [z2], 1), inx, axis=1)
+            y0 = mx.zeros((n, n_m), dtype=dtype)
+            y1 = mx.zeros((n, n_m, m), dtype=dtype)
+            y2 = mx.zeros((n, n_m, m, m), dtype=dtype)
+            eye = mx.broadcast_to(mx.eye(m, dtype=dtype), (n, n_m, m, m))
+            pre = combine(Element(A=y2, b=b_a, C=c_a, eta=y1, J=y2, ell=y0),
+                          Element(A=phi_a, b=y1, C=q_a, eta=y1, J=y2, ell=y0),
+                          formal=fm)
+            fut = combine(Element(A=phi_b, b=y1, C=q_b, eta=y1, J=y2, ell=y0),
+                          Element(A=eye, b=y1, C=y2, eta=eta_b, J=j_b,
+                                  ell=y0), formal=fm)
+            mean = combine(
+                Element(A=y2, b=pre.b, C=pre.C, eta=y1, J=y2, ell=y0),
+                Element(A=eye, b=y1, C=y2, eta=fut.eta, J=fut.J, ell=y0),
+                formal=fm).b
+        d = mx.take(r, mp, axis=1) - mx.sum(h[:, None, :] * mean, -1)
         w_m = mx.take(w, mp, axis=1)
         ell_m = -0.5 * mx.sum(d * d / w_m + mx.log(w_m / mx.take(r_ref, mp)),
                               -1)

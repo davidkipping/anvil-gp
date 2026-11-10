@@ -808,3 +808,126 @@ def test_chees_samples_a_masked_target():
     j = vm.reshape(chain.shape)[:, :, gt.names.index("log_jitter")]
     sd = float(np.median(j.std(axis=0)))
     assert 0.11 < sd < 0.17, f"median per-chain log_jitter width {sd:.3f}"
+
+
+def _mp_masked_sho(mpm, p, t, y, yerr, mask):
+    """The held-out likelihood of an underdamped SHO in 80-digit
+    arithmetic, relative to ``-1/2 sum log yerr^2`` as `GPLogLike.hi`."""
+    n = t.size
+    s, rho, q = (mpm.mpf(float(x)) for x in p)
+    w0, eta = 2 * mpm.pi / rho, mpm.sqrt(1 - 1 / (4 * q * q))
+
+    def kern(a, b):
+        tau = mpm.mpf(float(abs(t[a] - t[b])))
+        return s * s * mpm.exp(-w0 * tau / (2 * q)) * (
+            mpm.cos(eta * w0 * tau) + mpm.sin(eta * w0 * tau) / (2 * eta * q))
+    wv = [mpm.mpf(float(e)) ** 2 for e in yerr]
+    kept = [k for k in range(n) if not mask[k]]
+    cov = mpm.matrix(len(kept), len(kept))
+    for a, ia in enumerate(kept):
+        for b, ib in enumerate(kept):
+            cov[a, b] = kern(ia, ib) + (wv[ia] if a == b else 0)
+    r_s = mpm.matrix([mpm.mpf(float(y[k])) for k in kept])
+    lo = mpm.cholesky(cov)
+    al = mpm.cholesky_solve(cov, r_s)
+    ll = -0.5 * (r_s.T * al)[0] - sum(mpm.log(lo[a, a])
+                                      for a in range(len(kept)))
+    for k in (k for k in range(n) if mask[k]):
+        d = mpm.mpf(float(y[k])) - sum(kern(k, ib) * al[b]
+                                       for b, ib in enumerate(kept))
+        ll += -0.5 * d * d / wv[k] - 0.5 * mpm.log(wv[k])
+    return float(ll + 0.5 * sum(mpm.log(w) for w in wv))
+
+
+@pytest.mark.parametrize("layout", ["mid", "ends"])
+def test_the_float64_reference_holds_at_large_amplitude(layout):
+    """`hi` is what `validate_precision` and `reanchor_every` trust, so it
+    must not be the path that fails first.  At sigma = e^12 (1.6e5; ~1e6
+    yerr) the information-form window step it used until 2026-11-10 was
+    1.3e-3 (interior window) and 2.4e-3 (both ends) from an 80-digit
+    reference while the float32 kernel was within 2e-4.  With the
+    two-filter step: 2.5e-6 and 1.5e-6.  (Not a cure-all: the covariance
+    form runs out of float64 where the posterior variance is 1e-14 of the
+    prior's -- at e^16 it is 4e-3 to 0.15 off -- and with every other
+    point held out it is no better than before, 6e-5 here.)"""
+    import mpmath as mpm
+    mpm.mp.dps = 80
+    n = 60
+    term, kp = _TERMS["sho"]
+    rng = np.random.default_rng(0)
+    t = np.sort(rng.uniform(0, 6.0, n))
+    yerr = rng.uniform(0.1, 0.3, n)
+    grid = np.linspace(t.min(), t.max() + 1e-9, 4000)
+    y = (np.interp(t, grid, sample_ssm(term, kp, grid[1] - grid[0],
+                                       grid.size, rng))
+         + yerr * rng.standard_normal(n))
+    i = np.arange(n)
+    mask = (i > 20) & (i < 35) if layout == "mid" else (i < 8) | (i > 50)
+    gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                   GPPolicy(kappa_max=None), held_out=mask)
+    v = np.array([[12.0, 0.0, 0.0]])
+    truth = _mp_masked_sho(mpm, np.asarray(kp) * np.exp(v[0]), t, y, yerr,
+                           mask)
+    with mx.stream(mx.cpu):
+        hi = float(np.array(gp.hi(mx.array(v, dtype=mx.float64),
+                                  refuse=False))[0])
+    assert abs(hi - truth) < 1e-4, hi - truth
+    if metal_available():
+        with mx.stream(mx.gpu):
+            lo = float(np.array(gp(mx.array(v, dtype=mx.float32)))[0])
+        assert abs(lo - truth) < 2e-3, lo - truth
+
+
+def test_the_mlx_path_inside_the_prior_at_high_state():
+    """Four SHOs (m = 8) are past the kernel's state cap, so a held-out
+    fit runs on the MLX path.  With the information-form window step, on
+    this data, 6 of 96 draws within two prior sd were more than a
+    log-unit from float64, the worst 24.5 (the review's own case: 7,
+    worst +77), at kappa of a few hundred -- nothing refused them.  With
+    the two-filter step: 2, worst 2.5.  Better, not cured (unmasked: none
+    past 0.2), so construction warns."""
+    from anvilgp.anvil import make_target
+    term = ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm() + ag.SHOTerm()
+    rng = np.random.default_rng(4)
+    n = 1500
+    t = np.arange(n) * 0.02
+    y = sample_ssm(ag.SHOTerm(), [1.0, 2.0, 3.0], 0.02, n, rng)
+    yerr = np.full(n, 0.1)
+    y = y + yerr * rng.standard_normal(n)
+    mask = ((t > 8) & (t < 10)) | ((t > 20) & (t < 21))
+    with pytest.warns(RuntimeWarning, match="held_out on the MLX path"):
+        gt = make_target(term, t, y, yerr, held_out=mask)
+    gp = gt.loglike
+    assert not gp._metal_ok
+    lo_b, hi_b = [], []
+    for s, h in zip(gt.specs, gt.hypers):
+        sd = h.prior[2] if h.prior else None
+        a, b = (-2 * sd, 2 * sd) if sd else (s.lo, s.hi)
+        lo_b.append(max(a, s.lo))
+        hi_b.append(min(b, s.hi))
+    v = np.random.default_rng(5).uniform(lo_b, hi_b, (96, len(lo_b)))
+    with mx.stream(mx.gpu):
+        lo = np.array(gp(mx.array(v, dtype=mx.float32))).astype(np.float64)
+    with mx.stream(mx.cpu):
+        hi = np.array(gp.hi(mx.array(v, dtype=mx.float64)))
+    ok = lo > -1e29
+    err = np.abs(lo - hi)[ok]
+    assert ok.sum() >= 90
+    assert err.max() < 6.0, err.max()
+    assert (err > 1.0).sum() <= 3, np.sort(err)[-6:]
+
+
+def test_many_windows_on_the_mlx_path_warn():
+    """The MLX path's gradient graph grows with every kept segment; at
+    150 windows of a convolved term it exhausted Metal's resource limit
+    and ended the process.  Said at construction."""
+    n = 1500
+    t = np.arange(n) * 0.02
+    rng = np.random.default_rng(0)
+    y, yerr = rng.standard_normal(n) * 0.2, np.full(n, 0.1)
+    mask = np.zeros(n, bool)
+    mask[10::20] = True
+    term = ag.TermConvolution(ag.SHOTerm(), 0.01)
+    with pytest.warns(RuntimeWarning, match="kept segments on the MLX path"):
+        GPLogLike(None, t, None, y, yerr, term,
+                  ParamMap.log([1.0, 2.0, 3.0]), GPPolicy(), held_out=mask)
