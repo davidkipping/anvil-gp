@@ -235,7 +235,12 @@ Accuracy, float32 against float64 (dense-``Sigma`` verified):
   blocks of 16: 7e-6 to 1.4e-4 log-units, against 2.6e-5 to 6.4e-4 on
   the MLX path.
 - Marginalised basis, shared and per chain, flat and Gaussian prior:
-  1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the MLX path).
+  1.5e-5 to 5e-5 (2e-4 to 4.5e-4 on the MLX path).  That is an SHO with
+  interior windows.  With the window at an end of the data (the first 2.5
+  of 20 time units) it is 4.6e-4 (Matern-3/2), 1.7e-3 (Matern-5/2) and
+  5.8e-4 (real), the MLX path the same size, and the real term's gradient
+  1.8e-4 relative; trailing, 1.6e-5 to 2.3e-4 (2026-11-10 review, W7;
+  pinned by `test_a_marginalised_basis_with_the_window_at_an_end`).
 - The requester's scale (N = 2800, one-minute cadence, transit plus
   ingress and egress held out): sigma = yerr, 8.2e-5 against 1.0e-4
   unmasked; sigma = 30 yerr, rho = 30 hr, 7.6e-4 against 1.6e-4 (the
@@ -244,7 +249,19 @@ Accuracy, float32 against float64 (dense-``Sigma`` verified):
   5e-2.  The excluded regime (sigma = 300 yerr, rho = 10 hr): 0.49
   against the MLX path's 88.  (These are the window walk's, with anchors
   every 16 points; the per-point version before it measured 2.4e-3 and
-  0.54, the unanchored walk 6.4e-3 and 1.75.)
+  0.54, the unanchored walk 6.4e-3 and 1.75.)  One layout: at N = 6000
+  with three windows (300, 17 and 150 trailing points) on a mostly
+  regular cadence the review measured 2.2e-3 to 4.0e-3 for SHO,
+  Matern-5/2 and rotation terms, against 2e-4 to 5e-4 unmasked.
+- Near `kappa_max` at m >= 4 the masked kernel is much worse than the
+  unmasked one it was calibrated on (W6): over the whole default prior
+  box at N = 1500, kappa 3e3 to 7e5, about four prior sd out in sigma,
+  rotation +30 (regular cadence) and +126 (irregular) log-units against
+  0.6 to 0.8 unmasked, SHO + SHO -23 against 0.46.  Single terms with
+  m <= 3 stay within 0.6.
+- The float64 reference (`hi`) used the information-form window step
+  until 2026-11-10 and was *less* accurate than the float32 kernel at
+  large amplitude; it now takes the two-filter form (W5).
 
 Gradient accuracy, float32 against float64 central differences:
 

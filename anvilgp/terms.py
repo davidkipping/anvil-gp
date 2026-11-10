@@ -870,7 +870,11 @@ class TermConvolution(Term):
     values, up to 500 log-units for a convolved :class:`RealTerm` at high
     signal-to-noise.  Checked now against the dense float64 oracle over six
     term shapes, timescales of 1 to 100 exposures and signal-to-noise 3 to
-    100: exact everywhere in float64, float32 noise on both float32 paths.
+    100: exact in float64 (1e-10) there, float32 noise on both float32
+    paths.  Toward the edge of the series' range (``||F delta||`` of 6 to
+    8) float64 itself is 1e-6 to 1e-4 from dense, and a low-Q SHO has a
+    band there where the leaf's variance is negative and the value is the
+    failure value (docs/review-2026-11-10.md, W3).
     ``Q`` is formed as ``P - Phi P Phi^T``, which in float32 cost ~10x the
     unconvolved term's error on bright on-model data and 4-2800x off-model;
     :class:`~anvilgp.likelihood.GPLogLike` therefore evaluates this term's

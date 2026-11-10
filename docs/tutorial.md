@@ -427,6 +427,8 @@ That is a proper Gaussian likelihood -- the joint covariance whose Schur
 complement on M is `W_M` -- so the marginalised baseline, `gram`,
 `linear_posterior` and `predict` work with it unchanged; `predict`
 conditions on S only, so at a held-out time it gives `E[f_M | r_S]`.
+(`apply_inverse`, below, is the exception: it refuses a held-out
+likelihood.)
 `held_out` takes a boolean mask of length N or a list of `(t_lo, t_hi)`
 windows. It is data, fixed when the target is built, and the parameter
 vector is the same as without it. (Adding the conditional variance to the

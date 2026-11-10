@@ -202,6 +202,16 @@ when the data's rms over the median error bar exceeds `sqrt(kappa_max)`,
 since only then can a posterior get there (`kappa <= sigma^2 / r` for any
 timescale).
 
+With `held_out`, `kappa_max` is looser than it looks for m >= 4. The map
+above is the unmasked likelihood's. A held-out fit also reads two edge
+states per window, and their error grows faster with `kappa`: at kappa of
+3e3 to 7e5 a masked rotation term was 30 to 126 log-units from float64
+where the unmasked one was within 0.8, and SHO + SHO 23 against 0.46
+(docs/masked-gp-plan.md). Those draws were about four prior sd out in
+amplitude; m <= 3 terms stayed within 0.6. If a held-out posterior at
+m >= 4 reaches kappa in the thousands, lower `GPPolicy.kappa_max` to
+match.
+
 ## 7. Compose in the innovation, through the factor
 
 Found 2026-10-23, fixed 2026-10-24 (`46d392d`). Sums of terms (m >= 4: two

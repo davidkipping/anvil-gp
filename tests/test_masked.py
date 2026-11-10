@@ -961,3 +961,41 @@ def test_predict_at_held_out_times_of_a_convolved_term_with_a_basis():
                                rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(var, np.concatenate([o[1] for o in one], 1),
                                rtol=1e-10, atol=1e-14)
+
+
+@_on_kernel
+@pytest.mark.parametrize("where", ["lead", "trail"])
+@pytest.mark.parametrize("name", ["matern32", "matern52", "real"])
+def test_a_marginalised_basis_with_the_window_at_an_end(name, where):
+    """`test_a_marginalised_basis_on_the_kernel` pins one term and one
+    layout, and its numbers do not carry to a window at an end of the
+    data: with the first 2.5 of 20 time units held out the float32 value
+    is 4.6e-4 (Matern-3/2), 1.7e-3 (Matern-5/2) and 5.8e-4 (real) from
+    float64, against 1.5e-5 to 3.4e-5 for an interior window, and the
+    real term's gradient 1.8e-4 relative against 9e-7.  Trailing: 1.6e-5,
+    2.3e-4, 7.0e-5.  The MLX path is the same size (2.5e-4 to 3.5e-3), so
+    it is float32 rounding in the shared marginal algebra, not the
+    kernel.  SHO holds 4e-5 everywhere.  Pinned at what it is."""
+    term, kp = {**_TERMS, "matern32": (ag.Matern32Term(), [1.0, 1.5])}[name]
+    t, y, yerr = _data(term, kp)
+    y = y + 2.0 + 0.3 * (t - 10.0)
+    tc = float(t.mean())
+    mask = t < 2.5 if where == "lead" else t > 18.5
+    gk = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                   GPPolicy(kappa_max=None), held_out=mask,
+                   linear_basis=lambda vm, x, m0: mx.stack(
+                       [mx.ones_like(x), x - tc], axis=-1))
+    assert gk._metal_ok
+    rows = np.zeros((3, len(kp)))
+    rows[1:] = 0.1 * np.random.default_rng(2).standard_normal((2, len(kp)))
+    lo, hi = _lo_hi(gk, rows)
+    assert np.abs(lo - hi).max() < 5e-3
+    with mx.stream(mx.gpu):
+        grad = np.array(mx.grad(lambda w: gk(w).sum())(
+            mx.array(rows, dtype=mx.float32)))
+    fd = np.zeros_like(rows)
+    for i in range(rows.shape[1]):
+        d = np.zeros_like(rows)
+        d[:, i] = 1e-5
+        fd[:, i] = (_lo_hi(gk, rows + d)[1] - _lo_hi(gk, rows - d)[1]) / 2e-5
+    assert np.abs(grad - fd).max() < 1e-3 * np.abs(fd).max()

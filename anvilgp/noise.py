@@ -116,10 +116,11 @@ def scale_and_jitter(yerr, scale: tuple[float, float] = (0.1, 10.0),
     """Noise variance ``(s yerr)^2 + j^2``, per instrument if asked.
 
     ``s`` log-uniform on ``scale``; ``j`` log-uniform on ``jitter``, by
-    default ``1e-3`` to ``10`` times the median error bar -- the same span
-    as the default additive jitter (`priors.jitter_hyper`), whose lower
-    bound keeps ``j`` from wandering into the region where it no longer
-    changes the likelihood.
+    default ``1e-3`` to ``10`` times the median error bar.  The lower
+    bound is the default additive jitter's (`priors.jitter_hyper`, which
+    runs to ``1e3`` times): it keeps ``j`` from wandering into the region
+    where it no longer changes the likelihood.  The upper is tighter
+    because ``s`` already scales the error bars.
     """
     lo, hi = scale
     if not 0.0 < lo < hi:
