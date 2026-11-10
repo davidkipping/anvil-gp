@@ -1,6 +1,6 @@
 # Reply: held-out GP conditioning, now on the fused kernel
 
-**DRAFT, not sent.** To the TOI-199 b JWST/NIRSpec team, answering
+**Approved 2026-11-10.** To the TOI-199 b JWST/NIRSpec team, answering
 `anvilgp_masked_gp_request.md` and the field report
 `anvilgp_masked_speed_gap.md`.
 
