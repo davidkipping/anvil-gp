@@ -51,9 +51,10 @@ def pair():
 
 def _joint(pair):
     """[mu | a.* | b.*] through anvil.joint, the composition the note to
-    anvil proposed and anvil 0.12.0 built."""
-    if not hasattr(anvil, "joint"):
-        pytest.skip("anvil.joint needs anvil >= 0.12.0")
+    anvil proposed and anvil 0.12.0 built (0.12.1 fixed two defects)."""
+    version = tuple(int(p) for p in anvil.__version__.split(".")[:3])
+    if not hasattr(anvil, "joint") or version < (0, 12, 1):
+        pytest.skip("anvil.joint needs anvil >= 0.12.1")
     (a, _), (b, _) = pair
     jt = anvil.joint({"a": a.target, "b": b.target}, shared={"mu": ["a", "b"]})
     return jt, jt.member_columns("a"), jt.member_columns("b")

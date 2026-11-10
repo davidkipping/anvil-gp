@@ -462,7 +462,7 @@ res0 = anvil.run(EnsembleKernel(plain.target, seed=2), plain.target,
 v_last = plain.transform.model_np(
     np.asarray(res0.get_chain()[-1], dtype=np.float64))
 u_start = mx.array(gt.transform.from_model_np(v_last),   # via model space;
-                   dtype=mx.float32)                     # anvil wants mx
+                   dtype=mx.float32)        # NumPy is fine on anvil >= 0.12
 res = anvil.run(EnsembleKernel(gt.target, seed=2), gt.target, u_start,
                 n_warmup=500, n_samples=300, seed=4, progress=False)
 ```
@@ -518,10 +518,10 @@ res = anvil.run(EnsembleKernel(jt, seed=2), jt,
 ```
 
 Each half keeps its own GP and jitter; `mu` comes out at 0.40
-(0.29-0.51). `anvil.joint` needs anvil 0.12.0 or later; it composes the
-members in model space, so the shared column's prior and Jacobian count
-once, and the float64 path and `anvil.validate_precision` work on the
-result. `joint_u0` starts each member's columns at its own reference. A
+(0.29-0.51). `anvil.joint` needs anvil 0.12.1 or later (0.12.0's has two
+defects); it composes the members in model space, so the shared column's
+prior and Jacobian count once, and the float64 path and
+`anvil.validate_precision` work on the result. `joint_u0` starts each member's columns at its own reference. A
 member can be any anvil log-density, so a likelihood that is not a GP, or a
 GP anvil-gp does not support, sits beside these. A shared GP
 hyperparameter needs the same spec on every member.

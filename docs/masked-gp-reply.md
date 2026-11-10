@@ -81,10 +81,20 @@ Documented in the tutorial (docs/tutorial.md, "Holding a feature out of
 the GP"). The masked target has the same parameters, so you can skip
 `anvil.optimize` and start from your unmasked chain's last positions.
 Convert them through model space, as the example does, so the start is
-right even if the two targets' transforms differ, and pass the start to
-`anvil.run` as an `mx.array` (a NumPy `u0` is the opaque dtype error your
-first note reported against anvil). Keep a warm-up, because the posterior
-moves once the feature stops being absorbed.
+right even if the two targets' transforms differ. Keep a warm-up, because
+the posterior moves once the feature stops being absorbed.
+
+We passed on the two anvil issues in your first note, and both are fixed
+in anvil 0.12.1. `run` now accepts a NumPy `u0`, and it no longer
+overwrites a `compile_step` you set on the kernel. On an earlier anvil,
+pass the start as an `mx.array`, as the tutorial does. anvil added one
+caution: a log density that leaves MLX (NumPy on the CPU) runs uncompiled
+with `compile_step=False`, but no gradient flows through the NumPy part.
+That is a complete answer for the ensemble kernel but not for ChEES or
+`anvil.optimize`, which would run with only the prior's gradient. With
+`held_out` native, the CPU workaround is no longer needed. If the rest of
+your model is in `mlx.core` ops, the gradient sampler and the optimiser
+are open to the masked fit again.
 
 ## Two smaller things
 
