@@ -70,14 +70,27 @@ def predict(gp, v, t_pred, return_var: bool = True):
     if not np.all(np.isfinite(t_pred)):
         raise ValueError("t_pred must be finite")
     n_chains, n_pred = v.shape[0], t_pred.size
+    if n_pred == 0:
+        empty = np.empty((n_chains, 0))
+        return empty, (empty.copy() if return_var else None)
     k = 1 if gp.linear_basis is None else 1 + _n_basis(gp, v[:1])
     held = gp._held is not None
     # Held out with a basis, the posterior also needs every column's
     # smoothed value at M (`_posterior_gram`): M rides in the same run as
     # extra prediction points after the asked-for ones.
+    #
+    # An M time the caller also asked for is predicted once and read
+    # twice: a second copy at lag 0 is refused for a convolved term (whose
+    # points must be an exposure apart), and "predict at the held-out
+    # times" is the first thing a masked fit is asked.
     extra = (gp._t64[gp._held["m_pos_np"]] if held and k > 1
              else np.zeros(0))
-    grid = _grid(gp, np.concatenate([t_pred, extra]))
+    order = np.argsort(t_pred, kind="stable")
+    at = np.searchsorted(t_pred[order], extra)
+    hit = (at < n_pred) & (t_pred[order[np.minimum(at, n_pred - 1)]] == extra)
+    m_idx = np.where(hit, order[np.minimum(at, n_pred - 1)],
+                     n_pred + np.cumsum(~hit) - 1)
+    grid = _grid(gp, np.concatenate([t_pred, extra[~hit]]))
     mean = np.empty((n_chains, n_pred))
     var = np.empty((n_chains, n_pred)) if return_var else None
     for c, vc in _chunks(gp, v, grid, k, return_var):
@@ -89,7 +102,7 @@ def predict(gp, v, t_pred, return_var: bool = True):
             # float64 likelihood for it instead was two-thirds of the cost
             # (1.16 of 1.71 s at N = 1e4, 64 chains).
             beta, c_beta = _beta_posterior(gp, _posterior_gram(
-                gp, dict(out, mean=out["mean"][..., n_pred:]) if held
+                gp, dict(out, mean=out["mean"][..., m_idx]) if held
                 else out))
             s_phi = out["mean"][:, 1:, :n_pred]                 # (n, p, M)
             mu = mu - np.einsum("np,npm->nm", beta, s_phi)

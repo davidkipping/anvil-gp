@@ -1054,6 +1054,23 @@ class GPLogLike:
                 f"unaffected; use a gradient-free sampler, fewer windows, "
                 f"or a term the kernel serves.", RuntimeWarning, stacklevel=4)
 
+    def __deepcopy__(self, memo):
+        """A copy without the cached front-end functions, which are
+        `mx.custom_function` objects (not copyable) built on first use by
+        a call large enough to chunk; the copy rebuilds its own.  Its
+        gradient guard is rebuilt too: `deepcopy` copies a function by
+        reference, and the guard closes over the instance, so the copy
+        would have evaluated through the original."""
+        import copy
+        new = type(self).__new__(type(self))
+        memo[id(self)] = new
+        skip = ("_metal_matrices_fn", "_masked_matrices_fn", "_guard")
+        for key, val in self.__dict__.items():
+            new.__dict__[key] = (None if key in skip
+                                 else copy.deepcopy(val, memo))
+        new._guard = new._build_guard()
+        return new
+
     def _may_use_metal(self) -> bool:
         """Whether this instance can end up on the kernel: asked for, or
         left to the default with a state dimension the kernel holds."""

@@ -230,3 +230,15 @@ def test_bad_inputs_are_refused():
         gp.predict(np.zeros((2, 4)), [1.0])
     with pytest.raises(ValueError, match="finite"):
         gp.predict(np.zeros((1, 3)), [1.0, np.nan])
+
+
+def test_predict_at_no_times_is_empty():
+    """Used to raise ``KeyError: 'mean'``."""
+    rng = np.random.default_rng(0)
+    t = np.arange(50) * 0.1
+    gp = GPLogLike(None, t, None, rng.standard_normal(50), np.full(50, 0.1),
+                   ag.SHOTerm(), ParamMap.log([1.0, 2.0, 3.0]),
+                   GPPolicy(metal=False))
+    mean, var = gp.predict(np.zeros((3, 3)), [])
+    assert mean.shape == var.shape == (3, 0)
+    assert gp.predict(np.zeros((3, 3)), [], return_var=False)[1] is None

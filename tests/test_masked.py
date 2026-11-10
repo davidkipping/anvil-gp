@@ -931,3 +931,33 @@ def test_many_windows_on_the_mlx_path_warn():
     with pytest.warns(RuntimeWarning, match="kept segments on the MLX path"):
         GPLogLike(None, t, None, y, yerr, term,
                   ParamMap.log([1.0, 2.0, 3.0]), GPPolicy(), held_out=mask)
+
+
+def test_predict_at_held_out_times_of_a_convolved_term_with_a_basis():
+    """With a basis the held-out points ride along as extra prediction
+    points; asked for as well, they were a second copy at lag 0, which a
+    convolved term refuses ("at least that far from ... the other
+    prediction points").  They are now predicted once and read twice."""
+    rng = np.random.default_rng(0)
+    n = 200
+    t = np.arange(n) * 0.05
+    tc = float(t.mean())
+    yerr = np.full(n, 0.1)
+    y = np.sin(t) + 0.3 + 0.1 * (t - tc) + yerr * rng.standard_normal(n)
+    mask = (t > 4) & (t < 5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gp = GPLogLike(None, t, t, y, yerr,
+                       ag.TermConvolution(ag.SHOTerm(), 0.03),
+                       ParamMap.log([1.0, 2.0, 3.0]), GPPolicy(),
+                       held_out=mask,
+                       linear_basis=lambda vm, x, m0: mx.stack(
+                           [mx.ones_like(x), x - tc], -1))
+    rows = np.zeros((2, 3))
+    tp = np.concatenate([t[mask][:7][::-1], [-1.0, 11.0]])
+    mean, var = gp.predict(rows, tp)
+    one = [gp.predict(rows, tp[i:i + 1]) for i in range(tp.size)]
+    np.testing.assert_allclose(mean, np.concatenate([o[0] for o in one], 1),
+                               rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(var, np.concatenate([o[1] for o in one], 1),
+                               rtol=1e-10, atol=1e-14)

@@ -773,3 +773,25 @@ def test_construction_warns_when_the_data_could_reach_kappa_max():
 def test_kappa_max_must_be_positive():
     with pytest.raises(ValueError, match="kappa_max"):
         GPPolicy(metal=False, kappa_max=0.0)
+
+
+def test_a_deep_copy_is_independent_and_survives_a_chunked_call():
+    """Once a call large enough to chunk the front end had run, the cached
+    `mx.custom_function` made `copy.deepcopy` raise.  And a copy's gradient
+    guard, a closure copied by reference, evaluated through the original."""
+    import copy
+    rng = np.random.default_rng(1)
+    t = np.sort(rng.uniform(0, 30, 400))
+    y, yerr = rng.standard_normal(400) * 0.3, np.full(400, 0.2)
+    gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
+                   ParamMap.log([1.0, 2.0, 3.0]), GPPolicy())
+    v = mx.zeros((4096, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        mx.eval(mx.grad(lambda q: gp(q).sum())(v))
+        cp = copy.deepcopy(gp)
+        a, b = np.array(gp(v[:4])), np.array(cp(v[:4]))
+    assert np.array_equal(a, b)
+    assert cp._guard is not gp._guard
+    owners = [c.cell_contents.__self__ for c in cp._guard.__closure__
+              if hasattr(c.cell_contents, "__self__")]
+    assert owners and all(o is cp for o in owners)
