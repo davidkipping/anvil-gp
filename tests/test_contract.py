@@ -108,6 +108,63 @@ def test_multi_instrument_requires_an_instrument_index():
         gp.hi(a64(np.zeros((1, 1))))
 
 
+def _two_jitters_three_offsets(inst):
+    return ParamMap(
+        kernel=_const(KP), n_dim=1,
+        jitter=[KernelParam(link="const", value=j) for j in (0.3, 0.1)],
+        offset=[KernelParam(link="const", value=o) for o in (0.2, -0.1, 0.0)],
+        instrument=inst)
+
+
+def test_instrument_labels_must_fit_each_list_they_index():
+    """Two jitters and three offsets with labels 0..2: label 2 fits the
+    offsets but not the jitters.  Until 2026-11-10 the labels were checked
+    against the longer list, and label 2 read the *next chain's* jitter on
+    the kernel -- identical chains scored differently, on every path
+    alike, so no precision check could see it.  One shared entry is never
+    indexed, so one jitter beside three offsets stays legal."""
+    with pytest.raises(ValueError, match="2 jitters are declared"):
+        GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
+                  _two_jitters_three_offsets(np.arange(N) % 3),
+                  GPPolicy(metal=False, block=128))
+    pm = ParamMap(
+        kernel=_const(KP), n_dim=1,
+        jitter=[KernelParam(link="const", value=0.3)],
+        offset=[KernelParam(link="const", value=o) for o in (0.2, -0.1, 0.0)],
+        instrument=np.arange(N) % 3)
+    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                   GPPolicy(metal=False, block=128, hi_block=128))
+    out = np.array(gp.hi(a64(np.zeros((3, 1)))))
+    assert np.all(np.isfinite(out)) and np.ptp(out) == 0.0
+
+
+def test_instrument_labels_must_be_integers():
+    """`np.asarray(labels, dtype=int32)` truncates: 0.9 became instrument
+    0 before any range check ran.  Integer-valued floats are fine."""
+    lab = (np.arange(N) % 2).astype(np.float64)
+    with pytest.raises(ValueError, match="integer labels"):
+        GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(),
+                  _two_jitters_three_offsets(lab * 0.9),
+                  GPPolicy(metal=False, block=128))
+    pm = _two_jitters_three_offsets(lab)
+    pm.offset = pm.offset[:2]
+    GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+              GPPolicy(metal=False, block=128))
+
+
+def test_the_data_are_copied_at_construction():
+    """`hi` and `predict` read the float64 data, the float32 paths a cache
+    taken at construction: an alias let a later in-place edit move one
+    and not the other."""
+    y = Y.copy()
+    gp = GPLogLike(None, T, None, y, YERR, ag.SHOTerm(),
+                   ParamMap(kernel=_const(KP), n_dim=1),
+                   GPPolicy(metal=False, block=128, hi_block=128))
+    before = np.array(gp.hi(a64(np.zeros((1, 1)))))
+    y += 5.0
+    assert np.array_equal(np.array(gp.hi(a64(np.zeros((1, 1))))), before)
+
+
 def test_hi_tiles_over_chains_not_data():
     """A GP factorisation is global-sequential over data, so the float64 path
     can only tile chains.  The tile size must not change the answer."""

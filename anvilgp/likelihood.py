@@ -544,9 +544,12 @@ class GPLogLike:
         self.blocked = (use_blocked_leaves(kernel_spec.block_sizes)
                         if self.policy.blocked is None else self.policy.blocked)
 
-        self._t64 = np.asarray(t, dtype=np.float64).ravel()
-        self._y64 = np.asarray(y, dtype=np.float64).ravel()
-        self._yerr64 = np.asarray(yerr, dtype=np.float64).ravel()
+        # Copies: `np.asarray` of a float64 input is a view, and the float32
+        # caches below are taken once -- a caller who later edits `y` in
+        # place would move `hi` and `predict` but not the float32 value.
+        self._t64 = np.array(t, dtype=np.float64).ravel()
+        self._y64 = np.array(y, dtype=np.float64).ravel()
+        self._yerr64 = np.array(yerr, dtype=np.float64).ravel()
         self.n_data = self._t64.size
         if self._y64.size != self.n_data or self._yerr64.size != self.n_data:
             raise ValueError("t, y and yerr must have the same length")
@@ -653,18 +656,35 @@ class GPLogLike:
             # wraps -- so a typo'd instrument would quietly score against
             # the wrong jitter.  In the kernel it would index the *next
             # chain's* row, or past the buffer on the last chain.
-            n_lab = max(len(param_map.jitter), len(param_map.offset))
+            #
+            # Each list is checked on its own.  A single entry is shared by
+            # every instrument and is never indexed; a list of several is
+            # indexed by the label, so the label must fit *that* list.
+            # Checking against the longer of the two (as this did until
+            # 2026-11-10) let 2 jitters + 3 offsets with labels 0..2 through,
+            # and label 2 then read the next chain's jitter.
             lab = np.asarray(inst)
             if lab.shape != (len(self._y64),):
                 raise ValueError(
                     f"param_map.instrument has shape {lab.shape}, expected "
                     f"({len(self._y64)},) -- one label per observation")
-            if n_lab and (lab.min() < 0 or lab.max() >= n_lab):
-                raise ValueError(
-                    f"param_map.instrument labels run {lab.min()}..{lab.max()}"
-                    f" but only {n_lab} instrument(s) are declared "
-                    f"({len(param_map.jitter)} jitter, "
-                    f"{len(param_map.offset)} offset)")
+            if lab.dtype.kind not in "iu":
+                # int32 conversion would truncate 0.9 to 0 before any check
+                if (lab.dtype.kind not in "fb"
+                        or not np.all(lab == np.round(lab))):
+                    raise ValueError(
+                        f"param_map.instrument must be integer labels, got "
+                        f"dtype {lab.dtype}")
+            for what, entries in (("jitter", param_map.jitter),
+                                  ("offset", param_map.offset)):
+                n_lab = len(entries)
+                if n_lab > 1 and (lab.min() < 0 or lab.max() >= n_lab):
+                    raise ValueError(
+                        f"param_map.instrument labels run "
+                        f"{lab.min()}..{lab.max()} but {n_lab} {what}s are "
+                        f"declared: with more than one, each label indexes "
+                        f"that list (declared: {len(param_map.jitter)} "
+                        f"jitter, {len(param_map.offset)} offset)")
         self._inst32 = (None if inst is None
                         else mx.array(np.asarray(inst, dtype=np.int32)))
         self._init_kappa(inst)
