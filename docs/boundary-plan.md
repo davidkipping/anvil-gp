@@ -887,8 +887,11 @@ on the *gradient*; the same map on the *value* (regular cadence =
 exposure, N = 4000, five draws) has the square-root boundary at 1e-2 to
 0.3 log-units for a convolved Matern-5/2 at `||F delta||` of 0.08 to
 0.28, s/e 10 to 1000, and 0.09 for Matern-3/2 at 0.42, where the dense
-boundary is 2e-4 to 6e-3. That choice is open again
-(docs/review-2026-11-10.md).
+boundary is 2e-4 to 6e-3. So the Matern terms went back to the dense boundary on 2026-11-10: a
+wrong value corrupts every sampler, a coarse gradient only slows the
+gradient ones. The cost is step 1's first column, the dense boundary's
+gradient on bright TESS-like data (1.38 and 2.06 posterior sigma), and
+`GPPolicy(metal_boundary="sqrt")` is refused for them.
 
 The rotation's 0.63 is the unconvolved rotation's level on the same kind
 of data (0.57); the gap to 0.33 is the Metal rounding V measured. Pinned

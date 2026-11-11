@@ -63,7 +63,7 @@ from .elements import (Element, chunked_reduce, chunked_reduce_blocked,
                        leaf_elements, leaf_parts, tree_reduce,
                        use_blocked_leaves)
 from . import terms
-from .terms import (Matern32Term, Matern52Term, RotationTerm, SHOTerm, Term,
+from .terms import (RotationTerm, SHOTerm, Term,
                     TermSum, _block_diag)
 
 __all__ = ["GPLogLike", "GPPolicy", "ParamMap", "KernelParam", "a64"]
@@ -794,10 +794,11 @@ class GPLogLike:
             raise ValueError(
                 "GPPolicy(metal_boundary='sqrt') cannot serve this convolved "
                 "term: the square-root boundary clamps its (formally "
-                "indefinite) Q, which is measured safe only for SHOTerm, "
-                "RotationTerm, Matern32Term and Matern52Term members -- a "
-                "RealTerm's exposure correction drives the leaf's white "
-                "noise below zero -- and only up to ||F delta|| = "
+                "indefinite) Q, which is measured safe only for SHOTerm "
+                "and RotationTerm members -- a RealTerm's exposure "
+                "correction drives the leaf's white noise below zero, and "
+                "a Matern term's value comes out wrong by up to several "
+                "log-units -- and only up to ||F delta|| = "
                 f"{_SQRT_FDELTA:g} at the reference point (here "
                 f"{self._ref_fdelta:.3g}).  Use None (which picks 'dense' "
                 "here) or 'dense'")
@@ -3190,16 +3191,28 @@ _SQRT_FDELTA = 0.5
 _SQRT_CHAIN_FDELTA = 3.0
 
 
-#: convolved member types the square-root boundary is measured on.  Inside
-#: the ``_SQRT_FDELTA`` guard their leaf's white-noise part ``r + c`` stays
-#: positive -- ``c >= 0`` for SHO, rotation and Matern-3/2, and Matern-5/2's
-#: negative ``c`` is >= -4.6e-8 k(0), so it would take s/e ~ 5000 -- and the
-#: boundary beat the dense one (SHO + Matern-3/2, s/e 100: 0.05 against 2.06
-#: posterior sigma; Matern-5/2 at rho = 1 d: 0.04 against 1.38).
+#: convolved member types that take the square-root boundary.  Inside the
+#: ``_SQRT_FDELTA`` guard their leaf's white-noise part ``r + c`` stays
+#: positive (``c >= 0``) and both the value and the gradient are measured.
+#:
+#: The Matern terms were here from 2026-10-25 to 2026-11-10, on a
+#: *gradient* measurement (bright TESS 2-min data, s/e 100, per posterior
+#: sigma: SHO + Matern-3/2 0.05 against the dense boundary's 2.06,
+#: Matern-5/2 at rho = 1 d 0.04 against 1.38).  Nobody had mapped the
+#: *value*.  Clamping ``Q``'s negative part costs a Matern far more of it
+#: than an SHO: a convolved Matern-5/2 at N = 2000, cadence 0.03, exposure
+#: 0.02, s/e 10 was 1.4e-2 log-units from float64 at the reference point
+#: (``||F delta||`` = 0.07) and 7.5 at rho = 0.485 (0.28), where the dense
+#: boundary held 1e-4; over rho/exposure 30 to 1000 and s/e 10 to 1000 it
+#: was 1e-2 to 0.3 against 2e-4 to 6e-3, and Matern-3/2 9e-2 against 7e-4
+#: at 0.42.  A wrong value corrupts every sampler and a coarse gradient
+#: only slows the gradient ones, so they are back on the dense boundary,
+#: and that gradient floor on bright data is the known cost.
+#:
 #: `RealTerm`'s ``c`` reaches -0.17 k(0), ``r + c`` goes negative and the
 #: leaf has no real square root, so it keeps the dense boundary, which
 #: measured fine on it.
-_SQRT_CONVOLVED = (SHOTerm, RotationTerm, Matern32Term, Matern52Term)
+_SQRT_CONVOLVED = (SHOTerm, RotationTerm)
 
 
 def _convolution_takes_sqrt(inner: Term, ref_fdelta: float | None) -> bool:
@@ -3212,10 +3225,10 @@ def _convolution_takes_sqrt(inner: Term, ref_fdelta: float | None) -> bool:
     s/e = 100, where the dense boundary is 10 -- and their exposure
     correction is non-negative everywhere in the validated range.  A
     real-type member's correction is negative and can push the leaf
-    variance below zero (`RealTerm`: NaN), and Matern-5/2 measured worse
-    than dense, so anything else keeps the dense boundary
-    (docs/boundary-plan.md, VI; Matern-3/2 and -5/2 added after
-    measuring them inside the guard).  And only while ``Q``'s negative part is
+    variance below zero (`RealTerm`: NaN), and the Matern terms' *value*
+    is wrong by up to several log-units under the clamp
+    (`_SQRT_CONVOLVED`), so anything else keeps the dense boundary
+    (docs/boundary-plan.md, VI).  And only while ``Q``'s negative part is
     small, which it is below ``_SQRT_FDELTA`` at the reference point.  A
     chain that walks well past it keeps the square-root boundary (the
     choice is fixed at construction) and is refused beyond

@@ -603,10 +603,16 @@ def test_the_boundary_setting_is_validated_and_resolved():
                  None)._metal_boundary == "sqrt"
     pm_m = ParamMap(kernel=[KernelParam(link="log", index=i, ref=r)
                             for i, r in enumerate((1.3, 4.0))], n_dim=2)
+    # Matern members: dense.  They took the square-root boundary from
+    # 2026-10-25 to 2026-11-10 on a gradient measurement; their value
+    # under it is wrong (test_a_convolved_matern_value_on_the_default).
     for mat in (ag.Matern32Term(), ag.Matern52Term()):
-        assert GPLogLike(None, t, None, y, np.full(n, 0.3),
-                         ag.TermConvolution(mat, 0.01), pm_m,
-                         GPPolicy(metal=True))._metal_boundary == "sqrt"
+        conv = ag.TermConvolution(mat, 0.01)
+        assert GPLogLike(None, t, None, y, np.full(n, 0.3), conv, pm_m,
+                         GPPolicy(metal=True))._metal_boundary == "dense"
+        with pytest.raises(ValueError, match="Matern"):
+            GPLogLike(None, t, None, y, np.full(n, 0.3), conv, pm_m,
+                      GPPolicy(metal=True, metal_boundary="sqrt"))
     # ... only while Q's negative part is small: ||F delta|| <= 0.5 at the
     # reference point.  An exposure equal to the spacing against a timescale
     # of about two spacings is past it.
@@ -786,3 +792,36 @@ def test_a_convolved_chain_past_the_sqrt_boundarys_range_is_refused():
         gp, lo, hi, raw = both(**kw)
         assert np.all(lo > -1e29) and np.all(hi > -1e29)
         assert np.abs(lo - raw).max() < 2e-2, kw
+
+
+@pytest.mark.parametrize("name", ["matern52", "matern32"])
+def test_a_convolved_matern_value_on_the_default(name):
+    """On the square-root boundary (its default until 2026-11-10) a
+    convolved Matern-5/2 on this data was 1.4e-2 log-units from float64
+    at the reference point and 7.5 at rho = 0.485; on the dense boundary
+    it is within 2e-4 at every rho here.  Matern-3/2: 9e-2 at
+    ``||F delta||`` = 0.42 and s/e 100 on the map in docs/boundary-plan.md,
+    small on this data, and held to the same bound."""
+    if not am.metal_available():
+        pytest.skip("needs mx.fast.metal_kernel")
+    inner = ag.Matern52Term() if name == "matern52" else ag.Matern32Term()
+    n, delta, cad = 2000, 0.02, 0.03
+    rng = np.random.default_rng(2)
+    t = np.arange(n) * cad
+    y = sample_ssm(inner, [1.0, 2.0], cad, n, rng)
+    yerr = np.full(n, 0.1)
+    y = y + yerr * rng.standard_normal(n)
+    rhos = np.array([2.0, 1.0, 0.6, 0.485, 0.4, 0.3, 0.2, 0.15, 0.1])
+    rows = np.zeros((rhos.size, 2))
+    rows[:, 1] = np.log(rhos / 2.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gp = GPLogLike(None, t, None, y, yerr,
+                       ag.TermConvolution(inner, delta),
+                       ParamMap.log([1.0, 2.0]), GPPolicy())
+    assert gp._metal_ok and gp._metal_boundary == "dense"
+    with mx.stream(mx.gpu):
+        lo = np.array(gp(mx.array(rows, dtype=mx.float32))).astype(np.float64)
+    with mx.stream(mx.cpu):
+        hi = np.array(gp.hi(mx.array(rows, dtype=mx.float64)))
+    assert np.abs(lo - hi).max() < 2e-3, np.abs(lo - hi)

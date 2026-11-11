@@ -241,9 +241,15 @@ measurable (float32 error ~1e-4, the same as the unconvolved term, N = 300).
 N = 4096, varied by sd 0.19-0.32 across the posterior against 0.018
 unconvolved, and its gradient was 10 posterior sigma off at the default
 blocks -- **until 2026-10-25, when the lag table moved to float64** (on the
-host, rounded to float32; `likelihood._Float64FrontEnd`) and SHO, rotation and
-Matern members moved to the square-root block boundary: 0.63 and 0.016
-now. [boundary-plan.md](boundary-plan.md), VI. **Far off-model** -- white
+host, rounded to float32; `likelihood._Float64FrontEnd`) and SHO and rotation
+members moved to the square-root block boundary: 0.63 and 0.016
+now. [boundary-plan.md](boundary-plan.md), VI. (Convolved Matern members
+keep the dense boundary: the square-root one, which they had until
+2026-11-10, gave a wrong value, up to 7.5 log-units. Their gradient on
+bright data is therefore the dense boundary's, 1.4 to 2 posterior sigma
+at s/e 100 on TESS 2-min data. A chain of a convolved SHO or rotation
+term that walks to `||F delta|| > 3` is refused; a posterior that lives
+there wants `GPPolicy(metal_boundary="dense")`.) **Far off-model** -- white
 noise against a long timescale, as during an early burn-in -- the float32
 table was 20-2800x the unconvolved term's error at the same `kappa` for an
 SHO (2e-4 at `kappa` ~ 90, 1.3e-3 at ~860, 3.6e-2 at ~9700, N = 300) and

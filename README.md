@@ -721,12 +721,16 @@ marked as an estimate.
   the default blocks at the one-block rate (0.68-0.81 ESS per 1000
   gradients against 0.08-0.09). Convolved terms: since 2026-10-25 their
   lag table is computed in float64 on the host (its `Q` is formed by
-  subtraction, which cost ~10x in float32 on bright data) and SHO,
-  rotation and Matern members use the square-root boundary too while the
+  subtraction, which cost ~10x in float32 on bright data) and SHO and
+  rotation members use the square-root boundary too while the
   exposure is short against the timescale (`||F delta|| <= 0.5`) -- a TESS 2-min
   convolved rotation at s/e = 100 went from 10 posterior sigma and value
   sd 0.32 to 0.63 and 0.016; value + gradient +18% for convolved terms.
-  `RealTerm` members keep the dense boundary, which measured fine on them.
+  `RealTerm` and Matern members keep the dense boundary: it measured fine
+  on `RealTerm`, and the square-root one gave convolved Matern terms a
+  wrong value (up to 7.5 log-units; they had it from 2026-10-25 to
+  2026-11-10), at the cost of the dense boundary's gradient on bright
+  data (1.4-2 posterior sigma at s/e 100).
   **Still open:** at 2-s cadence and s/e 100 (m = 4) the gradient stays
   ~6-9 posterior sigma off, and that is not the boundary -- exact float64
   boundary quantities give 6.4 sigma too. The backward takes the entry
