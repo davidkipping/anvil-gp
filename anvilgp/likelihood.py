@@ -3374,6 +3374,20 @@ _FRONT_END_FWD_MIN_CHUNKS = 16
 #: real time (16 chunks: 0.18 GiB and 127 ms), so this is deliberately not
 #: the smallest achievable peak.
 _FRONT_END_BUDGET_BYTES = 512 << 20
+#: Most chunks, whatever the budget asks for.  Every chunk's backward is a
+#: few hundred to a thousand small MLX arrays, and Metal allows 499,000
+#: live buffers: MLX releases them only as command buffers complete, so
+#: one evaluation with too many chunks dies with "[metal::malloc] Resource
+#: limit (499000) exceeded" -- measured (2026-11-11, value + gradient,
+#: compiled) between 768 and 1024 chunks for SHO + SHO, 512 and 768 for
+#: rotation + SHO, 448 and 512 for that sum convolved; the budget alone
+#: asks for 1228 at SHO + SHO, N = 1e5 x 1024 chains.  256 leaves 1.75x
+#: under the heaviest of those.  Past it the retained intermediates
+#: exceed the budget in proportion (2.5 GiB there, on 13 GiB of tables).
+#: Not lower: SHO at N = 1e5 x 1024 asks for 292, and capped at 128 or
+#: 64 on a machine short of memory its value + gradient slowed from a
+#: steady 6-9 s a call to 25 and 54 s by the fifth (same 15.0 GiB peak).
+_FRONT_END_MAX_CHUNKS = 256
 
 def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     """How many lag-chunks to split the term front end's backward into.
@@ -3408,7 +3422,7 @@ def _front_end_chunks(n_chains: int, n_lags: int, n_state: int) -> int:
     # is n_chains x lags x m^2, so few lags is plenty of work at many
     # chains), returning 1 with the estimate 3x over budget (stage R2).
     n = -(-want // _FRONT_END_BUDGET_BYTES)
-    return max(1, min(n, n_lags))
+    return max(1, min(n, n_lags, _FRONT_END_MAX_CHUNKS))
 
 
 def _flatten(out):

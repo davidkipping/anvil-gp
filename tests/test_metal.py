@@ -2084,8 +2084,9 @@ def test_many_front_end_chunks_compile():
     gp, u = _distinct_gp(ag.SHOTerm() + ag.SHOTerm(),
                          [1.3, 4.0, 3.0, 0.7, 1.0, 2.0], n_chains=64)
     whole = _grad_at_budget(gp, u, 1 << 60)
-    old = L._FRONT_END_BUDGET_BYTES
+    old, old_cap = L._FRONT_END_BUDGET_BYTES, L._FRONT_END_MAX_CHUNKS
     L._FRONT_END_BUDGET_BYTES = 4_000_000
+    L._FRONT_END_MAX_CHUNKS = 10 ** 6     # the count this crashed at
     try:
         assert L._front_end_chunks(u.shape[0], gp._metal_uniq_dt.shape[0],
                                    4) > 200
@@ -2093,7 +2094,7 @@ def test_many_front_end_chunks_compile():
         with mx.stream(mx.gpu):
             g = np.array(f(u)[1], np.float64)
     finally:
-        L._FRONT_END_BUDGET_BYTES = old
+        L._FRONT_END_BUDGET_BYTES, L._FRONT_END_MAX_CHUNKS = old, old_cap
     assert np.max(np.abs(g - whole)) < 1e-5 * np.max(np.abs(whole))
 
 
@@ -2107,3 +2108,30 @@ def test_auto_metal_block_is_shorter_with_a_row_per_observation():
     assert _auto_metal_block(100_000, 4, n_lags=99_591) == 256
     gp, _ = _distinct_gp(ag.SHOTerm(), [1.3, 4.0, 3.0], n=60_000)
     assert gp._metal_uniq_dt.shape[0] > 4096 and gp.metal_block == 256
+
+
+def test_the_front_end_chunk_count_is_capped():
+    """Metal allows 499,000 live buffers and every chunk's backward is up
+    to a thousand small arrays: the budget alone asks for 1228 chunks at
+    SHO + SHO, N = 1e5 x 1024 chains, and value + gradient died with
+    "Resource limit (499000) exceeded" between 448 and 1024 chunks,
+    depending on the term (`_FRONT_END_MAX_CHUNKS`).  The heaviest term
+    measured, at the cap, on a table forced to need more."""
+    import anvilgp.likelihood as L
+    assert L._front_end_chunks(1024, 100_001, 4) == L._FRONT_END_MAX_CHUNKS
+    assert L._front_end_chunks(1024, 100_001, 6) == L._FRONT_END_MAX_CHUNKS
+    term = ag.TermConvolution(ag.RotationTerm() + ag.SHOTerm(), 0.05)
+    gp, u = _distinct_gp(term, [1.5, 7.0, 3.0, 1.0, 0.4, 1.3, 4.0, 3.0],
+                         n_chains=4)
+    old = L._FRONT_END_BUDGET_BYTES
+    L._FRONT_END_BUDGET_BYTES = 1 << 12
+    try:
+        assert L._front_end_chunks(4, gp._metal_uniq_dt.shape[0],
+                                   6) == L._FRONT_END_MAX_CHUNKS
+        f = mx.compile(mx.value_and_grad(lambda x: mx.sum(gp(x))))
+        with mx.stream(mx.gpu):
+            val, g = f(u)
+            mx.eval(val, g)
+    finally:
+        L._FRONT_END_BUDGET_BYTES = old
+    assert np.all(np.isfinite(np.array(g)))
