@@ -1540,25 +1540,50 @@ class GPLogLike:
             uniq, d.astype(f32)) + 1).astype(np.int32)
         lag_f = row(hd["dt_true"])
         lag_f[0] = 0
-        lag_b = np.concatenate([[0], lag_f[:0:-1]]).astype(np.int32)
         lagf_w, lagb_w = row(step_f), row(step_b)
+        # The backward series stops where the last window that reads it
+        # does.  Its state at a window's right edge comes from the S points
+        # after that window, so nothing before the earliest right edge
+        # (segment `j_min`'s first point) is ever read: on a transit in
+        # the middle of a visit that was 42% of the backward scan, its
+        # square-root pass, its r-sensitivities and its backward sweep,
+        # all for exits with zero cotangent (2026-11-10 review, E1).  One
+        # more point is kept past it, as a block of its own: its entry
+        # state *is* the exit the earliest window reads, so the backward
+        # direction still needs no replay (`entry_exits`).  A leading
+        # window (j_min = 0) reads the whole series, as before; with no
+        # right edge at all one point stands in for it, unread.
+        right = nxt[nxt < k]
+        j_min = int(right.min()) if right.size else k
+        if j_min == k:
+            n_b, b_segs = 1, [(0, 1)]
+        else:
+            n_b = n_s - bounds[j_min][0]
+            b_segs = [(n_s - e0, n_s - s0) for s0, e0 in bounds[j_min:]][::-1]
+            if j_min > 0:
+                b_segs.append((n_b, n_b + 1))
+                n_b += 1
+        lag_b = np.concatenate([[0], lag_f[:0:-1]]).astype(np.int32)[:n_b]
 
-        def place(segs):
+        def place(segs, end):
             starts, last = [], []
             for s0, e0 in segs:
                 starts.extend(range(s0, e0, blk))
                 last.append(len(starts) - 1)
-            return np.array(starts + [n_s], dtype=np.int32), np.array(last)
-        starts_f, last_f = place(bounds)
-        rsegs = [(n_s - e0, n_s - s0) for s0, e0 in bounds][::-1]
-        starts_b, last_b = place(rsegs)
-        last_b = last_b[::-1]                 # back in forward segment order
+            return np.array(starts + [end], dtype=np.int32), np.array(last)
+        starts_f, last_f = place(bounds, n_s)
+        starts_b, last_rev = place(b_segs, n_b)
+        # each forward segment's last backward block (0 where it has none:
+        # those segments are not a right edge of anything)
+        last_b = np.zeros(k, dtype=np.int64)
+        if j_min < k:
+            last_b[j_min:] = last_rev[:k - j_min][::-1]
         nb_f, nb_b = starts_f.size - 1, starts_b.size - 1
         ia = np.where(hd["prev_np"] < k,
                       last_f[np.minimum(hd["prev_np"], k - 1)], nb_f)
         ib = np.where(hd["next_np"] < k,
                       last_b[np.minimum(hd["next_np"], k - 1)], nb_b)
-        rev = np.arange(n_s - 1, -1, -1)
+        rev = np.arange(n_s - 1, -1, -1)[:n_b]
         # the MLX window step's lags to either edge, distinct (float32)
         lag_u, lag_inv = np.unique(np.concatenate(
             [hd["lag_a"], hd["lag_b"]]).astype(np.float32),
