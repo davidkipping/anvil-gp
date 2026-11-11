@@ -2866,10 +2866,42 @@ class GPLogLike:
                             vv, self._refuse_outside_series(vv, a_)),
                             self._infeasible_pull(vv))
                     return a_
+                def gram64(vv, cols):
+                    # The Gram from one pass of the float64 filter carrying
+                    # every column (`predict._smooth`, as `linear_posterior`
+                    # takes it), not by polarising `ev`: that was 1 + k(k +
+                    # 1)/2 evaluations per chain -- 448 lanes for 64 chains
+                    # at p = 2, 4288 at p = 10, where this is 64 and a
+                    # pass.  The two agree to ~1e-11.  `hi` is a value, so
+                    # nothing needs to differentiate it.
+                    from .predict import _gram_grid, _smooth
+                    ell0 = ev(vv, mx.zeros((vv.shape[0], self.n_data),
+                                           dtype=mx.float64))
+                    if isinstance(cols, tuple):    # (rc, phi), unscaled
+                        rc_, ph_ = (np.array(x) for x in cols)
+                        if ph_.ndim == 2:
+                            ph_ = np.broadcast_to(ph_, rc_.shape + ph_.shape[1:])
+                        z = np.concatenate(
+                            [rc_[:, None, :], np.swapaxes(ph_, 1, 2)], 1)
+                    else:
+                        z = np.array(cols)                     # (n, k, N)
+                    hd = self._held
+                    out_ = _smooth(
+                        self, np.array(vv), _gram_grid(self),
+                        return_var=False, gram=True,
+                        cols=z if hd is None else z[:, :, hd["s_pos_np"]])
+                    g = out_["gram"]
+                    if hd is not None:
+                        d = z[:, :, hd["m_pos_np"]] - out_["mean"]
+                        g = g + np.einsum(
+                            "nkm,nlm->nkl", d / out_["held"][1][:, None, :],
+                            d)
+                    return ell0, a64(g), ell0
                 if self.linear_basis is not None:
                     acc = self._marginal(
                         vb, ev, y, xm, mx.array(self._noise_x64,
-                                                dtype=mx.float64), r_ref)[0]
+                                                dtype=mx.float64), r_ref,
+                        gram_fn=gram64)[0]
                 else:
                     acc = ev(vb, None)
                 mx.eval(acc)
