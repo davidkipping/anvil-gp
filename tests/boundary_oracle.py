@@ -347,6 +347,10 @@ def boundary_from(source):
         kernel = tuple(np.array(x) for x in (ent_m, ent_C, seed_m, seed_C))
         new = source(inputs, kernel)
         new = [mx.array(np.asarray(x), dtype=mx.float32) for x in new]
+        # The forward's checkpoints (`forward_checkpoints`) are the filter
+        # from the kernel's own entry states; with those replaced the
+        # backward has to replay from the new ones itself.
+        kw.pop("ckpt", None)
         return orig(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                     *new, *rest, **kw)
 
