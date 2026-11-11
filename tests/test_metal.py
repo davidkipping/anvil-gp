@@ -2095,3 +2095,15 @@ def test_many_front_end_chunks_compile():
     finally:
         L._FRONT_END_BUDGET_BYTES = old
     assert np.max(np.abs(g - whole)) < 1e-5 * np.max(np.abs(whole))
+
+
+def test_auto_metal_block_is_shorter_with_a_row_per_observation():
+    """An all-distinct cadence at the regular cadence's 8192 was killed by
+    the GPU watchdog at N = 1e5 x 1024 chains (`_auto_metal_block`)."""
+    from anvilgp.likelihood import _auto_metal_block
+    assert _auto_metal_block(100_000, 2) == 8192
+    assert _auto_metal_block(100_000, 2, n_lags=14) == 8192
+    assert _auto_metal_block(100_000, 2, n_lags=99_591) == 256
+    assert _auto_metal_block(100_000, 4, n_lags=99_591) == 256
+    gp, _ = _distinct_gp(ag.SHOTerm(), [1.3, 4.0, 3.0], n=60_000)
+    assert gp._metal_uniq_dt.shape[0] > 4096 and gp.metal_block == 256

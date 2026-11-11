@@ -449,10 +449,24 @@ GPU watchdog); any number of per-instrument jitters, and any `noise_fn`
 (both read per observation since 2026-10-25); and an all-distinct-lag
 cadence degenerates
 the table to one row per point, which is correct but gives up the traffic
-saving — the value costs 13.2 GiB at 1024 chains x N = 1e5 where a regular
-cadence costs 0.4. The gradient handles it: its adjoint buffer holds one
-slot per `(block, lag)` pair that occurs, so it is bounded by N rather than
-by N x blocks, and that case runs at 1.3x the forward's peak. m > 6, the
+saving — the value peaks at 8.7 GiB at 1024 chains x N = 1e5 where a
+regular cadence costs 0.5, and value + gradient at 15.0 (2026-11-11; 13.2
+and 17.5 before the term front end's forward was chunked over lags). The
+gradient handles it: its adjoint buffer holds one slot per `(block, lag)`
+pair that occurs, so it is bounded by N rather than by N x blocks. Most
+of that peak is MLX evaluating the term algebra at table size, and part
+of it is Metal holding freed buffers until a command buffer commits:
+setting `MLX_MAX_OPS_PER_BUFFER=5` in the environment before Python
+starts commits sooner and lowers it (N = 20000 x 1024 chains: value 2311
+-> 1832 MiB, value + gradient 3440 -> 3070; N = 1e5 x 256: 2723 -> 2241
+and 4278 -> 3832; N = 1e5 x 1024: 8.7 -> 8.3 GiB and no change). It is
+MLX's setting, for the whole process, and it costs time where calls are
+short: on a regular cadence at N = 1e4, value + gradient 4.2 -> 5.8 ms at
+128 chains and 7.1 -> 8.3 at 1024, 2-3% at N = 1e5 and on the
+all-distinct cases above. Use it only when an all-distinct cadence is
+short of memory. On such a cadence the automatic block is 256 points,
+not the regular cadence's: at 8192 the GPU watchdog killed the N = 1e5 x
+1024 value within five calls. m > 6, the
 m = 5-6 register spill, and in-kernel propagators are the obvious follow-ons.
 
 ### The MLX reference path

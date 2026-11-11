@@ -883,8 +883,9 @@ class GPLogLike:
                     f"use.  See likelihood._MAX_METAL_BLOCK.")
         self.metal_block = (self.policy.metal_block
                             if self.policy.metal_block is not None
-                            else _auto_metal_block(self.n_data,
-                                                   kernel_spec.n_state))
+                            else _auto_metal_block(
+                                self.n_data, kernel_spec.n_state,
+                                int(self._metal_uniq_dt.shape[0])))
 
         # Decided once, not per call: whether the fused kernel can serve this
         # problem, and the gradient guard that wraps whichever path does.
@@ -3654,7 +3655,14 @@ def _notice_metal_choice(ok: bool, why: str) -> None:
     warnings.warn(msg, MetalDefaultNotice, stacklevel=4)
 
 
-def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
+#: Past this many distinct lags the automatic block is at most
+#: `_MANY_LAGS_BLOCK` (`_auto_metal_block`).  4096 is not measured: the
+#: kills were at ~1e5 lags, and ~2e4 ran clean at 2048.
+_MANY_LAGS = 4096
+_MANY_LAGS_BLOCK = 256
+
+
+def _auto_metal_block(n_data: int, n_state: int = 2, n_lags: int = 0) -> int:
     """Default observations per kernel thread.
 
     Two costs pull against each other: a longer block means fewer, longer
@@ -3688,6 +3696,20 @@ def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
     The uncapped rule picked 8192 at N = 1e5 for every m, which is a hard
     failure at m = 4 rather than a slow path; the cap was 1024 until
     2026-10-25, set on a quiet machine.
+
+    Those caps were set on regular cadences, where a thread reads the
+    same table row at every step.  With a row per observation (every
+    spacing distinct) each step reads rows no thread has touched, the
+    walk is slower, and the m = 2 rule's 8192 is killed: N = 1e5 x 1024
+    chains, compiled value called back to back, display in use
+    (2026-11-11) -- 8192 KILLED within 5 calls in 7 runs of 7; 2048
+    KILLED once in two runs of 8; 1024 KILLED once, at call 23, in four
+    runs of 30; 256 survived 210 calls and 12 of value + gradient.  The
+    term front end alone survived 120, so it is the kernels.  Shorter
+    blocks cost nothing there (N = 20000 x 1024: value 121 / 122 / 120 ms
+    and value + gradient 431 / 419 / 416 at 1024 / 512 / 256; the front
+    end is most of the call), so past `_MANY_LAGS` distinct lags the
+    block is at most `_MANY_LAGS_BLOCK`.
     """
     target = max(1.0, n_data / 12.0)
     p = 1
@@ -3696,6 +3718,8 @@ def _auto_metal_block(n_data: int, n_state: int = 2) -> int:
     if target - p > 2 * p - target:   # round to the *nearest*, not up
         p *= 2
     cap = _MAX_METAL_BLOCK.get(n_state, _MAX_METAL_BLOCK_HI_M)
+    if n_lags > _MANY_LAGS:
+        cap = min(cap, _MANY_LAGS_BLOCK)
     return max(min(256, cap), min(cap, p))
 
 
