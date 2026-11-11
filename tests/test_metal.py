@@ -1219,12 +1219,19 @@ def test_the_fold_plan_places_every_slot_exactly_once(name, build, _want):
         rows = np.repeat(np.arange(n_lags), plan.shape[1])[flat != n_slots]
         assert np.array_equal(rows, slot_lag[used]), f"{name}: wrong row"
     else:
-        used = np.concatenate([g[0] for g in plan])
-        assert np.array_equal(np.sort(used), np.arange(n_slots)), name
-        for sel, lags_of in plan:
+        tiers, groups = plan if kind == "hybrid" else ([], plan)
+        used = [g[0] for g in groups]
+        for sel, lags_of in groups:
             assert np.array_equal(slot_lag[sel], lags_of), name
-            assert len(np.unique(lags_of)) == len(lags_of), (
-                f"{name}: a group repeats a lag, so its scatter races")
+            assert np.unique(lags_of).size == lags_of.size, name
+        for lags_t, table in tiers:
+            assert np.unique(lags_t).size == lags_t.size, name
+            keep = table != n_slots
+            used.append(table[keep])
+            rows = np.repeat(lags_t, table.shape[1])[keep.ravel()]
+            assert np.array_equal(rows, slot_lag[table[keep]]), name
+        used = np.concatenate(used)
+        assert np.array_equal(np.sort(used), np.arange(n_slots)), name
 
 
 def test_assigning_metal_block_rebuilds_the_slot_map():
@@ -1928,3 +1935,42 @@ def test_the_kernel_gradient_survives_many_chains_at_m6():
         v, g = mx.vjp(gp, [u], [mx.ones((n_chains,), dtype=mx.float32)])
         mx.eval(v, g)
     assert np.all(np.isfinite(np.array(v))) and np.all(np.isfinite(np.array(g[0])))
+
+
+def test_a_deep_ragged_fold_is_tiered_not_one_scatter_per_block():
+    """Hundreds of short blocks on a nearly regular cadence -- a held-out
+    fit with one window per transit -- stack a few lags in every block and
+    many lags in one each.  One group per rank was a scatter pair per
+    block, 201 + 201 + 400 of them per gradient at 200 windows (2026-11-10
+    review, E3).  The hybrid plan folds the deep lags densely in tiers
+    and leaves at most `_MAX_FOLD_RANKS` groups; it is the same sum, and
+    reproducible."""
+    from anvilgp.likelihood import (_fold_plan_mx, _lag_fold_plan,
+                                    _MAX_FOLD_RANKS)
+    from anvilgp.metal import _fold_slots
+    rng = np.random.default_rng(0)
+    n_blocks, n_lags = 300, 420
+    slot_lag = []
+    for b in range(n_blocks):
+        lags = {1, 2} | set(rng.choice(np.arange(3, 12), 3, replace=False))
+        lags |= {12 + b, 12 + (b * 7) % 400}
+        slot_lag.extend(sorted(lags))
+    slot_lag = np.array(slot_lag, dtype=np.int32)
+    kind, plan = _lag_fold_plan(slot_lag, n_lags)
+    assert kind == "hybrid"
+    tiers, groups = plan
+    assert len(groups) <= _MAX_FOLD_RANKS and len(tiers) <= 10
+    for _, table in tiers:
+        assert table.size < 2 * (table != slot_lag.size).sum() + table.shape[0]
+    n, m = 3, 2
+    d = rng.standard_normal((n, slot_lag.size, m, m)).astype(np.float32)
+    want = np.zeros((n, n_lags, m, m))
+    np.add.at(want, (slice(None), slot_lag), d.astype(np.float64))
+    fold = _fold_plan_mx(kind, plan)
+    outs = []
+    for _ in range(3):
+        a, b = _fold_slots(mx.array(d), mx.array(2 * d), fold, n, n_lags, m)
+        outs.append((np.array(a), np.array(b)))
+    np.testing.assert_allclose(outs[0][0], want, rtol=2e-5, atol=1e-5)
+    np.testing.assert_allclose(outs[0][1], 2 * want, rtol=2e-5, atol=2e-5)
+    assert all(np.array_equal(o[0], outs[0][0]) for o in outs[1:])

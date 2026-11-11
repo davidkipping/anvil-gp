@@ -2704,6 +2704,11 @@ def _check_adjoint_budget(n_chains, n_slots, n_lags, npts, m, fold_plan):
     if kind == "dense":
         slab += 2 * n_chains * int(plan.shape[0]) * int(plan.shape[1]) \
             * m * m * 4
+    elif kind == "hybrid":
+        # one tier's gather at a time, each under 2x the slots it holds
+        slab += 2 * n_chains * m * m * 4 * max(
+            (int(t.shape[0]) * int(t.shape[1]) for _, t in plan[0]),
+            default=0)
     if slab > MAX_ADJOINT_BUFFER_BYTES:
         raise ValueError(
             f"the kernel gradient's adjoint buffer would be "
@@ -2742,6 +2747,17 @@ def _fold_slots(d_phi, d_q, fold_plan, n_chains, n_lags, m):
     # one would be correct today, but an empty plan would then return the
     # same array as two independent cotangents.
     d_q_tab = mx.zeros((n_chains, n_lags, m, m), dtype=d_q.dtype)
+    if kind == "hybrid":
+        # deep lags: a padded gather and an `mx.sum` per tier, placed at
+        # that tier's (distinct) lags; then the shallow remainder by rank
+        tiers, plan = plan
+        pad = mx.zeros((n_chains, 1, m, m), dtype=d_phi.dtype)
+        dp, dq = (mx.concatenate([x, pad], axis=1) for x in (d_phi, d_q))
+        for lags_t, table in tiers:
+            d_phi_tab = d_phi_tab.at[:, lags_t].add(
+                mx.sum(mx.take(dp, table, axis=1), axis=2))
+            d_q_tab = d_q_tab.at[:, lags_t].add(
+                mx.sum(mx.take(dq, table, axis=1), axis=2))
     for sel, lags_of in plan:
         d_phi_tab = d_phi_tab.at[:, lags_of].add(mx.take(d_phi, sel, axis=1))
         d_q_tab = d_q_tab.at[:, lags_of].add(mx.take(d_q, sel, axis=1))

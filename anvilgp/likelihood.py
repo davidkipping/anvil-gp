@@ -1056,9 +1056,7 @@ class GPLogLike:
         # and one lag row but every observation is lag 0 (stage R2).
         n_lags = int(self._metal_uniq_dt.shape[0]) + 1
         kind, plan = _lag_fold_plan(slag, n_lags)
-        self._metal_fold_plan = (
-            (kind, mx.array(plan)) if kind == "dense"
-            else (kind, [(mx.array(a), mx.array(b)) for a, b in plan]))
+        self._metal_fold_plan = _fold_plan_mx(kind, plan)
         #: slots the backward's adjoint buffer actually needs, as against
         #: ``n_blocks x n_distinct_lags`` if every block used every lag.
         #: Equal on a regular cadence; ~1/13 of it when every timestamp
@@ -1600,8 +1598,7 @@ class GPLogLike:
             sid, sstart, slag = _slot_map(lg, blk, starts=st)
             kind, plan = _lag_fold_plan(slag, n_lags)
             slots[d] = (mx.array(sid), mx.array(sstart), int(slag.size),
-                        (kind, mx.array(plan)) if kind == "dense" else
-                        (kind, [(mx.array(x), mx.array(y)) for x, y in plan]))
+                        _fold_plan_mx(kind, plan))
         lay = dict(
             blk=blk, uniq=mx.array(uniq, dtype=mx.float32),
             slots_f=slots["f"], slots_b=slots["b"],
@@ -3094,7 +3091,9 @@ def _lag_fold_plan(slot_lag: np.ndarray, n_lags: int):
     every block on the same handful of lags, and the padded table is then
     a few kilobytes.
 
-    Returns ``("dense", table)`` of shape ``(n_lags, max_rank)`` only when
+    Returns ``("hybrid", (tiers, groups))`` when the slots stack deeper
+    than twice :data:`_MAX_FOLD_RANKS` without qualifying as dense (see
+    the code); otherwise ``("dense", table)`` of shape ``(n_lags, max_rank)`` only when
     the slots stack deeper than :data:`_MAX_FOLD_RANKS` **and** the padded
     table stays within 4x the slots it holds; ``("groups", [(slots, lags),
     ...])`` otherwise, each group having distinct lags so each scatter is
@@ -3123,9 +3122,47 @@ def _lag_fold_plan(slot_lag: np.ndarray, n_lags: int):
         table[ordered, rank] = order            # sentinel stays where absent
         return ("dense", table)
 
-    return ("groups", [(order[rank == r].astype(np.int32),
-                        ordered[rank == r].astype(np.int32))
-                       for r in range(max_rank)])
+    if max_rank <= 2 * _MAX_FOLD_RANKS:
+        return ("groups", [(order[rank == r].astype(np.int32),
+                            ordered[rank == r].astype(np.int32))
+                           for r in range(max_rank)])
+
+    # Deep and ragged: a few lags in most blocks and many lags in one or
+    # two, which a held-out fit with hundreds of windows produces on any
+    # cadence that is not perfectly regular (every window is a block).
+    # One group per rank was then one scatter pair per *block*: 1604
+    # functional scatters of the whole table per gradient at 200 windows,
+    # 16,000 at 2000 (2026-11-10 review, E3).  So the deep lags fold
+    # densely, in tiers of similar depth (each table padded by under 2x),
+    # and only the shallow remainder goes by rank -- at most
+    # `_MAX_FOLD_RANKS` groups.  Every scatter still has distinct lags.
+    counts = np.bincount(slot_lag, minlength=n_lags)
+    deep = counts[ordered] > _MAX_FOLD_RANKS
+    tiers = []
+    tier_of = np.ceil(np.log2(np.maximum(counts, 1))).astype(np.int64)
+    for tr in np.unique(tier_of[ordered[deep]]):
+        sel = deep & (tier_of[ordered] == tr)
+        lags_t = np.unique(ordered[sel])
+        width = int(counts[lags_t].max())
+        table = np.full((lags_t.size, width), n_slots, dtype=np.int32)
+        table[np.searchsorted(lags_t, ordered[sel]), rank[sel]] = order[sel]
+        tiers.append((lags_t.astype(np.int32), table))
+    shallow = ~deep
+    groups = [(order[shallow & (rank == r)].astype(np.int32),
+               ordered[shallow & (rank == r)].astype(np.int32))
+              for r in range(_MAX_FOLD_RANKS)
+              if np.any(shallow & (rank == r))]
+    return ("hybrid", (tiers, groups))
+
+
+def _fold_plan_mx(kind, plan):
+    """A `_lag_fold_plan` with its index arrays on the device."""
+    pairs = lambda ps: [(mx.array(x), mx.array(y)) for x, y in ps]  # noqa: E731
+    if kind == "dense":
+        return kind, mx.array(plan)
+    if kind == "groups":
+        return kind, pairs(plan)
+    return kind, (pairs(plan[0]), pairs(plan[1]))
 
 
 #: Peak bytes MLX's backward through :meth:`Term.matrices` costs per byte of
