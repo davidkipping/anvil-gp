@@ -848,14 +848,26 @@ _FWD_STEP = """
             uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
 MEAN_PREDICT
             float cp[MDIM][MDIM], ch[MDIM];
+            // Phi C Phi^T as two products, 2 m^3, not one m^4 sum: equal
+            // at m = 2, and on a quiet machine (2026-11-10, N = 8192, 256
+            // chains) the value is 8% faster at m = 3, 5% at m = 4 and 27%
+            // at m = 6 (value + gradient 14%, 6%, 21%, with the sweep's
+            // two products done the same way).  docs/float32.md records an
+            // earlier m = 4 trial as 5% slower; that predates m = 5-6 and
+            // is not what this measures now.
+            float pcq[MDIM][MDIM];
+            for (uint i = 0; i < M; ++i)
+                for (uint w = 0; w < M; ++w) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u)
+                        a += phitab[off + i * M + u] * cov[u][w];
+                    pcq[i][w] = a;
+                }
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
                     float a = 0.0f;
-                    for (uint u = 0; u < M; ++u) {
-                        float pu = phitab[off + i * M + u];
-                        for (uint w = 0; w < M; ++w)
-                            a += pu * cov[u][w] * phitab[off + j * M + w];
-                    }
+                    for (uint w = 0; w < M; ++w)
+                        a += pcq[i][w] * phitab[off + j * M + w];
                     cp[i][j] = a + qtab[off + i * M + j];
                 }
             for (uint i = 0; i < M; ++i)
@@ -1240,12 +1252,18 @@ _SRC_BWD_CKPT = """
                 for (uint j = 0; j < M; ++j) a += Ph[i][j] * smean[li][j];
                 mp[i] = a;
             }
+            float pc0[MDIM][MDIM];              // Phi C, then (Phi C) Phi^T
+            for (uint i = 0; i < M; ++i)
+                for (uint w = 0; w < M; ++w) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u)
+                        a += Ph[i][u] * scov[li][u][w];
+                    pc0[i][w] = a;
+                }
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
                     float a = 0.0f;
-                    for (uint u = 0; u < M; ++u)
-                        for (uint w = 0; w < M; ++w)
-                            a += Ph[i][u] * scov[li][u][w] * Ph[j][w];
+                    for (uint w = 0; w < M; ++w) a += pc0[i][w] * Ph[j][w];
                     cp[i][j] = a + qtab[off + i * M + j];
                 }
             for (uint i = 0; i < M; ++i)
@@ -1343,13 +1361,17 @@ _SRC_BWD_CKPT = """
                     acc_p[i][j] += a + mp_bar[i] * smean[li][j];
                     acc_q[i][j] += cs[i][j];
                 }
-            float nb[MDIM][MDIM];
+            float nb[MDIM][MDIM], pc1[MDIM][MDIM];  // Phi^T cs, then Phi
+            for (uint i = 0; i < M; ++i)
+                for (uint u = 0; u < M; ++u) {
+                    float a = 0.0f;
+                    for (uint w = 0; w < M; ++w) a += Ph[w][i] * cs[w][u];
+                    pc1[i][u] = a;
+                }
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < M; ++j) {
                     float a = 0.0f;
-                    for (uint u = 0; u < M; ++u)
-                        for (uint w = 0; w < M; ++w)
-                            a += Ph[u][i] * cs[u][w] * Ph[w][j];
+                    for (uint u = 0; u < M; ++u) a += pc1[i][u] * Ph[u][j];
                     nb[i][j] = a;
                 }
             for (uint i = 0; i < M; ++i) {
@@ -3832,6 +3854,19 @@ def window_walk(xm_f, xc_f, xm_b, xc_b, phi_tab, q_tab, hvec, walk):
         return dict(grid=(max(n_thr, 1), 1, 1),
                     threadgroup=(min(64, max(n_thr, 1)), 1, 1))
     st_size = 2 * n * n_m * (m * m + k * m)
+    # Every held-out point's state from each side, and in the gradient the
+    # same again in cotangents: the largest thing a held-out fit allocates,
+    # and until 2026-11-10 outside every budget (9 GiB each on paper at
+    # 4096 chains x 14,000 held out, m = 4).  Refused like the adjoint
+    # buffer, not left to swap.
+    if 2 * st_size * 4 > MAX_ADJOINT_BUFFER_BYTES:
+        raise ValueError(
+            f"the held-out window step would hold {2 * st_size * 4 / 2**30:.1f}"
+            f" GiB of states and their cotangents ({n} chains x {n_m} "
+            f"held-out points x m = {m}, {k} column(s)), over "
+            f"MAX_ADJOINT_BUFFER_BYTES = "
+            f"{MAX_ADJOINT_BUFFER_BYTES / 2**30:.1f} GiB.  Use fewer chains, "
+            f"hold out fewer points, or GPPolicy(metal=False).")
     el_np, er_np = walk["edge_l_np"], walk["edge_r_np"]
     wl, wr = np.flatnonzero(el_np >= 0), np.flatnonzero(er_np >= 0)
     bl, br = mx.array(el_np[wl]), mx.array(er_np[wr])

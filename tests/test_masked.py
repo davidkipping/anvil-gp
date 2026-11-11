@@ -999,3 +999,21 @@ def test_a_marginalised_basis_with_the_window_at_an_end(name, where):
         d[:, i] = 1e-5
         fd[:, i] = (_lo_hi(gk, rows + d)[1] - _lo_hi(gk, rows - d)[1]) / 2e-5
     assert np.abs(grad - fd).max() < 1e-3 * np.abs(fd).max()
+
+
+@_on_kernel
+def test_the_window_step_is_inside_a_memory_budget(monkeypatch):
+    """Its states and their cotangents are the largest thing a held-out
+    fit allocates and were outside every fence."""
+    import anvilgp.metal as am
+    term, kp = _TERMS["sho"]
+    t, y, yerr = _data(term, kp)
+    gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                   GPPolicy(kappa_max=None), held_out=_layout("interior", t))
+    v = mx.zeros((4, 3), dtype=mx.float32)
+    with mx.stream(mx.gpu):
+        ok = np.array(gp(v))
+        monkeypatch.setattr(am, "MAX_ADJOINT_BUFFER_BYTES", 1024)
+        with pytest.raises(ValueError, match="held-out window step"):
+            mx.eval(gp(v))
+    assert np.all(np.isfinite(ok))
