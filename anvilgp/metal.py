@@ -412,10 +412,35 @@ def _starts_src(src: str, aligned: bool) -> str:
                            "the way `_starts_src` rewrites")
     out = (src.replace(a, "uint start = (uint)blk_start[blk_i];")
               .replace(b, "uint stop = (uint)blk_start[blk_i + 1];"))
+    # Checkpoints packed by position, not one full-length row per block:
+    # block i's start at ``start / SL + i`` of the chain's ``npts / SL +
+    # n_blocks`` (`_n_ckpt`).  A row per block is sized by the longest
+    # block the caller allows, and placed blocks are mostly short -- 75 MiB
+    # where 4 were written at 200 windows, 12.6 GiB per direction on paper
+    # at N = 1e5 with 2000 (2026-11-10 review, E2).
+    out = out.replace(_CKPT_BASE,
+                      "uint ckb = chain * (uint)n_ckpt + start / SL + blk_i;")
     if "blk_len" in out:
         raise RuntimeError("a placed-block kernel still reads blk_len, "
                            "whose buffer `_starts_inputs` gives to blk_start")
     return out
+
+
+#: where a block's checkpoints begin, in the aligned layout
+_CKPT_BASE = "uint ckb = ei * (uint)n_ckpt;"
+
+
+def _n_ckpt(npts: int, blk_len: int, slen: int, n_blocks: int, starts):
+    """``(n_ckpt, shape)`` of a backward's checkpoint buffer, less its
+    chain and state axes: per block for aligned blocks, per chain for
+    placed ones (`_starts_src`).  Block ``i`` of length ``L`` writes
+    ``ceil(L / slen)`` checkpoints from ``start / slen + i``, and
+    ``floor((start + L) / slen) + i + 1`` is at least their end."""
+    if starts is None:
+        n_ckpt = (blk_len + slen - 1) // slen
+        return n_ckpt, (n_blocks, n_ckpt)
+    n_ckpt = npts // slen + n_blocks
+    return n_ckpt, (n_ckpt,)
 
 
 def _starts_inputs(names: list, aligned):
@@ -1422,7 +1447,7 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
                             f"{arr.dtype}")
     slen = _SUB_LEN.get(m, 8) if sub_len is None else int(sub_len)
     n_blocks = _n_blocks_of(npts, blk_len, starts)
-    n_ckpt = (blk_len + slen - 1) // slen
+    n_ckpt, ck_shape = _n_ckpt(npts, blk_len, slen, n_blocks, starts)
     n_jit = _n_jit_of(jit2)
     n_slots = int(n_slots)
     shapes = [(n_chains, n_slots, m, m),
@@ -1430,7 +1455,7 @@ def backward_ckpt(phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
               (n_chains, n_blocks, m), (npts, n_chains),
               ((npts, n_chains, 1) if n_jit < 0
                else (n_chains, n_blocks, max(1, n_jit))),
-              (n_chains, n_blocks, n_ckpt, m + m * m)]
+              (n_chains,) + ck_shape + (m + m * m,)]
     outs = _bwd_ckpt_kernel(m, slen, n_jit, formal, starts is not None)(
         inputs=[
             phi_tab, q_tab, lag, inst, hvec, resid, r_ref, jit2, cot,
@@ -1707,14 +1732,14 @@ def backward_ckpt_mc(phi_tab, q_tab, lag, inst, hvec, cols, r_ref, jit2,
     kout = ka if shared else k
     slen = _sub_len_mc(m, k)
     n_blocks = _n_blocks_of(npts, blk_len, starts)
-    n_ckpt = (blk_len + slen - 1) // slen
+    n_ckpt, ck_shape = _n_ckpt(npts, blk_len, slen, n_blocks, starts)
     n_jit = _n_jit_of(jit2)
     n_slots = int(n_slots)
     shapes = [(n_chains, n_slots, m, m), (n_chains, n_slots, m, m),
               (n_chains, n_blocks, m), (npts, n_chains, kout),
               ((npts, n_chains, 1) if n_jit < 0
                else (n_chains, n_blocks, max(1, n_jit))),
-              (n_chains, n_blocks, n_ckpt, k * m + m * m)]
+              (n_chains,) + ck_shape + (k * m + m * m,)]
     outs = _bwd_mc_kernel(m, k, slen, n_jit, formal, (ka, kb, shared),
                           starts is not None)(
         inputs=[
