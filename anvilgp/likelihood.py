@@ -1176,10 +1176,40 @@ class GPLogLike:
             return _block_diag(*blocks) if len(blocks) > 1 else blocks[0]
         return blocks
 
-    def _metal_matrices(self, v: mx.array, uniq=None):
+    def _metal_front_end(self, v: mx.array, uniq=None):
+        """``(Phi table, Q table, h, Q)``: the kernel's lag tables
+        (`_metal_tables`) and ``Q`` at the distinct lags, for `kappa`.
+
+        When the table is large enough for `_metal_matrices` to chunk, the
+        tables come from it directly, row 0 and all.  On an all-distinct
+        cadence the term algebra, not the kernels, is the value's peak:
+        at N = 20000 x 1024 chains (SHO, a 313 MiB table) `Term.matrices`
+        peaked at 7.5 tables to return two, prepending row 0 made it 9.0,
+        and every kernel after that added 0.2 (2026-11-11).
+        """
+        tabs = self._metal_matrices(v, uniq, tables=True)
+        if len(tabs) == 4:
+            return tabs
+        phi, q, h = tabs
+        return (*self._metal_tables(v, phi, q), h, q)
+
+    def _metal_matrices(self, v: mx.array, uniq=None, tables=False):
         """``(Phi, Q, h)`` for the lag table, with a chunked backward.
         ``uniq`` replaces the data's own table (the held-out path's S lags,
         `_masked_metal_layout`), with its own cached custom function.
+
+        ``tables``: when chunked, return `_metal_front_end`'s four instead,
+        with the *forward* chunked too.  Each chunk's ``Phi`` and ``Q`` are
+        stacked into one array, so a chunk's shared intermediates are freed
+        before the next chunk is built, and the tables are concatenated
+        from the chunks with row 0 as one more piece -- no second copy.
+        Same N = 20000 x 1024 case, front end alone, compiled: 9.9 -> 6.3
+        tables of peak and 61.8 -> 39.7 ms at 64 chunks (SHO); SHO + SHO at
+        32, 8.0 -> 5.1 and 196 -> 180 ms.  The values are bit-identical.
+        What is left above the four tables the pieces and their
+        concatenation need is Metal's command-buffer batching, which holds
+        freed buffers until the batch commits: ``MLX_MAX_OPS_PER_BUFFER=5``
+        in the environment gave 4.6 tables at the same speed.
 
         The value is exactly :meth:`Term.matrices`; only the *backward* is
         different, and only when the lag table is large.  MLX retains every
@@ -1209,6 +1239,11 @@ class GPLogLike:
         n_chunk = _front_end_chunks(v.shape[0], uniq.shape[0], term.n_state)
         if n_chunk <= 1:
             return term.matrices(kp(v), uniq)
+        m, dtype = term.n_state, v.dtype
+        # A few chunks' pieces and transients are no smaller than the
+        # whole (6 chunks: 638 -> 718 MiB on the value), so the forward is
+        # chunked only where the table is large.
+        tables = tables and n_chunk >= _FRONT_END_FWD_MIN_CHUNKS
 
         # The chunk geometry depends only on (n_chains, n_lags, m), all
         # fixed for an instance after the first call, so build the
@@ -1218,15 +1253,46 @@ class GPLogLike:
         # `metal._bwd_ckpt_kernels`.
         attr = "_metal_matrices_fn" if own else "_masked_matrices_fn"
         cached = getattr(self, attr, None)
-        if cached is not None and cached[0] == (v.shape[0], n_chunk):
-            return cached[1](v)
+        key = (v.shape[0], n_chunk, bool(tables), dtype)
+
+        def out(res):
+            # ``Q`` at the distinct lags is a view of its table
+            return (*res, res[1][:, 1:]) if tables else res
+        if cached is not None and cached[0] == key:
+            return out(cached[1](v))
 
         n_lags = uniq.shape[0]
         step = -(-n_lags // n_chunk)
+        off = 1 if tables else 0
+
+        def p_inf(w):
+            return self._p_inf(kp(w), dtype, dense=True)
 
         @mx.custom_function
         def core(vv):
-            return term.matrices(kp(vv), uniq)
+            if not tables:
+                return term.matrices(kp(vv), uniq)
+            k_ = kp(vv)
+            n = vv.shape[0]
+            parts, h = [], None
+            # Not the backward's chunks: `mx.compile` merges a forward
+            # chunk with the identical forward inside the backward's
+            # `mx.vjp` of the same slice, which keeps every chunk's
+            # intermediates alive from here to the backward -- the peak
+            # the chunking exists to prevent (value + gradient 3.7 ->
+            # 14.5 GiB at N = 20000 x 1024 chains with equal steps, 3.6
+            # with these).
+            for lo in range(0, n_lags, step + 1):
+                ph, q, hh = term.matrices(k_, uniq[lo:lo + step + 1])
+                h = hh if h is None else h
+                parts.append(mx.stack([ph, q], axis=0))
+            # row 0 as `_metal_tables` has it
+            pin = p_inf(vv) if self._has_p_inf else None
+            q0 = (mx.broadcast_to(mx.eye(m, dtype=dtype), (n, 1, m, m))
+                  if pin is None else pin[:, None, :, :])
+            return (mx.concatenate([mx.zeros((n, 1, m, m), dtype=dtype)]
+                                   + [x[0] for x in parts], axis=1),
+                    mx.concatenate([q0] + [x[1] for x in parts], axis=1), h)
 
         @core.vjp
         def _core_vjp(primals, cotangents, outputs):
@@ -1235,7 +1301,7 @@ class GPLogLike:
             vv = primals[0] if isinstance(primals, (list, tuple)) else primals
             c_phi, c_q, c_h = cotangents
             z_h = mx.zeros_like(c_h)
-            acc = None
+            acc = []
             for i, lo in enumerate(range(0, n_lags, step)):
                 hi = min(lo + step, n_lags)
                 du = uniq[lo:hi]
@@ -1244,7 +1310,8 @@ class GPLogLike:
                     return term.matrices(kp(w), du)
 
                 g = mx.vjp(part, [vv],
-                           [c_phi[:, lo:hi], c_q[:, lo:hi],
+                           [c_phi[:, off + lo:off + hi],
+                            c_q[:, off + lo:off + hi],
                             c_h if i == 0 else z_h])[1][0]
                 # Deliberately no `mx.eval(g)` here.  Forcing each chunk to
                 # complete looks like the way to free it and does the
@@ -1253,11 +1320,18 @@ class GPLogLike:
                 # the whole loop, measured 3.6x *worse* than not chunking
                 # at all (7.76 GiB against 2.17).  Left lazy, MLX frees
                 # each chunk's intermediates as the sum is built: 0.97 GiB.
-                acc = g if acc is None else acc + g
-            return acc
+                acc.append(g)
+            if tables and self._has_p_inf:   # row 0 of Q is the term's
+                acc.append(mx.vjp(p_inf, [vv], [c_q[:, 0]])[1][0])
+            # Stacked and summed, not a running ``acc + g``: `mx.compile`
+            # fuses a chain of adds into one kernel, and past ~31 chunks
+            # that kernel has more arguments than Metal allows ("Too many
+            # inputs/outputs fused"; SHO + SHO at N = 20000 x 1024 chains
+            # is 236 chunks).
+            return mx.sum(mx.stack(acc, axis=0), axis=0)
 
-        setattr(self, attr, ((v.shape[0], n_chunk), core))
-        return core(v)
+        setattr(self, attr, (key, core))
+        return out(core(v))
 
     def _evaluate_metal(self, v: mx.array, resid: mx.array | None = None):
         """Design C: one kernel condenses the blocks, a second folds them.
@@ -1750,8 +1824,7 @@ class GPLogLike:
         both series' share of the jitter, for the held-out kernel path."""
         lay = self._masked_metal_layout()
         kp = self.param_map.kernel_params(v)
-        phi, q, h = self._metal_matrices(v, lay["uniq"])
-        pt, qt = self._metal_tables(v, phi, q)
+        pt, qt, h, q = self._metal_front_end(v, lay["uniq"])
         r, jit2 = self._metal_resid_jit(v, resid, need_resid)
         if jit2.ndim == 3:
             jf = mx.contiguous(mx.take(jit2, lay["s_pos"], 0))
@@ -1861,8 +1934,7 @@ class GPLogLike:
                 f"{self._slot_map_blk} but the launch uses "
                 f"{self.metal_block}; assign `metal_block` rather than "
                 f"`_metal_block` so the map is rebuilt")
-        phi, q, h = self._metal_matrices(v)
-        pt, qt = self._metal_tables(v, phi, q)
+        pt, qt, h, q = self._metal_front_end(v)
         r, jit2 = self._metal_resid_jit(v, resid, need_resid)
         return pt, qt, h, r, jit2, q
 
@@ -3288,6 +3360,9 @@ def _fold_plan_mx(kind, plan):
 #: into more chunks than strictly needed, which is cheap, while
 #: under-estimating lets the peak through, which is what this exists to stop.
 _FRONT_END_RETENTION = 48
+#: fewest backward chunks at which the front end's forward is chunked too
+#: (`GPLogLike._metal_matrices`)
+_FRONT_END_FWD_MIN_CHUNKS = 16
 
 #: Target peak for one chunk of that backward.  Chosen from a measured
 #: sweep at N = 2e4, 64 chains, an all-distinct cadence: the unchunked

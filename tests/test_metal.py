@@ -2028,3 +2028,70 @@ def test_forward_checkpoints_by_default_only_where_they_are_small():
     assert not fc(False, 2, 0, 1000, 8, 256)
     with pytest.raises(ValueError, match="forward_checkpoints"):
         GPPolicy(forward_checkpoints=1)
+
+
+# ---- the chunked front end emits the kernel's tables directly -------------
+
+_TABLE_TERMS = _CHUNK_TERMS + [
+    ("convolved", ag.TermConvolution(ag.SHOTerm(), 0.05), [1.3, 4.0, 3.0])]
+
+
+def _front_end_at_budget(gp, u, budget):
+    import anvilgp.likelihood as L
+    old = L._FRONT_END_BUDGET_BYTES
+    L._FRONT_END_BUDGET_BYTES = budget
+    try:
+        with mx.stream(mx.gpu):
+            out = gp._metal_front_end(u)
+            val, grad = mx.value_and_grad(lambda x: mx.sum(gp(x)))(u)
+            mx.eval(out, val, grad)
+        return [np.array(x) for x in out], float(val), np.array(grad)
+    finally:
+        L._FRONT_END_BUDGET_BYTES = old
+
+
+@pytest.mark.parametrize("name,term,pars", _TABLE_TERMS,
+                         ids=[c[0] for c in _TABLE_TERMS])
+def test_the_chunked_front_end_gives_the_same_tables(name, term, pars):
+    """`_metal_front_end`: chunked, the tables are concatenated from the
+    chunks with row 0 as one more piece (the peak on an all-distinct
+    cadence is the term algebra's, 9.9 -> 6.3 tables at N = 20000 x 1024
+    chains).  Bit for bit the unchunked tables, and the same gradient --
+    a convolved term's row 0 of ``Q`` is its own stationary covariance,
+    which depends on the parameters."""
+    gp, u = _distinct_gp(term, pars)
+    u = u + 0.05 * mx.array(np.random.default_rng(1).standard_normal(
+        u.shape).astype(np.float32))
+    whole, v0, g0 = _front_end_at_budget(gp, u, 1 << 60)
+    gp._metal_matrices_fn = None
+    chunk, v1, g1 = _front_end_at_budget(gp, u, 1 << 18)
+    assert gp._metal_matrices_fn is not None, "the chunked branch must run"
+    assert gp._metal_matrices_fn[0][2], "and its forward must be chunked"
+    for a, b in zip(whole, chunk):
+        np.testing.assert_array_equal(a, b)
+    assert v0 == v1
+    np.testing.assert_allclose(g1, g0, rtol=2e-5,
+                               atol=2e-6 * np.abs(g0).max())
+
+
+def test_many_front_end_chunks_compile():
+    """The chunks' gradients are stacked and summed.  A running ``acc +
+    g`` is one fused kernel under `mx.compile`, and for a sum of terms at
+    a few hundred chunks it had more arguments than Metal allows: "Too
+    many inputs/outputs fused" on SHO + SHO at N = 20000 x 1024 chains
+    (235 chunks), which anvil's compiled step would hit."""
+    import anvilgp.likelihood as L
+    gp, u = _distinct_gp(ag.SHOTerm() + ag.SHOTerm(),
+                         [1.3, 4.0, 3.0, 0.7, 1.0, 2.0], n_chains=64)
+    whole = _grad_at_budget(gp, u, 1 << 60)
+    old = L._FRONT_END_BUDGET_BYTES
+    L._FRONT_END_BUDGET_BYTES = 4_000_000
+    try:
+        assert L._front_end_chunks(u.shape[0], gp._metal_uniq_dt.shape[0],
+                                   4) > 200
+        f = mx.compile(mx.value_and_grad(lambda x: mx.sum(gp(x))))
+        with mx.stream(mx.gpu):
+            g = np.array(f(u)[1], np.float64)
+    finally:
+        L._FRONT_END_BUDGET_BYTES = old
+    assert np.max(np.abs(g - whole)) < 1e-5 * np.max(np.abs(whole))
