@@ -2878,6 +2878,42 @@ class GPLogLike:
                             vv, self._refuse_outside_series(vv, a_)),
                             self._infeasible_pull(vv))
                     return a_
+                def ev_held(vv, resid, cols=None):
+                    # Held out, the float64 value comes from the host
+                    # filter over S with M as prediction points
+                    # (`predict._smooth`), not from `_evaluate_masked`:
+                    # that reduces each segment by its own tree and chains
+                    # them in Python, ~27 ms a window (11.7 s for 64
+                    # chains at 400 windows, N = 20000, where this is
+                    # flat in the window count).  -> (ell, Gram, ell at a
+                    # zero residual), the Gram over ``cols`` or the
+                    # residual alone.
+                    from .predict import _gram_grid, _smooth
+                    hd = self._held
+                    sp, mp = hd["s_pos_np"], hd["m_pos_np"]
+                    z = cols
+                    if z is None and resid is not None:
+                        z = np.array(resid)[:, None, :]
+                    o = _smooth(self, np.array(vv), _gram_grid(self),
+                                return_var=False, gram=True,
+                                cols=None if z is None else z[:, :, sp])
+                    z_m, w_m = o["held"]
+                    if z is not None:
+                        z_m = z[:, :, mp]
+                    d = z_m - o["mean"]
+                    g = o["gram"] + np.einsum("nkm,nlm->nkl",
+                                              d / w_m[:, None, :], d)
+                    rr = self._yerr64 ** 2
+                    ell0 = -0.5 * (o["logdet"] - np.sum(np.log(rr[sp]))
+                                   + np.sum(np.log(w_m / rr[mp]), -1))
+                    ell0, ell = a64(ell0), a64(ell0 - 0.5 * g[:, 0, 0])
+                    if refuse:
+                        f = lambda a_: _sanitize(                # noqa: E731
+                            self._refuse_ill_conditioned(
+                                vv, self._refuse_outside_series(vv, a_)),
+                            self._infeasible_pull(vv))
+                        ell0, ell = f(ell0), f(ell)
+                    return ell, a64(g), ell0
                 def gram64(vv, cols):
                     # The Gram from one pass of the float64 filter carrying
                     # every column (`predict._smooth`, as `linear_posterior`
@@ -2887,8 +2923,10 @@ class GPLogLike:
                     # pass.  The two agree to ~1e-11.  `hi` is a value, so
                     # nothing needs to differentiate it.
                     from .predict import _gram_grid, _smooth
-                    ell0 = ev(vv, mx.zeros((vv.shape[0], self.n_data),
-                                           dtype=mx.float64))
+                    hd = self._held
+                    if hd is None:
+                        ell0 = ev(vv, mx.zeros((vv.shape[0], self.n_data),
+                                               dtype=mx.float64))
                     if isinstance(cols, tuple):    # (rc, phi), unscaled
                         rc_, ph_ = (np.array(x) for x in cols)
                         if ph_.ndim == 2:
@@ -2897,23 +2935,19 @@ class GPLogLike:
                             [rc_[:, None, :], np.swapaxes(ph_, 1, 2)], 1)
                     else:
                         z = np.array(cols)                     # (n, k, N)
-                    hd = self._held
-                    out_ = _smooth(
-                        self, np.array(vv), _gram_grid(self),
-                        return_var=False, gram=True,
-                        cols=z if hd is None else z[:, :, hd["s_pos_np"]])
-                    g = out_["gram"]
                     if hd is not None:
-                        d = z[:, :, hd["m_pos_np"]] - out_["mean"]
-                        g = g + np.einsum(
-                            "nkm,nlm->nkl", d / out_["held"][1][:, None, :],
-                            d)
-                    return ell0, a64(g), ell0
+                        _, g, ell0 = ev_held(vv, None, z)
+                        return ell0, g, ell0
+                    out_ = _smooth(self, np.array(vv), _gram_grid(self),
+                                   return_var=False, gram=True, cols=z)
+                    return ell0, a64(out_["gram"]), ell0
                 if self.linear_basis is not None:
                     acc = self._marginal(
                         vb, ev, y, xm, mx.array(self._noise_x64,
                                                 dtype=mx.float64), r_ref,
                         gram_fn=gram64)[0]
+                elif self._held is not None:
+                    acc = ev_held(vb, None)[0]
                 else:
                     acc = ev(vb, None)
                 mx.eval(acc)

@@ -92,6 +92,51 @@ def test_the_masked_likelihood_is_the_dense_sigma(name, layout):
         assert abs(got[c] - ref) < 1e-10 * abs(ref)
 
 
+@pytest.mark.parametrize("layout", _LAYOUTS)
+@pytest.mark.parametrize("name", list(_TERMS))
+def test_the_tree_reduction_is_the_host_filter(name, layout):
+    """`hi` takes the host filter over S (flat in the window count); the
+    float64 `_evaluate_masked` -- what a float64 `gram` differentiates and
+    the float32 MLX path mirrors -- is the segment-by-segment tree.  Two
+    routes to one number."""
+    term, kp = _TERMS[name]
+    t, y, yerr = _data(term, kp)
+    gp = _gp(term, kp, t, y, yerr, _layout(layout, t))
+    rows = _rows(len(kp), len(kp))
+    a64 = lambda x: mx.array(x, dtype=mx.float64)          # noqa: E731
+    with mx.stream(mx.cpu):
+        tree = np.array(gp._evaluate(
+            a64(rows), a64(gp._dt64), a64(gp._y64), a64(gp._yerr64 ** 2),
+            None, gp._inst32, 256, True, uniq=gp._uniq64))
+        host = np.array(gp.hi(a64(rows), refuse=False))
+    np.testing.assert_allclose(tree, host, rtol=1e-10, atol=1e-9)
+
+
+def test_hi_cost_is_flat_in_the_window_count():
+    """One host pass whatever the mask: 400 windows used to cost 400
+    segment reductions and a Python chain of compositions (11.7 s against
+    0.73 unmasked at N = 20000, 64 chains)."""
+    import time
+    n = 6000
+    t = np.arange(n) / 1440.0
+    rng = np.random.default_rng(0)
+    y, yerr = 1e-3 * rng.standard_normal(n), np.full(n, 1e-3)
+    took = {}
+    for k in (2, 300):
+        c = np.linspace(0.05, 0.95, k) * t[-1]
+        hw = (600 // k) / 2 / 1440.0
+        gp = GPLogLike(None, t, None, y, yerr, ag.SHOTerm(),
+                       ParamMap.log([1e-3, 0.02, 1.0]),
+                       GPPolicy(kappa_max=None),
+                       held_out=[(a - hw, a + hw) for a in c])
+        v = mx.zeros((16, 3))
+        mx.eval(gp.hi(v))
+        t0 = time.perf_counter()
+        mx.eval(gp.hi(v))
+        took[k] = time.perf_counter() - t0
+    assert took[300] < 2.0 * took[2], took
+
+
 def test_windows_are_the_same_mask():
     term, kp = _TERMS["sho"]
     t, y, yerr = _data(term, kp)

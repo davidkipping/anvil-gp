@@ -422,6 +422,8 @@ def _smooth(gp, v, grid, return_var, cols=None, alpha=False, gram=False):
         # steps' innovations are zero)
         w = inn_s[:, :, 0, :] / np.sqrt(sv_s[:, :, 0, :])      # (T, n, k)
         out["gram"] = np.einsum("tnk,tnl->nkl", w, w)
+        # log|K| of the observations, (n,), from the same innovations
+        out["logdet"] = np.sum(np.log(sv_s[:, :, 0, 0]), 0)
     if pred_slot.size == 0 and not alpha:
         return out
 
