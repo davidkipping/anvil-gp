@@ -1974,3 +1974,57 @@ def test_a_deep_ragged_fold_is_tiered_not_one_scatter_per_block():
     np.testing.assert_allclose(outs[0][0], want, rtol=2e-5, atol=1e-5)
     np.testing.assert_allclose(outs[0][1], 2 * want, rtol=2e-5, atol=2e-5)
     assert all(np.array_equal(o[0], outs[0][0]) for o in outs[1:])
+
+
+# ---- the forward's replay writes the backward's checkpoints ---------------
+
+def _ckpt_case(term, n_par, basis, mask, flag, n=1200):
+    rng = np.random.default_rng(3)
+    t = np.sort(rng.uniform(0, 30, n))
+    y, yerr = rng.standard_normal(n), np.full(n, 0.3)
+    kw = {}
+    if basis:
+        tc = (t - 15.0) / 15.0
+        kw["linear_basis"] = lambda vm, x, m0: mx.stack(
+            [mx.ones_like(m0), mx.broadcast_to(mx.array(
+                tc.astype(np.float32)), m0.shape)], axis=-1)
+    if mask:
+        kw["held_out"] = [(9.0, 11.0), (20.0, 20.5)]
+    gp = GPLogLike(None, t, None, y, yerr, term,
+                   ParamMap.log([1.0] * n_par),
+                   GPPolicy(metal=True, metal_block=128, kappa_max=None,
+                            forward_checkpoints=flag), **kw)
+    v = mx.array(0.1 * rng.standard_normal((8, n_par)).astype(np.float32))
+    val, grad = mx.value_and_grad(lambda x: mx.sum(gp(x)))(v), None
+    return np.array(gp(v)), np.array(val[1])
+
+
+@pytest.mark.parametrize("mask", [False, True], ids=["plain", "held_out"])
+@pytest.mark.parametrize("basis", [False, True], ids=["one", "columns"])
+@pytest.mark.parametrize("m", [2, 4])
+def test_checkpoints_from_the_replay_are_the_backwards_own(m, basis, mask):
+    """`forward_checkpoints`: the same filter from the same entry states,
+    so the value is untouched and the gradient is the backward's own to
+    rounding (the kernels are separate compilations)."""
+    term = ag.SHOTerm() if m == 2 else ag.SHOTerm() + ag.SHOTerm()
+    v0, g0 = _ckpt_case(term, 3 * m // 2, basis, mask, False)
+    v1, g1 = _ckpt_case(term, 3 * m // 2, basis, mask, True)
+    np.testing.assert_array_equal(v0, v1)
+    assert np.all(np.isfinite(g0))
+    np.testing.assert_allclose(g1, g0, rtol=2e-4,
+                               atol=2e-5 * np.abs(g0).max())
+
+
+def test_forward_checkpoints_by_default_only_where_they_are_small():
+    from anvilgp.metal import forward_checkpoints as fc
+    # m <= 3: no larger than the residual at any size
+    assert fc(None, 2, 0, 100_000, 4096, 4096)
+    assert fc(None, 3, 0, 100_000, 4096, 1024)
+    # m = 4 and 6: 2.5 and 5.25 of it, so only inside the byte budget
+    assert fc(None, 4, 0, 10_000, 1024, 256)
+    assert not fc(None, 4, 0, 100_000, 1024, 256)
+    assert not fc(None, 6, 0, 100_000, 1024, 64)
+    assert fc(True, 6, 0, 100_000, 1024, 64)
+    assert not fc(False, 2, 0, 1000, 8, 256)
+    with pytest.raises(ValueError, match="forward_checkpoints"):
+        GPPolicy(forward_checkpoints=1)

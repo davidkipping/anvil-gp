@@ -195,6 +195,17 @@ class GPPolicy:
     #: steps below float32's resolution of ``u`` are "accepted".  See
     #: docs/float32.md.
     kappa_max: float | None = 1e6
+    #: whether the kernel's forward also writes the checkpoints its
+    #: gradient replays from, which saves the gradient a pass: 8-16% of
+    #: value + gradient at m <= 3, 3-8% above.  A call no gradient
+    #: follows then holds a buffer it does not use -- 0.19 of the
+    #: residual's size at m = 2, 2.5 at m = 4, 5.25 at m = 6.  ``None``
+    #: writes them when that buffer is small (within 256 MiB, or no
+    #: larger than the residual and columns); ``True`` always, for a
+    #: gradient sampler on a large m >= 4 problem; ``False`` never, for a
+    #: gradient-free one short of memory.  See
+    #: `metal.forward_checkpoints`.
+    forward_checkpoints: bool | None = None
 
     def __post_init__(self):
         # Every one of these used to be accepted and fail later, far from
@@ -236,6 +247,11 @@ class GPPolicy:
             raise ValueError(
                 f"metal_boundary = {self.metal_boundary!r} must be None, "
                 f"'sqrt' or 'dense'")
+        if (self.forward_checkpoints is not None
+                and not isinstance(self.forward_checkpoints, bool)):
+            raise ValueError(
+                f"forward_checkpoints = {self.forward_checkpoints!r} must "
+                f"be None, True or False")
         if not 0.0 <= self.s_floor_rel < 1.0:
             raise ValueError(
                 f"s_floor_rel = {self.s_floor_rel!r} must be in [0, 1): the "
@@ -1267,7 +1283,8 @@ class GPLogLike:
                                   self.n_metal_slots,
                                   self._metal_fold_plan),
                            formal=self._formal,
-                           boundary=self._metal_boundary)
+                           boundary=self._metal_boundary,
+                           ckpt=self.policy.forward_checkpoints)
         return out, (q, h)
 
     def _check_mean_fn(self):
@@ -1750,7 +1767,8 @@ class GPLogLike:
         ell, xm_f, xc_f, xm_b, xc_b = scan_masked(
             pt, qt, h, mx.take(r, lay["s_pos"], 0),
             mx.take(r, lay["s_rev"], 0), jf, jb, fwd, bwd,
-            self.policy.s_floor_rel, lay["blk"], boundary=self._metal_boundary)
+            self.policy.s_floor_rel, lay["blk"], boundary=self._metal_boundary,
+            ckpt=self.policy.forward_checkpoints)
         pred = self._held_out_mean(kp, lay, xm_f[..., None, :], xc_f,
                                    xm_b[..., None, :], xc_b,
                                    (pt, qt, h))[..., 0]
@@ -1798,7 +1816,8 @@ class GPLogLike:
         fwd, bwd = self._masked_sides(lay)
         ld, g, xm_f, xc_f, xm_b, xc_b = scan_masked_mc(
             pt, qt, h, zf, zb, jf, jb, fwd, bwd, self.policy.s_floor_rel,
-            lay["blk"], boundary=self._metal_boundary)
+            lay["blk"], boundary=self._metal_boundary,
+            ckpt=self.policy.forward_checkpoints)
         d = z_m - self._held_out_mean(kp, lay, xm_f, xc_f, xm_b, xc_b,
                                       (pt, qt, h))
         w_m = self._masked_metal_noise(lay, jit2)
@@ -2427,7 +2446,8 @@ class GPLogLike:
                           slots=(self._metal_slot_id, self._metal_slot_start,
                                  self.n_metal_slots, self._metal_fold_plan),
                           formal=self._formal,
-                          boundary=self._metal_boundary)
+                          boundary=self._metal_boundary,
+                          ckpt=self.policy.forward_checkpoints)
         # `ld` is the plain likelihood of a zero residual, refused and
         # sanitised exactly as `_raw_resid` does it.
         ld = self._refuse_outside_series(v, ld)
