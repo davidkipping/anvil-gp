@@ -370,8 +370,13 @@ def periodogram_period(t, y, min_period=None, max_period=None, n_grid=20000):
     periods = np.exp(np.linspace(math.log(p_lo), math.log(p_hi), n_grid))
     w = 2.0 * np.pi / periods
     power = np.empty(n_grid)
-    for i in range(0, n_grid, 512):                  # blocked to bound memory
-        wi = w[i:i + 512][:, None]
+    # Blocked to bound memory, and by N as well as by the grid: a fixed
+    # 512 periods a block was six (512, N) temporaries, 643 MiB at N =
+    # 20000 and ~3 GiB at 1e5.  (The time is not bounded: 9 s at N = 20000
+    # and about 45 s at 1e5, once, at construction.)
+    step = int(max(8, min(512, 2_000_000 // max(t.size, 1))))
+    for i in range(0, n_grid, step):
+        wi = w[i:i + step][:, None]
         wt = wi * t[None, :]
         s2 = np.sum(np.sin(2 * wt), axis=1)
         c2 = np.sum(np.cos(2 * wt), axis=1)
@@ -380,6 +385,6 @@ def periodogram_period(t, y, min_period=None, max_period=None, n_grid=20000):
         c, s = np.cos(ph), np.sin(ph)
         yc, ys = y @ c.T, y @ s.T
         cc, ss = np.sum(c * c, axis=1), np.sum(s * s, axis=1)
-        power[i:i + 512] = 0.5 * (yc ** 2 / np.maximum(cc, 1e-300)
+        power[i:i + step] = 0.5 * (yc ** 2 / np.maximum(cc, 1e-300)
                                   + ys ** 2 / np.maximum(ss, 1e-300))
     return float(periods[int(np.argmax(power))])
