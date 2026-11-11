@@ -1599,7 +1599,11 @@ class GPLogLike:
             kind, plan = _lag_fold_plan(slag, n_lags)
             slots[d] = (mx.array(sid), mx.array(sstart), int(slag.size),
                         _fold_plan_mx(kind, plan))
+        # the median cadence's row of this table, for `kappa`
+        k_hit = (np.flatnonzero(uniq == f32(self._kappa_dt))
+                 if self._kappa_dt is not None else np.zeros(0, int))
         lay = dict(
+            kappa_row=int(k_hit[0]) if k_hit.size else None,
             blk=blk, uniq=mx.array(uniq, dtype=mx.float32),
             slots_f=slots["f"], slots_b=slots["b"],
             lag_f=i32(lag_f), lag_b=i32(lag_b),
@@ -1736,11 +1740,11 @@ class GPLogLike:
         `metal.scan_masked` (forward, and time-reversed), ``P r_S`` from
         the window-edge exits (`_held_out_mean`, by MLX, whose cotangents
         on the exits the scan's VJP carries into the kernels).  Returns
-        ``(log L, None)``: no lag table for `kappa`, whose median-cadence
-        row indexes the whole series' table, not this one (it rebuilds the
-        row instead, as on the MLX path)."""
+        ``(log L, tables)``, `kappa`'s ``(Q, h, row)`` with the median
+        cadence's row of *this* table (None if it has none: `kappa` then
+        rebuilds the row, as on the MLX path)."""
         from .metal import scan_masked
-        lay, kp, pt, qt, h, _, r, jit2, jf, jb = self._masked_metal_inputs(
+        lay, kp, pt, qt, h, q, r, jit2, jf, jb = self._masked_metal_inputs(
             v, resid)
         fwd, bwd = self._masked_sides(lay)
         ell, xm_f, xc_f, xm_b, xc_b = scan_masked(
@@ -1753,7 +1757,11 @@ class GPLogLike:
         d = mx.swapaxes(mx.take(r, lay["m_pos"], 0), 0, 1) - pred
         w_m = self._masked_metal_noise(lay, jit2)
         ell_m = -0.5 * mx.sum(d * d / w_m + mx.log(w_m / lay["rref_m"]), -1)
-        return ell + ell_m, None
+        return ell + ell_m, self._masked_kappa_tables(lay, q, h)
+
+    @staticmethod
+    def _masked_kappa_tables(lay, q, h):
+        return None if lay["kappa_row"] is None else (q, h, lay["kappa_row"])
 
     def _gram_metal_masked(self, v, cols):
         """`_gram_metal` with points held out: ``(ld, Z^T Sigma^-1 Z)``.
@@ -1763,7 +1771,7 @@ class GPLogLike:
         adds M's log-determinant half.  Differentiable as
         `_evaluate_metal_masked`; a shared basis gets no cotangent."""
         from .metal import scan_masked_mc
-        lay, kp, pt, qt, h, _, _, jit2, jf, jb = self._masked_metal_inputs(
+        lay, kp, pt, qt, h, q, _, jit2, jf, jb = self._masked_metal_inputs(
             v, need_resid=False)
         sp, sr = lay["s_pos"], lay["s_rev"]
         if isinstance(cols, tuple):
@@ -1796,7 +1804,7 @@ class GPLogLike:
         w_m = self._masked_metal_noise(lay, jit2)
         gram = g + mx.swapaxes(d / w_m[..., None], 1, 2) @ d
         ld = ld - 0.5 * mx.sum(mx.log(w_m / lay["rref_m"]), -1)
-        return ld, gram
+        return ld, gram, self._masked_kappa_tables(lay, q, h)
 
     def _metal_inputs(self, v: mx.array, resid: mx.array | None = None,
                       need_resid: bool = True):
@@ -2282,10 +2290,15 @@ class GPLogLike:
             jit = self.param_map.jitter_var_per_instrument(v)
             w = mx.broadcast_to(r if jit is None else r + jit,
                                 (n, r.shape[0]))
-        if (tables is not None and self._kappa_row is not None
+        row = self._kappa_row
+        if tables is not None and len(tables) == 3:
+            # another table than the whole series' (the held-out path's),
+            # with the median cadence's row in it
+            tables, row = tables[:2], tables[2]
+        if (tables is not None and row is not None
                 and not self._has_p_inf):
             q, h = (mx.stop_gradient(x) for x in tables)
-            qm = q[:, self._kappa_row]
+            qm = q[:, row]
             hqh = mx.sum(h * (qm @ h[..., None])[..., 0], -1)
             return mx.sum(h * h, -1) / (mx.maximum(hqh, 0.0)
                                         + mx.min(w, axis=-1))
@@ -2395,10 +2408,9 @@ class GPLogLike:
             return self._gram_polarised(v, self._raw_resid, cols)
         pull = self._infeasible_pull(v)
         if self._held is not None:
-            # no lag table for `kappa`: see `_evaluate_metal_masked`
-            ld, g = self._gram_metal_masked(v, cols)
+            ld, g, tabs = self._gram_metal_masked(v, cols)
             ld = self._refuse_outside_series(v, ld)
-            ld = _sanitize(self._refuse_ill_conditioned(v, ld, None), pull)
+            ld = _sanitize(self._refuse_ill_conditioned(v, ld, tabs), pull)
             return ld, g, ld
         if isinstance(cols, tuple):
             rc, phi = cols
