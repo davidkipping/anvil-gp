@@ -848,13 +848,29 @@ _FWD_STEP = """
             uint off = (chain * (uint)n_lags + (uint)lag[gi]) * M * M;
 MEAN_PREDICT
             float cp[MDIM][MDIM], ch[MDIM];
-            // Phi C Phi^T as two products, 2 m^3, not one m^4 sum: equal
-            // at m = 2, and on a quiet machine (2026-11-10, N = 8192, 256
+            // Phi C Phi^T.  For m >= 3 as two products, 2 m^3, not one
+            // m^4 sum: on a quiet machine (2026-11-10, N = 8192, 256
             // chains) the value is 8% faster at m = 3, 5% at m = 4 and 27%
-            // at m = 6 (value + gradient 14%, 6%, 21%, with the sweep's
+            // at m = 6 (value + gradient 14%, 11%, 23%, with the sweep's
             // two products done the same way).  docs/float32.md records an
             // earlier m = 4 trial as 5% slower; that predates m = 5-6 and
-            // is not what this measures now.
+            // is not what this measures now.  m <= 2 keeps the single sum:
+            // it gains nothing there, and the other association rounds
+            // differently, which is enough to send a ChEES run on a flat
+            // posterior down another path (one seed in eight took R-hat
+            // from 1.04 to 1.18 at 600/1200; no reason to move it).
+#if MDIM <= 2
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u) {
+                        float pu = phitab[off + i * M + u];
+                        for (uint w = 0; w < M; ++w)
+                            a += pu * cov[u][w] * phitab[off + j * M + w];
+                    }
+                    cp[i][j] = a + qtab[off + i * M + j];
+                }
+#else
             float pcq[MDIM][MDIM];
             for (uint i = 0; i < M; ++i)
                 for (uint w = 0; w < M; ++w) {
@@ -870,6 +886,7 @@ MEAN_PREDICT
                         a += pcq[i][w] * phitab[off + j * M + w];
                     cp[i][j] = a + qtab[off + i * M + j];
                 }
+#endif
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < i; ++j) {
                     float a = 0.5f * (cp[i][j] + cp[j][i]);
@@ -1252,6 +1269,16 @@ _SRC_BWD_CKPT = """
                 for (uint j = 0; j < M; ++j) a += Ph[i][j] * smean[li][j];
                 mp[i] = a;
             }
+#if MDIM <= 2                               // see the forward step
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u)
+                        for (uint w = 0; w < M; ++w)
+                            a += Ph[i][u] * scov[li][u][w] * Ph[j][w];
+                    cp[i][j] = a + qtab[off + i * M + j];
+                }
+#else
             float pc0[MDIM][MDIM];              // Phi C, then (Phi C) Phi^T
             for (uint i = 0; i < M; ++i)
                 for (uint w = 0; w < M; ++w) {
@@ -1266,6 +1293,7 @@ _SRC_BWD_CKPT = """
                     for (uint w = 0; w < M; ++w) a += pc0[i][w] * Ph[j][w];
                     cp[i][j] = a + qtab[off + i * M + j];
                 }
+#endif
             for (uint i = 0; i < M; ++i)
                 for (uint j = 0; j < i; ++j) {
                     float a = 0.5f * (cp[i][j] + cp[j][i]);
@@ -1361,7 +1389,18 @@ _SRC_BWD_CKPT = """
                     acc_p[i][j] += a + mp_bar[i] * smean[li][j];
                     acc_q[i][j] += cs[i][j];
                 }
-            float nb[MDIM][MDIM], pc1[MDIM][MDIM];  // Phi^T cs, then Phi
+            float nb[MDIM][MDIM];
+#if MDIM <= 2
+            for (uint i = 0; i < M; ++i)
+                for (uint j = 0; j < M; ++j) {
+                    float a = 0.0f;
+                    for (uint u = 0; u < M; ++u)
+                        for (uint w = 0; w < M; ++w)
+                            a += Ph[u][i] * cs[u][w] * Ph[w][j];
+                    nb[i][j] = a;
+                }
+#else
+            float pc1[MDIM][MDIM];              // Phi^T cs, then Phi
             for (uint i = 0; i < M; ++i)
                 for (uint u = 0; u < M; ++u) {
                     float a = 0.0f;
@@ -1374,6 +1413,7 @@ _SRC_BWD_CKPT = """
                     for (uint u = 0; u < M; ++u) a += pc1[i][u] * Ph[u][j];
                     nb[i][j] = a;
                 }
+#endif
             for (uint i = 0; i < M; ++i) {
                 float a = 0.0f;
                 for (uint j = 0; j < M; ++j) {
