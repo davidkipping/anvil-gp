@@ -466,7 +466,14 @@ short: on a regular cadence at N = 1e4, value + gradient 4.2 -> 5.8 ms at
 all-distinct cases above. Use it only when an all-distinct cadence is
 short of memory. On such a cadence the automatic block is 256 points,
 not the regular cadence's: at 8192 the GPU watchdog killed the N = 1e5 x
-1024 value within five calls. m > 6, the
+1024 value within five calls. The same holds from about 1300 distinct
+lags at that size (value + gradient was killed at every block of 2048
+or more), so past 1024 lags a block the regular rule would make longer
+than 2048 is 256 too. There the short block costs memory, because the
+gradient's buffer is one slot per (block, lag) pair that occurs: 1281
+lags at N = 1e5 x 1024 chains peak at 14.6 GiB, against 3.5 at 8192 on
+the runs that survived it (`likelihood._auto_metal_block` has the
+table). m > 6, the
 m = 5-6 register spill, and in-kernel propagators are the obvious follow-ons.
 
 ### The MLX reference path

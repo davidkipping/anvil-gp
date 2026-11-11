@@ -2106,6 +2106,14 @@ def test_auto_metal_block_is_shorter_with_a_row_per_observation():
     assert _auto_metal_block(100_000, 2, n_lags=14) == 8192
     assert _auto_metal_block(100_000, 2, n_lags=99_591) == 256
     assert _auto_metal_block(100_000, 4, n_lags=99_591) == 256
+    # 1025 lags survived 8192 (120 value and 100 gradient calls); 1281
+    # was killed once in two runs, and every longer block from 1538 on
+    assert _auto_metal_block(100_000, 2, n_lags=1024) == 8192
+    assert _auto_metal_block(100_000, 2, n_lags=1281) == 256
+    assert _auto_metal_block(50_000, 2, n_lags=2049) == 256
+    # where the regular rule's block is short already it stays
+    assert _auto_metal_block(20_000, 2, n_lags=2001) == 2048
+    assert _auto_metal_block(20_000, 2, n_lags=19_980) == 256
     gp, _ = _distinct_gp(ag.SHOTerm(), [1.3, 4.0, 3.0], n=60_000)
     assert gp._metal_uniq_dt.shape[0] > 4096 and gp.metal_block == 256
 

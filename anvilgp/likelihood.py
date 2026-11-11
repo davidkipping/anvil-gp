@@ -3669,11 +3669,14 @@ def _notice_metal_choice(ok: bool, why: str) -> None:
     warnings.warn(msg, MetalDefaultNotice, stacklevel=4)
 
 
-#: Past this many distinct lags the automatic block is at most
-#: `_MANY_LAGS_BLOCK` (`_auto_metal_block`).  4096 is not measured: the
-#: kills were at ~1e5 lags, and ~2e4 ran clean at 2048.
+#: Many distinct lags shorten the automatic block (`_auto_metal_block`):
+#: past `_MANY_LAGS` it is at most `_MANY_LAGS_BLOCK`; past
+#: `_SOME_LAGS`, the same wherever the regular rule would give more than
+#: `_SOME_LAGS_KEEP`.
 _MANY_LAGS = 4096
 _MANY_LAGS_BLOCK = 256
+_SOME_LAGS = 1024
+_SOME_LAGS_KEEP = 2048
 
 
 def _auto_metal_block(n_data: int, n_state: int = 2, n_lags: int = 0) -> int:
@@ -3712,18 +3715,41 @@ def _auto_metal_block(n_data: int, n_state: int = 2, n_lags: int = 0) -> int:
     2026-10-25, set on a quiet machine.
 
     Those caps were set on regular cadences, where a thread reads the
-    same table row at every step.  With a row per observation (every
-    spacing distinct) each step reads rows no thread has touched, the
-    walk is slower, and the m = 2 rule's 8192 is killed: N = 1e5 x 1024
-    chains, compiled value called back to back, display in use
-    (2026-11-11) -- 8192 KILLED within 5 calls in 7 runs of 7; 2048
-    KILLED once in two runs of 8; 1024 KILLED once, at call 23, in four
-    runs of 30; 256 survived 210 calls and 12 of value + gradient.  The
-    term front end alone survived 120, so it is the kernels.  Shorter
-    blocks cost nothing there (N = 20000 x 1024: value 121 / 122 / 120 ms
-    and value + gradient 431 / 419 / 416 at 1024 / 512 / 256; the front
-    end is most of the call), so past `_MANY_LAGS` distinct lags the
-    block is at most `_MANY_LAGS_BLOCK`.
+    same table row at every step and its backward flushes a lag's adjoint
+    once a run.  With many distinct lags every step reads another row and
+    flushes another slot, the walk is slower, and long blocks are killed.
+    N = 1e5 x 1024 chains, m = 2, compiled calls back to back, display in
+    use (2026-11-11), ``value calls / value + gradient calls`` survived or
+    the call it was KILLED at:
+
+        lags / block   8192            4096   2048        1024           512     256
+          601          60/40
+         1025          160/110 (4 runs)
+         1281          K@26; 20/40 ok                                             20/40
+         1538          K@0, K@17       K@0    K@10        5/20                    5/20
+         2049          K@0, K@2        K@0    K@0         65/60          60/40    5/20
+         3074          K@0             K@3    K@7         5/20                    5/20
+         4096          K@0             K@4    K@5         5/20; K@1      60/40    5/20
+         8194          value K@28
+        16354          value 30 ok
+        31270          value K@6
+        99591 (all)    value K<5 (x7)         value K@4   value K@23     30/-     270/12
+
+    (kills are of value + gradient unless marked; at 1024 and 2048 with
+    all lags distinct, once in four runs of 30 and once in two of 8).
+
+    The term front end alone survived 120 calls at 99591 lags, so it is
+    the kernels.  At N = 20000 x 1024 the regular rule's 2048 ran clean at
+    2001 and at 19980 lags, so thread count matters too.  Hence: past
+    `_MANY_LAGS` lags at most `_MANY_LAGS_BLOCK`, which is free there (N =
+    20000 x 1024, all distinct: value 121 / 122 / 120 ms and value +
+    gradient 431 / 419 / 416 at 1024 / 512 / 256; the front end is most
+    of the call); past `_SOME_LAGS`, the same where the regular rule
+    gives more than `_SOME_LAGS_KEEP`.  In that middle range the short
+    block is what runs at all, and it costs memory: the adjoint buffer is
+    one slot per (block, lag) pair that occurs, so 1281 lags at N = 1e5
+    x 1024 is 3.5 GiB of value + gradient at 8192 (when it survives) and
+    14.6 at 256.
     """
     target = max(1.0, n_data / 12.0)
     p = 1
@@ -3732,9 +3758,10 @@ def _auto_metal_block(n_data: int, n_state: int = 2, n_lags: int = 0) -> int:
     if target - p > 2 * p - target:   # round to the *nearest*, not up
         p *= 2
     cap = _MAX_METAL_BLOCK.get(n_state, _MAX_METAL_BLOCK_HI_M)
-    if n_lags > _MANY_LAGS:
-        cap = min(cap, _MANY_LAGS_BLOCK)
-    return max(min(256, cap), min(cap, p))
+    blk = max(min(256, cap), min(cap, p))
+    if n_lags > _MANY_LAGS or (n_lags > _SOME_LAGS and blk > _SOME_LAGS_KEEP):
+        blk = min(blk, _MANY_LAGS_BLOCK)
+    return blk
 
 
 def _pow2(n: int) -> int:
