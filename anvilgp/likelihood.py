@@ -197,12 +197,27 @@ class GPPolicy:
     kappa_max: float | None = 1e6
 
     def __post_init__(self):
+        # Every one of these used to be accepted and fail later, far from
+        # here: `hi_chain_block=0` as "range() arg 3 must not be zero" at
+        # the first `hi`, `metal=0` as a slot-map error (the code tests
+        # `is False`), `metal='yes'` and `block=0` not at all.
+        if self.metal is not None and not isinstance(self.metal, bool):
+            raise ValueError(
+                f"metal = {self.metal!r} must be True, False or None")
+        for name, optional in (("block", False), ("hi_block", False),
+                               ("hi_chain_block", False),
+                               ("sub_block", True), ("metal_block", True)):
+            val = getattr(self, name)
+            if val is None and optional:
+                continue
+            if (isinstance(val, bool) or not isinstance(val, (int, np.integer))
+                    or val < 1):
+                raise ValueError(
+                    f"{name} = {val!r} must be a positive integer"
+                    + (" or None" if optional else ""))
         if self.kappa_max is not None and not self.kappa_max > 0:
             raise ValueError(
                 f"kappa_max = {self.kappa_max!r} must be positive or None")
-        if self.metal_block is not None and int(self.metal_block) < 1:
-            raise ValueError(
-                f"metal_block = {self.metal_block!r} must be None or >= 1")
         if (self.metal_block is not None
                 and int(self.metal_block) > max(_MAX_METAL_BLOCK.values())):
             # `_auto_metal_block` caps this per state dimension because the
@@ -512,10 +527,20 @@ class GPLogLike:
             #: ``S^-1`` and ``log|S|``, once in float64 (`_marginal`).
             self._prior_prec = np.linalg.inv(s_)
             self._prior_logdet = float(2.0 * np.sum(np.log(np.diag(ch))))
+        if linear_prior is not None and linear_basis is None:
+            raise ValueError(
+                "`linear_prior` is set but `linear_basis` is None: there "
+                "are no linear parameters for it to be a prior on.")
+        if self._linear_prior is not None and not (
+                np.all(np.isfinite(self._linear_prior[0]))
+                and np.all(np.isfinite(self._linear_prior[1]))):
+            raise ValueError("linear_prior's mean and covariance must be "
+                             "finite")
         if param_map.noise is not None and noise_fn is None:
             raise ValueError(
                 "`param_map.noise` is set but `noise_fn` is None: the noise "
                 "columns would be sampled but inert.")
+        _check_param_map(param_map, kernel_spec)
         if noise_fn is not None and param_map.jitter:
             raise ValueError(
                 "`noise_fn` gives the whole noise variance, so it cannot be "
@@ -634,6 +659,20 @@ class GPLogLike:
         # jitter.  Always present and always int32: the kernel indexes it
         # unconditionally in the multi-jitter variant, and a zero vector is
         # the right answer when there is one instrument or none.
+        if param_map.instrument is None:
+            for what, entries in (("jitter", param_map.jitter),
+                                  ("offset", param_map.offset)):
+                if len(entries) > 1:
+                    raise ValueError(
+                        f"{len(entries)} {what}s are declared but "
+                        f"param_map.instrument is None: it says which datum "
+                        f"belongs to which instrument")
+        elif np.asarray(param_map.instrument).dtype.kind not in "iufb":
+            raise ValueError(
+                f"param_map.instrument must be integer labels 0, 1, ...; "
+                f"got dtype {np.asarray(param_map.instrument).dtype} (map "
+                f"names to integers with np.unique(names, "
+                f"return_inverse=True)[1])")
         self._metal_inst = (mx.zeros((self.n_data,), dtype=mx.int32)
                             if param_map.instrument is None
                             else mx.array(np.asarray(param_map.instrument,
@@ -648,6 +687,7 @@ class GPLogLike:
         self._noise_x64 = (self._t64 if self._x_mean64 is None
                            else self._x_mean64)
         self._noise_x32 = mx.array(self._noise_x64.astype(np.float32))
+        self._check_mean_fn()
         self._cache_shared_basis()
         self._resolve_held_out(held_out)
         inst = param_map.instrument
@@ -1093,9 +1133,12 @@ class GPLogLike:
                            "param_map.instrument to say which datum is which")
         if self._held is not None and self.term.reversal_signs() is None:
             return False, ("a held-out mask needs the term's time reversal "
-                           "(Term.reversal_signs), which a convolved term "
-                           "does not have; a masked fit runs at the MLX "
-                           "path's speed (roughly 10-30x the kernel's)")
+                           "(Term.reversal_signs), which "
+                           + ("a convolved term does not have"
+                              if self._formal else
+                              f"{type(self.term).__name__} does not declare")
+                           + "; a masked fit runs at the MLX path's speed "
+                           "(roughly 10-30x the kernel's)")
         if not metal_available():
             return False, "mx.fast.metal_kernel is unavailable here"
         return True, ""
@@ -1229,6 +1272,31 @@ class GPLogLike:
                            boundary=self._metal_boundary)
         return out, (q, h)
 
+    def _check_mean_fn(self):
+        """One two-chain call of ``mean_fn`` at construction, for its type
+        and shape only (its value at ``v_mean = 0`` need not be physical).
+        A wrong shape used to surface at the first evaluation as an MLX
+        ``swapaxes`` or broadcast error with no mention of the mean
+        model."""
+        pm = self.param_map
+        if self.mean_fn is None or pm.mean is None:
+            return
+        n_mean = len(range(pm.n_dim)[pm.mean])
+        with mx.stream(mx.cpu):
+            out = self.mean_fn(
+                mx.zeros((2, n_mean), dtype=mx.float64),
+                None if self._x_mean64 is None
+                else mx.array(self._x_mean64, dtype=mx.float64))
+        if not isinstance(out, mx.array):
+            raise TypeError(
+                f"mean_fn must return an mx.array built from its arguments, "
+                f"got {type(out).__name__}")
+        if tuple(out.shape) != (2, self.n_data):
+            raise ValueError(
+                f"mean_fn returned shape {tuple(out.shape)} for 2 chains; "
+                f"it must be (n_chains, {self.n_data}): one row per chain, "
+                f"one column per observation")
+
     def _cache_shared_basis(self):
         """A ``linear_basis`` shared by every chain -- one returning ``(N,
         p)`` -- is a constant, so it is evaluated once, here, in float64
@@ -1270,12 +1338,31 @@ class GPLogLike:
                 mx.zeros((1, n_mean), dtype=mx.float64),
                 mx.array(self._noise_x64, dtype=mx.float64),
                 mx.zeros((1, self.n_data), dtype=mx.float64))
+            if not isinstance(phi, mx.array):
+                raise TypeError(
+                    f"linear_basis must return an mx.array built from its "
+                    f"arguments, got {type(phi).__name__}")
+            shape = tuple(phi.shape)
+            ok = (phi.ndim == 2 and shape[0] == self.n_data
+                  or phi.ndim == 3 and shape[:2] == (1, self.n_data))
+            if not ok or shape[-1] < 1:
+                raise ValueError(
+                    f"linear_basis returned shape {shape}; it must be "
+                    f"({self.n_data}, p) for a basis shared by every chain "
+                    f"or (n_chains, {self.n_data}, p) per chain, p >= 1")
+            if (self._linear_prior is not None
+                    and self._linear_prior[0].size != shape[-1]):
+                raise ValueError(
+                    f"linear_prior is for {self._linear_prior[0].size} "
+                    f"linear parameter(s) but linear_basis has "
+                    f"{shape[-1]} column(s)")
+            if not bool(mx.all(mx.isfinite(phi))):
+                raise ValueError(
+                    "linear_basis is not finite at the mean model's zero "
+                    "point (v_mean = 0, m0 = 0)")
             if phi.ndim != 2:
                 return                        # per chain: evaluated each time
             phi = np.array(phi.astype(mx.float64))
-        if phi.shape[0] != self.n_data:
-            raise ValueError(f"linear_basis returned {phi.shape}; a shared "
-                             f"basis is ({self.n_data}, p)")
         # Gram-Schmidt, twice per column, of the weighted, column-normalised
         # basis, W^1/2 Phi D^-1 = Q_w R.  R_jj -- the part of column j not in
         # the earlier ones, relative to its own norm -- decides a dead
@@ -2067,6 +2154,11 @@ class GPLogLike:
         map fits the wrong thing; too narrow and MLX raises somewhere deep in
         a broadcast with no mention of the parameter map.
         """
+        if not isinstance(v, mx.array):
+            raise TypeError(
+                f"v must be an mx.array of shape (n_chains, "
+                f"{self.param_map.n_dim}), got {type(v).__name__}; wrap it "
+                f"as mx.array(v, dtype=mx.float32)")
         if v.ndim != 2:
             raise ValueError(
                 f"v must be (n_chains, n_dim); got shape {tuple(v.shape)}")
@@ -2871,6 +2963,13 @@ def _held_mask(t: np.ndarray, held_out) -> np.ndarray:
             and np.issubdtype(arr.dtype, np.number)):
         mask = np.zeros(t.size, dtype=bool)
         for lo, hi in arr.astype(np.float64):
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                raise ValueError(
+                    f"held_out window ({lo:g}, {hi:g}) is not finite")
+            if lo > hi:
+                raise ValueError(
+                    f"held_out window ({lo:g}, {hi:g}) is reversed: give "
+                    f"(t_lo, t_hi) with t_lo <= t_hi")
             inside = (t >= lo) & (t <= hi)
             if not inside.any():
                 raise ValueError(
@@ -3164,6 +3263,42 @@ class _Float64FrontEnd:
                 return attr(p, *rest)
             return self._bridges[name](p, *rest)
         return call
+
+
+def _check_param_map(pm, term) -> None:
+    """Refuse a parameter map that does not fit its term or its own
+    ``n_dim``, at construction.  Each of these was accepted and either
+    ignored (extra kernel entries), failed in a broadcast at the first
+    call (too few; an index out of range gave "Shapes (2,0) and (1,120)")
+    or made every chain the failure value (a zero or NaN reference)."""
+    if len(pm.kernel) != term.n_params:
+        raise ValueError(
+            f"param_map.kernel has {len(pm.kernel)} entries but "
+            f"{type(term).__name__} has {term.n_params} parameters "
+            f"({', '.join(term.param_names)})")
+    for what, entries in (("kernel", pm.kernel), ("jitter", pm.jitter),
+                          ("offset", pm.offset)):
+        for i, k in enumerate(entries):
+            if k.link == "const":
+                if not np.isfinite(k.value):
+                    raise ValueError(
+                        f"param_map.{what}[{i}] has a non-finite value")
+                continue
+            if (k.index is None or isinstance(k.index, bool)
+                    or not isinstance(k.index, (int, np.integer))
+                    or not 0 <= k.index < pm.n_dim):
+                raise ValueError(
+                    f"param_map.{what}[{i}] reads column {k.index!r} of v, "
+                    f"which has n_dim = {pm.n_dim} columns (0 to "
+                    f"{pm.n_dim - 1})")
+            if not np.isfinite(k.ref) or not np.isfinite(k.scale):
+                raise ValueError(
+                    f"param_map.{what}[{i}] has a non-finite reference")
+            if k.link == "log" and not k.ref > 0:
+                raise ValueError(
+                    f"param_map.{what}[{i}] has link 'log' and reference "
+                    f"{k.ref!r}: it must be positive (the parameter is "
+                    f"ref * exp(v))")
 
 
 #: largest reference-point spectral ``||F delta||`` at which a convolved

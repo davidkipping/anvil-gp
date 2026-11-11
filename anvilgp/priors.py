@@ -354,6 +354,12 @@ def periodogram_period(t, y, min_period=None, max_period=None, n_grid=20000):
     """
     t = np.asarray(t, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
+    if t.size < 4 or not t[-1] > t[0]:
+        raise ValueError(
+            f"a periodogram needs at least 4 points over a non-zero "
+            f"baseline, got {t.size}"
+            + (" (seed_period=True with held_out: these are the kept "
+               "points)" if t.size < 4 else ""))
     y = y - y.mean()
     d = np.diff(t)
     d = d[d > 0]

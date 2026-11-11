@@ -103,9 +103,11 @@ def test_multi_instrument_requires_an_instrument_index():
     pm = ParamMap(kernel=_const(KP), n_dim=1,
                   jitter=[KernelParam(link="const", value=0.1),
                           KernelParam(link="const", value=0.2)])
-    gp = GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm, GPPolicy(metal=False, block=128))
-    with pytest.raises(ValueError, match="instrument"):
-        gp.hi(a64(np.zeros((1, 1))))
+    # at construction since 2026-11-10; it used to build and fail at the
+    # first call
+    with pytest.raises(ValueError, match="instrument is None"):
+        GPLogLike(None, T, None, Y, YERR, ag.SHOTerm(), pm,
+                  GPPolicy(metal=False, block=128))
 
 
 def _two_jitters_three_offsets(inst):
@@ -795,3 +797,120 @@ def test_a_deep_copy_is_independent_and_survives_a_chunked_call():
     owners = [c.cell_contents.__self__ for c in cp._guard.__closure__
               if hasattr(c.cell_contents, "__self__")]
     assert owners and all(o is cp for o in owners)
+
+
+# -- bad inputs are refused where they are given (2026-11-10 review) --------
+
+def _build(pm=None, policy=None, **kw):
+    return GPLogLike(kw.pop("mean_fn", None), T, kw.pop("x_mean", None), Y,
+                     YERR, ag.SHOTerm(),
+                     pm or ParamMap(kernel=_const(KP), n_dim=1),
+                     policy or GPPolicy(metal=False, block=128), **kw)
+
+
+@pytest.mark.parametrize("kw, match", [
+    (dict(metal="yes"), "metal = 'yes'"),
+    (dict(metal=0), "metal = 0"),
+    (dict(block=0), "block = 0"),
+    (dict(block=-4), "block = -4"),
+    (dict(sub_block=0), "sub_block = 0"),
+    (dict(hi_block=0), "hi_block = 0"),
+    (dict(hi_chain_block=0), "hi_chain_block = 0"),
+    (dict(metal_block=2.5), "metal_block = 2.5"),
+    (dict(metal_block="16"), "metal_block = '16'"),
+])
+def test_a_bad_policy_is_refused_when_it_is_made(kw, match):
+    """`hi_chain_block=0` was "range() arg 3 must not be zero" at the first
+    `hi`, `metal=0` a slot-map error (the code tests ``is False``), and the
+    rest were accepted."""
+    with pytest.raises(ValueError, match=match):
+        GPPolicy(**kw)
+
+
+def test_a_parameter_map_that_does_not_fit_is_refused():
+    """Extra kernel entries were ignored, too few was a NumPy broadcast
+    error, an index out of range "Shapes (2,0) and (1,120)" at the first
+    call, and a zero or NaN log reference made every chain the failure
+    value."""
+    log = lambda i, r=1.0: KernelParam(link="log", index=i, ref=r)  # noqa: E731
+    for kernel, n_dim, match in [
+            ([log(0), log(1), log(2), log(3)], 4, "4 entries but SHOTerm has 3"),
+            ([log(0), log(1)], 2, "2 entries but SHOTerm has 3"),
+            ([log(0), log(1), log(5)], 3, r"kernel\[2\] reads column 5"),
+            ([log(0), log(1), log(-1)], 3, r"kernel\[2\] reads column -1"),
+            ([log(0), log(1, 0.0), log(2)], 3, r"kernel\[1\].*positive"),
+            ([log(0), log(1, float("nan")), log(2)], 3, "non-finite"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            _build(ParamMap(kernel=kernel, n_dim=n_dim))
+    with pytest.raises(ValueError, match=r"jitter\[0\] reads column 3"):
+        _build(ParamMap(kernel=_const(KP), n_dim=1, jitter=[log(3)]))
+
+
+def test_instrument_labels_that_are_not_numbers_are_refused():
+    pm = ParamMap(kernel=_const(KP), n_dim=1,
+                  jitter=[KernelParam(link="const", value=j)
+                          for j in (0.3, 0.1)],
+                  instrument=np.where(T > 7.5, "b", "a"))
+    with pytest.raises(ValueError, match="integer labels 0, 1"):
+        _build(pm)
+
+
+def test_a_mean_function_of_the_wrong_shape_is_refused_at_construction():
+    """It used to surface at the first evaluation, as an MLX ``swapaxes``
+    or broadcast error that did not mention the mean model."""
+    pm = ParamMap(kernel=_const(KP), n_dim=1, mean=slice(0, 1))
+    bad = {"(n,)": lambda vm, x: vm[:, 0],
+           "(N,)": lambda vm, x: x,
+           "(n, N, 1)": lambda vm, x: (vm[:, :1] * x[None, :])[..., None],
+           "(N, n)": lambda vm, x: (vm[:, :1] * x[None, :]).T}
+    for name, fn in bad.items():
+        with pytest.raises(ValueError, match="mean_fn returned shape"):
+            _build(pm, mean_fn=fn, x_mean=T)
+    with pytest.raises(TypeError, match="mean_fn must return an mx.array"):
+        _build(pm, mean_fn=lambda vm, x: np.zeros((2, N)), x_mean=T)
+    _build(pm, mean_fn=lambda vm, x: vm[:, :1] * x[None, :], x_mean=T)
+
+
+def test_a_bad_linear_basis_or_prior_is_refused_at_construction():
+    one = lambda vm, x, m0: mx.ones_like(x)[:, None]            # noqa: E731
+    with pytest.raises(TypeError, match="linear_basis must return"):
+        _build(linear_basis=lambda vm, x, m0: np.ones((N, 1)))
+    for fn in (lambda vm, x, m0: mx.ones_like(x),               # (N,)
+               lambda vm, x, m0: mx.zeros((N, 0)),              # p = 0
+               lambda vm, x, m0: mx.ones((N + 1, 1))):
+        with pytest.raises(ValueError, match="linear_basis returned shape"):
+            _build(linear_basis=fn)
+    with pytest.raises(ValueError, match="not finite"):
+        _build(linear_basis=lambda vm, x, m0: mx.log(x - 1e9)[:, None])
+    with pytest.raises(ValueError, match="there are no linear parameters"):
+        _build(linear_prior=(np.zeros(1), np.eye(1)))
+    with pytest.raises(ValueError, match="must be finite"):
+        _build(linear_basis=one,
+               linear_prior=(np.array([np.nan]), np.eye(1)))
+    _build(linear_basis=one, linear_prior=(np.zeros(1), np.eye(1)))
+
+
+def test_v_must_be_an_mx_array():
+    gp = _build()
+    with pytest.raises(TypeError, match="v must be an mx.array"):
+        gp(np.zeros((1, 1), dtype=np.float32))
+
+
+def test_a_held_out_window_says_what_is_wrong_with_it():
+    for win, match in [((8.0, 2.0), "reversed"),
+                       ((float("nan"), 2.0), "not finite"),
+                       ((1e6, 2e6), "contains no data")]:
+        with pytest.raises(ValueError, match=match):
+            _build(held_out=[win])
+
+
+def test_seed_period_needs_enough_kept_points():
+    """One kept point was a ``math domain error`` from the periodogram."""
+    pytest.importorskip("anvil")
+    from anvilgp.anvil import make_target
+    mask = np.ones(N, dtype=bool)
+    mask[N // 2] = False
+    with pytest.raises(ValueError, match="at least 4 points"):
+        make_target(ag.RotationTerm(), T, Y, YERR, held_out=mask,
+                    seed_period=True)

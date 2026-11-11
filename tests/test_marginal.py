@@ -289,7 +289,7 @@ def test_a_bad_linear_prior_is_refused():
         return mx.ones_like(m0)[..., None]
     for prior, match in [((np.zeros(1), -np.eye(1)), "positive definite"),
                          ((np.zeros(2), np.eye(3)), "linear_prior must"),
-                         ((np.zeros(2), np.eye(2)), "p = 1")]:
+                         ((np.zeros(2), np.eye(2)), "has 1 column")]:
         with pytest.raises(ValueError, match=match):
             gp = GPLogLike(None, t, None, y, yerr, TERM, ParamMap.log(KP),
                            GPPolicy(metal=False), linear_basis=basis,
