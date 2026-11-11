@@ -372,15 +372,18 @@ the cadence's propagator, restarting from the edge every 16 points to
 keep its float32 rounding from compounding (docs/masked-gp-plan.md). At
 N = 2818 one-minute points with 398 (14%) held out in two windows,
 Matern-3/2, against the unmasked likelihood on the kernel (quiet
-machine, 2026-11-07; probe 73.3 and 74.1 ms):
+machine, 2026-11-10; probe 72.8 and 73.5 ms):
 
 | | 128 chains: value | value + gradient | 1024 chains: value | value + gradient |
 |---|---:|---:|---:|---:|
-| jitter only | 1.72 ms (1.8x) | 4.15 ms (2.2x) | 3.16 ms (2.2x) | 7.31 ms (2.5x) |
-| error scale + quadratic baseline | 2.62 ms (1.7x) | 6.08 ms (2.0x) | 7.21 ms (2.0x) | 13.9 ms (2.0x) |
+| jitter only | 1.46 ms (1.6x) | 4.08 ms (2.1x) | 2.51 ms (1.6x) | 6.60 ms (2.3x) |
+| error scale + quadratic baseline | 2.79 ms (1.9x) | 5.76 ms (2.0x) | 6.21 ms (1.8x) | 12.87 ms (2.0x) |
 
-The unmasked figures they are against: 0.94, 1.93, 1.46 and 2.95 ms
-plain; 1.57, 3.01, 3.57 and 6.88 ms with the noise model and baseline.
+The unmasked figures they are against: 0.94, 1.91, 1.61 and 2.93 ms
+plain; 1.45, 2.94, 3.52 and 6.49 ms with the noise model and baseline.
+(On 2026-11-07, before the reversed scan was stopped at the earliest
+window and the conditioning guard read the scans' own table: 1.72, 4.15,
+3.16 and 7.31 ms plain, 2.62, 6.08, 7.21 and 13.9 with the baseline.)
 At 128 chains the unmasked times are near 1 ms, mostly launch latency,
 and the ratios move by about 0.2 between runs. Four windows over the
 same points cost about what two do; one window holding all 398 costs a

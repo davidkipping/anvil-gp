@@ -393,7 +393,11 @@ removes the large numbers instead of storing them more carefully.
    ms (1.12x), and 53.9 -> 58.0 ms at m = 4, 256 chains (1.08x) -- the
    backward dominates, and it lost its `ell` work too. Forming `Phi C
    Phi^T` as two m^3 products instead of one m^4 sum was tried for the
-   shared step and bought nothing (5% slower at m = 4).
+   shared step and bought nothing (5% slower at m = 4). (Re-measured
+   2026-11-10 with the sweep's two products done the same way and the
+   kernel at m up to 6: 8% / 14% faster at m = 3 on value / value +
+   gradient, 5% / 11% at m = 4, 25% / 22% at m = 6. In since then for
+   m >= 3.)
 
    **What it gives up.** On well-conditioned long series the replay's own
    floor is the larger one: a covariance propagated recursively in float32
