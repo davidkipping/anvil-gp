@@ -261,7 +261,10 @@ Accuracy, float32 against float64 (dense-``Sigma`` verified):
   m <= 3 stay within 0.6.
 - The float64 reference (`hi`) used the information-form window step
   until 2026-11-10 and was *less* accurate than the float32 kernel at
-  large amplitude; it now takes the two-filter form (W5).
+  large amplitude; it took the two-filter form (W5), and since
+  2026-11-11 a host filter and smoother over the kept points, which
+  the same 80-digit comparison passes; the two-filter tree remains for
+  the float64 `gram` and is pinned against it.
 
 Gradient accuracy, float32 against float64 central differences:
 
@@ -276,10 +279,11 @@ Gradient accuracy, float32 against float64 central differences:
   1.7e-3.
 
 Cost, measured on a quiet machine (benchmarks.md has the table): at
-N = 2818 with 14% held out, 1.7-2.2x the unmasked kernel's value and
-2.0-2.5x value + gradient from 128 to 1024 chains; with the requester's
-noise model and baseline, 1.7x and 2.0x at 128 chains, 2.0x and 2.0x at
-1024.  How it got there (2026-11-06/07):
+N = 2818 with 14% held out, 1.2-1.6x the unmasked kernel's value and
+1.8-2.4x value + gradient from 128 to 1024 chains; with the requester's
+noise model and baseline, 1.4x and 1.8x at 128 chains, 1.6x and 2.0x at
+1024 (2026-11-11; on 2026-11-07, 1.7-2.2x and 2.0-2.5x).  How it got
+there (2026-11-06/07, then the 2026-11-10 review):
 
 - First measurement, 10-90x.  The window step was MLX ops, and MLX's
   batched matmul spent 10.7 ms per (chains x points) 2 x 2 product.
@@ -298,6 +302,15 @@ noise model and baseline, 1.7x and 2.0x at 128 chains, 2.0x and 2.0x at
   propagator adjoint summed in registers and flushed per lag slot as the
   scans' backward does.  The forward stays one kernel: at 128 chains,
   where launches dominate, splitting it cost 0.3 ms.
+- Since 2026-11-11 a thread is one 16-point run between anchors, not a
+  whole window: the walk from the right anchors on the same grid as the
+  walk from the left (a run's last point, where it was every 16th from
+  the right edge), so no run reads another's state.  The kernels are
+  unchanged; only the layout is (`_masked_metal_layout`).  One window
+  of 14,000 points at 128 chains: value 31.1 -> 6.6 ms at m = 2, 182 ->
+  25.0 at m = 4.  The float64 reference (`hi`) is now one host filter
+  pass over the kept points, flat in the window count (11.7 -> 0.71 s
+  at 400 windows, N = 20000, 64 chains).
 - Anchors.  Walking compounds the cadence propagator's float32 rounding:
   for a slow process ``Phi(dt)`` differs from ``I`` only past its fourth
   digit, and 170 steps took the error at sigma = 30 yerr, rho = 30 hr

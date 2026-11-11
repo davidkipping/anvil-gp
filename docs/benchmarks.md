@@ -369,26 +369,45 @@ kernel, forward and time-reversed (the backward needing only its
 boundary pass, no replay, unless a window leads the data), then join the
 two at the held-out points by walking each window from its edges with
 the cadence's propagator, restarting from the edge every 16 points to
-keep its float32 rounding from compounding (docs/masked-gp-plan.md). At
-N = 2818 one-minute points with 398 (14%) held out in two windows,
-Matern-3/2, against the unmasked likelihood on the kernel (quiet
-machine, 2026-11-10; probe 72.8 and 73.5 ms):
+keep its float32 rounding from compounding (docs/masked-gp-plan.md);
+each 16-point run is a thread of its own. At N = 2818 one-minute points
+with 398 (14%) held out in two windows, Matern-3/2, against the unmasked
+likelihood on the kernel (quiet machine, 2026-11-11; probe 72.9 and
+74.5 ms):
 
 | | 128 chains: value | value + gradient | 1024 chains: value | value + gradient |
 |---|---:|---:|---:|---:|
-| jitter only | 1.46 ms (1.6x) | 4.08 ms (2.1x) | 2.51 ms (1.6x) | 6.60 ms (2.3x) |
-| error scale + quadratic baseline | 2.79 ms (1.9x) | 5.76 ms (2.0x) | 6.21 ms (1.8x) | 12.87 ms (2.0x) |
+| jitter only | 1.15 ms (1.2x) | 3.40 ms (1.8x) | 2.44 ms (1.6x) | 6.56 ms (2.4x) |
+| error scale + quadratic baseline | 2.08 ms (1.4x) | 5.11 ms (1.8x) | 5.83 ms (1.6x) | 12.44 ms (2.0x) |
 
-The unmasked figures they are against: 0.94, 1.91, 1.61 and 2.93 ms
-plain; 1.45, 2.94, 3.52 and 6.49 ms with the noise model and baseline.
-(On 2026-11-07, before the reversed scan was stopped at the earliest
-window and the conditioning guard read the scans' own table: 1.72, 4.15,
-3.16 and 7.31 ms plain, 2.62, 6.08, 7.21 and 13.9 with the baseline.)
-At 128 chains the unmasked times are near 1 ms, mostly launch latency,
-and the ratios move by about 0.2 between runs. Four windows over the
-same points cost about what two do; one window holding all 398 costs a
-little more at small chain counts (2.2x against 1.8x at 128 chains,
-plain value), because the walk is one thread per chain and window.
+The unmasked figures they are against: 0.96, 1.85, 1.57 and 2.75 ms
+plain; 1.47, 2.85, 3.62 and 6.13 ms with the noise model and baseline
+(the unmasked gradient is itself 3-6% faster than on 2026-11-10: it
+takes its checkpoints from the forward's replay, which the masked
+likelihood's reversed scan cannot). Earlier masked figures: 2026-11-10,
+with one thread walking a whole window, 1.46, 4.08, 2.51 and 6.60 ms
+plain and 2.79, 5.76, 6.21 and 12.87 with the baseline; 2026-11-07,
+before the reversed scan was stopped at the earliest window, 1.72, 4.15,
+3.16 and 7.31 ms plain, 2.62, 6.08, 7.21 and 13.9. At 128 chains the
+unmasked times are near 1 ms, mostly launch latency, and the ratios move
+by about 0.2 between runs. One, two and four windows over the same
+points now cost the same to within 5%.
+
+A long window no longer costs sequential depth. One window in the
+middle of N = 30,000 two-minute points (same day, 128 chains; the
+unmasked value is 5.2 ms at m = 2 and 29.5 at m = 4, value + gradient
+8.9 and 68.2):
+
+| held out | SHO: value | value + gradient | SHO + SHO: value | value + gradient |
+|---:|---:|---:|---:|---:|
+| 400 | 8.66 -> 7.94 ms | 17.7 -> 16.6 | 41.4 -> 37.0 | 98.4 -> 90.0 |
+| 4,000 | 15.2 -> 8.26 | 31.2 -> 18.2 | 79.0 -> 34.6 | 180 -> 87.5 |
+| 14,000 | 31.1 -> 6.60 | 65.7 -> 20.2 | 182 -> 25.0 | 394 -> 68.7 |
+
+Before, the walk cost 1.9 us a held-out point at m = 2 and 11.5 at
+m = 4 whatever the chain count. At 1024 chains the 14,000-point window
+went from 40.2 to 26.6 ms (value) and 96.0 to 82.8 (value + gradient)
+at m = 2, and from 270 to 137 and 622 to 372 at m = 4.
 
 Most of what is left is the two scans: with the joining step stubbed
 out, the masked likelihood is 1.8x the unmasked value and 1.9x value +

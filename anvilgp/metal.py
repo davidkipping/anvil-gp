@@ -4055,7 +4055,9 @@ def window_walk(xm_f, xc_f, xm_b, xc_b, phi_tab, q_tab, hvec, walk):
     and the lag table (``phi_tab``, ``q_tab`` with row 0, as the scans read
     it).  ``walk`` is the host-side layout (`GPLogLike._masked_metal_layout`):
     ``idx`` packs the window starts, each window's edge blocks (-1 for the
-    stationary prior) and each point's table row for the step from the
+    stationary prior; a "window" here is one independent run of points, a
+    chunk of a held-out window between two anchors) and each point's table
+    row for the step from the
     previous point (or the left edge) and toward the next (or the right
     edge); ``slots`` = ``(slot_id, slot_start, n_slots, fold_plan)`` for
     the steps.  Three kernels (`_SRC_WALK`, and in the VJP `_SRC_FUSE_VJP`
@@ -4117,8 +4119,8 @@ def window_walk(xm_f, xc_f, xm_b, xc_b, phi_tab, q_tab, hvec, walk):
             output_shapes=[(2, n, n_win, k, m), (2, n, n_win, m, m),
                            (n, n_slots, m, m), (n, n_slots, m, m)],
             output_dtypes=[mx.float32] * 4, **grid(n_win * n))
-        # each edge is one window's (distinct windows have distinct edge
-        # blocks), so these scatters never repeat an index
+        # a window's chunks share its edge blocks: `.at[].add` sums the
+        # repeated indices
         z = mx.zeros_like
         d_xmf = z(xmf).at[:, bl].add(mx.take(d_em[0], wl, axis=1))
         d_xcf = z(xcf).at[:, bl].add(mx.take(d_ec[0], wl, axis=1))

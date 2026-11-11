@@ -1514,11 +1514,22 @@ class GPLogLike:
         (the stationary prior).
 
         ``walk`` is the window step's layout (`metal.window_walk`): the
-        windows (runs of held-out points between the same two segments),
-        their edge blocks (-1 for the prior), and each point's table row
-        for the step from the previous point (or the left edge) and toward
-        the next (or the right edge).  Those lags -- the cadence, mostly --
-        are added to the table, so the walk needs no other propagator.
+        windows (runs of held-out points between the same two segments)
+        cut into chunks of `_walk_anchor` points, each chunk's edge blocks
+        (-1 for the prior), and each point's table row for the step from
+        the previous point (or the left edge) and toward the next (or the
+        right edge).  Those lags -- the cadence, mostly -- are added to
+        the table, so the walk needs no other propagator.
+
+        A chunk is what the kernel calls a window and gives a thread.
+        Both walks restart from the window's edge at an anchor, so with
+        the anchors of both on one grid -- a chunk's first point for the
+        walk from the left, its last for the walk from the right -- no
+        chunk reads another's state, and the walk's sequential depth is
+        `_walk_anchor`, not the window's length.  One thread per window
+        cost 1.9 us a held-out point at m = 2 and 11.5 at m = 4 whatever
+        the chain count: 26 of a 31 ms value for one window of 14,000
+        points at m = 2, 161 of 182 ms at m = 4 (2026-11-11).
         """
         hd = self._held
         blk = int(self.metal_block)
@@ -1542,8 +1553,13 @@ class GPLogLike:
         # the edge itself (its lag to the edge; 0 from the prior)
         w_of = np.repeat(np.arange(p_first.size), np.diff(win_start))
         pos = np.arange(n_m)
-        anc_f = (pos - p_first[w_of]) % self._walk_anchor == 0
-        anc_b = (p_last[w_of] - pos) % self._walk_anchor == 0
+        na = self._walk_anchor
+        anc_f = (pos - p_first[w_of]) % na == 0
+        anc_b = ((pos - p_first[w_of]) % na == na - 1) | (pos == p_last[w_of])
+        # the chunks: from one left anchor to before the next
+        ch_start = np.concatenate(
+            [np.flatnonzero(anc_f), [n_m]]).astype(np.int32)
+        ch_win = w_of[ch_start[:-1]]
         step_f[anc_f] = np.where(prev[anc_f] < k, hd["lag_a"][anc_f], 0.0)
         step_b[anc_b] = np.where(nxt[anc_b] < k, hd["lag_b"][anc_b], 0.0)
         # one table for the scans and the walk; row 0 is the first S
@@ -1609,7 +1625,7 @@ class GPLogLike:
         n_lags = int(uniq.size) + 1
         slots = {}
         steps = np.concatenate([lagf_w, lagb_w])
-        w_starts = np.concatenate([win_start, n_m + win_start[1:]])
+        w_starts = np.concatenate([ch_start, n_m + ch_start[1:]])
         for d, lg, st in (("f", lag_f, starts_f), ("b", lag_b, starts_b),
                           ("w", steps, w_starts)):
             sid, sstart, slag = _slot_map(lg, blk, starts=st)
@@ -1645,13 +1661,14 @@ class GPLogLike:
         # except after its last block, which only a leading window reads.
         lay["entry_exits"] = not bool(np.any(edge_r == nb_b - 1))
         from .metal import WALK_ANCHOR_BIT
+        edge_l, edge_r = edge_l[ch_win], edge_r[ch_win]       # per chunk
         lay["walk"] = dict(
             idx=i32(np.concatenate([
-                win_start, edge_l, edge_r,
+                ch_start, edge_l, edge_r,
                 np.where(anc_f, lagf_w | WALK_ANCHOR_BIT, lagf_w),
                 np.where(anc_b, lagb_w | WALK_ANCHOR_BIT, lagb_w)])),
             slots_packed=i32(np.concatenate([sid_w, sstart_w])),
-            edge_l_np=edge_l, edge_r_np=edge_r, n_win=win_start.size - 1,
+            edge_l_np=edge_l, edge_r_np=edge_r, n_win=ch_start.size - 1,
             n_m=n_m, signs=lay["signs"], slots=slots["w"])
         hd["metal"] = lay
         return lay

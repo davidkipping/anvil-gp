@@ -1062,3 +1062,45 @@ def test_the_window_step_is_inside_a_memory_budget(monkeypatch):
         with pytest.raises(ValueError, match="held-out window step"):
             mx.eval(gp(v))
     assert np.all(np.isfinite(ok))
+
+
+def test_the_window_walk_is_cut_at_its_anchors():
+    """One thread per chunk of `_walk_anchor` points, not per window: both
+    walks restart from the edge at a chunk's end, so no chunk reads
+    another's state and a long window costs no sequential depth (one
+    window of 14,000 points at m = 4: the walk 161 -> 4.3 ms at 128
+    chains).  Value and gradient against the MLX window step, on a window
+    of many chunks with a ragged last one."""
+    from anvilgp.metal import WALK_ANCHOR_BIT
+    if not metal_available():
+        pytest.skip("no Metal")
+    term, kp = _TERMS["sho"]
+    rng = np.random.default_rng(7)
+    n = 900
+    t = np.sort(rng.uniform(0, 30, n))
+    y, yerr = rng.standard_normal(n), np.full(n, 0.2)
+    mask = ((np.arange(n) >= 300) & (np.arange(n) < 503)) | (np.arange(n) < 5)
+    gp = GPLogLike(None, t, None, y, yerr, term, ParamMap.log(kp),
+                   GPPolicy(metal=True, kappa_max=None), held_out=mask)
+    walk = gp._masked_metal_layout()["walk"]
+    idx, n_c, n_m = np.array(walk["idx"]), walk["n_win"], walk["n_m"]
+    start = idx[:n_c + 1]
+    lagf, lagb = idx[3 * n_c + 1:][:n_m], idx[3 * n_c + 1 + n_m:]
+    na = gp._walk_anchor
+    assert n_c == 1 + -(-203 // na) and np.diff(start).max() <= na
+    assert np.all(lagf[start[:-1]] >= WALK_ANCHOR_BIT)
+    assert np.all(lagb[start[1:] - 1] >= WALK_ANCHOR_BIT)
+    assert (lagf >= WALK_ANCHOR_BIT).sum() == n_c
+    assert (lagb >= WALK_ANCHOR_BIT).sum() == n_c
+
+    v = mx.array(0.1 * rng.standard_normal((6, 3)).astype(np.float32))
+    f = lambda x: mx.sum(gp(x))                           # noqa: E731
+    val, grad = np.array(gp(v)), np.array(mx.grad(f)(v))
+    gp._force_mlx_window = True
+    try:
+        val_m, grad_m = np.array(gp(v)), np.array(mx.grad(f)(v))
+    finally:
+        gp._force_mlx_window = False
+    np.testing.assert_allclose(val, val_m, rtol=0, atol=5e-3)
+    np.testing.assert_allclose(grad, grad_m, rtol=2e-3,
+                               atol=2e-3 * np.abs(grad_m).max())
